@@ -41,8 +41,10 @@ MS_CDN = "https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/01/23/abcd?auth_ke
 FAKE_SERVER = r'''#!{python}
 # A stand-in for llama-server: it records how it was started, then behaves as the control file says.
 # With a stop_delay file, it takes that many seconds to end after SIGTERM, as a busy server may.
+# It ends once the process that started it is gone, however that went, so it never outlives its test.
 import json, os, signal, sys, time
 control = {control!r}
+owner = os.getppid()
 try:
     with open(os.path.join(control, "stop_delay")) as f:
         delay = float(f.read())
@@ -70,8 +72,8 @@ if behavior[0] == "ready":
     if len(behavior) > 1:  # "ready N": exits N seconds after it was ready
         time.sleep(float(behavior[1]))
         sys.exit(1)
-while True:
-    time.sleep(1)
+while os.getppid() == owner != 1:  # (launchd's from the start: its owner died before it ran)
+    time.sleep(0.2)
 '''
 
 
@@ -1549,3 +1551,50 @@ def test_the_offered_models_and_the_reranker_pins():
     assert set(EMBEDDING_MODEL["sources"]) == set(local_helper.SOURCES)
     assert local_helper.command("/b", "/m", "reranker")[-9:] == [
         "--reranking", "-c", "4096", "-ub", "2048", "-np", "2", "--cache-ram", "0"]
+
+
+# The stand-in never outlives its test (M2, after S1-21a's follow-up). It was left running only when the test process
+# died before its app closed (ended by a signal while a test hung): the app stops its helper on close, but nothing
+# ended a helper whose owner was gone. A check after every test (conftest._no_helper_left_running) fails on any left.
+
+
+def _running(pid):
+    from backend import reading
+    return reading._info(pid) is not None  # none once ended (a zombie has no record)
+
+
+def test_a_stand_in_helper_ends_when_the_process_that_started_it_dies(fake):
+    import signal
+    import subprocess
+    owner = ("import subprocess, sys, time; p = subprocess.Popen([sys.argv[1]], stdout=subprocess.DEVNULL); "
+             "print(p.pid, flush=True); time.sleep(60)")
+    with allow_subprocess(sys.executable):
+        started_by = subprocess.Popen([sys.executable, "-c", owner, str(fake.binary)], stdout=subprocess.PIPE,
+                                      text=True)
+    helper = int(started_by.stdout.readline())
+    try:
+        started_by.kill()  # as a test process ended by a signal is: its app never closes
+        started_by.wait()
+        deadline = time.monotonic() + 5
+        while _running(helper) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _running(helper)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(helper, signal.SIGKILL)  # this test's own helper, by its pid: never left behind
+
+
+def test_the_check_after_each_test_finds_a_stand_in_left_running(tmp_path, fake):
+    import subprocess
+    from conftest import _helpers_left
+    with allow_subprocess(str(fake.binary)):
+        helper = subprocess.Popen([str(fake.binary)], stdout=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 5
+        while not fake.launches and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _helpers_left(tmp_path, grace=0) == [helper.pid]
+    finally:
+        helper.kill()
+        helper.wait()
+    assert _helpers_left(tmp_path) == []

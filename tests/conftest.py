@@ -87,6 +87,42 @@ def _no_reading_child_left_stopped():
     assert not left, f"stopped processes left in a reading child's group, not ended: {left}"
 
 
+def _helpers_left(root, grace=2.0):
+    """The stand-in helpers (tests/test_local_helper.py Fake) started under root that still run, given grace seconds
+    to end: each records its pid as it starts (control/launches.jsonl). One ended has no record (reading._info)."""
+    import json
+    import time
+
+    from backend import reading
+
+    pids = [json.loads(line)["pid"] for path in Path(root).glob("**/control/launches.jsonl")
+            for line in path.read_text().splitlines()]
+    deadline = time.monotonic() + grace
+    while True:
+        left = [pid for pid in pids if reading._info(pid) is not None]
+        if not left or time.monotonic() >= deadline:
+            return left
+        time.sleep(0.02)
+
+
+@pytest.fixture(autouse=True)
+def _no_helper_left_running(request):
+    """A test leaves no stand-in helper running: its app stops the helpers it started when it closes. One left fails
+    the test, named, and is then ended by its recorded pid so that it outlives nothing."""
+    root = request.getfixturevalue("tmp_path") if "tmp_path" in request.fixturenames else None  # torn down after this
+    yield
+    if root is None:
+        return
+    import os
+    import signal
+
+    left = _helpers_left(root)
+    for pid in left:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    assert not left, f"stand-in helpers left running after the test: {left}"
+
+
 @pytest.fixture
 def reading_stub(monkeypatch):
     """Read in tests/reading_stub.py's child for the rest of the test: reading_stub(mode, *args)
