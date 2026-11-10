@@ -218,3 +218,13 @@ test('a kept notice is cleared by a later success, and its draft let go once its
   assert.equal(purged(kept, [{ id: 'r2', replaced: ['r1'] }]), kept);
   assert.equal(purged(kept, null), kept); // reading again: kept until the read says
 });
+
+// PR 51 fix batch 3, internal recheck: every action names its record, and an unnamed one clears nothing
+test('a notice is cleared only by a success on the record it names', async () => {
+  const { settled } = await import('../src/memory.js');
+  const unnamed = { problem: 'Not saved', draft: null, id: null };
+  assert.equal(settled(unnamed, null, null), unnamed);
+  const source = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
+  assert.match(source, /act\(\(\) => changeRecord\(record, \{ status: 'confirmed' \}\), null, record\.id\)/);
+  assert.match(source, /act\(\(\) => forgetRecord\(record\), null, record\.id\)/);
+});

@@ -144,11 +144,11 @@ function Row({ record, onChanged, onFailed }) {
         <div className="flex flex-wrap gap-2">
           {!written && record.status === 'inferred' && (
             <Button size="sm" variant="outline" className="h-7" disabled={busy}
-              onClick={() => act(() => changeRecord(record, { status: 'confirmed' }))}>{t('memory.confirm')}</Button>
+              onClick={() => act(() => changeRecord(record, { status: 'confirmed' }), null, record.id)}>{t('memory.confirm')}</Button>
           )}
           <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setEditing(record.content)}>
             {t('memory.edit')}</Button>
-          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => act(() => forgetRecord(record))}>
+          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => act(() => forgetRecord(record), null, record.id)}>
             {t('memory.forget')}</Button>
         </div>
       )}

@@ -79,7 +79,7 @@ export function keepUnsaved(key, value) {
 
 // The kept notice after an action on record id: what it could not save (failed), or, once that record's action
 // succeeded, nothing; another record's success leaves it.
-export const settled = (kept, failed, id) => failed ?? (kept?.id === id ? null : kept);
+export const settled = (kept, failed, id) => failed ?? (id != null && kept?.id === id ? null : kept);
 
 // The kept notice once a read completed (records): its draft let go, not only hidden, when the read holds neither its
 // record nor a later version of it (no client-held derived state); while the view reads again (null), as it was.
