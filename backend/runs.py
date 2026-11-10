@@ -1804,6 +1804,7 @@ class Harness:
 
         async def keeping():  # registered, stored, linked and recorded to its end, whatever cancellation comes meanwhile
             nonlocal result, message
+            kept_sha = None
             if turn.listed or result.meta.get("passages") or result.meta.get("memory"):  # what it gave the model is
                 # covered before the next dispatch (S1-21a: memory records too)
                 await self._register_context(claim, turn.evidence.numbered, turn.listed)
@@ -1821,6 +1822,7 @@ class Harness:
                         log.warning("a tool output could not be kept for paging (%s)", type(error).__name__)
                         kept = False
                     if kept:
+                        kept_sha = sha  # named, by its hash only, on the call's tool_result event
                         turn.outputs[handle] = {"step": step, "number": number, "length": len(whole_text),
                                                 "segments": segments}
                         result = result.model_copy(update={"text": compaction.preview(whole_text, handle, size),
@@ -1838,7 +1840,8 @@ class Harness:
                     "step": step, "call_id": call_id, "name": name, "ok": result.ok,
                     **({"error": result.error.type} if result.error else {}),
                     **({"meta": result.meta} if result.meta else {}),
-                    **({"result": ref} if ref else {"result_unavailable": True})},
+                    **({"result": ref} if ref else {"result_unavailable": True}),
+                    **({"kept": kept_sha} if kept_sha else {})},
                     also=lambda conn: _keep_result(conn, claim.run_id, step, number, ref, materials,
                                                    # S1-21b: a page served from a kept output follows the records it
                                                    # shows (a tool's own result follows its papers, reading 10)

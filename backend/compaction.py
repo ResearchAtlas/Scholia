@@ -22,9 +22,11 @@ A compaction that fails, is refused or cannot be sent leaves the older turns out
 asked for again.
 
 Paging. A tool's output over the 8,000-character preview goes whole to the content store under a run_bodies row of the
-turn (OUTPUT_SLOT plus its call's number), linked to the papers whose text it holds; the model gets the preview and a
-handle, and the `read_output` tool (backend/agent.py) returns the next 8,000 characters. A handle is valid only in its own
-turn (agent.Turn.outputs), and goes with the turn's run or any of those papers.
+turn (OUTPUT_SLOT plus its call's number), linked to the papers and memory records whose text it holds (fix batch 2:
+every record it contains, shown or not; a page served from it, to the records the page shows); the model gets the
+preview and a handle, and the `read_output` tool (backend/agent.py) returns the next 8,000 characters. A handle is valid
+only in its own turn (agent.Turn.outputs); the output goes with the turn's run, and with any of those papers or records,
+in the deletion's own transaction.
 """
 
 import json
@@ -246,7 +248,8 @@ def keep_output(conn, run_id, step, number, sha256, materials, memory_ids=()):
 
 
 def kept_output(conn, run_id, step, number):
-    """The sha256 of a paged output still kept for its turn, or None (its paper deleted, or its run gone)."""
+    """The sha256 of a paged output still kept for its turn, or None (a paper or memory record it held deleted or
+    forgotten, or its run gone)."""
     row = conn.execute("SELECT sha256 FROM run_bodies WHERE run_id = ? AND step = ? AND attempt = ?",
                        (run_id, step, OUTPUT_SLOT + number)).fetchone()
     return row[0] if row else None

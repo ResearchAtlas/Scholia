@@ -536,7 +536,7 @@ async def read_output(call, turn):
             text = (await asyncio.to_thread(turn.harness.content.read, sha)).decode("utf-8")
         except Exception:  # missing or damaged: as if not kept
             text = None
-    if text is None:  # gone with a paper whose text it held, or never kept
+    if text is None:  # gone with a paper or memory record whose text it held, or never kept
         return failed(call.id, "not_found", "That output is no longer kept.")
     shown = reveal(turn, kept["segments"], offset)
     return ToolResult(id=call.id, ok=True, text=compaction.page(text, offset, handle), meta={

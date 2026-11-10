@@ -337,7 +337,7 @@ async def test_fix2_forget_removes_a_kept_output_and_the_pages_served_from_it(tm
         assert (await client.delete(f"/api/memory/{held['records'][1]}")).status_code in (200, 204)
         kept = {s for _, s in await bodies(second)}
         assert whole not in kept and page_sha not in kept  # in the deletion's own transaction
-        assert await served(second, whole) in (404, 410) and await served(second, page_sha) == 410  # removed, said so
+        assert await served(second, whole) == 410 and await served(second, page_sha) == 410  # removed, said so
 
 
 
