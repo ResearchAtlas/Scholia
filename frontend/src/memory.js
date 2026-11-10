@@ -53,13 +53,22 @@ export const changeRecord = (record, body) => patch(`/api/memory/${encodeURIComp
 export const forgetRecord = (record) => del(`/api/memory/${encodeURIComponent(record.id)}?version=${record.version}`);
 export const review = (body) => post('/api/memory/review', body);
 
-// A memory action from the views: null once done, else what was not saved, the error in words and the researcher's own
-// text, which the view keeps across its reread (S1-21a follow-up MB1; the record itself is always read again).
-export async function attempt(t, action, draft = null) {
+// A memory action from the views: null once done, else what was not saved, the error in words and the text in the box
+// (id: the record it was for), which the view keeps across its reread (S1-21a follow-up MB1; the record itself is
+// always read again).
+export async function attempt(t, action, draft = null, id = null) {
   try {
     await action();
     return null;
   } catch (error) {
-    return { problem: errorText(t, error instanceof ApiError ? error.code : 'internal'), draft };
+    return { problem: errorText(t, error instanceof ApiError ? error.code : 'internal'), draft, id };
   }
+}
+
+// The kept text, shown only beside a read that still holds its record, or the version that replaced it: Edit fills the
+// box with the record's own text, which may come from a paper, so once the record is forgotten or goes with its paper,
+// and while the views read again, it is not shown (no client-held derived state; PR 51 review 1).
+export function draftFor(unsaved, records) {
+  const held = (records ?? []).some((record) => record.id === unsaved?.id || record.supersedes_id === unsaved?.id);
+  return unsaved?.draft && held ? unsaved.draft : null;
 }

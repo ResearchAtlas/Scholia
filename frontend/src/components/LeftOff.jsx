@@ -36,9 +36,13 @@ export function LeftOff({ projectId }) {
     libraryEvents.addEventListener('changed', changed); // memory changes too (memory.js memoryChanged)
     return () => libraryEvents.removeEventListener('changed', changed);
   }, [projectId, load]);
-  if (!found?.show || hidden || leftOffDismissed(projectId, found.latest_turn_at)) return null;
-  const empty = !found.done.length && !found.questions.length && !found.next_step && !found.to_confirm.length && !found.notice;
-  if (empty) return null;
+  const unsavedNotice = <Unsaved unsaved={unsaved} records={found?.to_confirm ?? null} onDismiss={() => setUnsaved(null)} />;
+  const empty = found && !found.done.length && !found.questions.length && !found.next_step && !found.to_confirm.length
+    && !found.notice;
+  if (!found?.show || hidden || leftOffDismissed(projectId, found.latest_turn_at) || empty) {
+    // what Keep, Edit or Forget could not save is said even when the card is not (its reread failed, or it is gone)
+    return unsaved ? <section aria-label={t('leftOff.title')} className="mb-8 grid gap-2 text-sm">{unsavedNotice}</section> : null;
+  }
   return (
     <section aria-label={t('leftOff.title')} className="mb-8 grid gap-4 rounded-xl border bg-card p-4 text-sm shadow-xs">
       <div className="flex items-center gap-2">
@@ -61,7 +65,7 @@ export function LeftOff({ projectId }) {
           </div>
         </div>
       )}
-      <Unsaved unsaved={unsaved} onDismiss={() => setUnsaved(null)} />
+      {unsavedNotice}
       {found.to_confirm.length > 0 && (
         <div className="grid gap-2">
           <h3 className="text-xs font-medium text-muted-foreground">{t('leftOff.confirm')}</h3>

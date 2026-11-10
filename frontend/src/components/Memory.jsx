@@ -7,7 +7,7 @@ import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError } from '../api.js';
 import { visible } from '../text.js';
-import { attempt, changeRecord, forgetRecord, memoryChanged, readMemory, recordText, review } from '../memory.js';
+import { attempt, changeRecord, draftFor, forgetRecord, memoryChanged, readMemory, recordText, review } from '../memory.js';
 import { libraryEvents, readGuard } from '../library.js';
 import { LoadState, Section } from './fields.jsx';
 import { Button } from '@/components/ui/button';
@@ -33,7 +33,7 @@ export function MemorySection({ project }) {
   }, [load]);
   return (
     <Section title={t('memory.title')} hint={t('memory.hint')}>
-      <Unsaved unsaved={unsaved} onDismiss={() => setUnsaved(null)} />
+      <Unsaved unsaved={unsaved} records={found && [...found.personal, ...found.project]} onDismiss={() => setUnsaved(null)} />
       {!found ? <LoadState problem={problem} onRetry={load} /> : (
         <div className="grid gap-6">
           {found.memory_enabled === false && <p className="text-sm text-muted-foreground">{t('memory.offNote')}</p>}
@@ -48,13 +48,14 @@ export function MemorySection({ project }) {
 }
 
 // What a memory action could not save: the error, and the researcher's own text, until dismissed (MB1).
-export function Unsaved({ unsaved, onDismiss }) {
+export function Unsaved({ unsaved, records, onDismiss }) {
   const t = useT();
   if (!unsaved) return null;
+  const draft = draftFor(unsaved, records); // records: what the view's current read holds (null while it reads)
   return (
     <div role="alert" className="grid gap-1 rounded-lg border border-destructive/40 px-3 py-2 text-xs">
       <p className="text-destructive">{unsaved.problem}</p>
-      {unsaved.draft && <p className="break-words text-muted-foreground">{t('memory.unsavedText', { text: unsaved.draft })}</p>}
+      {draft && <p className="break-words text-muted-foreground">{t('memory.unsavedText', { text: draft })}</p>}
       <div><Button size="sm" variant="ghost" className="h-7" onClick={onDismiss}>{t('memory.dismiss')}</Button></div>
     </div>
   );
@@ -65,9 +66,9 @@ export function Unsaved({ unsaved, onDismiss }) {
 function useMemoryAction(onChanged, onFailed) {
   const t = useT();
   const [busy, setBusy] = useState(false);
-  async function act(action, draft = null) {
+  async function act(action, draft = null, id = null) {
     setBusy(true);
-    const failed = await attempt(t, action, draft);
+    const failed = await attempt(t, action, draft, id);
     setBusy(false);
     if (failed) onFailed?.(failed);
     onChanged?.();
@@ -113,7 +114,7 @@ function Row({ record, onChanged, onFailed }) {
       {editing !== null ? (
         <form className="grid gap-2" onSubmit={(event) => {
           event.preventDefault();
-          if (visible(editing)) act(() => changeRecord(record, { content: editing }), editing).then(() => setEditing(null));
+          if (visible(editing)) act(() => changeRecord(record, { content: editing }), editing, record.id).then(() => setEditing(null));
         }}>
           <label className="sr-only" htmlFor={`memory-${record.id}`}>{t('memory.contentLabel')}</label>
           <Textarea id={`memory-${record.id}`} value={editing} onChange={(event) => setEditing(event.target.value)} rows={2} />
@@ -144,7 +145,8 @@ export function Proposal({ proposal, onChanged, onFailed }) {
   const t = useT();
   const { busy, act: acted } = useMemoryAction(onChanged, onFailed);
   const [editing, setEditing] = useState(null);
-  const act = (body) => acted(() => review({ id: proposal.id, version: proposal.version, ...body }), body.content ?? null);
+  const act = (body) => acted(() => review({ id: proposal.id, version: proposal.version, ...body }), body.content ?? null,
+    proposal.id);
   const marks = [proposal.structured?.older && t('memory.older'), proposal.structured?.out_of_date && t('memory.outOfDate'),
     proposal.structured?.source === 'answer' && t('memory.fromAnswer')].filter(Boolean);
   return (

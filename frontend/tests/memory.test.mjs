@@ -155,3 +155,22 @@ test('Where we left off is read again once a turn of this conversation starts', 
   const source = readFileSync(join(SRC, 'components', 'ConversationView.jsx'), 'utf8');
   assert.match(source, /<LeftOff key=\{live\?\.runId \?\? 'none'\} projectId=\{projectId\} \/>/);
 });
+
+// PR 51 review 1 (P1 1, P2 6): a kept draft may hold its record's own text (Edit fills the box with it), so it is shown
+// only beside a read that still holds that record (or the version that replaced it): once the record is forgotten or
+// goes with a paper, or while the views read again, only the error is said. Where we left off says it even when its
+// card is not shown (a failed reread included).
+test('a kept draft is shown only while the current read still holds its record', async () => {
+  const { attempt, draftFor } = await import('../src/memory.js');
+  const { ApiError } = await import('../src/api.js');
+  const failed = await attempt(t, async () => { throw new ApiError(400, 'personal_from_strict'); }, 'Wages rose 5%', 'r1');
+  assert.equal(failed.id, 'r1');
+  assert.equal(draftFor(failed, [{ id: 'r1' }]), 'Wages rose 5%');
+  assert.equal(draftFor(failed, [{ id: 'r2', supersedes_id: 'r1' }]), 'Wages rose 5%'); // edited elsewhere since
+  assert.equal(draftFor(failed, [{ id: 'r2' }]), null); // forgotten, or gone with its paper
+  assert.equal(draftFor(failed, null), null); // reading again, or the read failed
+  for (const name of ['Memory.jsx', 'LeftOff.jsx']) {
+    assert.match(readFileSync(join(SRC, 'components', name), 'utf8'), /<Unsaved [^>]*records=\{/, name);
+  }
+  assert.match(readFileSync(join(SRC, 'components', 'LeftOff.jsx'), 'utf8'), /return unsaved \? /);
+});
