@@ -250,7 +250,8 @@ def _dict(conn, found, with_sources=True):
 
 def listing(conn, project_id=None, statuses=None):
     """{"personal": [...], "project": [...]}: the records the memory views show, newest first; project records of
-    project_id only."""
+    project_id only. Each names every earlier version it replaced (`replaced`, newest first: the superseded records of
+    its chain), so what a view keeps for one of them stays shown beside its latest version (Q13, PR 51 recheck 3)."""
     statuses = statuses or ("confirmed", "inferred", "proposed")
     rows = conn.execute(
         f"SELECT {_COLUMNS} FROM memory_records WHERE status IN (SELECT value FROM json_each(?))"
@@ -259,7 +260,21 @@ def listing(conn, project_id=None, statuses=None):
     found = {"personal": [], "project": []}
     for item in rows:
         record = _dict(conn, item)
-        found[record["scope"]].append(record)
+        record["replaced"] = _replaced(conn, record) if record["status"] != "proposed" else []  # a proposal replaced
+        found[record["scope"]].append(record)  # nothing yet: its supersedes_id names the record it would replace
+    return found
+
+
+def _replaced(conn, record):
+    """The superseded versions record replaced, newest first, by its supersedes_id chain."""
+    found, seen, earlier = [], {record["id"]}, record["supersedes_id"]
+    while earlier is not None and earlier not in seen:
+        row = conn.execute("SELECT status, supersedes_id FROM memory_records WHERE id = ?", (earlier,)).fetchone()
+        if row is None or row[0] != "superseded":
+            break
+        found.append(earlier)
+        seen.add(earlier)
+        earlier = row[1]
     return found
 
 

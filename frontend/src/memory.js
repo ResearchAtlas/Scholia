@@ -77,11 +77,12 @@ export function keepUnsaved(key, value) {
   keptEvents.dispatchEvent(new Event('changed'));
 }
 
-// The kept text, shown only beside a read that still holds its record, or the version that replaced it: Edit fills the
-// box with the record's own text, which may come from a paper, so once the record is forgotten or goes with its paper,
-// and while the views read again, it is not shown (no client-held derived state; PR 51 review 1).
+// The kept text, shown only beside a read that still holds its record, or a later version of it (each listed record
+// names every version it replaced: `replaced`, Q13): Edit fills the box with the record's own text, which may come from
+// a paper, so once the record and every later version are forgotten or gone with their paper, and while the views read
+// again, it is not shown (no client-held derived state; PR 51 review 1).
 export function draftFor(unsaved, records) {
   const held = unsaved?.id != null
-    && (records ?? []).some((record) => record.id === unsaved.id || record.supersedes_id === unsaved.id);
+    && (records ?? []).some((record) => record.id === unsaved.id || (record.replaced ?? []).includes(unsaved.id));
   return unsaved?.draft && held ? unsaved.draft : null;
 }

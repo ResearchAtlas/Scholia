@@ -937,3 +937,16 @@ async def test_a_revoked_turn_stays_revoked_when_its_ending_failed_and_it_is_rec
         await client.state["harness"].recover(kick=False)  # as the next start does
         assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", failed[0]) == [
             ("cancelled", "revoked")]
+
+
+async def test_the_memory_views_list_each_record_with_every_version_it_replaced(tmp_path):
+    # Q13 (PR 51 recheck 3): a failed edit's draft for r0 stays shown beside r2 after two edits (r0, r1, r2); the
+    # views' listing names, for each record, every earlier version it replaced (newest first)
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        r0 = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                      "content": "We use interviews"})).json()["id"]
+        r1 = (await client.patch(f"/api/memory/{r0}", json={"version": 1, "content": "We use surveys"})).json()
+        r2 = (await client.patch(f"/api/memory/{r1['id']}", json={"version": r1["version"], "content": "We use diaries"})).json()
+        listed = (await client.get("/api/memory", params={"project_id": project})).json()["project"]
+        assert [(r["id"], r["replaced"]) for r in listed if r["type"] == "decision"] == [(r2["id"], [r1["id"], r0])]

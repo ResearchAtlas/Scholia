@@ -169,7 +169,7 @@ test('a kept draft is shown only while the current read still holds its record',
   const failed = await attempt(t, async () => { throw new ApiError(400, 'personal_from_strict'); }, 'Wages rose 5%', 'r1');
   assert.equal(failed.id, 'r1');
   assert.equal(draftFor(failed, [{ id: 'r1' }]), 'Wages rose 5%');
-  assert.equal(draftFor(failed, [{ id: 'r2', supersedes_id: 'r1' }]), 'Wages rose 5%'); // edited elsewhere since
+  assert.equal(draftFor(failed, [{ id: 'r2', supersedes_id: 'r1', replaced: ['r1'] }]), 'Wages rose 5%'); // edited since
   assert.equal(draftFor(failed, [{ id: 'r2' }]), null); // forgotten, or gone with its paper
   assert.equal(draftFor(failed, null), null); // reading again, or the read failed
   for (const name of ['Memory.jsx', 'LeftOff.jsx']) {
@@ -194,4 +194,13 @@ test('a failed action\'s notice outlives a remount of the view that shows it', a
     assert.match(source, /useUnsaved\(/, name);
     assert.doesNotMatch(source, /setUnsaved\(null\); load\(\)/, name);
   }
+});
+
+// Q13 (PR 51 recheck 3): a draft stays shown while the read holds its record or any later version of it (the listing
+// names each record's earlier versions, `replaced`), and goes once the record and every later version are gone
+test('a kept draft is shown beside a later version of its record, however many edits later', async () => {
+  const { draftFor } = await import('../src/memory.js');
+  const unsaved = { problem: 'Not saved', draft: 'my words', id: 'r0' };
+  assert.equal(draftFor(unsaved, [{ id: 'r2', supersedes_id: 'r1', replaced: ['r1', 'r0'] }]), 'my words');
+  assert.equal(draftFor(unsaved, [{ id: 'r9', replaced: ['r8'] }]), null);
 });
