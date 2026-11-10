@@ -2075,6 +2075,11 @@ class Harness:
                     finished["output"] = "held"
                 if exists:
                     _event(conn, active.run_id, "step_finished", finished)
+                if exists and call.memory_off:  # refused for memory (switched off, or a record it holds changed):
+                    # revoked in the record, with the step that says so, so every later reader (the terminal write,
+                    # recovery, a restart, Continue, the trace) ends it revoked, as a deletion's revocation is (MB11)
+                    conn.execute("UPDATE runs SET cancel_reason = 'revoked' WHERE id = ? AND status = 'running'"
+                                 " AND cancel_reason IS NULL", (active.run_id,))
                 if not result.dispatched:
                     spending.release(conn, call.reservation_id)
 

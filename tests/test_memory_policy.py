@@ -870,3 +870,70 @@ async def test_a_record_moved_since_it_was_shown_is_not_forgotten_from_the_old_v
         stale = await client.delete(f"/api/memory/{record}", params={"version": shown})
         assert (stale.status_code, stale.json()["code"]) == (409, "version_changed")
         assert await rows(client, "SELECT project_id FROM memory_records WHERE id = ?", record) == [(private,)]
+
+
+# PR 51 fix batch 3 (Q11, recheck 3): a memory refusal's revoked ending is durable
+
+
+async def test_a_revoked_extraction_stays_revoked_when_its_ending_failed_and_it_is_recovered(tmp_path, monkeypatch):
+    # the reviewer's case: the proposal is edited before dispatch, and the cancellation's write fails once; the run is
+    # then recovered (kick_background) and must end cancelled/revoked, as the record says, never failed
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use interviews", status="proposed",
+            sources=[("project", project)]))
+        dispatch, finish, failed = runs.Harness._call, runs.Harness._finish_background, []
+
+        async def edited_meanwhile(self, *args, **kwargs):
+            if sys._getframe(1).f_code.co_name == "_extraction_call":
+                edited = await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
+                assert edited.status_code == 200
+            return await dispatch(self, *args, **kwargs)
+
+        def failing_once(self, conn, active, status, *args, **kwargs):
+            if status == "cancelled" and not failed:
+                failed.append(active.run_id)
+                raise RuntimeError("the cancellation's write failed")
+            return finish(self, conn, active, status, *args, **kwargs)
+        monkeypatch.setattr(runs.Harness, "_call", edited_meanwhile)
+        monkeypatch.setattr(runs.Harness, "_finish_background", failing_once)
+        await send(client, await conversation_in(client, project), "We sample thirty nurses")
+        await background_idle(client)
+        assert failed and await rows(client, "SELECT status FROM runs WHERE workflow = 'memory'") == [("running",)]
+        await client.state["harness"].kick_background()
+        await background_idle(client)
+        assert provider.extractions == []
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
+            ("cancelled", "revoked")]
+
+
+async def test_a_revoked_turn_stays_revoked_when_its_ending_failed_and_it_is_recovered(tmp_path, monkeypatch):
+    from cited import cited, with_papers
+    from test_search import WAGES
+    held, finish, failed = {}, runs.Harness._finish_turn, []
+
+    async def edit_then_list(body):
+        changed = await held["client"].patch(f"/api/memory/{held['record']}", json={"version": 1, "content": "Changed"})
+        assert changed.status_code == 200
+        return steps_reply(provider, [call("list_materials")])
+
+    def failing_once(self, conn, run_id, status, cancel_reason, *args, **kwargs):
+        if status == "cancelled" or kwargs.get("claim") is not None and kwargs["claim"].cancel_requested.is_set():
+            if not failed:
+                failed.append(run_id)
+                raise RuntimeError("the cancellation's write failed")
+        return finish(self, conn, run_id, status, cancel_reason, *args, **kwargs)
+    provider = Scripted(edit_then_list, "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "SECRET decision"})).json()["id"]
+        held.update(client=client, record=record)
+        monkeypatch.setattr(runs.Harness, "_finish_turn", failing_once)
+        await send(client, await conversation_in(client, project), "What did we decide last time?")
+        assert failed and len(provider.agent_steps) == 1
+        await client.state["harness"].recover(kick=False)  # as the next start does
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", failed[0]) == [
+            ("cancelled", "revoked")]
