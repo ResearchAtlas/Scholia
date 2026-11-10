@@ -1027,3 +1027,41 @@ async def test_a_refused_turn_whose_receipt_failed_ends_revoked_with_continue(tm
         stream = await send(client, await conversation_in(client, project), "What did we decide last time?")
         assert failed and len(provider.agent_steps) == 1
         assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")
+
+
+async def test_a_refused_extraction_stopped_by_a_shutdown_before_its_receipt_is_never_sent_again(tmp_path, monkeypatch):
+    # Q14, the reviewer's first case (internal review P3 1): refused for memory, then a shutdown stops it before the
+    # refusal's receipt is recorded; restarted (kick_background, as the next launch does) it ends revoked, with no call
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        harness = client.state["harness"]
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use interviews", status="proposed",
+            sources=[("project", project)]))
+        dispatch, write, stopped, edited = runs.Harness._call, runs.Harness._write, [], []
+
+        async def edited_meanwhile(self, *args, **kwargs):
+            if sys._getframe(1).f_code.co_name == "_extraction_call" and not edited:
+                response = await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
+                assert response.status_code == 200
+                edited.append(True)
+            return await dispatch(self, *args, **kwargs)
+
+        async def shut_down_before_the_receipt(self, fn):
+            if edited and fn.__qualname__.endswith("_call.<locals>.record") and not stopped:
+                [(run,)] = await rows(client, "SELECT id FROM runs WHERE workflow = 'memory'")
+                stopped.append(run)
+                self._request_cancel(self.registry.runs[run], "shutdown")  # as the app's shutdown does
+                raise asyncio.CancelledError()
+            return await write(self, fn)
+        monkeypatch.setattr(runs.Harness, "_call", edited_meanwhile)
+        monkeypatch.setattr(runs.Harness, "_write", shut_down_before_the_receipt)
+        await send(client, await conversation_in(client, project), "We sample thirty nurses")
+        await background_idle(client)
+        assert stopped
+        await harness.kick_background()
+        await background_idle(client)
+        assert provider.extractions == []
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
+            ("cancelled", "revoked")]
