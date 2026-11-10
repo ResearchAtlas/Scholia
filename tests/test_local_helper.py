@@ -39,10 +39,13 @@ HF_CDN = "https://us.aws.cdn.hf.co/xet-bridge-us/0123/abcd?X-Amz-Signature=signe
 MS_CDN = "https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/01/23/abcd?auth_key=signed"
 
 FAKE_SERVER = r'''#!{python}
-# A stand-in for llama-server: it records how it was started, then behaves as the control file says.
-# With a stop_delay file, it takes that many seconds to end after SIGTERM, as a busy server may.
-# It ends once the process that started it is gone, however that went, so it never outlives its test.
-import json, os, signal, sys, time
+# A stand-in for llama-server. First, a shared lock on its control folder's stand-in.lock, held while it lives (the
+# check after each test, conftest._no_stand_in_left_running, reads it). Then it records how it was started and
+# behaves as the control file says. With a stop_delay file, it takes that many seconds to end after SIGTERM, as a
+# busy server may. It ends once the process that started it is gone, however that went, so it never outlives its test.
+import fcntl, os
+fcntl.flock(os.open({lock!r}, os.O_RDONLY), fcntl.LOCK_SH)
+import json, signal, sys, time
 control = {control!r}
 owner = os.getppid()
 try:
@@ -96,7 +99,9 @@ class Fake:
         self.control = root / "control"
         for folder in (self.binary.parent, self.library.parent, self.contents / "Resources", self.control):
             folder.mkdir(parents=True)
-        self.binary.write_text(FAKE_SERVER.format(python=sys.executable, control=str(self.control)))
+        (self.control / "stand-in.lock").touch()
+        self.binary.write_text(FAKE_SERVER.format(python=sys.executable, control=str(self.control),
+                                                  lock=str(self.control / "stand-in.lock")))
         self.binary.chmod(0o755)
         self.library.write_bytes(b"a stand-in library")
         local_helper.write_manifest(self.contents)
@@ -1555,12 +1560,14 @@ def test_the_offered_models_and_the_reranker_pins():
 
 # The stand-in never outlives its test (M2, after S1-21a's follow-up). It was left running only when the test process
 # died before its app closed (ended by a signal while a test hung): the app stops its helper on close, but nothing
-# ended a helper whose owner was gone. A check after every test (conftest._no_helper_left_running) fails on any left.
+# ended a helper whose owner was gone. It now ends with its owner, and holds a shared lock on its control folder's
+# stand-in.lock while it lives; a check after every test (conftest._no_stand_in_left_running) fails, naming the file,
+# when that lock is still held. Nothing is ever signalled by the check (PR 51 recheck 2).
 
 
-def _running(pid):
-    from backend import reading
-    return reading._info(pid) is not None  # none once ended (a zombie has no record)
+def _held(fake):
+    from conftest import _stand_ins_left
+    return _stand_ins_left(fake.control.parent, grace=0) == [fake.control / "stand-in.lock"]
 
 
 def test_a_stand_in_helper_ends_when_the_process_that_started_it_dies(fake):
@@ -1572,52 +1579,59 @@ def test_a_stand_in_helper_ends_when_the_process_that_started_it_dies(fake):
         started_by = subprocess.Popen([sys.executable, "-c", owner, str(fake.binary)], stdout=subprocess.PIPE,
                                       text=True)
     helper = int(started_by.stdout.readline())
-    try:
-        started_by.kill()  # as a test process ended by a signal is: its app never closes
-        started_by.wait()
-        deadline = time.monotonic() + 5
-        while _running(helper) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert not _running(helper)
-    finally:
-        from conftest import _stand_in
-        if _stand_in(helper, fake.contents.parents[1], 0):  # only once confirmed this test's own stand-in
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(helper, signal.SIGKILL)
+    deadline = time.monotonic() + 5
+    while not _held(fake) and time.monotonic() < deadline:  # running: it holds its lock
+        time.sleep(0.02)
+    started_by.kill()  # as a test process ended by a signal is: its app never closes
+    started_by.wait()
+    deadline = time.monotonic() + 5
+    while _held(fake) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if _held(fake):  # it outlived its owner (the fix regressed): the lock it holds proves the recorded pid is it
+        os.kill(helper, signal.SIGTERM)
+        raise AssertionError("the stand-in outlived the process that started it")
 
 
 def test_the_check_after_each_test_finds_a_stand_in_left_running(tmp_path, fake):
     import subprocess
-    from conftest import _helpers_left
+    from conftest import _stand_ins_left
     with allow_subprocess(str(fake.binary)):
         helper = subprocess.Popen([str(fake.binary)], stdout=subprocess.DEVNULL)
     try:
         deadline = time.monotonic() + 5
         while not fake.launches and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert _helpers_left(tmp_path, grace=0) == [helper.pid]
+        assert _stand_ins_left(tmp_path, grace=0) == [fake.control / "stand-in.lock"]  # named by its lock file
     finally:
-        helper.kill()
+        helper.kill()  # this test's own child, by its handle
         helper.wait()
-    assert _helpers_left(tmp_path) == []
+    assert _stand_ins_left(tmp_path) == []
 
 
-def test_the_check_never_names_a_process_that_is_not_this_tests_stand_in(tmp_path, fake):
-    # PR 51 review 1 (P1 2): a pid in the launch records may be another process's by now; it is never named, nor
-    # signalled. Here: this test's own process, written as if a stand-in had recorded it.
-    from conftest import _helpers_left
-    (fake.control / "launches.jsonl").write_text(json.dumps({"argv": [], "env": {}, "pid": os.getpid()}) + "\n")
-    assert _helpers_left(tmp_path, grace=0) == []
+def test_the_check_never_touches_a_process_that_is_not_a_stand_in(tmp_path, fake):
+    # PR 51 recheck 2 (P1 2): a process naming the stand-in's path, with its pid in the launch records, is neither
+    # named nor signalled (the check signals nothing at all)
+    import subprocess
+    from conftest import _stand_ins_left
+    with allow_subprocess(sys.executable):
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", str(fake.binary)])
+    try:
+        (fake.control / "launches.jsonl").write_text(json.dumps({"argv": [], "env": {}, "pid": other.pid}) + "\n")
+        assert _stand_ins_left(tmp_path, grace=0) == []
+        assert other.poll() is None  # still running, untouched
+    finally:
+        other.kill()  # this test's own child, by its handle
+        other.wait()
 
 
 def test_the_check_finds_a_stand_in_still_starting(tmp_path, fake):
-    # PR 51 review 1 (P2 7): one that has not yet written its launch record is found too
+    # PR 51 recheck 2 (P2 3): one started just before the check, its lock not yet taken, is found by the second look
     import subprocess
-    from conftest import _helpers_left
+    from conftest import _stand_ins_left
     with allow_subprocess(str(fake.binary)):
         helper = subprocess.Popen([str(fake.binary)], stdout=subprocess.DEVNULL)
     try:
-        assert _helpers_left(tmp_path, grace=0) == [helper.pid]
+        assert _stand_ins_left(tmp_path, grace=0) == [fake.control / "stand-in.lock"]
     finally:
         helper.kill()
         helper.wait()

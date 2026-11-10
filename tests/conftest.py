@@ -87,82 +87,50 @@ def _no_reading_child_left_stopped():
     assert not left, f"stopped processes left in a reading child's group, not ended: {left}"
 
 
-def _argv(pid):
-    """A process's arguments as the kernel holds them (sysctl KERN_PROCARGS2), or None once it cannot be read."""
-    import ctypes
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
-                            ctypes.c_void_p, ctypes.c_size_t]
-    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
-    size = ctypes.c_size_t(0)
-    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
-        return None
-    buffer = ctypes.create_string_buffer(size.value)
-    if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
-        return None
-    raw = buffer.raw[:size.value]
-    argc = int.from_bytes(raw[:4], "little")
-    parts = [part for part in raw[4:].split(b"\0") if part]  # the executable's path, then its arguments
-    return [part.decode(errors="replace") for part in parts[1:1 + argc]]
-
-
-def _stand_in(pid, root, since):
-    """Whether pid is, now, a stand-in helper this test started: a process started at or after since (the test's
-    start, seconds since the epoch) running the stand-in binary (tests/test_local_helper.py Fake) under root. Any
-    other process, a pid another process took since included, is not."""
-    import os
-
-    from backend import reading
-
-    info = reading._info(pid)  # none once it has ended (a zombie has no record)
-    if info is None or info.start[0] + info.start[1] / 1e6 < since - 1:
-        return False
-    folder = os.path.realpath(root) + os.sep
-    return any(os.path.realpath(arg).startswith(folder) and arg.endswith("/Contents/MacOS/llama-server")
-               for arg in _argv(pid) or ())
-
-
-def _helpers_left(root, grace=2.0, since=0.0):
-    """The stand-in helpers started under root (since then) that still run, given grace seconds to end: those its
-    launch records name (control/launches.jsonl, written as each starts) and this process's children still starting,
-    read again at every look, each confirmed a stand-in of this test (_stand_in) before it is named."""
-    import json
+def _stand_ins_left(root, grace=2.0):
+    """The lock files under root (control/stand-in.lock, one per stand-in bundle, tests/test_local_helper.py Fake)
+    that a live stand-in still holds: each holds a shared lock on its own while it lives. Each is tried without
+    waiting until it is free or grace seconds have passed, and once more 0.1 s after all were free. Nothing is
+    signalled: a stand-in left running ends with this process (its end-of-owner exit)."""
+    import fcntl
     import os
     import time
 
-    from backend import reading
+    def held(path):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)  # (closing it lets the lock go)
+        return False
 
+    locks = sorted(Path(root).glob("**/control/stand-in.lock"))
+    if not locks:
+        return []
     deadline = time.monotonic() + grace
-    while True:
-        recorded = [json.loads(line)["pid"] for path in Path(root).glob("**/control/launches.jsonl")
-                    for line in path.read_text().splitlines()]
-        left = sorted({pid for pid in (*recorded, *reading._children(os.getpid())) if _stand_in(pid, root, since)})
-        if not left or time.monotonic() >= deadline:
-            return left
+    while (left := [path for path in locks if held(path)]) and time.monotonic() < deadline:
         time.sleep(0.02)
+    if left:
+        return left
+    # shortcut: a stand-in takes its lock as its first statement, so one exec'd within the interpreter's start-up
+    # (tens of ms) is unseen at the first look; this second look narrows that window, it does not close it. Closing it
+    # needs the launcher to hand the stand-in a locked descriptor, which the app's own helper launch (close_fds) does
+    # not allow without a test seam in backend/local_helper.py.
+    time.sleep(0.1)
+    return [path for path in locks if held(path)]
 
 
 @pytest.fixture(autouse=True)
-def _no_helper_left_running(request):
+def _no_stand_in_left_running(request):
     """A test leaves no stand-in helper running: its app stops the helpers it started when it closes. One left fails
-    the test, named, and is then ended, each only once confirmed this test's stand-in (_stand_in) just before."""
-    import time
-
+    the test, naming its lock file; nothing is signalled."""
     root = request.getfixturevalue("tmp_path") if "tmp_path" in request.fixturenames else None  # torn down after this
-    since = time.time()
     yield
-    if root is None:
-        return
-    import os
-    import signal
-
-    left = _helpers_left(root, since=since)
-    for pid in left:
-        if _stand_in(pid, root, since):
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
-    assert not left, f"stand-in helpers left running after the test: {left}"
+    if root is not None:
+        left = _stand_ins_left(root)
+        assert not left, f"stand-in helpers left running after the test (their lock files): {[str(p) for p in left]}"
 
 
 @pytest.fixture
