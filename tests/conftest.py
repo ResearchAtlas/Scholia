@@ -87,19 +87,55 @@ def _no_reading_child_left_stopped():
     assert not left, f"stopped processes left in a reading child's group, not ended: {left}"
 
 
-def _helpers_left(root, grace=2.0):
-    """The stand-in helpers (tests/test_local_helper.py Fake) started under root that still run, given grace seconds
-    to end: each records its pid as it starts (control/launches.jsonl). One ended has no record (reading._info)."""
+def _argv(pid):
+    """A process's arguments as the kernel holds them (sysctl KERN_PROCARGS2), or None once it cannot be read."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+        return None
+    buffer = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        return None
+    raw = buffer.raw[:size.value]
+    argc = int.from_bytes(raw[:4], "little")
+    parts = [part for part in raw[4:].split(b"\0") if part]  # the executable's path, then its arguments
+    return [part.decode(errors="replace") for part in parts[1:1 + argc]]
+
+
+def _stand_in(pid, root, since):
+    """Whether pid is, now, a stand-in helper this test started: a process started at or after since (the test's
+    start, seconds since the epoch) running the stand-in binary (tests/test_local_helper.py Fake) under root. Any
+    other process, a pid another process took since included, is not."""
+    import os
+
+    from backend import reading
+
+    info = reading._info(pid)  # none once it has ended (a zombie has no record)
+    if info is None or info.start[0] + info.start[1] / 1e6 < since - 1:
+        return False
+    folder = os.path.realpath(root) + os.sep
+    return any(os.path.realpath(arg).startswith(folder) and arg.endswith("/Contents/MacOS/llama-server")
+               for arg in _argv(pid) or ())
+
+
+def _helpers_left(root, grace=2.0, since=0.0):
+    """The stand-in helpers started under root (since then) that still run, given grace seconds to end: those its
+    launch records name (control/launches.jsonl, written as each starts) and this process's children still starting,
+    read again at every look, each confirmed a stand-in of this test (_stand_in) before it is named."""
     import json
+    import os
     import time
 
     from backend import reading
 
-    pids = [json.loads(line)["pid"] for path in Path(root).glob("**/control/launches.jsonl")
-            for line in path.read_text().splitlines()]
     deadline = time.monotonic() + grace
     while True:
-        left = [pid for pid in pids if reading._info(pid) is not None]
+        recorded = [json.loads(line)["pid"] for path in Path(root).glob("**/control/launches.jsonl")
+                    for line in path.read_text().splitlines()]
+        left = sorted({pid for pid in (*recorded, *reading._children(os.getpid())) if _stand_in(pid, root, since)})
         if not left or time.monotonic() >= deadline:
             return left
         time.sleep(0.02)
@@ -108,18 +144,22 @@ def _helpers_left(root, grace=2.0):
 @pytest.fixture(autouse=True)
 def _no_helper_left_running(request):
     """A test leaves no stand-in helper running: its app stops the helpers it started when it closes. One left fails
-    the test, named, and is then ended by its recorded pid so that it outlives nothing."""
+    the test, named, and is then ended, each only once confirmed this test's stand-in (_stand_in) just before."""
+    import time
+
     root = request.getfixturevalue("tmp_path") if "tmp_path" in request.fixturenames else None  # torn down after this
+    since = time.time()
     yield
     if root is None:
         return
     import os
     import signal
 
-    left = _helpers_left(root)
+    left = _helpers_left(root, since=since)
     for pid in left:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
+        if _stand_in(pid, root, since):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
     assert not left, f"stand-in helpers left running after the test: {left}"
 
 

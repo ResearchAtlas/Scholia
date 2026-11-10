@@ -1580,8 +1580,10 @@ def test_a_stand_in_helper_ends_when_the_process_that_started_it_dies(fake):
             time.sleep(0.05)
         assert not _running(helper)
     finally:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(helper, signal.SIGKILL)  # this test's own helper, by its pid: never left behind
+        from conftest import _stand_in
+        if _stand_in(helper, fake.contents.parents[1], 0):  # only once confirmed this test's own stand-in
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(helper, signal.SIGKILL)
 
 
 def test_the_check_after_each_test_finds_a_stand_in_left_running(tmp_path, fake):
@@ -1598,3 +1600,24 @@ def test_the_check_after_each_test_finds_a_stand_in_left_running(tmp_path, fake)
         helper.kill()
         helper.wait()
     assert _helpers_left(tmp_path) == []
+
+
+def test_the_check_never_names_a_process_that_is_not_this_tests_stand_in(tmp_path, fake):
+    # PR 51 review 1 (P1 2): a pid in the launch records may be another process's by now; it is never named, nor
+    # signalled. Here: this test's own process, written as if a stand-in had recorded it.
+    from conftest import _helpers_left
+    (fake.control / "launches.jsonl").write_text(json.dumps({"argv": [], "env": {}, "pid": os.getpid()}) + "\n")
+    assert _helpers_left(tmp_path, grace=0) == []
+
+
+def test_the_check_finds_a_stand_in_still_starting(tmp_path, fake):
+    # PR 51 review 1 (P2 7): one that has not yet written its launch record is found too
+    import subprocess
+    from conftest import _helpers_left
+    with allow_subprocess(str(fake.binary)):
+        helper = subprocess.Popen([str(fake.binary)], stdout=subprocess.DEVNULL)
+    try:
+        assert _helpers_left(tmp_path, grace=0) == [helper.pid]
+    finally:
+        helper.kill()
+        helper.wait()
