@@ -120,7 +120,7 @@ async def test_read_passage_reads_whole_passages_in_order_within_its_bounds_and_
         await send(client, conversation, "Read it")
         first, second = (tool_messages(b)[-1]["content"] for b in provider.agent_steps[1:3])
         # S1-21b: whole passages up to the 50,000-character bound, the first 8,000 characters shown with a handle for more
-        assert len(first) <= 8000 + 200 and "Read on with read_output" in first
+        assert len(first) <= 8000 and "Read on with read_output" in first
         assert first.index("Paragraph 0") < first.index("Paragraph 1")
         assert "Paragraph 5 " in second and "Paragraph 4 " not in second
 
@@ -363,7 +363,7 @@ async def test_only_passages_a_model_was_shown_count_as_read_in_the_run(tmp_path
         await send(client, conversation, "Hello there")
         [shown] = tool_messages(provider.agent_steps[1])
         # S1-21b: the rest is kept and paged; only what a served page shows is read
-        assert "Read on with read_output" in shown["content"] and len(shown["content"]) <= 8000 + 200
+        assert "Read on with read_output" in shown["content"] and len(shown["content"]) <= 8000
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         found = {c["marker"]: c["existence"] for c in turn["citations"]}
         assert found["[S1.8]" if "[S1.8]" not in shown["content"] else "[S1.1]"] in ("not_found", "ok")

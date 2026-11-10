@@ -25,6 +25,7 @@ from test_search import paper
 pytestmark = pytest.mark.asyncio
 LONG = paper("Long Panel", *[f"Paragraph {i} " + "word " * 300 for i in range(14)])
 HANDLE = agent.traced_id("call_read_passage") + ".1"  # the call's content-free id and its number in the turn
+NEXT = compaction.shown_of(compaction.PREVIEW)  # where a preview's footer says to read on (its note within the preview)
 
 
 def markers(text):
@@ -36,7 +37,7 @@ async def test_o1_o2_read_passage_past_its_preview_is_paged_and_only_pages_serve
 
     def second(body):  # the model reads on from where the preview stopped
         pages["first"] = tool_messages(body)[-1]["content"]
-        return [call("read_output", call_id="c2", handle=HANDLE, offset=compaction.PREVIEW)]
+        return [call("read_output", call_id="c2", handle=HANDLE, offset=NEXT)]
 
     def answer(body):
         pages["second"] = tool_messages(body)[-1]["content"]
@@ -50,8 +51,8 @@ async def test_o1_o2_read_passage_past_its_preview_is_paged_and_only_pages_serve
         stream = await send(client, conversation, "Read the long paper")
         assert stream[-1]["status"] == "succeeded"
         first = pages["first"]
-        assert first.startswith("[S1.1] Long Panel") and len(first) <= compaction.PREVIEW + 200
-        assert f"handle {HANDLE}, offset {compaction.PREVIEW}" in first  # the preview names its handle
+        assert first.startswith("[S1.1] Long Panel") and len(first) <= compaction.PREVIEW  # the note within it
+        assert f"handle {HANDLE}, offset {NEXT}" in first  # the preview names its handle
         assert first[:compaction.PREVIEW].count("Paragraph") < 14  # the rest is past the preview
         second_page = pages["second"]
         assert "Paragraph" in second_page and set(markers(second_page)).isdisjoint(markers(first))
@@ -74,7 +75,7 @@ async def test_o1_o2_read_passage_past_its_preview_is_paged_and_only_pages_serve
 
 async def test_o1_a_handle_from_another_turn_or_past_the_end_is_refused(tmp_path):
     provider = Scripted([call("read_passage", material_id="m")], "Read.",
-                        [call("read_output", call_id="c3", handle=HANDLE, offset=compaction.PREVIEW)], "Done.")
+                        [call("read_output", call_id="c3", handle=HANDLE, offset=NEXT)], "Done.")
     async with cited(tmp_path, provider) as client:
         project, [material] = await with_papers(client, LONG)
         provider.script[0] = [call("read_passage", material_id=material)]
@@ -106,7 +107,7 @@ async def test_o1_reading_past_the_end_or_an_unknown_handle_is_refused(tmp_path)
 async def test_i5_no_paged_text_reaches_the_logs(tmp_path, caplog):
     caplog.set_level(logging.DEBUG)
     provider = Scripted([call("read_passage", material_id="m")],
-                        [call("read_output", call_id="c2", handle=HANDLE, offset=compaction.PREVIEW)], "Done.")
+                        [call("read_output", call_id="c2", handle=HANDLE, offset=NEXT)], "Done.")
     async with cited(tmp_path, provider) as client:
         project, [material] = await with_papers(client, LONG)
         provider.script[0] = [call("read_passage", material_id=material)]
@@ -131,7 +132,7 @@ async def test_the_router_returns_a_result_whole_whatever_its_tools_budget():
 async def test_pages_are_whole_and_say_how_to_read_on():
     text = "a" * 20000
     first = compaction.preview(text, "h")
-    assert first.startswith("a" * compaction.PREVIEW) and "offset 8000" in first
+    assert first.startswith("a" * NEXT) and f"offset {NEXT}" in first and len(first) <= compaction.PREVIEW
     middle = compaction.page(text, 8000, "h")
     assert middle.startswith("a" * compaction.PREVIEW) and middle[compaction.PREVIEW] == "\n" and "offset 16000" in middle
     assert compaction.page(text, 16000, "h").endswith("[End of the output.]")
@@ -162,13 +163,13 @@ async def test_o2_read_passage_reads_whole_passages_up_to_its_bound_and_lists_th
                               compaction.OUTPUT_SLOT)
         whole = (client.state["db"].data_dir / "content" / sha[:2] / sha).read_text()
         assert len(whole) <= agent.READ_CHARS and "Paragraph 0 " in whole and "Paragraph 39 " not in whole
-        assert whole.rstrip().endswith("Read one with its ordinal.)") and "Passages left out, by ordinal:" in whole
+        assert whole.rstrip().endswith("Read one with its ordinal.)") and "left out, by ordinal:" in whole
 
 
 def reading_on(handle):
     """A step that reads the second page of the output handle names, once the preview showed it."""
     def step(body):
-        return [call("read_output", call_id="next", handle=handle, offset=compaction.PREVIEW)]
+        return [call("read_output", call_id="next", handle=handle, offset=NEXT)]
     return step
 
 
@@ -183,7 +184,7 @@ async def test_fix1_answer_from_library_past_the_preview_is_kept_whole_and_its_e
         conversation = await conversation_in(client, project)
         run = (await send(client, conversation, "Answer from my library"))[0]["run_id"]
         first, second = tool_messages(provider.agent_steps[-1])
-        assert f"handle {handle}, offset {compaction.PREVIEW}" in first["content"] and "END-MARK" not in first["content"]
+        assert f"handle {handle}, offset {NEXT}" in first["content"] and "END-MARK" not in first["content"]
         assert "END-MARK" in second["content"] and "Citation checks, in order:" in second["content"]
         assert await rows(client, "SELECT count(*) FROM run_bodies WHERE run_id = ? AND attempt = ?", run,
                           compaction.OUTPUT_SLOT + 1) == [(1,)]
@@ -200,7 +201,7 @@ async def test_fix1_every_tool_is_paged_past_its_preview(tmp_path, monkeypatch):
         conversation = await conversation_in(client, project)
         await send(client, conversation, "List them")
         first, second = tool_messages(provider.agent_steps[-1])
-        assert len(first["content"]) <= compaction.PREVIEW + 200 and "END-MARK" in second["content"]
+        assert len(first["content"]) <= compaction.PREVIEW and "END-MARK" in second["content"]
 
 
 @pytest.mark.parametrize("failure", ["refused", "raised"])
@@ -238,8 +239,8 @@ async def test_fix1_papers_and_memory_records_past_the_preview_count_as_given_on
     from backend.db.database import new_id
     listing, remembering = agent.traced_id("call_list_materials") + ".1", agent.traced_id("call_read_memory") + ".2"
     provider = Scripted([call("list_materials"), call("read_memory")],
-                        [call("read_output", call_id="p1", handle=listing, offset=compaction.PREVIEW),
-                         call("read_output", call_id="p2", handle=remembering, offset=compaction.PREVIEW)], "Done.")
+                        [call("read_output", call_id="p1", handle=listing, offset=NEXT),
+                         call("read_output", call_id="p2", handle=remembering, offset=NEXT)], "Done.")
     async with cited(tmp_path, provider) as client:
         project, [selected] = await with_papers(client, LONG)
         papers = [new_id() for _ in range(400)]
@@ -302,9 +303,9 @@ async def test_fix2_forget_removes_a_kept_output_and_the_pages_served_from_it(tm
 
     async def forget_then_read_on(body):  # a record past the preview, never shown, is forgotten mid-turn
         assert (await held["client"].delete(f"/api/memory/{held['records'][0]}")).status_code in (200, 204)
-        return steps_reply(provider, [call("read_output", "p1", handle=handle, offset=compaction.PREVIEW)])
+        return steps_reply(provider, [call("read_output", "p1", handle=handle, offset=NEXT)])
     provider = Scripted([call("read_memory")], forget_then_read_on, "Done.",
-                        [call("read_memory")], [call("read_output", "p2", handle=handle, offset=compaction.PREVIEW)],
+                        [call("read_memory")], [call("read_output", "p2", handle=handle, offset=NEXT)],
                         "Done.")
     async with cited(tmp_path, provider) as client:
         held["client"] = client
@@ -344,7 +345,7 @@ async def test_fix2_forget_removes_a_kept_output_and_the_pages_served_from_it(tm
 async def test_fix2_a_conversations_deletion_removes_its_kept_outputs_pages_and_their_links(tmp_path):
     # Fix batch 2 sweep: every stored copy this PR keeps goes with its run's conversation, links included.
     handle = agent.traced_id("call_read_memory") + ".1"
-    provider = Scripted([call("read_memory")], [call("read_output", "p1", handle=handle, offset=compaction.PREVIEW)],
+    provider = Scripted([call("read_memory")], [call("read_output", "p1", handle=handle, offset=NEXT)],
                         "Done.")
     async with cited(tmp_path, provider) as client:
         project, [selected] = await with_papers(client, LONG)
@@ -381,4 +382,122 @@ async def test_fix3_read_passage_stays_within_its_bound_counting_what_it_emits(t
         whole = (client.state["db"].data_dir / "content" / sha[:2] / sha).read_text()
         assert len(whole) <= agent.READ_CHARS  # lines, separators and the omission notice counted
         # whole passages only, as many as fit: the room left is less than one more (each about 2,500 characters here)
-        assert "Passages left out, by ordinal:" in whole and len(whole) > agent.READ_CHARS - 2600
+        assert "left out, by ordinal:" in whole and len(whole) > agent.READ_CHARS - agent.NOTE_MAX - 2600
+
+
+def gapped_readings(material, version, count=10_000, title="Chapters and references (synthetic)"):
+    """read_passage's readings (one paper's, without references) for count chapter paragraphs, each followed by a
+    reference passage left out: their ordinals 0, 2, 4, ... leave a gap at every other one. Any other reading is real."""
+    from backend import search_index
+    real = search_index.readings
+
+    def readings(conn, project_id, passage_ids=None, references=True, materials=None):
+        if materials == [material] and not references and passage_ids is None:
+            return {f"p{i}": (material, title, [], "paragraph", f"Chapter {i}.", None, 2 * i, version)
+                    for i in range(count)}
+        return real(conn, project_id, passage_ids, references, materials)
+    return readings
+
+
+async def test_fix4_the_omission_notice_is_bounded_whatever_the_ordinals_left_out(tmp_path, monkeypatch):
+    # gpt-6-astra recheck 4 (P7): 10,000 chapter and reference pairs listed every left-out ordinal one by one: 64,570
+    # characters stored, the first passage 19 of them, past the 50,000-character read bound.
+    from backend import search_index
+    provider = Scripted([call("read_passage", material_id="m")], "Read.")
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, LONG)
+        [(version,)] = await rows(client, "SELECT id FROM material_versions WHERE material_id = ?", material)
+        monkeypatch.setattr(search_index, "readings", gapped_readings(material, version))
+        provider.script[0] = [call("read_passage", material_id=material)]
+        run = (await send(client, await conversation_in(client, project), "Read it"))[0]["run_id"]
+        [(sha,)] = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt >= ?", run,
+                              compaction.OUTPUT_SLOT)
+        whole = (client.state["db"].data_dir / "content" / sha[:2] / sha).read_text()
+        assert len(whole) <= agent.READ_CHARS
+        read = len(re.findall(r"^\[S\d+\.\d+\]", whole, re.M))
+        assert read > 100 and f"({10_000 - read} passages left out, by ordinal: {2 * read}, {2 * read + 2}" in whole
+        assert whole.endswith(", and more. Read one with its ordinal.)")  # honest: how many, and the first of them
+
+
+async def test_fix4_choosing_passages_works_through_what_it_keeps_not_the_whole_paper(tmp_path, monkeypatch):
+    # gpt-6-astra recheck 4 (P8): every passage of the paper went through the sizing probe, each copying and scanning
+    # the growing evidence: 10,000 passages for 47 kept. Counted by the passages the evidence is given, not by time.
+    from backend import search_index
+    given = []
+    real = agent.Evidence.add
+
+    def counted(self, records, shown=True):
+        given.append(len(records))
+        return real(self, records, shown)
+    monkeypatch.setattr(agent.Evidence, "add", counted)
+    provider = Scripted([call("read_passage", material_id="m")], "Read.")
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, LONG)
+        [(version,)] = await rows(client, "SELECT id FROM material_versions WHERE material_id = ?", material)
+        monkeypatch.setattr(search_index, "readings", gapped_readings(material, version, title="T" * 900))
+        provider.script[0] = [call("read_passage", material_id=material)]
+        conversation = await conversation_in(client, project)
+        given.clear()
+        run = (await send(client, conversation, "Read it"))[0]["run_id"]
+        [(sha,)] = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt >= ?", run,
+                              compaction.OUTPUT_SLOT)
+        read = len(re.findall(r"^\[S\d+\.\d+\]", (client.state["db"].data_dir / "content" / sha[:2] / sha).read_text(),
+                              re.M))
+        assert 0 < read < 100 and sum(given) <= 2 * read + 2  # what it keeps, and one more, never the whole paper
+
+
+async def test_fix4_the_left_out_note_has_a_bounded_form_at_its_worst():
+    huge = [{"ordinal": 10 ** 9 + 2 * i} for i in range(200_000)]  # long ordinals, every one a range of its own
+    note = agent._left_out(huge, 1)
+    assert len(note) <= agent.NOTE_MAX and note.endswith(", and more. Read one with its ordinal.)")
+    assert note.startswith("\n\n(199999 passages left out, by ordinal: 1000000002, 1000000004")
+    assert agent._left_out([{"ordinal": n} for n in (1, 2, 3, 7)], 1) == \
+        "\n\n(3 passages left out, by ordinal: 2-3, 7. Read one with its ordinal.)"
+    assert agent._left_out([{"ordinal": 1}], 1) == ""
+
+
+async def test_fix4_a_passage_longer_than_the_bound_alone_is_cut_at_it_and_said_so(tmp_path, monkeypatch):
+    from backend import search_index
+    real = search_index.readings
+    provider = Scripted([call("read_passage", material_id="m")], "Read.")
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, LONG)
+        [(version,)] = await rows(client, "SELECT id FROM material_versions WHERE material_id = ?", material)
+
+        def readings(conn, project_id, passage_ids=None, references=True, materials=None):
+            if materials == [material] and not references and passage_ids is None:  # a passage past the read bound
+                return {"p0": (material, "Huge", [], "paragraph", "word " * 12_000, None, 0, version),
+                        "p1": (material, "Huge", [], "paragraph", "Next.", None, 1, version)}
+            return real(conn, project_id, passage_ids, references, materials)
+        monkeypatch.setattr(search_index, "readings", readings)
+        provider.script[0] = [call("read_passage", material_id=material)]
+        run = (await send(client, await conversation_in(client, project), "Read it"))[0]["run_id"]
+        [(sha,)] = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt >= ?", run,
+                              compaction.OUTPUT_SLOT)
+        whole = (client.state["db"].data_dir / "content" / sha[:2] / sha).read_text()
+        assert len(whole) <= agent.READ_CHARS and "this passage is longer than the read bound" in whole
+        assert whole.endswith("(1 passage left out, by ordinal: 1. Read one with its ordinal.)")
+
+
+@pytest.mark.parametrize("size", [200, 500, 4000, compaction.PREVIEW])
+async def test_fix4_a_preview_and_its_note_stay_within_the_tools_budget(size):
+    # Fix batch 4 sweep: every tool's declared bound against all it emits, notes included, at the worst case: the
+    # longest handle and the largest counts the app can give.
+    handle = agent.traced_id("x" * 100) + f".{10 ** 6}"
+    text = "y" * 10 ** 7
+    for emitted in (compaction.preview(text, handle, size), compaction.unkept(text, size)):
+        assert len(emitted) <= size and emitted.startswith("y" * compaction.shown_of(size))
+    assert len(compaction.page(text, 10 ** 6, handle)) <= agent.REGISTRY.get_definition("read_output").output_chars
+
+
+async def test_fix4_a_small_budget_tool_past_its_preview_is_paged_within_its_budget(tmp_path, monkeypatch):
+    async def long_place(call, turn):
+        return ToolResult(id=call.id, ok=True, text="z" * 5000)
+    monkeypatch.setitem(agent.REGISTRY._implementations, "open_place", long_place)
+    provider = Scripted([call("open_place", place="library")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, LONG)
+        await send(client, await conversation_in(client, project), "Open the library")
+        [opened] = tool_messages(provider.agent_steps[-1])
+        assert len(opened["content"]) <= agent.REGISTRY.get_definition("open_place").output_chars
+        assert "read_output" in opened["content"]

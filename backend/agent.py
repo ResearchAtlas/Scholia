@@ -23,6 +23,7 @@ its non-text arguments and its result's ids and counts, never the text (section 
 
 import asyncio
 import hashlib
+import itertools
 import json
 
 from fastapi import APIRouter
@@ -168,7 +169,7 @@ async def list_materials(call, turn):
              for line in [" | ".join(str(x) for x in (material, title or "(untitled)", year or "n.d.", kind.replace(
                  "_", " "), "RETRACTED" if retraction == "retracted" else None) if x)]]
     more = rows[0][5] - len(rows)
-    text, shown = _paged(turn, call.id, items, "\n", tail=f"\n({more} more papers not listed.)" if more > 0 else "")
+    text, shown, _ = _paged(turn, call.id, items, "\n", tail=f"\n({more} more papers not listed.)" if more > 0 else "")
     return ToolResult(id=call.id, ok=True, text=text, meta={"materials": [v for *_, v in shown]})
 
 
@@ -202,8 +203,8 @@ async def search_passages(call, turn):
     # S1-21b: whole passages, best first; past the preview, kept and paged, each read once a page shows its marker
     head = "(Meaning search was unavailable: these come from keyword search only.)\n\n" \
         if found["mode"] == "keyword_only" else ""
-    text, shown = _paged(turn, call.id, _passage_items(turn, keys), "\n\n", head=head)
-    return ToolResult(id=call.id, ok=True, text=text, meta={"passages": _read(turn, shown), "mode": found["mode"]})
+    text, _, read = _paged(turn, call.id, _passage_items(turn, keys), "\n\n", head=head)
+    return ToolResult(id=call.id, ok=True, text=text, meta={"passages": read, "mode": found["mode"]})
 
 
 @REGISTRY.register(
@@ -234,28 +235,75 @@ async def read_passage(call, turn):
         if not records:
             return failed(call.id, "not_found", "That paper has no passage at that ordinal.")
     # Whole passages in order within the read bound (S1-21b: past the 8,000-character preview, paged with read_output),
-    # counted as they are emitted: each passage's line with its marker, title and facts, the separators between them and
-    # the note of those left out (fix batch 3: the title repeats on every passage). The first is read whatever its length.
+    # counted as they are emitted: each passage's line with its marker, title and facts, and the separators between them
+    # (fix batch 3: the title repeats on every passage); when some are left out, their note, at most NOTE_MAX characters,
+    # is reserved too (fix batch 4). The candidates are sized one at a time and only until the bound is passed, so the
+    # work follows what is kept, never the whole paper; the probe numbers them as the turn will. A first passage longer
+    # than the bound alone is cut at it, said so.
     probe = Evidence(turn.evidence.numbered)  # numbered as the turn will number them, markers' length too
     probe.pending = dict(turn.evidence.pending)
-    sizes = [len(probe.lines(probe.add([record], shown=False))[0]) for record in records]
-
-    def note(left):
-        return f"\n\n(Passages left out, by ordinal: {_ranges(left)}. Read one with its ordinal.)" if left else ""
-    count, used = 0, 0
-    for n, size in enumerate(sizes, 1):
-        used += size + (2 if n > 1 else 0)
-        if n > 1 and used + len(note([r["ordinal"] for r in records[n:]])) > READ_CHARS:
+    sizes, used = [], 0
+    for record in records:
+        size = len(probe.lines(probe.add([record], shown=False))[0]) + (2 if sizes else 0)
+        if used + size > READ_CHARS:
             break
-        count = n
-    kept, left = records[:count], [r["ordinal"] for r in records[count:]]
+        sizes.append(size)
+        used += size
+    count = len(sizes)
+    if count < len(records):  # some are left out: room for their note
+        while count > 1 and sum(sizes[:count]) > READ_CHARS - NOTE_MAX:
+            count -= 1
+        count = max(count, 1)
+    kept = records[:count]
     keys = list(dict.fromkeys(turn.evidence.add(kept, shown=False)))
-    text, shown = _paged(turn, call.id, _passage_items(turn, keys), "\n\n", tail=note(left))
+    tail = _left_out(records, count)
+    items = _passage_items(turn, keys)
+    room = READ_CHARS - len(tail)
+    if len(items[0][0]) > room:  # one passage longer than the bound: cut at it, said so (the note under CUT_NOTE)
+        items[0] = (items[0][0][:room - CUT_NOTE]
+                    + f"\n(Cut at {room - CUT_NOTE} characters: this passage is longer than the read bound.)",
+                    *items[0][1:])
+    text, _, read = _paged(turn, call.id, items, "\n\n", tail=tail)
     return ToolResult(id=call.id, ok=True, text=text, meta={
-        "passages": _read(turn, shown), "version_id": rows[0][1][7], "left_out": len(left)})
+        "passages": read, "version_id": rows[0][1][7], "left_out": len(records) - count})
 
 
 PREVIEW_ROOM = 7000  # characters of whole passages a selection read directly must fit (B40), within the 8,000 preview
+NOTE_RANGES = 400  # characters of left-out ordinal ranges read_passage's note lists before it says "and more"
+NOTE_MAX = NOTE_RANGES + 120  # the most characters that note takes (_left_out)
+CUT_NOTE = 80  # room kept for the note on a passage cut at the read bound
+
+
+def _left_out(records, count):
+    """read_passage's note of the passages after the first count that it leaves out: how many, and their ordinals as
+    ranges, at most NOTE_RANGES characters of them, then "and more" (fix batch 4: gaps left by reference passages made
+    the list as long as the paper). At most NOTE_MAX characters; its work stops with the list."""
+    left = len(records) - count
+    if left <= 0:
+        return ""
+    listed, used, more = [], 0, False
+    for part in _ranges_of(r["ordinal"] for r in itertools.islice(records, count, None)):
+        if used + len(part) + 2 > NOTE_RANGES:
+            more = True
+            break
+        listed.append(part)
+        used += len(part) + 2
+    return (f"\n\n({left} passage{'s' if left != 1 else ''} left out, by ordinal: {', '.join(listed)}"
+            f"{', and more' if more else ''}. Read one with its ordinal.)")
+
+
+def _ranges_of(numbers):
+    """Runs of consecutive numbers as "a" or "a-b", one at a time."""
+    start = previous = None
+    for n in numbers:
+        if start is not None and n == previous + 1:
+            previous = n
+            continue
+        if start is not None:
+            yield str(start) if start == previous else f"{start}-{previous}"
+        start = previous = n
+    if start is not None:
+        yield str(start) if start == previous else f"{start}-{previous}"
 LABEL_CHARS = 60  # S1-21b: a listed paper or memory record is shown once a page holds this much of its line (or all)
 
 
@@ -272,18 +320,21 @@ def _paged(turn, call_id, items, sep, head="", tail=""):
         segments.append((at, len(line), label, kind, value))
         at += len(line) + len(sep)
     turn.segments[call_id] = segments
-    return head + sep.join(line for line, *_ in items) + tail, reveal(turn, segments, 0)
+    text = head + sep.join(line for line, *_ in items) + tail
+    # what the model is shown now: all of it, or a preview's part (the harness pages the rest, compaction.preview)
+    return (text, *reveal(turn, segments, 0, len(text) if len(text) <= compaction.PREVIEW
+                          else compaction.shown_of(compaction.PREVIEW)))
 
 
-def reveal(turn, segments, offset):
+def reveal(turn, segments, offset, size=compaction.PREVIEW):
     """What a page from offset (the preview: 0) gives the run of the items it shows any character of, so nothing it shows
     is sent unregistered (fix batch 1 review, P1-2): a paper listed, its title in the request; a memory record held by
     the request; a passage's paper registered, and the passage read in the run (citable) only once the page completes its
-    marker (compaction.marked). Returns the segments it shows."""
-    shown = [s for s in segments if compaction.shows(s[0], s[1], offset)]
+    marker (compaction.marked). Returns (the segments it shows, the passages it reads, by passage id)."""
+    shown = [s for s in segments if compaction.shows(s[0], s[1], offset, size)]
     for start, _, label, kind, value in shown:
         if kind == "passage":
-            if compaction.marked(start, label, offset):
+            if compaction.marked(start, label, offset, size):
                 turn.evidence.show([value])
             record = turn.evidence.numbered.get(value) or turn.evidence.pending.get(value)
             if record is not None:
@@ -293,13 +344,8 @@ def reveal(turn, segments, offset):
     held = [v for _, _, _, k, v in shown if k == "memory"]
     if held:
         _remembered(turn, [record for record, _ in held], {m for _, materials in held for m in materials})
-    return shown
-
-
-def _read(turn, shown, offset=0):
-    """The passages a page from offset reads in the run (it completes their markers), by passage id."""
-    return [turn.evidence.numbered[v]["passage_id"] for start, _, label, k, v in shown
-            if k == "passage" and v in turn.evidence.numbered and compaction.marked(start, label, offset)]
+    return shown, [turn.evidence.numbered[v]["passage_id"] for start, _, label, k, v in shown
+                   if k == "passage" and compaction.marked(start, label, offset, size)]
 _MARKER_SLACK = 8  # a marker the turn numbers ([S12.30]) may be longer than one numbered from 1
 
 
@@ -460,7 +506,7 @@ async def read_project_state(call, turn):
     lines, held = await turn.read(read)
     if not lines:
         return ToolResult(id=call.id, ok=True, text="The project state is empty so far.", meta={"memory": []})
-    text, shown = _paged(turn, call.id, [(line, line[:LABEL_CHARS], "memory", h) for line, h in zip(lines, held)], "\n")
+    text, shown, _ = _paged(turn, call.id, [(line, line[:LABEL_CHARS], "memory", h) for line, h in zip(lines, held)], "\n")
     return ToolResult(id=call.id, ok=True, text=text, meta={"memory": [v[0] for *_, v in shown]})
 
 
@@ -486,7 +532,7 @@ async def read_memory(call, turn):
     found = await turn.read(read)
     if not found:
         return ToolResult(id=call.id, ok=True, text="No memory record is recorded for this.", meta={"memory": []})
-    text, shown = _paged(turn, call.id, [(line, line[:LABEL_CHARS], "memory", h) for line, h in found], "\n")
+    text, shown, _ = _paged(turn, call.id, [(line, line[:LABEL_CHARS], "memory", h) for line, h in found], "\n")
     return ToolResult(id=call.id, ok=True, text=text, meta={"memory": [v[0] for *_, v in shown]})
 
 
@@ -545,9 +591,9 @@ async def read_output(call, turn):
             text = None
     if text is None:  # gone with a paper or memory record whose text it held, or never kept
         return failed(call.id, "not_found", "That output is no longer kept.")
-    shown = reveal(turn, kept["segments"], offset)
+    shown, read = reveal(turn, kept["segments"], offset)
     return ToolResult(id=call.id, ok=True, text=compaction.page(text, offset, handle), meta={
-        "passages": _read(turn, shown, offset), "materials": [v for *_, k, v in shown if k == "paper"],
+        "passages": read, "materials": [v for *_, k, v in shown if k == "paper"],
         "memory": [v[0] for *_, k, v in shown if k == "memory"], "page": True})
 
 

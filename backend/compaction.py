@@ -201,15 +201,27 @@ def sendable(conn, run_id):
 # Paged tool outputs
 
 
+FOOTER_MAX = 160  # the most characters a preview's note takes (fix batch 4: within the preview, never past it)
+
+
+def shown_of(size):
+    """How much of a long output a preview of size characters (PREVIEW, or a tool's own smaller budget) shows: the rest
+    of it is its note, so the preview with its note never passes the budget."""
+    return max(0, size - FOOTER_MAX)
+
+
 def preview(text, handle, size=PREVIEW):
-    """The first size characters of a long output (PREVIEW, or a tool's own smaller budget), and how to read on."""
-    return text[:size] + (f"\n[Output continues: {len(text)} characters in all. Read on with read_output, handle "
-                          f"{handle}, offset {size}.]")
+    """A long output's preview within size characters: its first shown_of(size), and how to read on."""
+    shown = shown_of(size)
+    return text[:shown] + (f"\n[Output continues: {len(text)} characters in all. Read on with read_output, handle "
+                           f"{handle}, offset {shown}.]")
 
 
 def unkept(text, size=PREVIEW):
-    """The first size characters of a long output that could not be kept for paging: the rest is said to be unavailable."""
-    return text[:size] + f"\n[Cut at {size} of {len(text)} characters: the rest could not be kept and cannot be read.]"
+    """A long output that could not be kept for paging, within size characters: its first shown_of(size), and that the
+    rest is unavailable."""
+    shown = shown_of(size)
+    return text[:shown] + f"\n[Cut at {shown} of {len(text)} characters: the rest could not be kept and cannot be read.]"
 
 
 def page(text, offset, handle):
@@ -225,13 +237,13 @@ def shows(start, length, offset, size=PREVIEW):
     return start < offset + size and start + length > offset
 
 
-def marked(start, label, offset):
+def marked(start, label, offset, size=PREVIEW):
     """Whether the page from offset completes the label (a passage's marker, the head of a listed paper's or memory
     record's line) of an item whose line starts at start: it shows the label's end, so the label is whole on it, or
     (cut by the boundary before it) on it and the page before, which the footer named. Only then does the item count as
     given to the model (agent._paged)."""
     end = start + len(label)
-    return offset < end <= offset + PREVIEW
+    return offset < end <= offset + size
 
 
 def keep_output(conn, run_id, step, number, sha256, materials, memory_ids=()):
