@@ -501,3 +501,54 @@ async def test_fix4_a_small_budget_tool_past_its_preview_is_paged_within_its_bud
         [opened] = tool_messages(provider.agent_steps[-1])
         assert len(opened["content"]) <= agent.REGISTRY.get_definition("open_place").output_chars
         assert "read_output" in opened["content"]
+
+
+async def test_fix4_review_reading_on_costs_nothing_more_as_the_turns_evidence_grows(tmp_path, monkeypatch):
+    # Fix batch 4 internal review (P2): each candidate copied and scanned the whole of the turn's evidence, twice, so
+    # twenty reads of a paper of short passages took 104 s in all. Counted by evidence entries walked (each walk of the
+    # turn's evidence maps counts their size), not by time: reading walks them at most once a turn, never per read.
+    from backend import search_index
+    walked = []
+
+    class Walked(dict):
+        def keys(self):
+            walked.append(len(self))
+            return super().keys()
+
+        def items(self):
+            walked.append(len(self))
+            return super().items()
+
+        def __iter__(self):
+            walked.append(len(self))
+            return super().__iter__()
+    real_init = agent.Evidence.__init__
+
+    def counted(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        self.numbered, self.pending = Walked(self.numbered), Walked(self.pending)
+    monkeypatch.setattr(agent.Evidence, "__init__", counted)
+    provider = Scripted([call("read_passage", material_id="m")], "Read.")
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, LONG)
+        [(version,)] = await rows(client, "SELECT id FROM material_versions WHERE material_id = ?", material)
+        monkeypatch.setattr(search_index, "readings", gapped_readings(material, version, count=3000))
+        provider.script[0] = [call("read_passage", call_id=f"r{i}", material_id=material) for i in range(6)]
+        walked.clear()
+        await send(client, await conversation_in(client, project), "Read it")
+        read = len(provider.agent_steps[-1]["messages"])  # (the turn ran its six reads)
+        assert read and sum(walked) < 20_000  # six reads of about 1,000 passages each, never walked per passage
+
+
+async def test_fix4_review_sizing_numbers_as_the_evidence_will_and_take_backs_renumber_as_before():
+    record = lambda p, m="m": {"passage_id": p, "material_id": m, "text": p, "title": "T", "evidence_type": "full_text"}
+    evidence = agent.Evidence({(1, 1): record("p1"), (2, 1): record("q1", "n")})
+    evidence.add([record("p2"), record("p3")], shown=False)  # pending in a paged output
+    candidates = [record("p3"), record("p4"), record("r1", "o"), record("q2", "n"), record("r2", "o")]
+    predicted = list(evidence.keys_for(candidates))
+    assert predicted == evidence.add(candidates, shown=False)  # sizing numbers them exactly as adding does
+    assert predicted == [(1, 3), (1, 4), (3, 1), (2, 2), (3, 2)]
+    before = set(evidence.numbered)
+    [new] = evidence.add([record("s1", "s")])
+    evidence.keep([new], (), before)  # taken back: its number is given again, as before the index
+    assert evidence.add([record("t1", "t")]) == [new]

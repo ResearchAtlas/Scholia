@@ -1964,7 +1964,7 @@ class Harness:
                 needs_evidence=True)
 
         def whole(records):  # B40: a selection is read directly only when its answer step's request holds it whole,
-            probe = agent.Evidence(turn.evidence.numbered)  # numbered as the turn will number it, markers' length too
+            probe = agent.Evidence(turn.evidence.numbered, turn.evidence.pending)  # numbered as the turn will number it
             probe_keys = list(dict.fromkeys(probe.add(records)))
             try:
                 return not assembled({k: probe.numbered[k] for k in probe_keys},

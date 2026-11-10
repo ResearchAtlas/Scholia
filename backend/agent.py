@@ -51,25 +51,53 @@ class Evidence:
     """The turn's evidence: {(source, passage): record}, the router's pre-load first, then every passage a
     tool gave the model, each paper keeping its source number and each passage its marker once given. S1-21b: pending
     holds passages numbered in a paged output past its preview (read_passage), read in the run only once a page showing
-    their marker is served (read_output), so their markers are never given to another passage meanwhile."""
+    their marker is served (read_output), so their markers are never given to another passage meanwhile. Fix batch 4:
+    an index of the markers given (by passage and paper), each paper's source and each source's last passage number,
+    so numbering a passage, or sizing one before it is numbered (keys_for), costs the same however much the turn has
+    read; it is built whole only when markers are taken back (keep)."""
 
-    def __init__(self, numbered):
+    def __init__(self, numbered, pending=None):
         self.numbered = dict(numbered)
-        self.pending = {}
+        self.pending = dict(pending or {})
         self.revealed = set()  # pending keys a later tool's add gave out (keep can return them to pending)
+        self._index()
+
+    def _index(self):
+        self._keys, self._source, self._last, self._top = {}, {}, {}, 0
+        for key, record in {**self.numbered, **self.pending}.items():
+            self._note(key, record)
+
+    def _note(self, key, record):
+        self._keys[(record["passage_id"], record["material_id"])] = key
+        self._source.setdefault(record["material_id"], key[0])  # its first source, as the evidence lists it
+        self._last[key[0]] = max(self._last.get(key[0], 0), key[1])
+        self._top = max(self._top, key[0])
+
+    def keys_for(self, records):
+        """The markers add(records) would give them, one at a time, numbering nothing: what read_passage sizes its
+        candidates by before it numbers those it keeps."""
+        keys, sources, last, top = {}, {}, {}, self._top
+        for record in records:
+            ident = (record["passage_id"], record["material_id"])
+            key = self._keys.get(ident) or keys.get(ident)
+            if key is None:
+                source = self._source.get(record["material_id"]) or sources.get(record["material_id"])
+                if source is None:
+                    top += 1
+                    source = sources[record["material_id"]] = top
+                last[source] = max(self._last.get(source, 0), last.get(source, 0)) + 1
+                key = keys[ident] = (source, last[source])
+            yield key
 
     def add(self, records, shown=True):
         """The markers of records (given in order), numbering those not yet in the evidence (pending ones unless shown)."""
         keys = []
         for record in records:
-            known = {**self.numbered, **self.pending}
-            key = next((k for k, r in known.items() if r["passage_id"] == record["passage_id"]
-                        and r["material_id"] == record["material_id"]), None)
+            key = self._keys.get((record["passage_id"], record["material_id"]))
             if key is None:
-                source = next((k[0] for k, r in known.items() if r["material_id"] == record["material_id"]),
-                              max((k[0] for k in known), default=0) + 1)
-                key = (source, max((k[1] for k in known if k[0] == source), default=0) + 1)
+                [key] = self.keys_for([record])
                 (self.numbered if shown else self.pending)[key] = record
+                self._note(key, record)
             elif shown and key in self.pending:
                 self.show([key])
                 self.revealed.add(key)
@@ -82,18 +110,24 @@ class Evidence:
             if key in self.pending:
                 self.numbered[key] = self.pending.pop(key)
 
+    def record(self, key):
+        return self.numbered.get(key) or self.pending[key]
+
     def lines(self, keys):
-        known = {**self.numbered, **self.pending}
-        return citations.bundle({k: known[k] for k in dict.fromkeys(keys)})
+        return citations.bundle({k: self.record(k) for k in dict.fromkeys(keys)})
 
     def keep(self, keys, kept, before):
         """Take back the markers of keys that were new (not in before) and are not in kept: passages retrieved but
-        never shown to a model are not read in the run."""
+        never shown to a model are not read in the run (their numbers given again, as before the index)."""
+        taken = False
         for key in keys:
             if key not in kept and key not in before:
                 record = self.numbered.pop(key, None)
                 if record is not None and key in self.revealed:  # still in a paged output: its marker stays its own
                     self.pending[key] = record
+                taken = taken or record is not None
+        if taken:
+            self._index()
 
 
 class Turn:
@@ -240,11 +274,9 @@ async def read_passage(call, turn):
     # is reserved too (fix batch 4). The candidates are sized one at a time and only until the bound is passed, so the
     # work follows what is kept, never the whole paper; the probe numbers them as the turn will. A first passage longer
     # than the bound alone is cut at it, said so.
-    probe = Evidence(turn.evidence.numbered)  # numbered as the turn will number them, markers' length too
-    probe.pending = dict(turn.evidence.pending)
     sizes, used = [], 0
-    for record in records:
-        size = len(probe.lines(probe.add([record], shown=False))[0]) + (2 if sizes else 0)
+    for record, key in zip(records, turn.evidence.keys_for(records)):  # numbered as the turn will number them
+        size = len(citations.bundle({key: record})[0]) + (2 if sizes else 0)
         if used + size > READ_CHARS:
             break
         sizes.append(size)
