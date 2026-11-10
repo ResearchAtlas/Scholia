@@ -361,3 +361,24 @@ async def test_fix2_a_conversations_deletion_removes_its_kept_outputs_pages_and_
         for table in ("run_bodies", "run_body_memory", "run_body_materials"):
             assert await rows(client, f"SELECT count(*) FROM {table} WHERE sha256 IN (SELECT value FROM json_each(?))",
                               json.dumps(shas)) == [(0,)], table
+
+
+async def test_fix3_read_passage_stays_within_its_bound_counting_what_it_emits(tmp_path):
+    # gpt-6-astra recheck 3 (P1, finding 2): the title is repeated on every passage, so 40 paragraphs under a 990-character
+    # title stored 71,749 characters against the 50,000-character read bound.
+    title = "A Very Long Title " + "on minimum wages and employment " * 30  # about 990 characters
+    longer = paper("Long Panel", *[f"Paragraph {i} " + "word " * 300 for i in range(40)])
+    provider = Scripted([call("read_passage", material_id="m")], "Read.")
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, longer)
+        response = await client.patch(f"/api/materials/{material}", json={"title": title[:990]})  # the researcher's edit
+        assert response.status_code == 200, response.text
+        provider.script[0] = [call("read_passage", material_id=material)]
+        conversation = await conversation_in(client, project)
+        run = (await send(client, conversation, "Read it"))[0]["run_id"]
+        [(sha,)] = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt >= ?", run,
+                              compaction.OUTPUT_SLOT)
+        whole = (client.state["db"].data_dir / "content" / sha[:2] / sha).read_text()
+        assert len(whole) <= agent.READ_CHARS  # lines, separators and the omission notice counted
+        # whole passages only, as many as fit: the room left is less than one more (each about 2,500 characters here)
+        assert "Passages left out, by ordinal:" in whole and len(whole) > agent.READ_CHARS - 2600

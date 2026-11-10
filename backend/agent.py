@@ -233,17 +233,24 @@ async def read_passage(call, turn):
         records = [r for r in records if r["ordinal"] == ordinal]
         if not records:
             return failed(call.id, "not_found", "That paper has no passage at that ordinal.")
-    # Whole passages in order within the read bound (S1-21b: past the 8,000-character preview, paged with read_output).
-    room, kept = READ_CHARS - 1000, []  # room left for the note of passages left out
-    for record in records:
-        if room < len(record["text"]) + 200 and kept:
+    # Whole passages in order within the read bound (S1-21b: past the 8,000-character preview, paged with read_output),
+    # counted as they are emitted: each passage's line with its marker, title and facts, the separators between them and
+    # the note of those left out (fix batch 3: the title repeats on every passage). The first is read whatever its length.
+    probe = Evidence(turn.evidence.numbered)  # numbered as the turn will number them, markers' length too
+    probe.pending = dict(turn.evidence.pending)
+    sizes = [len(probe.lines(probe.add([record], shown=False))[0]) for record in records]
+
+    def note(left):
+        return f"\n\n(Passages left out, by ordinal: {_ranges(left)}. Read one with its ordinal.)" if left else ""
+    count, used = 0, 0
+    for n, size in enumerate(sizes, 1):
+        used += size + (2 if n > 1 else 0)
+        if n > 1 and used + len(note([r["ordinal"] for r in records[n:]])) > READ_CHARS:
             break
-        kept.append(record)
-        room -= len(record["text"]) + 200
-    left = [r["ordinal"] for r in records[len(kept):]]
+        count = n
+    kept, left = records[:count], [r["ordinal"] for r in records[count:]]
     keys = list(dict.fromkeys(turn.evidence.add(kept, shown=False)))
-    tail = f"\n\n(Passages left out, by ordinal: {_ranges(left)}. Read one with its ordinal.)" if left else ""
-    text, shown = _paged(turn, call.id, _passage_items(turn, keys), "\n\n", tail=tail)
+    text, shown = _paged(turn, call.id, _passage_items(turn, keys), "\n\n", tail=note(left))
     return ToolResult(id=call.id, ok=True, text=text, meta={
         "passages": _read(turn, shown), "version_id": rows[0][1][7], "left_out": len(left)})
 
