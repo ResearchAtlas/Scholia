@@ -1189,6 +1189,11 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             # each its next version: every view, ask or request that showed it in the source project is stale (PR 51)
             conn.execute("UPDATE memory_records SET project_id = ?, sensitivity = ?, updated_at = ?, version = version + 1"
                          " WHERE id IN (SELECT value FROM json_each(?))", (body.project_id, target[0], now, moved))
+            # a moved proposal whose record moved too saw it one version earlier, as the record now is
+            conn.execute("UPDATE memory_records SET structured = json_set(structured, '$.seen',"
+                         " json_extract(structured, '$.seen') + 1) WHERE id IN (SELECT value FROM json_each(?1))"
+                         " AND status = 'proposed' AND json_extract(structured, '$.seen') IS NOT NULL"
+                         " AND supersedes_id IN (SELECT value FROM json_each(?1))", (moved,))
             # their vectors leave the source project's partition; the destination's next index run makes them again
             # under its own (S1-21a follow-up MB2; requested once the move has ended)
             conn.execute("INSERT INTO index_queue (target, target_id, project_id, op) SELECT 'memory', value, ?,"

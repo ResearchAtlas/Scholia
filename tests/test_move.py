@@ -214,3 +214,29 @@ async def test_keep_never_replaces_another_projects_record(tmp_path):
         proposal = await asyncio.to_thread(client.state["db"].write, proposed)
         assert await asyncio.to_thread(client.state["db"].write, lambda conn: memory.keep(conn, proposal, None)) is None
         assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", target) == [("confirmed",)]
+
+
+async def test_a_replacement_proposal_moved_with_its_record_stays_keepable(tmp_path):
+    # PR 51 fix batch 2, internal review: a move raises both versions, so the version the proposal saw rises with them
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        first = (await client.post("/api/projects", json={"name": "First"})).json()["id"]
+        second = (await client.post("/api/projects", json={"name": "Second"})).json()["id"]
+        await level(client, second, "private")
+        moving = (await client.post("/api/conversations", json={"project_id": first})).json()["id"]
+        await send(client, moving, "Remember: we use interviews")
+        await background_idle(client)
+        [(target, turn)] = await rows(client, "SELECT m.id, s.source_id FROM memory_records m JOIN memory_sources s"
+                                              " ON s.memory_id = m.id AND s.source_kind = 'turn' WHERE m.type != 'progress'")
+
+        def proposed(conn):
+            record = memory.write(conn, project_id=first, scope="project", kind="decision", content="we use surveys",
+                                  status="proposed", sources=[("turn", turn)], structured={"seen": 1})
+            conn.execute("UPDATE memory_records SET supersedes_id = ? WHERE id = ?", (target, record))
+            return record
+        proposal = await asyncio.to_thread(client.state["db"].write, proposed)
+        assert (await client.post(f"/api/conversations/{moving}/move", json={"project_id": second})).status_code == 200
+        [(version,)] = await rows(client, "SELECT version FROM memory_records WHERE id = ?", proposal)
+        kept = await client.post("/api/memory/review", json={"id": proposal, "action": "keep", "version": version})
+        assert kept.status_code == 200, kept.text
+        assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", target) == [("superseded",)]

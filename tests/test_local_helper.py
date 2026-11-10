@@ -1571,7 +1571,6 @@ def _held(fake):
 
 
 def test_a_stand_in_helper_ends_when_the_process_that_started_it_dies(fake):
-    import signal
     import subprocess
     owner = ("import subprocess, sys, time; p = subprocess.Popen([sys.argv[1]], stdout=subprocess.DEVNULL); "
              "print(p.pid, flush=True); time.sleep(60)")
@@ -1582,14 +1581,13 @@ def test_a_stand_in_helper_ends_when_the_process_that_started_it_dies(fake):
     deadline = time.monotonic() + 5
     while not _held(fake) and time.monotonic() < deadline:  # running: it holds its lock
         time.sleep(0.02)
+    assert _held(fake)
     started_by.kill()  # as a test process ended by a signal is: its app never closes
     started_by.wait()
     deadline = time.monotonic() + 5
     while _held(fake) and time.monotonic() < deadline:
         time.sleep(0.05)
-    if _held(fake):  # it outlived its owner (the fix regressed): the lock it holds proves the recorded pid is it
-        os.kill(helper, signal.SIGTERM)
-        raise AssertionError("the stand-in outlived the process that started it")
+    assert not _held(fake), f"the stand-in (pid {helper}) outlived the process that started it"  # nothing signalled
 
 
 def test_the_check_after_each_test_finds_a_stand_in_left_running(tmp_path, fake):
