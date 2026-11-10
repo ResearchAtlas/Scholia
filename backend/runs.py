@@ -1558,17 +1558,18 @@ class Harness:
                 self._cited_request(ctx, found, decision)
         await self._carry_summary(claim, ctx)
 
-    async def _carry_summary(self, claim, ctx):
+    async def _carry_summary(self, claim, ctx, numbered=None, listed=()):
         """Before a step whose request (the last one _cited_request built) holds the summary: its papers registered
         (context_materials) and the memory records it follows (summary_memory), once; called before the first step and
         every later one, whose request may be the first to carry it (fix batch 1 review, P1-1). Before the first step, a
         summary_memory written for a compaction call that carried an earlier summary is set to this summary's, or taken
-        back when no request carries a summary."""
+        back when no request carries a summary. numbered and listed are the step's own evidence and listed papers, so
+        this registration, which replaces the run's record, keeps its [passage, paper] pairs (fix batch 1 recheck)."""
         summary = ctx.get("summary_info")
         if summary is not None and ctx.get("summary_registered"):
             return
         if summary is not None and ctx.get("summary_kept"):
-            await self._register_context(claim, {}, summary["materials"])
+            await self._register_context(claim, numbered or {}, {*listed, *summary["materials"]})
             if summary["memory_ids"] or ctx.get("summary_memory"):
                 await self._summary_memory(claim, summary["memory_ids"])
             ctx["summary_registered"] = True
@@ -1686,7 +1687,8 @@ class Harness:
                 except context.OverWindow:
                     return "chain_over_window"
                 await self._register_context(claim, turn.evidence.numbered, turn.listed)
-                await self._carry_summary(claim, ctx)  # S1-21b: a summary this step's request is the first to carry
+                await self._carry_summary(claim, ctx, turn.evidence.numbered, turn.listed)  # S1-21b: a summary this
+                # step's request is the first to carry
             judge_estimate = self._judge_estimate(ctx, turn.evidence.numbered)
             estimate = budget_router.request_cost(ctx["facts"]["rates"], request.input_tokens, request.max_tokens)
             call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate, allowance=judge_estimate,

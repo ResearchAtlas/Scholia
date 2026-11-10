@@ -497,18 +497,20 @@ async def test_fix1_review_a_summary_first_carried_by_a_later_step_is_registered
             seen.append(json.loads((await rows(client, "SELECT inputs FROM runs WHERE id = ?", active.run_id))[0][0]))
         return await real_call(self, active, call_, route, key, request, *args, **kwargs)
     monkeypatch.setattr(runs_module.Harness, "_call", noted)
-    async with started(tmp_path / "data", provider) as client:
+    async with cited(tmp_path, provider) as client:
         await small_history(client)
-        _, chat = await conversation(client)
+        project, _ = await with_papers(client, WAGES)
+        chat = await conversation_in(client, project)
         await send(client, chat, "Remember: my method is semi-structured interviews")
         for i in range(1, 3):
             await send(client, chat, f"QUESTION-{i} about cohorts")
         flag["on"] = True
-        stream = await send(client, chat, "QUESTION-3 about cohorts")
+        stream = await send(client, chat, "QUESTION-3 What do minimum wages do to earnings?")
         assert stream[-1]["status"] == "succeeded"
         first, second = provider.turns[-2:]
         assert compaction.LABEL not in first["messages"][0]["content"] and compaction.LABEL in second["messages"][0]["content"]
         [event] = await compactions(client, stream[0]["run_id"])
         assert event["memory_ids"] and seen and seen[0].get("summary_memory") == event["memory_ids"]  # before it left
+        assert seen[0]["evidence"]  # recheck (P1): its own passages stay registered with the dispatch check
         steps = await answer_steps(client, stream[0]["run_id"])
         assert [s.get("summary") for s in steps] == [None, {"turns": [0, 1]}]

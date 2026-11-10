@@ -289,10 +289,10 @@ def reveal(turn, segments, offset):
     return shown
 
 
-def _read(turn, shown):
-    """The passages read in the run among segments a page shows (their markers completed), by passage id."""
-    return [turn.evidence.numbered[v]["passage_id"] for _, _, _, k, v in shown
-            if k == "passage" and v in turn.evidence.numbered]
+def _read(turn, shown, offset=0):
+    """The passages a page from offset reads in the run (it completes their markers), by passage id."""
+    return [turn.evidence.numbered[v]["passage_id"] for start, _, label, k, v in shown
+            if k == "passage" and v in turn.evidence.numbered and compaction.marked(start, label, offset)]
 _MARKER_SLACK = 8  # a marker the turn numbers ([S12.30]) may be longer than one numbered from 1
 
 
@@ -540,7 +540,7 @@ async def read_output(call, turn):
         return failed(call.id, "not_found", "That output is no longer kept.")
     shown = reveal(turn, kept["segments"], offset)
     return ToolResult(id=call.id, ok=True, text=compaction.page(text, offset, handle), meta={
-        "passages": _read(turn, shown), "materials": [v for *_, k, v in shown if k == "paper"],
+        "passages": _read(turn, shown, offset), "materials": [v for *_, k, v in shown if k == "paper"],
         "memory": [v[0] for *_, k, v in shown if k == "memory"], "page": True})
 
 
