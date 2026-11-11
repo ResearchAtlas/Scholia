@@ -617,3 +617,56 @@ async def test_each_way_a_message_joins_the_queue_is_streamed_as_queued(tmp_path
         assert "queued" in (await steer(client, run_id, "Shorter, please")).json()
         release.set()
         assert [e["type"] for e in await sending].count("queued") == 1
+
+
+# S1-33 fix batch 3 (PR 52 cycle 3): lifecycle first (charter section 10)
+
+
+async def test_a_note_carried_out_by_a_steps_first_attempt_stays_read_when_stop_comes_before_its_retry_leaves(
+        tmp_path, monkeypatch):
+    # E1 case 2, with a note (design review A): the step carrying the note went out once (rejected, reporting $0.20),
+    # and Stop came while the gate decided on its retry. The note was read, by the attempt that carried it out; the
+    # retry is recorded as never sent, with no body kept for it, and the step is charged what its first attempt reported.
+    import dataclasses
+    import time
+    from backend import openrouter, outbound_gate, reach
+    real_reach = reach.reach
+    monkeypatch.setattr(reach, "reach", lambda provider, *a, **kw: dataclasses.replace(
+        real_reach(provider, *a, **kw), tools=True) if not provider.is_openrouter else real_reach(provider, *a, **kw))
+    monkeypatch.setattr(openrouter, "resolve_model_reasoning", lambda route, effort, **kw: ({"effort": "high"}, None))
+    gate = Gate(0)
+    provider = Scripted(None, (400, {"error": {}, "usage": {"prompt_tokens": 10, "completion_tokens": 0, "cost": 0.2}}))
+    provider.script[0] = gate.wrap(provider, {"calls": [call("list_materials")]})
+    async with started(tmp_path / "data", provider) as client:
+        settings = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+            "providers.lab.kind": "openai-compatible", "providers.lab.base_url": "http://127.0.0.1:9/v1"}})
+        await client.put("/api/keys/lab", json={"key": "k"})
+        conversation = await named(client)
+        harness, loop, real, chats = client.state["harness"], asyncio.get_running_loop(), outbound_gate.OutboundGate._check, []
+
+        def checking(self, request, scope, hop=None):
+            if request.url.path.endswith("/chat/completions"):
+                chats.append(request)
+                if len(chats) == 3:  # the second step's retry: Stop arrives while the gate decides
+                    loop.call_soon_threadsafe(lambda: harness._request_cancel(harness.registry.turns[conversation],
+                                                                              "researcher"))
+                    time.sleep(0.3)
+            return real(self, request, scope, hop)
+        monkeypatch.setattr(outbound_gate.OutboundGate, "_check", checking)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?", provider="lab", model="m"))
+        await gate.reached.wait()
+        run_id = await running_run(client, conversation)
+        await steer(client, run_id, "Only recent ones")
+        gate.open.set()
+        stream = await sending
+        assert stream[-1]["status"] == "cancelled" and len(chats) == 3 and len(provider.steps) == 2
+        attempts = [(d["attempt"], d["outcome"], d["dispatched"], "body" in d) for (d,) in (
+            (json.loads(data),) for (data,) in await rows(client, "SELECT data FROM run_events WHERE run_id = ?"
+                                                                  " AND type = 'model_attempt' AND json_extract(data, '$.step') = 1"
+                                                                  " ORDER BY seq", run_id))]
+        assert attempts == [(0, "request", True, True), (1, "cancelled", False, False)]
+        assert await rows(client, "SELECT settled_usd, basis FROM budget_reservations WHERE run_id = ? AND step_seq = 1",
+                          run_id) == [(0.2, "reported")]
+        read = await conversation_read(client, conversation)
+        assert [n["state"] for n in read["turns"][-1]["steering"]] == ["read"] and read["queued"] == []

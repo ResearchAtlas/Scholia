@@ -312,6 +312,38 @@ async def test_cancellation_propagates_to_the_caller():
         await task
 
 
+async def test_an_attempt_cut_off_by_a_cancellation_joins_the_callers_list_sent_or_not_by_the_gates_notice(
+        takes_reasoning):
+    # S1-33 (PR 52 cycle 3, design review A): the caller's own list keeps every attempt as it ends, one cut off by a
+    # cancellation too, so a caller whose call never returns still knows what each did. One the gate let out may be
+    # billed; one the gate was still deciding on never left.
+    async def never(request):
+        await asyncio.sleep(60)
+
+    client, sent = client_for(httpx.Response(400, json={"usage": {"cost": 0.2}}), never)
+    attempts = []
+    task = asyncio.create_task(openrouter.query_model(client, LOCAL, "key", MESSAGES, effort="high", attempts=attempts))
+    while len(sent) < 2:
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [(a.outcome, a.dispatched, a.reported_cost) for a in attempts] == [("request", True, 0.2),
+                                                                             ("cancelled", True, None)]
+
+    async def checking(request):  # stands in for the gate still deciding: no notice yet
+        await asyncio.sleep(60)
+
+    attempts = []
+    task = asyncio.create_task(openrouter.query_model(httpx.AsyncClient(transport=httpx.MockTransport(checking)),
+                                                      OPENROUTER, "key", MESSAGES, attempts=attempts))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [(a.outcome, a.dispatched, a.http_status) for a in attempts] == [("cancelled", False, None)]
+
+
 async def test_reasoning_text_comes_only_from_the_messages_own_fields():
     assert openrouter.extract_reasoning({"content": "<think>hidden</think>answer"}) is None
     assert openrouter.extract_reasoning({"reasoning": "step one"}) == "step one"

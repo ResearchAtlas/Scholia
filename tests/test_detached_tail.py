@@ -478,3 +478,75 @@ async def test_running_background_runs_stay_on_the_activity_list(tmp_path):
         await asyncio.to_thread(client.state["db"].write, insert)
         listed = (await client.get("/api/activity?limit=1")).json()["runs"]
         assert [r["run_id"] for r in listed] == [old, older, new2]  # every running one, then the limit
+
+
+# S1-33 fix batch 3 (PR 52 cycle 3, E2): a background call its receipt never recorded is closed by its run's own handler
+# as its attempts say, as a turn's is, never left open for recovery to charge at its estimate.
+
+
+def fails_once_armed(monkeypatch, target, name):
+    """target.<name> raises once, the first time it is called after the returned list is armed (True appended)."""
+    real, armed = getattr(target, name), []
+
+    def failing(*args, **kwargs):
+        if armed and armed[0] is True:
+            armed[0] = False
+            raise RuntimeError("the receipt's write failed")
+        return real(*args, **kwargs)
+    monkeypatch.setattr(target, name, failing)
+    return armed
+
+
+@pytest.mark.parametrize("workflow", ["title", "memory"])
+async def test_a_background_call_that_never_connected_is_released_when_its_receipt_write_fails(
+        tmp_path, monkeypatch, workflow):
+    # E2 (SPEC:425: a reservation for a step never dispatched is released): the request never connected and the write
+    # recording that failed once. The run's handler closes the call as its attempt says, released, so recovery finds
+    # nothing open to charge, and an extraction's allowance is whole (spending.run_cost counts none of it).
+    import httpx
+    from backend import spending
+    armed = fails_once_armed(monkeypatch, spending, "release")
+
+    def unreachable(body):
+        armed.append(True)
+        raise httpx.ConnectError("connection refused")
+    provider = MockProvider()
+    (provider.title_replies if workflow == "title" else provider.memory_replies).append(unreachable)
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client, **({} if workflow == "title" else {"title": "Named"}))
+        await send(client, conversation_id)
+        await background_idle(client)
+        assert armed == [False]  # the receipt's write did fail
+        [(run_id,)] = await rows(client, "SELECT id FROM runs WHERE kind = 'background' AND workflow = ?", workflow)
+        before = await rows(client, "SELECT status, settled_usd FROM budget_reservations WHERE run_id = ?", run_id)
+        assert before == [("released", None)]
+        attempts = [json.loads(d) for (d,) in await rows(
+            client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'", run_id)]
+        assert [(a["outcome"], a["dispatched"]) for a in attempts] == [("network", False)]
+        await client.state["harness"].recover(kick=False)  # as at the next start: nothing left to settle
+        assert await rows(client, "SELECT status, settled_usd FROM budget_reservations WHERE run_id = ?", run_id) == before
+        assert await rows(client, "SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'model_attempt'",
+                          run_id) == [(1,)]
+        cost = await asyncio.to_thread(client.state["db"].read, lambda conn: spending.run_cost(conn, run_id))
+        assert cost == 0
+
+
+async def test_a_reported_background_call_whose_receipt_write_fails_keeps_its_reported_charge(tmp_path, monkeypatch):
+    # E2's other side: the extraction's request went out and reported its cost, then the receipt's write failed once.
+    # Its run's handler settles it at that reported cost, never left open for recovery's estimate.
+    from backend import runs
+    armed = fails_once_armed(monkeypatch, runs, "_settle_attempts")
+    provider = MockProvider()
+
+    def reported(body):
+        armed.append(True)
+        return provider.answer('{"records": []}', cost=0.0007)
+    provider.memory_replies.append(reported)
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client, title="Named")
+        await send(client, conversation_id)
+        await background_idle(client)
+        assert armed == [False]
+        [(run_id,)] = await rows(client, "SELECT id FROM runs WHERE kind = 'background' AND workflow = 'memory'")
+        assert await rows(client, "SELECT status, settled_usd, basis FROM budget_reservations WHERE run_id = ?",
+                          run_id) == [("settled", 0.0007, "reported")]

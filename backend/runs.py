@@ -385,18 +385,25 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None, memory_chang
 
 @dataclass
 class _Call:
-    """One admitted model call: its run, step, reservation and whether it may have left."""
+    """One admitted model call: its run, step, reservation and what each of its attempts did."""
     run_id: str
     step: int
     reservation_id: str
-    dispatched: bool = False
     route: str | None = None  # the route key, once the call is under way
-    retention: dict | None = None  # the retention terms the gate applied when it let the call out
+    rates: dict | None = None  # the step's rates, which settle an attempt that reported tokens and no cost
+    # S1-33 (PR 52 cycle 3): the adapter's own list of the call's attempts (openrouter.Attempt), each joining it as it
+    # ends, one cut off by a cancellation included: the one record of what the call did, which _record_attempts reads
+    attempts: list = field(default_factory=list)
     bodies: list = field(default_factory=list)  # S1-19: each attempt's request body as stored (its sha256, or None)
     materials: tuple = ()  # the papers whose text its request holds, for the bodies' deletion links
     declined: bool = False  # S1-19c: an attempt refused at dispatch because the turn's time limit had passed
     memory_off: bool = False  # S1-21a: an attempt holding memory refused at dispatch: memory switched off, or a record
     # it holds changed since (MB11)
+
+    @property
+    def dispatched(self) -> bool:
+        """Whether an attempt may have reached the provider (and so may be billed), by its attempts only."""
+        return any(attempt.dispatched for attempt in self.attempts)
 
 
 class Harness:
@@ -2320,9 +2327,6 @@ class Harness:
             " WHERE b.id = ? AND b.status = 'open' AND r.status = 'running'", (call.reservation_id,)).fetchone())
         if project_id is None:  # its run, conversation or project was deleted (or it ended) since admission
             raise asyncio.CancelledError()
-        def dispatched(terms=None):  # the gate let the request out: from here it may be billed
-            call.dispatched, call.retention = True, terms
-
         async def keep(body):  # stored, and linked to its papers, before it is sent: a stop or a crash keeps it
             # Held from collection until its link commits (or is skipped: then collected once idle).
             with self.content.hold() if self.content is not None else nullcontext([]) as held:
@@ -2333,7 +2337,7 @@ class Harness:
 
         call.materials = tuple(sorted(set(materials)))
 
-        call.route = route.key
+        call.route, call.rates = route.key, facts["rates"]
         def past():  # the turn's time limit, read by the dispatch check as the request is about to leave
             call.declined = call.declined or _past_deadline(active.context)
             return call.declined
@@ -2350,15 +2354,11 @@ class Harness:
                                           provider=route.provider.name) as client:
             result = await openrouter.query_model(
                 client, route, key, request.messages, timeout=timeout or MODEL_CALL_SECONDS, effort=facts["effort"],
-                max_tokens=request.max_tokens, zdr_enabled=zero_retention, on_dispatch=dispatched, on_body=keep,
+                max_tokens=request.max_tokens, zdr_enabled=zero_retention, attempts=call.attempts, on_body=keep,
                 tools=request.tools or None,  # S1-19c: the agent loop's function tools, counted with the request
                 # The catalog row the route's facts were read from, so the request is the one they
                 # describe; a Private call is limited to the endpoints it lists, as the gate checks.
                 model_entry=facts["row"])
-            # S1-33 (PR 52 cycle 2): the call's outcome is known now, and it replaces the gate's earlier notice, which
-            # says only that a request was being let out (one that then never connected did not leave): a failed
-            # receipt below is closed (_close_call) as what the attempts say, never as sent when none was
-            call.dispatched = result.dispatched
             finished = {"step": call.step, "outcome": "turn_deadline" if call.declined else result.error_kind or "ok",
                         **({"cut": "output_limit"} if result.cut else {})}  # stopped at its output limit
             # S1-19c: an agent step's reply is kept whole as it arrives (model-route rule 5: each assistant step stored
@@ -2372,17 +2372,10 @@ class Harness:
                 # The receipt settles the reservation by its id even if the run was deleted
                 # meanwhile; the run's own record goes with the run.
                 exists = conn.execute("SELECT 1 FROM runs WHERE id = ?", (active.run_id,)).fetchone() is not None
-                for number in range(len(result.attempts), len(call.bodies)):  # kept, then never sent (its time ran out)
-                    _kept_body(conn, call, number, False)
-                if exists:
-                    for number, attempt in enumerate(result.attempts):
-                        answered = number == len(result.attempts) - 1 and request.tools and result.ok
-                        _event(conn, active.run_id, "model_attempt", {
-                            "step": call.step, "attempt": number, "route": route.key, **attempt.record(),
-                            **_kept_body(conn, call, number, attempt.dispatched),
-                            **(_keep_reply(conn, call, number, kept_reply["ref"]) if answered else {})})
-                if result.dispatched:
-                    _settle_attempts(conn, call.reservation_id, facts["rates"], result.attempts)
+                answered = exists and request.tools and result.ok  # its reply, kept beside its last attempt
+                _record_attempts(conn, call, exists, reply=_keep_reply(conn, call, len(call.attempts) - 1,
+                                                                       kept_reply["ref"]) if answered else None)
+                if call.dispatched:
                     if exists:  # S1-33: the bar's notices this settlement reached
                         noticed.extend(_notices(conn, active.run_id, self.data_dir))
                     if rehold is not None and exists:  # the answer's unspent, held again for its judge (_reserve)
@@ -2399,8 +2392,6 @@ class Harness:
                     finished["output"] = "held"
                 if exists:
                     _event(conn, active.run_id, "step_finished", finished)
-                if not result.dispatched:
-                    spending.release(conn, call.reservation_id)
 
             async def recording():
                 # The reply is held from collection until the record that links it commits (as request bodies are).
@@ -2543,6 +2534,9 @@ class Harness:
                 summary={"reason": ended.reason} if ended.reason else None)))
         except Exception as error:  # its record still says running: kept for the next start
             log.error("background run failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
+            call = active.call  # a call its receipt never recorded is closed now as its attempts say, as a turn's is
+            with suppress(Exception):  # (_stop_turn): never left open for recovery to charge at its estimate
+                await _through(self._write(lambda conn: _close_call(conn, call, self.data_dir)))
         finally:
             # Released only after its terminal record committed (and it is in `finished`), or still
             # running in the record: left for the next start, or by a terminal write that raised, which
@@ -3323,27 +3317,37 @@ def _normalized(sentence):
     return " ".join(unicodedata.normalize("NFC", sentence or "").split())
 
 
-def _close_call(conn, call, data_dir):
-    """Close a call cut off before it was recorded: one that may have gone out settles at
-    its estimate and leaves a content-free attempt with an unknown charge; one that never
-    left is released. Either happens once; a call already recorded is left as it is. Returns the budget notices
-    its settlement reached (S1-33), recorded with it as with any settlement (data_dir's settings)."""
-    if call is None:
-        return []
-    if call.dispatched:
-        if not spending.settle(conn, call.reservation_id):
-            return []
-        if _running(conn, call.run_id):
-            _event(conn, call.run_id, "model_attempt", {
-                "step": call.step, "attempt": max(len(call.bodies) - 1, 0), "route": call.route,
-                "retention": call.retention, "outcome": "cancelled",
-                "http_status": None, "dispatched": True, "charge": "unknown",
-                **_kept_body(conn, call, len(call.bodies) - 1, True)})
-        return _notices(conn, call.run_id, data_dir)
-    spending.release(conn, call.reservation_id)
-    for number in range(len(call.bodies)):  # its text never left the machine: none of it is kept
+def _record_attempts(conn, call, events, reply=None):
+    """S1-33 (PR 52 cycle 3): the one recorder of what a call's attempts did, from the adapter's own list
+    (call.attempts): a body kept but never sent is not kept; with events (its run is still there), one content-free
+    model_attempt each, naming its body, and reply (what the last one's event says of its kept reply); then its
+    reservation settled from the attempts that went out (_settle_attempts), or released when none did. The receipt
+    (Harness._call) and _close_call both record a call through it, so each says the same of every attempt."""
+    for number in range(len(call.attempts), len(call.bodies)):  # kept, then never sent
         _kept_body(conn, call, number, False)
-    return []
+    if events:
+        for number, attempt in enumerate(call.attempts):
+            _event(conn, call.run_id, "model_attempt", {
+                "step": call.step, "attempt": number, "route": call.route, **attempt.record(),
+                **_kept_body(conn, call, number, attempt.dispatched),
+                **((reply or {}) if number == len(call.attempts) - 1 else {})})
+    if call.dispatched:
+        _settle_attempts(conn, call.reservation_id, call.rates, call.attempts)
+    else:
+        spending.release(conn, call.reservation_id)
+
+
+def _close_call(conn, call, data_dir):
+    """Close a call cut off before it was recorded (Stop, a turn limit, shutdown, a failed receipt) as what its attempts
+    did (_record_attempts): a reported charge is kept, an attempt cut off after the gate let it out counts at the
+    estimate, and one that never left is released. Once: a call whose reservation is no longer open was recorded, and is
+    left as it is. Returns the budget notices its settlement reached (S1-33), recorded with it as with any settlement
+    (data_dir's settings)."""
+    if call is None or conn.execute("SELECT 1 FROM budget_reservations WHERE id = ? AND status = 'open'",
+                                    (call.reservation_id,)).fetchone() is None:
+        return []
+    _record_attempts(conn, call, _running(conn, call.run_id))
+    return _notices(conn, call.run_id, data_dir) if call.dispatched else []
 
 
 def _accounting(conn, run_id, complete=True):

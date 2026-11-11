@@ -255,21 +255,20 @@ def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens
 
 async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, timeout: float = 120.0,
                       effort: str | None = None, zdr_enabled: bool = False, max_tokens: int | None = None,
-                      model_entry=None, capability_records=None, on_dispatch=None, on_body=None, tools=None) -> ModelResult:
+                      model_entry=None, capability_records=None, attempts=None, on_body=None, tools=None) -> ModelResult:
     """One chat completion. Never raises for a provider failure: the result carries
     the failure kind and every attempt. Cancellation propagates (the caller settles
     what the attempt in flight cost). The client must be the outbound gate's: its
     notice that a request went out is the only evidence that an attempt may be
-    billed. on_dispatch, if given, is called with that notice, so a caller cancelled
-    before it knows nothing left. on_body, if given, is awaited with each attempt's exact request bytes
+    billed. attempts, if given, is the caller's list, which each attempt joins as it ends, one cut off by a
+    cancellation included (sent or not by the gate's notice), so a caller whose call never returns still knows what
+    each attempt did (S1-33, PR 52 cycle 3). on_body, if given, is awaited with each attempt's exact request bytes
     before they are sent (S1-19: the trace keeps them even for a call stopped in flight).
     """
     sent = []  # the gate's notices that the current attempt's request went out, with the terms it applied
 
     def dispatched(terms=None):
         sent.append(terms)
-        if on_dispatch is not None:
-            on_dispatch(terms)
 
     extensions = {DISPATCHED: dispatched}
     payload = build_payload(route, messages, effort=effort, zdr_enabled=zdr_enabled, max_tokens=max_tokens,
@@ -280,7 +279,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
     if zdr_enabled:
         headers[NO_RESPONSE_CACHE[0]] = NO_RESPONSE_CACHE[1]  # OpenRouter's response caching off (section 6.4)
     deadline = time.monotonic() + timeout
-    attempts = []
+    attempts = [] if attempts is None else attempts
     while True:
         # Encoded here, as httpx would encode json=, so the trace keeps the exact bytes that went out (S1-19).
         sending = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
@@ -299,6 +298,10 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
                             timeout=httpx.Timeout(remaining, connect=connect_timeout_for(remaining))),
                 timeout=remaining,
             )
+        except asyncio.CancelledError:  # cut off: it may have left only if the gate let it out
+            attempts.append(Attempt("cancelled", None, _ms(started), dispatched=bool(sent),
+                                    retention=sent[-1] if sent else None))
+            raise
         except Exception as error:  # cancellation is not an Exception, and propagates
             # The gate's notice decides whether the request left: refused, cut off by the time
             # bound during the gate's check, or never connected, it did not.
