@@ -1235,6 +1235,8 @@ class Harness:
                 except _Cancelled:
                     raise asyncio.CancelledError() from None
                 except spending.BudgetExceeded as exceeded:
+                    if active.cancel_requested.is_set():  # a Stop that came during the write: _through swallowed it
+                        raise asyncio.CancelledError() from None
                     if from_allowance or active.kind != "turn" or evaluation.get("on"):
                         raise
                     refused = exceeded
@@ -2000,6 +2002,8 @@ class Harness:
 
         try:
             while True:
+                if claim.cancel_requested.is_set():  # a Stop already requested ends the wait (S1-33 review 1)
+                    raise asyncio.CancelledError()
                 claim.answered.clear()
                 answer, done = await self._write(look)
                 if done:

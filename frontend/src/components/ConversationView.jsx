@@ -11,7 +11,7 @@ import { LeftOff, Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
-import { NOTICES, clear, limitText, send, showing, stop, unsavedAnswer, useLiveTurn } from '../live.js';
+import { NOTICES, clear, drain, limitText, send, showing, stop, unsavedAnswer, useLiveTurn } from '../live.js';
 import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
@@ -22,7 +22,7 @@ import { addTo } from './Library.jsx';
 import { actionLines, composerFill } from '../memory.js'; // S1-21a
 import { Ask } from './Ask.jsx';
 import { BudgetBar, Queued, SteeringNotes } from './FollowUp.jsx'; // S1-33
-import { follow, isActiveRun, nextQueued } from '../followup.js';
+import { follow, isActiveRun } from '../followup.js';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
@@ -144,11 +144,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   useEffect(() => {
     if (!waiting) return undefined;
     const timer = setTimeout(async () => {
-      if ((await load()) && handoff) {
-        const finished = live?.status === 'succeeded' ? live.runId : null;
-        clear(id);
-        if (finished) drain(finished);
-      }
+      if ((await load()) && handoff) clear(id);
     }, handoff && !failed ? 0 : POLL_MS);
     return () => clearTimeout(timer);
   }, [waiting, handoff, failed, reads, id, load]);
@@ -156,27 +152,13 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   // S1-33: a steering note read, or a budget notice reached, is shown from the record
   useEffect(() => { if (live?.steered) load(); }, [live?.steered, load]);
 
-  // S1-33 (F11, queue): after a turn that succeeded the oldest queued message starts as the next turn; the backend
-  // starts it only if that turn is still the latest and succeeded, and once. After any other ending it waits with Send.
-  const drained = useRef(new Set()); // the turns a queued message was started after, from this window
-  async function drain(runId) {
-    if (!runId || drained.current.has(runId)) return;
-    try {
-      const next = nextQueued(await get(`/api/conversations/${id}`), runId);
-      if (next && !drained.current.has(runId)) {
-        drained.current.add(runId);
-        await sendQueued(next, runId);
-      }
-    } catch {
-      load(); // read again: it waits with Send
-    }
-  }
-  async function sendQueued(item, after = null) {
+  // S1-33: a waiting message's Send (live.js drain starts the oldest on its own after a turn that succeeded)
+  async function sendQueued(item) {
     setProblem(null);
     try {
       await readChoice();
-      await send(id, `/api/conversations/${id}/queue/${encodeURIComponent(item.id)}/send`,
-        { ...messageRoute(currentChoice()), ...(after ? { after } : {}) }, item.text);
+      await send(id, `/api/conversations/${id}/queue/${encodeURIComponent(item.id)}/send`, messageRoute(currentChoice()),
+        item.text);
     } catch (error) {
       if (!(error instanceof ApiError && ['not_queued', 'not_after_success', 'active_run'].includes(error.code))) {
         setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
@@ -216,7 +198,10 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     try {
       const sent = await follow(id, runId, text);
       await load();
-      if (sent.queued) drain(runId ?? (turns ?? []).at(-1)?.run_id); // its turn may have ended: started if it succeeded
+      if (sent.queued) { // its turn may have ended already: started if that turn succeeded
+        await readChoice();
+        drain(id, runId ?? (turns ?? []).at(-1)?.run_id, messageRoute(currentChoice()));
+      }
       return true;
     } catch (error) {
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
@@ -329,11 +314,12 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
           }} />)}
         </div>
       )}
+      {/* S1-33: outside the message box's form, so the waiting messages' own forms are never nested in it */}
+      <div className="mx-auto w-full max-w-3xl shrink-0 px-4">
+        <Queued conversationId={id} queued={queued} running={running} onChanged={load} onSend={(item) => sendQueued(item)} />
+        <BudgetBar projectId={projectId} conversationId={id} seen={`${reads}.${live?.budget ?? 0}`} />
+      </div>
       <Composer running={running} problem={problem} onSend={submit} projectId={projectId} onAttach={attach}
-        above={<>
-          <Queued conversationId={id} queued={queued} running={running} onChanged={load} onSend={(item) => sendQueued(item)} />
-          <BudgetBar projectId={projectId} conversationId={id} seen={`${reads}.${live?.budget ?? 0}`} />
-        </>}
         onStop={() => Promise.resolve(stop(id, live?.runId ?? shown.find((turn) => turn.status === 'running')?.run_id))
           .then(load).catch(() => {})} />
     </section>
@@ -473,7 +459,7 @@ function Answer({ text, citations = null, onOpen }) {
   );
 }
 
-function Composer({ running, problem, onSend, onStop, projectId, onAttach, above }) {
+function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
   const t = useT();
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
@@ -514,7 +500,6 @@ function Composer({ running, problem, onSend, onStop, projectId, onAttach, above
     <form onSubmit={submit} className="shrink-0 px-4 pb-4">
       <div className="mx-auto w-full max-w-3xl">
         {problem && <p role="alert" className="mb-2 text-sm text-destructive">{problem}</p>}
-        {above}
         <div className="relative rounded-2xl border bg-card p-2 shadow-xs transition-shadow focus-within:border-brand/50 focus-within:shadow-md focus-within:shadow-brand/5">
           {chosen.length > 0 && (
             <ul className="flex flex-wrap gap-1 px-1 pb-1" aria-label={t('composer.chosen')}>

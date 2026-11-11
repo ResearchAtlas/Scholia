@@ -95,8 +95,8 @@ def answer(conn, run_id, ask_id, option=None, text=None, registry=None, data_dir
     run with a cancel requested (registry's, read in this transaction) is ending: its ask is closed,
     though its terminal record is not written yet. S1-33: a budget ask's answer applies its effect here too
     (backend/budgets.py, read with data_dir's settings), its typed text a new limit; the reply's `budget` says what
-    it applied, and a new project budget is returned under `project_budget_usd` for the caller to write once this
-    has committed."""
+    it applied, and a project budget's decision is returned under `project_budget` for the caller to apply once this
+    has committed (budgets.saved)."""
     if (option is None) == (text is None):
         raise AskRefused(400, "invalid_answer", "Answer with one option or with text")
     run = conn.execute("SELECT status, cancel_reason, waiting FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -126,7 +126,7 @@ def answer(conn, run_id, ask_id, option=None, text=None, registry=None, data_dir
     if ask["kind"] == "budget":  # its effect, in this transaction (section 6.2, Effects)
         from backend import budgets
         try:
-            reply["budget"], reply["project_budget_usd"] = budgets.decide(conn, run_id, ask, option, text, data_dir)
+            reply["budget"], reply["project_budget"] = budgets.decide(conn, run_id, ask, option, text, data_dir)
         except budgets.Refused as refused:
             error = AskRefused(400, refused.code, refused.message)
             error.needed_usd = refused.needed_usd  # the least limit this step needs
@@ -246,26 +246,23 @@ async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
             return JSONResponse({"code": refused.code, "message": refused.message, **(
                 {"needed_usd": refused.needed_usd} if getattr(refused, "needed_usd", None) else {})},
                 status_code=refused.status)
-        if (limit := answered.pop("project_budget_usd", None)) is not None:
-            project_id = await asyncio.to_thread(state["db"].read, lambda conn: conn.execute(
-                "SELECT project_id FROM runs WHERE id = ?", (run_id,)).fetchone())
+        if (decided := answered.pop("project_budget", None)) is not None:
             try:
-                await asyncio.to_thread(lambda: load_settings(state["data_dir"], project_id[0]).save(
-                    {"project.budget_usd": limit}))
+                await asyncio.to_thread(lambda: load_settings(state["data_dir"], decided["project_id"]).save(
+                    {"project.budget_usd": decided["to_usd"]}))
                 saved = True
             except Exception as error:
                 log.warning("a project budget answered in an ask was not saved (%s)", type(error).__name__)
                 saved = False
                 answered["budget"] = {**answered["budget"], "applied": False, "error": "not_saved",
-                                      "limit_usd": answered["budget"]["from_usd"]}
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(state["db"].write, lambda conn: _budget_saved(conn, run_id, ask_id, saved))
-        answered.get("budget", {}).pop("from_usd", None)
+                                      "limit_usd": decided["from_usd"]}
+            with contextlib.suppress(Exception):  # a project deleted meanwhile keeps no record of it
+                await asyncio.to_thread(state["db"].write, lambda conn: _budget_saved(conn, run_id, decided, saved))
     if (active := registry.runs.get(run_id)) is not None:  # a run waiting on it wakes now
         active.answered.set()
     return answered
 
 
-def _budget_saved(conn, run_id, ask_id, saved):
+def _budget_saved(conn, run_id, decided, saved):
     from backend import budgets
-    budgets.saved(conn, run_id, ask_id, saved)
+    budgets.saved(conn, run_id, decided, saved)

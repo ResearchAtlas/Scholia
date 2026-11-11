@@ -22,7 +22,7 @@ import unicodedata
 
 from backend import governance, openrouter, spending
 from backend.runs import _budgets_now, _event
-from backend.settings import load_settings
+from backend.settings import PERSONAL, PROJECT, load_settings
 
 _EPSILON = 1e-9
 EVALUATION_ATTEMPTS = openrouter.MAX_ATTEMPTS  # the HTTP attempts one call may make, each charged if it goes out
@@ -130,20 +130,24 @@ def _typed(text):
 
 def _amount(conn, budget, scope_id, current):
     """What Continue adds: the amount the budget's last decision recorded while its limit is what that decision left,
-    else the limit itself."""
+    else the limit itself; for a limit of zero, the budget's default (so Continue never adds nothing)."""
     column = "r.conversation_id" if budget == "conversation" else "r.project_id"
     row = conn.execute(
         "SELECT json_extract(e.data, '$.to_usd'), json_extract(e.data, '$.amount_usd') FROM run_events e"
         f" JOIN runs r ON r.id = e.run_id WHERE e.type = 'budget_decision' AND {column} = ?"
         " AND json_extract(e.data, '$.budget') = ? AND json_extract(e.data, '$.amount_usd') IS NOT NULL"
         " ORDER BY e.rowid DESC LIMIT 1", (scope_id, budget)).fetchone()
-    return row[1] if row is not None and abs(row[0] - current) <= _EPSILON else current
+    found = row[1] if row is not None and abs(row[0] - current) <= _EPSILON else current
+    return found if found > 0 else (PERSONAL if budget == "conversation" else PROJECT)[
+        ("budget", "conversation_usd") if budget == "conversation" else ("project", "budget_usd")][0]
 
 
 def decide(conn, run_id, ask, option, text, data_dir):
     """A budget ask's answer, in its transaction: the decision recorded (a `budget_decision` event and an audit record)
-    and, for a conversation, its new limit written. Returns (what the reply says of it, the project's new limit to
-    write to its config.toml once this commits, or None). Raises Refused for a typed limit it cannot apply."""
+    and, for a conversation, its new limit written. Returns (what the reply says of it, the project budget's decision
+    still to apply, or None). A project budget's change is recorded here as decided but not applied: its config.toml is
+    written once this commits, and only then is it recorded applied (or not saved) with its audit record (saved), so
+    no record says the budget was raised before the file says so. Raises Refused for a typed limit it cannot apply."""
     params, project_id = ask["params"], ask["project_id"]
     budget, conversation_id = params["budget"], params.get("conversation_id")
     limits = _limits(conn, data_dir, project_id, conversation_id if budget == "conversation" else None)
@@ -165,22 +169,29 @@ def decide(conn, run_id, ask, option, text, data_dir):
     stale = abs(current - params["limit_usd"]) > _EPSILON
     applied = not stale and decision not in STOPS and abs(wanted - current) > _EPSILON
     to = wanted if applied else current
+    pending = applied and budget == "project"
+    decided = {"ask_id": ask["ask_id"], "budget": budget, "decision": decision, "from_usd": current, "to_usd": to,
+               "amount_usd": amount}
     _event(conn, run_id, "budget_decision", {
-        "ask_id": ask["ask_id"], "budget": budget, "decision": decision, "from_usd": current, "to_usd": to,
-        "amount_usd": amount, "applied": applied, **({"stale": True} if stale else {})})
-    governance.record(conn, "budget_decision", project_id, budget=budget, decision=decision, from_usd=current, to_usd=to,
-                      applied=applied)
+        **decided, **({"to_usd": current, "applied": False, "pending_usd": to} if pending else {"applied": applied}),
+        **({"stale": True} if stale else {})})
+    if not pending:
+        governance.record(conn, "budget_decision", project_id, budget=budget, decision=decision, from_usd=current,
+                          to_usd=to, applied=applied)
     if applied and budget == "conversation":
         conn.execute("UPDATE conversations SET budget_usd = ? WHERE id = ?", (to, conversation_id))
-    return {"applied": applied, "budget": budget, "limit_usd": to, "from_usd": current}, \
-        (to if applied and budget == "project" else None)
+    return {"applied": applied, "budget": budget, "limit_usd": to}, ({**decided, "project_id": project_id} if pending else None)
 
 
-def saved(conn, run_id, ask_id, ok):
-    """After a project budget's decision committed and its config.toml write was tried: whether it was written, on the
-    run's record (a run deleted meanwhile records nothing)."""
+def saved(conn, run_id, decided, ok):
+    """After a project budget's decision committed and its config.toml write was tried: the decision recorded applied
+    (or not saved, its limit unchanged) on the run's record, which a run deleted meanwhile no longer has, and audited."""
+    record = {**decided, **({} if ok else {"to_usd": decided["from_usd"]}), "applied": ok, "saved": ok}
+    record.pop("project_id")
     if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is not None:
-        _event(conn, run_id, "budget_decision", {"ask_id": ask_id, "budget": "project", "saved": ok})
+        _event(conn, run_id, "budget_decision", record)
+    governance.record(conn, "budget_decision", decided["project_id"], budget="project", decision=decided["decision"],
+                      from_usd=decided["from_usd"], to_usd=record["to_usd"], applied=ok)
 
 
 def queued_row(row):

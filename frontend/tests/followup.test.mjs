@@ -63,3 +63,9 @@ test('no budget text promises a strict ceiling (F11, What a budget promises; SPE
   assert.ok(budgetText.length > 10);
   for (const text of budgetText) assert.ok(!/ceiling|cannot exceed|never exceed|guarantee/i.test(text), text);
 });
+
+test('the waiting messages and the bar are outside the message box\'s form, so their forms never nest in it', () => {
+  const source = readFileSync(fileURLToPath(new URL('../src/components/ConversationView.jsx', import.meta.url)), 'utf8');
+  const composer = source.slice(source.indexOf('function Composer('), source.indexOf('const MENTION'));
+  assert.ok(composer.length > 0 && !/<Queued|<BudgetBar/.test(composer));
+});

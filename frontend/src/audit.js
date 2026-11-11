@@ -23,6 +23,9 @@ function shown(t, key, value, dates) {
   if (key === 'answer') return named(t, 'ask.answer', value); // the option chosen, never typed text
   if (key === 'budget') return named(t, 'audit.budget', value); // S1-33: which budget a decision was about
   if (key === 'decision') return named(t, 'audit.budgetDecision', value);
+  if (key.endsWith('_usd') && typeof value === 'number') {
+    return new Intl.NumberFormat(dates.resolvedOptions().locale, { style: 'currency', currency: 'USD', maximumFractionDigits: 4 }).format(value);
+  }
   if (TIME_FIELDS.has(key) && typeof value === 'string') return dates.format(new Date(value));
   if (Array.isArray(value)) return String(value.length); // the settings files a full backup left out: how many
   if (value && typeof value === 'object') { // the records a deletion removed, by table: their count

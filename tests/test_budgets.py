@@ -655,9 +655,21 @@ async def test_a_project_budget_answer_whose_settings_write_fails_raises_nothing
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.05)
         assert await _project_budget(client, project) == 1.0
+        # recorded decided, then not saved, and audited as not applied: no record says the budget was raised (review 1)
+        decided = await _decisions(client, ask["run_id"])
+        assert [(d["decision"], d["applied"], d["to_usd"], d.get("saved")) for d in decided] == [
+            ("continue", False, 1.0, None), ("continue", False, 1.0, False)]
+        import json
+        audited = [json.loads(d) for (d,) in await _rows(client, "SELECT data FROM audit_log WHERE event = 'budget_decision'")]
+        assert [(a["decision"], a["to_usd"], a["applied"]) for a in audited] == [("continue", 1.0, False)]
         monkeypatch.setattr(settings.Settings, "save", saving)
-        await _answer(client, again, option="stop")
-        assert (await sending)[-1]["cancel_reason"] == "limit"
+        await _answer(client, again, option="continue")  # saved now: decided, then applied, and audited once each
+        assert (await sending)[-1]["status"] == "succeeded" and await _project_budget(client, project) == 2.0
+        decided = await _decisions(client, ask["run_id"])
+        assert [(d["applied"], d["to_usd"]) for d in decided[2:]] == [(False, 1.0), (True, 2.0)]
+        audited = await _rows(client, "SELECT json_extract(data, '$.to_usd'), json_extract(data, '$.applied')"
+                                      " FROM audit_log WHERE event = 'budget_decision'")
+        assert audited == [(1.0, 0), (2.0, 1)]
 
 
 @pytest.mark.asyncio
@@ -834,9 +846,9 @@ async def test_the_evaluation_mark_is_set_at_creation_only(tmp_path):
         project = (await client.post("/api/projects", json={"name": "Evaluation", "evaluation": True})).json()["id"]
         normal = (await client.post("/api/projects", json={"name": "Thesis"})).json()
         assert normal["evaluation"] is False
-        changed = await client.patch(f"/api/projects/{project}", json={"evaluation": False})
+        changed = await client.patch(f"/api/projects/{project}", json={"evaluation": False})  # not a field it changes
+        assert changed.status_code == 200 and changed.json()["evaluation"] is True
         assert (await client.get(f"/api/projects/{project}")).json()["evaluation"] is True
-        assert changed.status_code in (200, 400, 422)
         with pytest.raises(sqlite3.IntegrityError, match="evaluation"):
             await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
                 "UPDATE projects SET evaluation = 0 WHERE id = ?", (project,)))
@@ -867,10 +879,31 @@ async def test_a_budget_of_zero_asks_at_the_cap_and_the_route_holds_through_the_
         conversation, _ = await _conversation(client, budget=0)
         sending, ask = await _asking(client, conversation)
         assert (ask["params"]["form"], ask["params"]["limit_usd"]) == ("cap", 0)
-        assert (await _answer(client, ask, text="1")).json()["budget"]["limit_usd"] == 1.0
+        # Continue on a zero budget adds the default's amount, never nothing (review 1)
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 10
         assert (await sending)[-1]["status"] == "succeeded"
         events = {kind: json.loads(data) for kind, data in await _rows(
             client, "SELECT type, data FROM run_events WHERE run_id = ? AND type IN ('route', 'step_started')"
                     " ORDER BY seq", ask["run_id"])}
         assert (events["step_started"]["route"], events["step_started"]["effort"]) == (
             events["route"]["route"], events["route"]["effort"])
+
+
+@pytest.mark.asyncio
+async def test_a_stop_landing_during_the_refused_reservation_ends_the_turn_and_raises_no_ask(tmp_path, monkeypatch):
+    # Review 1, finding 1 (L1): the write that refuses the step runs to its end through a cancellation, which must
+    # not be lost: the turn ends as stopped, with no ask nobody could answer.
+    from scholia_app import send
+    async with await _app(tmp_path) as client:
+        conversation, _ = await _conversation(client, budget=0.03)
+        harness, loop, real, fired = client.state["harness"], asyncio.get_running_loop(), spending.reserve, []
+
+        def reserve(conn, **kwargs):  # a Stop arrives while the refusing write is in flight
+            if not fired:
+                fired.append(1)
+                loop.call_soon_threadsafe(harness._request_cancel, harness.registry.runs[kwargs["run_id"]], "researcher")
+            return real(conn, **kwargs)
+        monkeypatch.setattr(spending, "reserve", reserve)
+        stream = await asyncio.wait_for(send(client, conversation, "Short?"), 10)
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "researcher")
+        assert await _rows(client, "SELECT count(*) FROM run_events WHERE type = 'ask'") == [(0,)]

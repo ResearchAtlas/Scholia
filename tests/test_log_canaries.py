@@ -352,9 +352,12 @@ async def test_no_steering_queued_or_budget_answer_canary_reaches_the_log(tmp_pa
             await client.post(path, json={"text": "CANARY-LIMIT"})
             await client.post(path, json={"text": "25"})  # its settings write fails: it asks again
             again = await asked(client, conversation)
-            while again["ask_id"] == ask["ask_id"]:
+            for _ in range(200):  # asked again, by a new ask
+                if again["ask_id"] != ask["ask_id"]:
+                    break
                 await asyncio.sleep(0.05)
                 again = await asked(client, conversation)
+            assert again["ask_id"] != ask["ask_id"]
             await client.post(f"/api/runs/{again['run_id']}/asks/{again['ask_id']}", json={"option": "not_now"})
             await sending
             await background_idle(client)

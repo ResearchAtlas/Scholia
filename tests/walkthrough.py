@@ -408,7 +408,7 @@ def agent_step(body):
 BUDGET_WALK = re.compile(r"[(（](?:budget walk|预算演示) \$([0-9.]+)")
 SLOW = ("(slow, synthetic)", "（慢，合成数据）")
 STEER_WALK = ("(steer walk, synthetic)", "（引导演示，合成数据）")
-SLOW_SECONDS = 4
+SLOW_SECONDS = 10  # long enough to queue and edit a message while it runs
 
 
 async def later(reply):

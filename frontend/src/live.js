@@ -3,7 +3,8 @@
 // closes (backend/runs.py stream_closed), and several conversations may run at once
 // (slice-1 spec section 2).
 import { useSyncExternalStore } from 'react';
-import { post, stream } from './api.js';
+import { get, post, stream } from './api.js';
+import { nextQueued } from './followup.js';
 import { asksChanged } from './library.js';
 import { memoryChanged } from './memory.js';
 
@@ -73,8 +74,26 @@ export function send(conversationId, path, body, text) {
       aborts.delete(conversationId);
       if (turns.get(conversationId) && !turn.done) set(conversationId, { ...turn, done: true }, 'run_finished');
       admitted();
+      if (turn.status === 'succeeded') drain(conversationId, turn.runId, body);
     });
   });
+}
+
+// S1-33 (F11, queue): after a turn that succeeded, the oldest message waiting in its conversation starts as the next
+// turn, on the route the turn was sent on, wherever the window is; the backend starts it only while that turn is still
+// the latest and succeeded, and once. After any other ending it waits with Send.
+export async function drain(conversationId, runId, route = {}) {
+  if (!runId) return;
+  try {
+    const next = nextQueued(await get(`/api/conversations/${encodeURIComponent(conversationId)}`), runId);
+    const { model, provider, effort } = route;
+    if (next) {
+      await send(conversationId, `/api/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(next.id)}/send`,
+        { model, provider, effort, after: runId }, next.text);
+    }
+  } catch {
+    // refused (started meanwhile, or no longer after a turn that succeeded): it waits, as the conversation shows
+  }
 }
 
 // Stop: cancels the run, which then finishes its stream; before the run has started,
