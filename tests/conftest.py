@@ -87,6 +87,52 @@ def _no_reading_child_left_stopped():
     assert not left, f"stopped processes left in a reading child's group, not ended: {left}"
 
 
+def _stand_ins_left(root, grace=2.0):
+    """The lock files under root (control/stand-in.lock, one per stand-in bundle, tests/test_local_helper.py Fake)
+    that a live stand-in still holds: each holds a shared lock on its own while it lives. Each is tried without
+    waiting until it is free or grace seconds have passed, and once more 0.1 s after all were free. Nothing is
+    signalled: a stand-in left running ends with this process (its end-of-owner exit)."""
+    import fcntl
+    import os
+    import time
+
+    def held(path):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)  # (closing it lets the lock go)
+        return False
+
+    locks = sorted(Path(root).glob("**/control/stand-in.lock"))
+    if not locks:
+        return []
+    deadline = time.monotonic() + grace
+    while (left := [path for path in locks if held(path)]) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if left:
+        return left
+    # shortcut: a stand-in takes its lock as its first statement, so one exec'd within the interpreter's start-up
+    # (tens of ms) is unseen at the first look; this second look narrows that window, it does not close it. Closing it
+    # needs the launcher to hand the stand-in a locked descriptor, which the app's own helper launch (close_fds) does
+    # not allow without a test seam in backend/local_helper.py.
+    time.sleep(0.1)
+    return [path for path in locks if held(path)]
+
+
+@pytest.fixture(autouse=True)
+def _no_stand_in_left_running(request):
+    """A test leaves no stand-in helper running: its app stops the helpers it started when it closes. One left fails
+    the test, naming its lock file; nothing is signalled."""
+    root = request.getfixturevalue("tmp_path") if "tmp_path" in request.fixturenames else None  # torn down after this
+    yield
+    if root is not None:
+        left = _stand_ins_left(root)
+        assert not left, f"stand-in helpers left running after the test (their lock files): {[str(p) for p in left]}"
+
+
 @pytest.fixture
 def reading_stub(monkeypatch):
     """Read in tests/reading_stub.py's child for the rest of the test: reading_stub(mode, *args)

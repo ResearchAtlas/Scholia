@@ -304,8 +304,12 @@ def keep(conn, proposal, version, edited=False):
     target, seen = found["supersedes_id"], found["structured"].get("seen")
     now = utc_now()
     if target is not None:
-        current = conn.execute("SELECT status, version FROM memory_records WHERE id = ?", (target,)).fetchone()
-        if current is None or current[0] in ("superseded", "proposed") or (seen is not None and current[1] != seen):
+        current = conn.execute("SELECT status, version, scope, project_id FROM memory_records WHERE id = ?",
+                               (target,)).fetchone()
+        if current is None or current[0] in ("superseded", "proposed") or (seen is not None and current[1] != seen) \
+                or (current[2], current[3] if current[2] == "project" else None) != (
+                    found["scope"], found["project_id"] if found["scope"] == "project" else None):
+            # (never a record of another scope or project: a moved conversation's proposal, S1-21a follow-up MB6)
             conn.execute("UPDATE memory_records SET structured = json_set(coalesce(structured, '{}'),"
                          " '$.out_of_date', json('true')), updated_at = ? WHERE id = ?", (now, proposal))
             return None
@@ -313,10 +317,11 @@ def keep(conn, proposal, version, edited=False):
                      (now, now, target))
         conn.execute("INSERT INTO index_queue (target, target_id, project_id, op) VALUES ('memory', ?, ?, 'remove')",
                      (target, found["project_id"]))
-        conn.execute("UPDATE memory_records SET version = ? WHERE id = ?", (current[1] + 1, proposal))
+    # its next version, past both its own and the replaced record's (PR 51: a view that showed it before is stale)
+    version = max(found["version"], current[1] if target is not None else 0) + 1
     structured = {k: v for k, v in found["structured"].items() if k not in ("out_of_date", "older", "seen", "source")}
-    conn.execute("UPDATE memory_records SET status = 'confirmed', structured = ?, updated_at = ? WHERE id = ?",
-                 (json.dumps(structured) if structured else None, now, proposal))
+    conn.execute("UPDATE memory_records SET status = 'confirmed', structured = ?, version = ?, updated_at = ? WHERE id = ?",
+                 (json.dumps(structured) if structured else None, version, now, proposal))
     conn.execute("INSERT OR IGNORE INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'researcher', 'views')",
                  (proposal,))
     if found["type"] in RECALLED:
@@ -333,10 +338,10 @@ def in_scope(conn, project_id, statuses=ACTIVE, kinds=WRITABLE):
         " ORDER BY updated_at DESC, rowid DESC", (json.dumps(list(statuses)), json.dumps(list(kinds)), project_id)).fetchall()]
 
 
-def matching(conn, project_id, text, limit=3, floor=0.4, statuses=ACTIVE):
-    """Up to limit records of the project's scope (active, or of statuses) most like text, best first:
+def matching(conn, project_id, text, limit=3, floor=0.4, statuses=ACTIVE, kinds=WRITABLE):
+    """Up to limit records of the project's scope (active, or of statuses; of kinds) most like text, best first:
     [(likeness, record)]."""
-    scored = [(likeness(text, r["content"]), r) for r in in_scope(conn, project_id, statuses=statuses)]
+    scored = [(likeness(text, r["content"]), r) for r in in_scope(conn, project_id, statuses=statuses, kinds=kinds)]
     return sorted([s for s in scored if s[0] >= floor or normalized(text) in normalized(s[1]["content"])],
                   key=lambda s: -s[0])[:limit]
 
@@ -379,7 +384,8 @@ def forget_candidates(conn, project_id, text=None, previous=None):
     """Records a forget may mean: the ones most like text; for a bare "forget this", the active records the previous
     turn (previous: its run id) or its extraction made, else the one changed last."""
     if text is not None:
-        return matching(conn, project_id, text, floor=0.2, statuses=("confirmed", "inferred", "proposed"))
+        return matching(conn, project_id, text, floor=0.2, statuses=("confirmed", "inferred", "proposed"),
+                        kinds=TYPES)  # the agent's notes and progress too, as the views forget them (MB3)
     made = [r for r in in_scope(conn, project_id, kinds=TYPES) if previous is not None and (
         r["created_by_run_id"] == previous or conn.execute(
             "SELECT 1 FROM runs WHERE id = ? AND source_turn_id = ?", (r["created_by_run_id"], previous)).fetchone())]
@@ -739,7 +745,8 @@ def _progress(conn, project_id, event, count, sources, wording):
         return write(conn, project_id=project_id, scope="project", kind="progress", content=wording(count, day),
                      status="inferred", sources=sources, structured={"event": event, "count": count, "date": day})
     total = found[1] + count
-    conn.execute("UPDATE memory_records SET content = ?, structured = json_set(structured, '$.count', ?), updated_at = ?"
+    conn.execute("UPDATE memory_records SET content = ?, structured = json_set(structured, '$.count', ?), updated_at = ?,"
+                 " version = version + 1"  # its next version: an as-shown check sees the change (PR 51 review 1)
                  " WHERE id = ?", (wording(total, day), total, utc_now(), found[0]))
     conn.executemany("INSERT OR IGNORE INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, ?, ?)",
                      [(found[0], k, i) for k, i in sources])
@@ -953,14 +960,27 @@ async def change_memory(record_id: str, body: Change, request: Request):
 
 
 @router.delete("/api/memory/{record_id}")
-async def delete_memory(record_id: str, request: Request):
+async def delete_memory(record_id: str, request: Request, version: int | None = None):
     """Forget: the record's content is deleted (with the versions it replaced), its vector removed, its audit record
-    written without content, and the runs whose request holds it revoked."""
+    written without content, and the runs whose request holds it revoked. version: the one the view showed; a record
+    changed or replaced since is not forgotten (409, as an edit at a stale version; S1-21a follow-up MB10). Without
+    it nothing is forgotten (400): which version was shown cannot be told (PR 51 review 1)."""
     state = request.app.state.scholia
+    if version is None:
+        return _refused(Refused(400, "invalid_request", "Name the version shown"))
+
+    def shown(conn):
+        found = row(conn, record_id)
+        if found is None:
+            raise LookupError(record_id)
+        if found["version"] != version or found["status"] == "superseded":
+            raise ValueError("changed")
     try:
-        await _forget(state, record_id)
+        await _forget(state, record_id, check=shown)
     except LookupError:
         return _refused(Refused(404, "not_found", "No such record"))
+    except ValueError as error:
+        return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
     return {"ok": True}
 
 
@@ -988,12 +1008,14 @@ async def answer_review(body: Review, request: Request):
         return {"ok": True}
     if body.id is None or body.action is None:
         return _refused(Refused(400, "invalid_request", "Name the proposal and what to do"))
+    if body.version is None:  # Keep, Edit and Forget act on the version shown, never on whatever is there now
+        return _refused(Refused(400, "invalid_request", "Name the version shown"))
     if body.action == "forget":
         def shown(conn):  # Forget the proposal as it was shown: still proposed, at that version (else 409, as Keep)
             found = row(conn, body.id)
             if found is None:
                 raise LookupError(body.id)
-            if found["status"] != "proposed" or (body.version is not None and found["version"] != body.version):
+            if found["status"] != "proposed" or found["version"] != body.version:
                 raise ValueError("changed")
         try:
             await _forget(state, body.id, check=shown)
@@ -1010,7 +1032,7 @@ async def answer_review(body: Review, request: Request):
         found = row(conn, body.id)
         if found is None or found["status"] != "proposed":
             raise LookupError(body.id)
-        return edit(conn, body.id, body.version if body.version is not None else found["version"], content=content)
+        return edit(conn, body.id, body.version, content=content)
     try:
         record = await asyncio.to_thread(state["db"].write, answer)
     except LookupError:

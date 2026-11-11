@@ -11,7 +11,7 @@ import pytest
 from backend import memory
 from scholia_app import MockProvider, background_idle, send, started
 from test_materials import project_of
-from test_memory import conversation_in, rows, write
+from test_memory import conversation_in, forget, rows, write
 
 pytestmark = pytest.mark.asyncio
 
@@ -162,7 +162,7 @@ async def test_recall_ranks_by_meaning_when_the_search_model_answers_and_a_forgo
                                         " AND json_extract(data, '$.memory') IS NOT NULL", stream[0]["run_id"])
         trace = json.loads(trace)["memory"]
         assert trace["mode"] == "similarity" and trace["records"][0] == wages["id"]
-        assert (await client.delete(f"/api/memory/{wages['id']}")).json() == {"ok": True}
+        assert (await forget(client, wages['id'])).json() == {"ok": True}
         assert await asyncio.to_thread(index.memory_embedded, [wages["id"]]) == set()  # removed, checked gone
 
 
@@ -202,3 +202,104 @@ async def test_a_personal_record_stays_shown_to_another_projects_extraction_afte
         await send(client, await conversation_in(client, other), "Hello")
         await background_idle(client)
         assert provider.extractions and "Alice" in json.dumps(provider.extractions[-1])
+
+
+async def test_a_moved_conversations_record_is_found_by_meaning_in_its_new_project(tmp_path):
+    # S1-21a follow-up MB2: its vector leaves the source project's partition and is made again under the destination's
+    from cited import cited
+    from test_search import idle
+    async with cited(tmp_path) as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        conversation = await conversation_in(client, first)
+        await send(client, conversation, "Remember: wage floors raise the earnings of low-paid workers")
+        [(record,)] = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+        await idle(client, first)
+        await background_idle(client, timeout=20)
+        index = client.state["index"]
+        scope = lambda: asyncio.to_thread(index._read, lambda conn: conn.execute(  # noqa: E731
+            "SELECT scope FROM memory_rows WHERE memory_id = ?", (record,)).fetchall())
+        assert await scope() == [(f"project:{first}",)]
+        assert (await client.post(f"/api/conversations/{conversation}/move", json={"project_id": second})).status_code == 200
+        await idle(client, second)
+        await background_idle(client, timeout=20)
+        assert await scope() == [(f"project:{second}",)]
+
+
+async def test_a_record_a_command_or_an_extraction_writes_gets_its_vector(tmp_path):
+    # S1-21a follow-up MB7: an index run follows a write (the queue never embeds a memory addition)
+    from cited import Provider, cited
+    from test_memory import candidate, extracted
+    from test_search import idle
+    provider = Provider()
+    extracted(provider, candidate("our sample is thirty nurses", span="our sample is thirty nurses", kind="decision"))
+    async with cited(tmp_path, provider) as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Our sample is thirty nurses")  # the extraction writes it
+        await background_idle(client, timeout=20)
+        await send(client, conversation, "Remember: we decided on interviews")
+        await idle(client, project)
+        await background_idle(client, timeout=20)
+        ids = [r for (r,) in await rows(client, "SELECT id FROM memory_records WHERE type IN ('decision', 'event')")]
+        assert len(ids) == 2
+        await idle(client, project)
+        assert await asyncio.to_thread(client.state["index"].memory_embedded, ids) == set(ids)
+
+
+async def test_a_proposal_an_extraction_confirms_gets_its_vector(tmp_path):
+    # MB7, internal review: the index run follows any extraction that wrote or confirmed memory
+    from cited import Provider, cited
+    from test_memory import candidate, extracted
+    from test_search import idle
+    provider = Provider()
+    extracted(provider, candidate("we sample thirty nurses", span="we sample thirty nurses"))
+    async with cited(tmp_path, provider) as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="we sample thirty nurses",
+            status="proposed", sources=[("project", project)]))
+        await idle(client, project)
+        await background_idle(client, timeout=20)
+        await send(client, await conversation_in(client, project), "We sample thirty nurses")
+        await background_idle(client, timeout=20)
+        await idle(client, project)
+        assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", proposal) == [("confirmed",)]
+        assert await asyncio.to_thread(client.state["index"].memory_embedded, [proposal]) == {proposal}
+
+
+async def test_an_embedding_that_finishes_after_its_record_moved_never_writes_the_old_partition(tmp_path, monkeypatch):
+    # PR 51 review 1 (P2 3): the vector is stored only while the record is still of the scope it was embedded for,
+    # checked as it is written; the destination's own index run then embeds it under its partition
+    from backend import local_helper
+    from cited import cited
+    from test_search import idle
+    embed, moved = local_helper.embed, {}
+
+    async def moving_meanwhile(state, texts, **kwargs):
+        vectors = await embed(state, texts, **kwargs)
+        if moved.get("conversation") and not moved.get("done") and "wage floors" in texts[0] \
+                and not kwargs.get("query"):  # the record's own embedding, not a recall query
+            moved["done"] = True  # the source project's run has its vector; the record moves before it is stored
+            for _ in range(200):  # once the turn that saved it has ended (a running turn's conversation never moves)
+                response = await moved["client"].post(f"/api/conversations/{moved['conversation']}/move",
+                                                      json={"project_id": moved["to"]})
+                if response.status_code != 409:
+                    break
+                await asyncio.sleep(0.05)
+            assert response.status_code == 200, response.text
+        return vectors
+    async with cited(tmp_path) as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        conversation = await conversation_in(client, first)
+        monkeypatch.setattr(local_helper, "embed", moving_meanwhile)
+        moved.update(client=client, conversation=conversation, to=second)
+        await send(client, conversation, "Remember: wage floors raise the earnings of low-paid workers")
+        [(record,)] = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+        for _ in range(3):
+            await idle(client, first)
+            await idle(client, second)
+            await background_idle(client, timeout=20)
+        assert moved.get("done")
+        index = client.state["index"]
+        assert await asyncio.to_thread(index._read, lambda conn: conn.execute(
+            "SELECT scope FROM memory_rows WHERE memory_id = ?", (record,)).fetchall()) == [(f"project:{second}",)]

@@ -8,14 +8,16 @@ import { History, X } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { openPlace } from '../live.js';
 import { libraryEvents, readGuard } from '../library.js';
-import { dismissLeftOff, fillComposer, leftOffDismissed, memoryChanged, readLeftOff, recordText, review } from '../memory.js';
-import { Proposal } from './Memory.jsx';
+import { dismissLeftOff, fillComposer, leftOffDismissed, memoryChanged, readLeftOff, recordText, review, settled }
+  from '../memory.js';
+import { Proposal, Unsaved, useUnsaved } from './Memory.jsx';
 import { Button } from '@/components/ui/button';
 
-export function LeftOff({ projectId }) {
+export function LeftOff({ projectId, turn = null }) {
   const t = useT();
   const [found, setFound] = useState(null);
   const [hidden, setHidden] = useState(false);
+  const [unsaved, setUnsaved] = useUnsaved(`leftOff:${projectId}`); // what Keep, Edit or Forget could not save (MB1, Q12)
   const guard = useRef(null); // which reads may be shown (library.js readGuard)
   if (guard.current === null) guard.current = readGuard();
   const load = useCallback(() => {
@@ -23,6 +25,14 @@ export function LeftOff({ projectId }) {
     return readLeftOff(projectId).then((read) => { if (settle(true)) setFound(read); }, () => { if (settle(false)) setFound(null); });
   }, [projectId]);
   useEffect(() => { guard.current.libraryChanged(); setFound(null); setHidden(false); load(); }, [load]); // another project's read is never shown
+  // A turn of this conversation admitted (turn: its run id): the project's latest turn is new, so it is read again, in
+  // place (MB4; never remounted, which dropped a failed action's notice, Q12).
+  useEffect(() => {
+    if (turn === null) return;
+    guard.current.libraryChanged();
+    setFound(null);
+    load();
+  }, [turn]); // the turn only: a change of project reads again above
   // A paper deleted or memory changed anywhere: what it shows is dropped at once, and read again (no client-held
   // derived state); a read asked before the change is never shown, nor is its next step put in the box.
   useEffect(() => {
@@ -35,9 +45,13 @@ export function LeftOff({ projectId }) {
     libraryEvents.addEventListener('changed', changed); // memory changes too (memory.js memoryChanged)
     return () => libraryEvents.removeEventListener('changed', changed);
   }, [projectId, load]);
-  if (!found?.show || hidden || leftOffDismissed(projectId, found.latest_turn_at)) return null;
-  const empty = !found.done.length && !found.questions.length && !found.next_step && !found.to_confirm.length && !found.notice;
-  if (empty) return null;
+  const unsavedNotice = <Unsaved unsaved={unsaved} onKeep={setUnsaved} />;
+  const empty = found && !found.done.length && !found.questions.length && !found.next_step && !found.to_confirm.length
+    && !found.notice;
+  if (!found?.show || hidden || leftOffDismissed(projectId, found.latest_turn_at) || empty) {
+    // what Keep, Edit or Forget could not save is said even when the card is not (its reread failed, or it is gone)
+    return unsaved ? <section aria-label={t('leftOff.title')} className="mb-8 grid gap-2 text-sm">{unsavedNotice}</section> : null;
+  }
   return (
     <section aria-label={t('leftOff.title')} className="mb-8 grid gap-4 rounded-xl border bg-card p-4 text-sm shadow-xs">
       <div className="flex items-center gap-2">
@@ -60,11 +74,13 @@ export function LeftOff({ projectId }) {
           </div>
         </div>
       )}
+      {unsavedNotice}
       {found.to_confirm.length > 0 && (
         <div className="grid gap-2">
           <h3 className="text-xs font-medium text-muted-foreground">{t('leftOff.confirm')}</h3>
           <ul className="grid gap-2">
-            {found.to_confirm.map((proposal) => <Proposal key={proposal.id} proposal={proposal} onChanged={() => memoryChanged(projectId)} />)}
+            {found.to_confirm.map((proposal) => <Proposal key={proposal.id} proposal={proposal} onChanged={() => memoryChanged(projectId)}
+              onFailed={(failed, id) => setUnsaved((kept) => settled(kept, failed, id))} />)}
           </ul>
         </div>
       )}

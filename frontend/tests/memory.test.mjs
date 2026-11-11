@@ -131,3 +131,90 @@ test('a memory change goes through the one invalidation path every view, ask and
     }
   }
 });
+
+// MB1, as simplified (Q16, PR 51 recheck 5, for Harold): a failed action's notice says what was not saved, kept outside
+// the views; the text typed stays only in its open editor, and no copy of a record's text is kept anywhere else.
+test('a failed memory action keeps its notice, never the text typed', async () => {
+  const { attempt } = await import('../src/memory.js');
+  const { ApiError } = await import('../src/api.js');
+  assert.equal(await attempt(t, async () => ({ ok: true })), null);
+  const failed = await attempt(t, async () => { throw new ApiError(400, 'personal_from_strict', 'x'); }, true, 'r1');
+  assert.deepEqual(failed, { problem: t('errors.personal_from_strict'), code: 'personal_from_strict', edit: true, id: 'r1' });
+  for (const name of ['Memory.jsx', 'LeftOff.jsx']) {
+    const source = readFileSync(join(SRC, 'components', name), 'utf8');
+    assert.match(source, /<Unsaved /, name); // said outside the rows a reread replaces
+    assert.match(source, /onFailed=/, name);
+  }
+  assert.doesNotMatch(readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8'), /finally \{\s*onChanged/);
+});
+// S1-21a follow-up MB4: a turn started here makes the project's latest turn new, so Where we left off is read again
+// (the backend then says not to show it) rather than staying on screen from before.
+test('Where we left off is read again once a turn of this conversation starts', () => {
+  // Q12 (PR 51 recheck 3): read again in place, never remounted (a remount dropped a failed action's notice)
+  const source = readFileSync(join(SRC, 'components', 'ConversationView.jsx'), 'utf8');
+  assert.match(source, /<LeftOff projectId=\{projectId\} turn=\{live\?\.runId \?\? null\} \/>/);
+  assert.doesNotMatch(source, /<LeftOff key=/);
+  assert.match(readFileSync(join(SRC, 'components', 'LeftOff.jsx'), 'utf8'), /\}, \[turn\]\);/);
+});
+
+// Q12 (PR 51 recheck 3): what an action could not save is kept outside the components that show it (by view and project),
+// so a remount (a new conversation's first turn, the views opened again) never drops it, and another project's is never
+// shown; nothing resets it but Dismiss, or a later failure in the same view.
+test('a failed action\'s notice outlives a remount of the view that shows it', async () => {
+  const { keepUnsaved, keptUnsaved } = await import('../src/memory.js');
+  keepUnsaved('leftOff:p1', { problem: 'Not saved', code: 'empty', edit: true, id: 'r1' });
+  assert.deepEqual(keptUnsaved('leftOff:p1'), { problem: 'Not saved', code: 'empty', edit: true, id: 'r1' });
+  assert.equal(keptUnsaved('leftOff:p2'), null);
+  assert.equal(keptUnsaved('settings:p1'), null);
+  keepUnsaved('leftOff:p1', null);
+  assert.equal(keptUnsaved('leftOff:p1'), null);
+  for (const name of ['Memory.jsx', 'LeftOff.jsx']) {
+    const source = readFileSync(join(SRC, 'components', name), 'utf8');
+    assert.match(source, /useUnsaved\(/, name);
+    assert.doesNotMatch(source, /setUnsaved\(null\); load\(\)/, name);
+  }
+});
+
+// PR 51 fix batch 3, internal review: a kept notice goes once the same record's action succeeds
+test('a kept notice is cleared by a later success on the same record', async () => {
+  const { settled } = await import('../src/memory.js');
+  const kept = { problem: 'Not saved', code: 'empty', edit: true, id: 'r1' };
+  assert.equal(settled(kept, null, 'r1'), null); // the same record's action succeeded
+  assert.equal(settled(kept, null, 'r2'), kept); // another record's
+  const failed = { problem: 'Again', code: 'empty', edit: false, id: 'r2' };
+  assert.equal(settled(kept, failed, 'r2'), failed);
+});
+
+// PR 51 fix batch 3, internal recheck: every action names its record, and an unnamed one clears nothing
+test('a notice is cleared only by a success on the record it names', async () => {
+  const { settled } = await import('../src/memory.js');
+  const unnamed = { problem: 'Not saved', code: 'empty', edit: false, id: null };
+  assert.equal(settled(unnamed, null, null), unnamed);
+  const source = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
+  assert.match(source, /act\(\(\) => changeRecord\(record, \{ status: 'confirmed' \}\), false, record\.id\)/);
+  assert.match(source, /act\(\(\) => forgetRecord\(record\), false, record\.id\)/);
+});
+
+// Q16 (PR 51 recheck 5; the simplification, for Harold): no unsaved text outside the editor. The editor keeps its text
+// while it is open: a failure that changed nothing neither closes it nor makes the view read again; one saying the record
+// changed (it is read again) closes it, and the notice says the edit was not saved. With no kept text and no state
+// request, a late answer for one draft cannot reach another's (the race cannot occur).
+test('the text typed lives only in its open editor', async () => {
+  const { readsAgain } = await import('../src/memory.js');
+  assert.equal(readsAgain(null), true); // done: the views read again
+  // refused before any write: nothing changed, the editor stays open
+  for (const code of ['personal_from_strict', 'invalid_request', 'empty', 'not_confirmable']) {
+    assert.equal(readsAgain({ code }), false, code);
+  }
+  // the record changed, or the outcome is unknown (a dropped connection, an error after a commit): read again
+  for (const code of ['version_changed', 'out_of_date', 'not_found', 'internal']) assert.equal(readsAgain({ code }), true, code);
+  const memory = readFileSync(join(SRC, 'memory.js'), 'utf8');
+  const view = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
+  for (const gone of [/memoryState/, /draftShown/, /withState/, /api\/memory\/state/, /\.draft\b/]) {
+    assert.doesNotMatch(memory, gone);
+    assert.doesNotMatch(view, gone);
+  }
+  assert.match(view, /\.then\(\(saved\) => \{ if \(saved\) setEditing\(null\); \}\)/); // closed only once saved
+  assert.match(view, /t\('memory\.editNotSaved'\)/);
+  assert.match(readFileSync(join(SRC, 'components', 'LeftOff.jsx'), 'utf8'), /return unsaved \? /); // said unshown too
+});

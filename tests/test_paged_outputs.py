@@ -21,6 +21,7 @@ from backend.tools.types import ToolCall, ToolResult
 from cited import cited, conversation_in, events_of, rows, with_papers
 from scholia_app import send
 from test_search import paper
+from test_memory import forget
 
 pytestmark = pytest.mark.asyncio
 LONG = paper("Long Panel", *[f"Paragraph {i} " + "word " * 300 for i in range(14)])
@@ -303,7 +304,7 @@ async def test_fix2_forget_removes_a_kept_output_and_the_pages_served_from_it(tm
     held = {}
 
     async def forget_then_read_on(body):  # a record past the preview, never shown, is forgotten mid-turn
-        assert (await held["client"].delete(f"/api/memory/{held['records'][0]}")).status_code in (200, 204)
+        assert (await forget(held["client"], held['records'][0])).status_code in (200, 204)
         return steps_reply(provider, [call("read_output", "p1", handle=handle, offset=NEXT)])
     provider = Scripted([call("read_memory")], forget_then_read_on, "Done.",
                         [call("read_memory")], [call("read_output", "p2", handle=handle, offset=NEXT)],
@@ -336,7 +337,7 @@ async def test_fix2_forget_removes_a_kept_output_and_the_pages_served_from_it(tm
         page_sha = paging["result"]
         assert "detail" in page["content"] and held["records"][1] in paging["meta"]["memory"]  # the oldest's tail
         assert await served(second, whole) == 200 and await served(second, page_sha) == 200
-        assert (await client.delete(f"/api/memory/{held['records'][1]}")).status_code in (200, 204)
+        assert (await forget(client, held['records'][1])).status_code in (200, 204)
         kept = {s for _, s in await bodies(second)}
         assert whole not in kept and page_sha not in kept  # in the deletion's own transaction
         assert await served(second, whole) == 410 and await served(second, page_sha) == 410  # removed, said so
