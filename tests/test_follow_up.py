@@ -724,3 +724,67 @@ async def test_a_message_naming_papers_waits_with_them_and_starts_narrowed_to_th
         assert [q["id"] for q in (await conversation_read(client, conversation))["queued"]] == [later["id"]]
         assert (await client.post(f"/api/conversations/{conversation}/queue", json={
             "content": "Too many?", "material_ids": ["x"] * 51})).status_code == 400  # as many as a message may name
+
+
+# PR 52 cycle 4 (G5's class: committed bookkeeping separated from its publication by a cancellation): what the record
+# says once a write committed is said on the turn's stream too, even when Stop lands just after it.
+
+
+async def test_a_note_read_by_a_step_that_went_out_is_said_read_when_stop_lands_as_its_client_closes(tmp_path,
+                                                                                                   monkeypatch):
+    # The step carrying the note went out and its receipt committed (the note is read in the record); Stop lands while
+    # the call's client closes. The stream still says the note was read, as the record does.
+    from backend import outbound_gate
+    gate = Gate(0)
+    provider = Scripted(None, "Done.")
+    provider.script[0] = gate.wrap(provider, {"calls": [call("list_materials")]})
+    real = outbound_gate._AsyncTransport.aclose
+
+    async def closing(self):
+        await real(self)
+        harness = client.state["harness"]
+        if len(provider.steps) == 2 and (active := harness.registry.turns.get(conversation)) is not None:
+            harness._request_cancel(active, "researcher")
+            await asyncio.sleep(0)  # the Stop lands here, the step's receipt committed
+    monkeypatch.setattr(outbound_gate._AsyncTransport, "aclose", closing)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await gate.reached.wait()
+        run_id = await running_run(client, conversation)
+        seq = (await steer(client, run_id, "Only the ones from 2020")).json()["steering"]["seq"]
+        gate.open.set()
+        stream = await sending
+        assert stream[-1]["status"] == "cancelled" and len(provider.steps) == 2
+        assert [n["state"] for n in (await conversation_read(client, conversation))["turns"][-1]["steering"]] == ["read"]
+        assert {"type": "steering_note", "read": [seq]} in stream
+
+
+async def test_a_note_queued_by_the_answers_commit_is_said_queued_when_stop_lands_during_that_commit(tmp_path,
+                                                                                                    monkeypatch):
+    # A note sent while the last step ran is queued by the answer's commit (L7, F6); Stop lands while that write runs.
+    # Once it commits, the stream says a message was queued, before the turn's end.
+    import time
+    from backend import runs
+    gate = Gate(0)
+    provider = Scripted(None)
+    provider.script.append(gate.wrap(provider, "The answer."))
+    provider.script.pop(0)
+    real = runs.Harness._commit_answer
+    async with started(tmp_path / "data", provider) as client:
+        harness, loop = client.state["harness"], asyncio.get_running_loop()
+
+        def committing(self, conn, claim, answer, ctx):
+            committed = real(self, conn, claim, answer, ctx)
+            loop.call_soon_threadsafe(lambda: harness._request_cancel(claim, "researcher"))
+            time.sleep(0.3)  # the Stop lands while this write is still to commit
+            return committed
+        monkeypatch.setattr(runs.Harness, "_commit_answer", committing)
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await gate.reached.wait()
+        assert (await steer(client, await running_run(client, conversation), "Also say how many")).status_code == 200
+        gate.open.set()
+        stream = await sending
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["Also say how many"]
+        assert [e["type"] for e in stream][-2:] == ["queued", "run_finished"]

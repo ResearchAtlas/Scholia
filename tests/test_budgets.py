@@ -1244,6 +1244,41 @@ async def test_a_settlement_on_stop_or_recovery_records_the_notices_it_reaches(t
         assert ("conversation", 50) in noticed
 
 
+@pytest.mark.asyncio
+async def test_the_notices_a_recorded_settlement_reached_are_streamed_when_stop_lands_as_its_client_closes(
+        tmp_path, monkeypatch):
+    # PR 52 cycle 4 (G5, N2; cycle 4 A's probe): both budgets at $0.49 of $1, and a $0.02 reply, whose receipt records
+    # both 50% notices; Stop lands while the call's client closes, once that receipt committed. Both are streamed as
+    # `budget` all the same (the turn's cleanup finds the call recorded, with nothing more to notice).
+    from backend import outbound_gate
+    from scholia_app import MockProvider, send
+    answered = asyncio.Event()
+
+    def reply(body):
+        answered.set()
+        return provider.answer("Hi.", cost=0.02)
+    provider = MockProvider(reply)
+    real = outbound_gate._AsyncTransport.aclose
+
+    async def closing(self):
+        await real(self)
+        harness = client.state["harness"]
+        if answered.is_set() and (active := harness.registry.turns.get(conversation)) is not None:
+            harness._request_cancel(active, "researcher")
+            await asyncio.sleep(0)  # the Stop lands here, the call's receipt committed
+    monkeypatch.setattr(outbound_gate._AsyncTransport, "aclose", closing)
+    async with await _app(tmp_path, provider) as client:
+        conversation, project = await _conversation(client, budget=1.0)
+        await _project_budget(client, project, 1.0)
+        await _spent(client, project, 0.49, conversation)
+        stream = await send(client, conversation, "Short?")
+        assert stream[-1]["status"] == "cancelled"
+        noticed = await _rows(client, "SELECT json_extract(data, '$.budget'), json_extract(data, '$.percent')"
+                                      " FROM run_events WHERE type = 'budget_notice'")
+        assert sorted(noticed) == [("conversation", 50), ("project", 50)]
+        assert sorted((e["budget"], e["percent"]) for e in stream if e["type"] == "budget") == sorted(noticed)
+
+
 # S1-33 fix batch 2: Continue's amount, the notices' record and the spend's bases
 
 

@@ -1880,10 +1880,8 @@ class Harness:
             await handed({"type": "step", "seq": call.step, "phase": "answer"})
             result = await self._call(claim, call, ctx["route"], ctx["key"], request, ctx["facts"],
                                       zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
-                                      rehold=ctx if judge_estimate else None)
+                                      rehold=ctx if judge_estimate else None, notes=[seq for seq, _ in notes])
             turn.step = call.step
-            if notes and result.dispatched:  # said only once the request that carried them went out
-                turn.emit({"type": "steering_note", "read": [seq for seq, _ in notes]})
             if result.dispatched and ctx.get("summary_info") and not request.cuts.get("summary"):
                 # its dependencies stay registered from here (context_materials and summary_memory are never taken back
                 # once a request carrying the summary left), and every later step's request carries this one's reply
@@ -2312,7 +2310,7 @@ class Harness:
                       "endpoints": list(found.tags), "row": row, "output": found.output, "tools": found.tools}
 
     async def _call(self, active, call, route, key, request, facts, *, output=None, zero_retention=False, timeout=None,
-                    materials=(), rehold=None, hold=False):
+                    materials=(), rehold=None, hold=False, notes=()):
         """The dispatch path: every model call goes through here, and nowhere else calls the provider
         adapter (tests/test_dispatch_path.py). It sends the request the context assembler built, for
         an admitted call (its reservation), through the gate with the dispatch check, and records it,
@@ -2326,7 +2324,8 @@ class Harness:
         deleting one of them deletes it (backend/db/deletion.py). A body of a paper deleted before it is
         recorded is not kept. hold (S1-21a): the output is model text that may quote a paper, so it is kept in the run's
         inputs (`held.output`, taken out at its terminal record and by a deletion of one of its papers,
-        provenance.forget) and the finished step names it only ("output": "held")."""
+        provenance.forget) and the finished step names it only ("output": "held"). notes (S1-33): the steering notes the
+        request carries, said read on the turn's stream once it went out."""
         if not isinstance(request, context.Request):
             raise TypeError("a model request is built by the context assembler")
         if context.serialized_tokens(request.messages, request.tools) + request.max_tokens > request.window:
@@ -2419,10 +2418,12 @@ class Harness:
 
             # Recorded before the client closes, and to its end even if cancelled meanwhile.
             _, cancelled = await _through(recording())
+            if active.kind == "turn":  # streamed once recorded, with no await between, so a Stop as the client closes
+                for notice in noticed:  # cannot skip them (PR 52 cycle 4, G5): the bar reads its figures again
+                    active.events.put_nowait({"type": "budget", **notice})
+                if notes and call.dispatched:  # said only once the request that carried them went out
+                    active.events.put_nowait({"type": "steering_note", "read": list(notes)})
         active.call = None
-        if active.kind == "turn":  # streamed once recorded: the bar reads its figures again
-            for notice in noticed:
-                active.events.put_nowait({"type": "budget", **notice})
         if cancelled:
             raise asyncio.CancelledError()
         if call.declined:  # refused at dispatch for the turn's time limit: recorded and settled, the turn stops there
@@ -2470,11 +2471,19 @@ class Harness:
         """A run's terminal write (a background run's or a turn's): fn in one transaction, after whose commit
         the writer itself marks the run finished here (Registry.finished), so no cancellation of this await
         can separate the mark from the commit, and the run is known finished before it is released. A write
-        that raises marks nothing."""
-        final = await asyncio.to_thread(self.db.write, fn, committed=lambda: self.registry.finished.add(active.run_id))
-        if isinstance(final, dict) and final.pop("queued", None):  # S1-33: a note it queued, streamed once committed
-            active.events.put_nowait({"type": "queued"})
-        return final
+        that raises marks nothing. A cancellation meanwhile is raised at once, as before; the write goes on to its
+        end, and what it queued is streamed once it commits all the same (PR 52 cycle 4, G5's class)."""
+        def said(final):
+            if isinstance(final, dict) and final.pop("queued", None):  # S1-33: a note it queued, streamed once committed
+                active.events.put_nowait({"type": "queued"})
+            return final
+        writing = asyncio.ensure_future(asyncio.to_thread(
+            self.db.write, fn, committed=lambda: self.registry.finished.add(active.run_id)))
+        try:
+            return said(await asyncio.shield(writing))
+        except asyncio.CancelledError:
+            writing.add_done_callback(lambda done: done.cancelled() or done.exception() or said(done.result()))
+            raise
 
     async def _background(self, active: ActiveRun) -> None:
         active.started = True
