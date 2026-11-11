@@ -265,7 +265,7 @@ test('a memory change names a project only where the change is confined to it', 
   const named = files.flatMap((name) => [...readFileSync(join(SRC, name), 'utf8').matchAll(/memoryChanged\(([^)]*)\)/g)]
     .filter((call) => call[1] !== 'null').map((call) => `${name}: ${call[1]}`));
   assert.deepEqual(named.sort(), [
-    'components/Governance.jsx: project.id', // its protection: no record is written, and no other project reads it (backend/memory.py valid)
+    'components/Governance.jsx: project.id', // its protection: no record is written, and no other project's read depends on it (backend/memory.py valid)
     'components/LeftOff.jsx: projectId', // the project's allowance notice (backend/memory.py notice)
     'components/Settings.jsx: project.id', // the project's own memory switch
   ]);
