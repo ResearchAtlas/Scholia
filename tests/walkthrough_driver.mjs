@@ -1881,13 +1881,16 @@ async function zotero(ctx) {
     // After Check again, a group or a collection Zotero no longer lists is left, before any request goes to
     // it: the library for My Library, the collection for all items (status.md's Z21).
     const select = browser().getByLabel(L('zotero.library'), { exact: true });
+    // The collections listed: the library's collections request has been answered, so it is in the request log.
+    const listed = () => browser().getByRole('navigation', { name: L('zotero.collections'), exact: true })
+      .getByText(L('common.loading'), { exact: true }).waitFor({ state: 'detached', timeout: 15000 });
     const again = async (text) => {  // the requests Zotero got from this Check again on
       state(text);
       const from = zoteroRequests().length;
       await browser().getByRole('button', { name: L('zotero.checkAgain'), exact: true }).click();
       await browser().getByText(L('zotero.status.ready'), { exact: true }).waitFor({ timeout: 15000 });
       await browser().getByText(plural('zotero.itemCount', 6), { exact: true }).waitFor({ timeout: 15000 });
-      await page.waitForTimeout(500);
+      await listed();
       return zoteroRequests().slice(from);
     };
     await browser().getByRole('button', { name: 'Linked files', exact: true }).click();
@@ -1900,6 +1903,7 @@ async function zotero(ctx) {
     await again('ready');
     await select.selectOption('groups/4711');
     await browser().getByText(plural('zotero.itemCount', 0), { exact: true }).waitFor();
+    await listed();  // the group's own requests are all in the log before Check again's are counted
     sent = await again('pruned');
     check('a group gone since is left for My Library, and not asked for again', await select.inputValue() === 'users/0'
       && (await select.locator('option').allTextContents()).join('|') === [L('zotero.myLibrary'), '合成课题组'].join('|')
