@@ -1682,8 +1682,11 @@ async def test_a_reply_whose_cost_or_token_count_no_float_holds_is_delivered_and
         assert [e["content"] for e in stream if e["type"] == "chat_response"] == ["Hi."]
         estimate, status, settled, basis = await reservation(client, stream[0]["run_id"])
         assert (status, basis) == ("settled", "estimated") and 0 < settled <= estimate
-        if "cost" not in usage:  # no count the step's rates can price: its estimate
-            assert settled == estimate
+        [attempt] = await attempts_of(client, stream[0]["run_id"])
+        if "cost" not in usage:  # no count the step's rates can price: its estimate, its charge unknown (review F5)
+            assert settled == estimate and attempt[3] == "unknown" and stream[-1]["accounting"]["unknown_attempts"] == 1
+        else:
+            assert attempt[3] == "estimated" and stream[-1]["accounting"]["unknown_attempts"] == 0
 
 
 async def test_a_turn_whose_reply_a_defect_left_unread_settles_at_its_estimate_with_its_attempt_sent(tmp_path, monkeypatch):

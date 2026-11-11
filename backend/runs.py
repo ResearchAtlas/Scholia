@@ -650,9 +650,9 @@ class Harness:
         ({"steering": {"run_id", "seq"}}), in one transaction ordered with the turn's terminal write by the single
         writer; one for a turn that has ended, will not run here, or offers no tools (it has no next step) waits as
         the conversation's next turn instead ({"queued": row}), never lost; for a turn that has ended or will not run
-        here, "ended" says so, and the interface then starts it as a new turn if the conversation is free (reading
-        12). Never a second run. AdmissionError for a run that is not a turn, or a message that is empty or too
-        long."""
+        here, "ended" says so, and it then starts only as any waiting message does (Harold, 2026-11-12, variant 1N,
+        which narrows reading 12). Never a second run. AdmissionError for a run that is not a turn, or a message that
+        is empty or too long."""
         from backend import budgets  # it imports this module
         if visible(text) is None:
             raise AdmissionError(400, "empty_message", "The message is empty")
@@ -798,6 +798,8 @@ class Harness:
                 plan, route, problem, facts = following, candidate, None, found_facts
         if problem:
             raise AdmissionError(400, problem, _REFUSED[problem])
+        if queued is not None and queued[1] is not None:  # S1-33: on the finished turn's route (send_queued, G8), not
+            plan.policy_reason = "kept_route"  # a model the researcher chose now (GET /api/models/recent)
         instructions, _ = await asyncio.to_thread(load_instructions, self.data_dir, project_id)
         budgets = personal.values["context"]
         # S1-19c: a route whose endpoints all take tool calls runs the agent loop, with the skill catalog, the skills
@@ -2475,19 +2477,12 @@ class Harness:
         """A run's terminal write (a background run's or a turn's): fn in one transaction, after whose commit
         the writer itself marks the run finished here (Registry.finished), so no cancellation of this await
         can separate the mark from the commit, and the run is known finished before it is released. A write
-        that raises marks nothing. A cancellation meanwhile is raised at once, as before; the write goes on to its
-        end, and what it queued is streamed once it commits all the same (PR 52 cycle 4, G5's class)."""
-        def said(final):  # S1-33: a note it queued, streamed once committed
-            if isinstance(final, dict) and final.pop("queued", None):
-                active.events.put_nowait({"type": "queued"})
-            return final
-        writing = asyncio.ensure_future(asyncio.to_thread(
-            self.db.write, fn, committed=lambda: self.registry.finished.add(active.run_id)))
-        try:
-            return said(await asyncio.shield(writing))
-        except asyncio.CancelledError:
-            writing.add_done_callback(lambda done: done.cancelled() or done.exception() or said(done.result()))
-            raise
+        that raises marks nothing. A turn's are awaited through _through (_end_turn, _stop_turn, the answer's commit),
+        so what one queued is streamed once it commits, whatever cancellation came (PR 52 cycle 4, G5's class)."""
+        final = await asyncio.to_thread(self.db.write, fn, committed=lambda: self.registry.finished.add(active.run_id))
+        if isinstance(final, dict) and final.pop("queued", None):  # S1-33: a note it queued, streamed once committed
+            active.events.put_nowait({"type": "queued"})
+        return final
 
     async def _background(self, active: ActiveRun) -> None:
         active.started = True

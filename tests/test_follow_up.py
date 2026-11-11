@@ -249,13 +249,14 @@ async def test_a_queued_message_starts_on_its_own_only_after_a_turn_that_succeed
 async def test_a_waiting_message_started_after_a_turn_runs_on_that_turns_recorded_route_whatever_the_request_says(
         tmp_path, named_route):
     # PR 52 cycle 4 (G8; Harold, 2026-11-11: a waiting message keeps the finished turn's route; cycle 4 C's probe): a
-    # turn sent on the default route (Auto), then the default changed in Settings. The waiting message started after
-    # it (after) runs on the route and effort that turn recorded (runs.inputs), never the new default, nor a model,
-    # provider or effort its request names.
+    # turn sent on the default route (Auto) at an effort, then the default changed in Settings. The waiting message
+    # started after it (after) runs on the route and effort that turn recorded (runs.inputs), never the new default,
+    # nor a model, provider or effort its request names; and, not being a model the researcher chose, it is not among
+    # the recent models (internal review F1).
     from backend import budget_router
     async with started(tmp_path / "data", MockProvider()) as client:
         conversation = await named(client)
-        first = await send(client, conversation, "First?")
+        first = await send(client, conversation, "First?", effort="low")
         assert first[-1]["status"] == "succeeded"
         run_id = first[0]["run_id"]
         [(route,)] = await rows(client, "SELECT json_extract(inputs, '$.route') FROM runs WHERE id = ?", run_id)
@@ -269,7 +270,28 @@ async def test_a_waiting_message_started_after_a_turn_runs_on_that_turns_recorde
         assert sent.status_code == 200 and events(sent)[-1]["status"] == "succeeded"
         assert await rows(client, "SELECT json_extract(inputs, '$.route'), json_extract(inputs, '$.effort') FROM runs"
                                   " WHERE conversation_id = ? AND kind = 'turn' ORDER BY started_at", conversation) == [
-            (route, None), (route, None)]
+            (route, "low"), (route, "low")]
+        assert (await client.get("/api/models/recent")).json() == {"models": []}  # Auto chose it, never the researcher
+
+
+async def test_a_waiting_message_keeps_a_route_whose_provider_and_model_names_hold_colons(tmp_path):
+    # Internal review F4: the recorded route "<provider>:<model>" is split at the model its turn recorded, so a provider
+    # named "lab:one" with the model "m:1" is kept as it was, not read as provider "lab".
+    async with started(tmp_path / "data", MockProvider()) as client:
+        settings = (await client.get("/api/settings")).json()
+        assert (await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+            'providers."lab:one".kind': "openai-compatible", 'providers."lab:one".base_url': "http://127.0.0.1:9/v1"}})
+        ).status_code == 200
+        assert (await client.put("/api/keys/lab:one", json={"key": "k"})).status_code == 200
+        conversation = await named(client)
+        first = await send(client, conversation, "First?", provider="lab:one", model="m:1")
+        assert first[-1]["status"] == "succeeded", first
+        queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})).json()
+        sent = await client.post(f"/api/conversations/{conversation}/queue/{queued['id']}/send",
+                                 json={"after": first[0]["run_id"]})
+        assert sent.status_code == 200 and events(sent)[-1]["status"] == "succeeded"
+        assert await rows(client, "SELECT json_extract(inputs, '$.route') FROM runs WHERE conversation_id = ?"
+                                  " AND kind = 'turn' ORDER BY started_at", conversation) == [("lab:one:m:1",)] * 2
 
 
 async def test_the_queue_drains_once_whatever_arrives_at_the_same_moment(tmp_path):

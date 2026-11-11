@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -356,8 +357,8 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
                            cut=_choice(body).get("finish_reason") == "length", message=_choice(body).get("message"))
 
 
-def _count(value):
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+def _count(value):  # a token count; one no float can hold is none (PR 52 cycle 4: it prices nothing)
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= sys.float_info.max
 
 
 def _failed(kind, attempts, route):

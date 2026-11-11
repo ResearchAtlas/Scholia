@@ -6,7 +6,6 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { budgetBar, follow, isActiveRun, nextQueued } from '../src/followup.js';
 import { drain, send, stop, stopsAt, subscribe } from '../src/live.js';
-import * as live from '../src/live.js';
 import { ApiError, post } from '../src/api.js';
 
 const spend = (conversation, project, percents = [50, 85, 90]) => ({
@@ -400,7 +399,7 @@ function viewHandlers(id, overrides = {}) {
     setProblem: (problem) => { if (problem) env.problems.push(problem); }, problems: [], readChoice: async () => {},
     currentChoice: () => null, messageRoute: () => ({}), t: (key) => key, errorText: (t, code) => code, load: async () => {},
     post, setDraft: () => {}, chosenPapers: () => [], choosePapers: () => {}, onCreated: () => {}, isActiveRun, ApiError,
-    send, drain, stopsAt, follow, idle: live.idle, halt: live.halt, ...overrides }; // idle and halt: what the view used before
+    send, drain, stopsAt, follow, ...overrides };
   const names = Object.keys(env);
   const made = new Function(...names, `${['sendQueued', 'submit', 'followUp', 'resume'].map(handler).join('\n')}
     return { sendQueued, submit, followUp, resume };`)(...names.map((name) => env[name]));
@@ -793,9 +792,11 @@ async function trial(seed, install) {
       if (state.halted) broken.push(`${url}: started on its own after a Stop here`);
     } else if (sending) {
       const key = url.includes('/queue/') ? url.split('/').at(-2) : body.content ?? 'continue';
-      if (!state.pressed.has(key)) broken.push(`${url}: started with no action of the researcher's`);
-      else if (state.pressed.get(key) !== stopsAt(conversation)) broken.push(`${url}: left after a Stop pressed since its action`);
-      state.pressed.delete(key);
+      const presses = state.pressed.get(key) ?? []; // the Stop count at each press of it not yet sent
+      const at = presses.indexOf(stopsAt(conversation));
+      if (!presses.length) broken.push(`${url}: started with no action of the researcher's`);
+      else if (at < 0) broken.push(`${url}: left after a Stop pressed since its action`);
+      else presses.splice(at, 1);
     }
     return later(() => {
       if (init.signal?.aborted) throw abortError();
@@ -845,6 +846,7 @@ async function trial(seed, install) {
     });
   };
   install(fetch);
+  const press = (key) => state.pressed.set(key, [...(state.pressed.get(key) ?? []), stopsAt(conversation)]);
   let shownTurn = null;
   const unsubscribe = subscribe((id, turn) => { if (id === conversation) shownTurn = turn; });
   const view = () => {
@@ -854,8 +856,8 @@ async function trial(seed, install) {
       readChoice: () => (random() < 0.5 ? Promise.resolve() : later(() => {})) });
   };
   const actions = {
-    message: () => { const text = `m${state.items += 1}`; state.pressed.set(text, stopsAt(conversation)); view().submit(text); },
-    send: () => { if (!state.queued.length) return; const item = pick(state.queued); state.pressed.set(item.id, stopsAt(conversation)); view().sendQueued(item); },
+    message: () => { const text = `m${state.items += 1}`; press(text); view().submit(text); },
+    send: () => { if (!state.queued.length) return; const item = pick(state.queued); press(item.id); view().sendQueued(item); },
     stop: () => { state.halted = true; stop(conversation, running()?.run_id).catch(() => {}); },
     stopElsewhere: () => { const turn = latest(); if (turn) { state.stopped.add(turn.run_id); end(turn, 'cancelled'); } },
     finish: () => { const turn = running(); if (turn) end(turn, pick(['succeeded', 'succeeded', 'failed'])); },

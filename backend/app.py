@@ -1400,10 +1400,12 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         if body.after is not None:  # started on its own: on the route and effort that turn ran on, whatever the request
             # names or the default is now (Harold, 2026-11-11: a waiting message keeps the finished turn's route; PR 52
             # cycle 4, G8); the admission refuses it unless that turn is the latest and succeeded
-            route, effort = await read(lambda conn: conn.execute(
-                "SELECT json_extract(inputs, '$.route'), json_extract(inputs, '$.effort') FROM runs"
-                " WHERE id = ? AND conversation_id = ?", (body.after, conversation_id)).fetchone()) or (None, None)
-            provider, _, model = (route or ":").partition(":")  # "<provider>:<model>", as answers.check splits it
+            route, effort, model = await read(lambda conn: conn.execute(
+                "SELECT json_extract(r.inputs, '$.route'), json_extract(r.inputs, '$.effort'), json_extract(e.data,"
+                " '$.plan.model') FROM runs r LEFT JOIN run_events e ON e.run_id = r.id AND e.type = 'route'"
+                " WHERE r.id = ? AND r.conversation_id = ?", (body.after, conversation_id)).fetchone()) or (None,) * 3
+            # "<provider>:<model>", split at its recorded model (either may hold a colon; as recent_models splits it)
+            provider = route[:-len(model) - 1] if route and model and route.endswith(":" + model) else None
         # the papers it names, checked as any message's are (a paper deleted since: selection_invalid, and it waits)
         claim = await harness().admit_turn(conversation_id, row[0], model=model or None, provider=provider or None,
                                            effort=effort, material_ids=json.loads(row[1]) if row[1] else None,
