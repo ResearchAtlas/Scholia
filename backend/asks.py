@@ -238,10 +238,9 @@ async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
     budget = await asyncio.to_thread(state["db"].read, lambda conn: (asked(conn, run_id)[0] or {}).get("kind") == "budget")
     locks = (state["project_files"], state["harness"].settings_lock) if budget else ()
 
-    async def answering():
+    async def answering(written):  # written: the answer's own write, which only this endpoint makes
         try:
-            answered = await asyncio.to_thread(state["db"].write, lambda conn: answer(
-                conn, run_id, ask_id, body.option, body.text, registry, state["data_dir"]))
+            answered = await asyncio.to_thread(state["db"].write, written)
         except AskRefused as refused:
             return JSONResponse({"code": refused.code, "message": refused.message, **(
                 {"needed_usd": refused.needed_usd} if getattr(refused, "needed_usd", None) else {})},
@@ -265,7 +264,8 @@ async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
         # S1-33 (PR 52 cycle 2): once under the locks, the answer, its config.toml write and their record run to their
         # end whatever cancellation arrives, and the locks are held until then, so no Settings save or deletion runs
         # beside a write still going on in its worker
-        answered, cancelled = await _through(answering())
+        answered, cancelled = await _through(answering(lambda conn: answer(
+            conn, run_id, ask_id, body.option, body.text, registry, state["data_dir"])))
     if cancelled:
         raise asyncio.CancelledError()
     return answered

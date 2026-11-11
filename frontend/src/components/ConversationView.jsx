@@ -193,6 +193,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   }
 
   // S1-33 (F11): a message sent while a turn runs, steered or queued as the setting says; said once read back.
+  // shortcut: it carries no Library selection or @-mentions (they stay chosen for the next message sent when no turn
+  // runs); a queued message would need a selection column and its deletion links (PR 52 cycle 2, D21).
   async function followUp(text) {
     const runId = live?.runId ?? shown.find((turn) => turn.status === 'running')?.run_id ?? null;
     try {

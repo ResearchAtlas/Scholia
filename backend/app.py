@@ -627,13 +627,15 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             raise ApiError(409, "settings_changed", "The settings changed since they were read")
         changed = _providers_changed(body.updates, providers.configured(data_dir, include_off=True))
         refuse_if_busy(changed)  # before any field is written
+        limit_before = (loaded.values.get("project") or {}).get("budget_usd")  # S1-33: whether the save changes it
         try:
             saving = _finished(loaded.save, body.updates)  # under the project-files lock to its end
             # A provider turned off, moved or removed takes routes away: ordered with dispatch.
             await (state["gate"].ordered(None, saving) if changed else saving)
-            if body.project_id is not None and "project.budget_usd" in body.updates:
-                # S1-33: a limit set here is Continue's amount from now on, whatever an earlier answer decided (if this
-                # fails, the saved limit stands, and the old amount still applies only while the limit equals its result)
+            if body.project_id is not None and (loaded.values.get("project") or {}).get("budget_usd") != limit_before:
+                # S1-33: a limit changed here is Continue's amount from now on, whatever an earlier answer decided (if
+                # this fails, the saved limit stands, and the old amount still applies only while the limit equals its
+                # result); saving the limit unchanged changes nothing
                 try:
                     await _to_end(write(lambda conn: conn.execute(
                         "UPDATE projects SET budget_decided = NULL WHERE id = ?", (body.project_id,))))

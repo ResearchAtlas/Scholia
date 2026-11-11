@@ -1110,9 +1110,12 @@ async def test_a_settlement_on_stop_or_recovery_records_the_notices_it_reaches(t
 
 
 @pytest.mark.asyncio
-async def test_a_settings_edit_makes_the_project_limit_continues_amount_even_back_at_the_last_decided_value(tmp_path):
+@pytest.mark.parametrize("edits, after", [((5.0, 2.0), 4.0), ((2.0,), 3.0)])
+async def test_a_settings_edit_makes_the_project_limit_continues_amount_even_back_at_the_last_decided_value(
+        tmp_path, edits, after):
     # D3 (A5, reading 3): $1, Continue to $2, then $5 and $2 set in Settings: $2 is now the researcher's own setting, so
-    # the next Continue adds $2 (to $4), not the $1 the old decision added.
+    # the next Continue adds $2 (to $4), not the $1 the old decision added. Saving the $2 unchanged sets nothing: the
+    # decision's $1 stays the amount (to $3), as a save of an unchanged value changes nothing (review of batch 2).
     async with await _app(tmp_path) as client:
         conversation, project = await _conversation(client)
         await _project_budget(client, project, 1.0)
@@ -1120,13 +1123,13 @@ async def test_a_settings_edit_makes_the_project_limit_continues_amount_even_bac
         sending, ask = await _asking(client, conversation)
         assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 2.0
         await sending
-        await _project_budget(client, project, 5.0)
-        await _project_budget(client, project, 2.0)
+        for usd in edits:
+            await _project_budget(client, project, usd)
         [(spent,)] = await _rows(client, "SELECT sum(settled_usd) FROM budget_reservations WHERE project_id = ?", project)
         await _spent(client, project, round(2.0 - spent, 9))  # the cap again
         sending, ask = await _asking(client, conversation, "Again?")
         assert ask["params"]["form"] == "cap"
-        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 4.0
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == after
         await sending
 
 
