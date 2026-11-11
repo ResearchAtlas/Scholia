@@ -2434,6 +2434,64 @@ async function memoryFlow(ctx) {
   });
 }
 
+// S1-21b: compaction (checklist W5): a long synthetic conversation under a small history budget, so its earlier turns
+// are summarized; Details names the summary and the turns it covers, read back from the trace.
+async function compactionFlow(ctx) {
+  const { page, L, C, step, check, get } = ctx;
+  const { dialog, openSidebar } = navigation(ctx);
+  const box = () => page.locator('#composer');
+  const zh = C.lang !== 'en';
+  const name = zh ? '长对话（合成数据）' : 'A long conversation (synthetic)';
+  const requests = () => readFileSync(C.requestLog, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const until = async (what, test, tries = 150) => {
+    for (let i = 0; i < tries; i += 1) { const value = await test(); if (value) return value; await page.waitForTimeout(200); }
+    throw new Error(`${what} did not happen in time`);
+  };
+  if (await dialog().count()) { await page.keyboard.press('Escape'); await page.waitForTimeout(500); }
+  const id = (await get('/api/projects', { method: 'POST', body: JSON.stringify({ name, sensitivity: 'normal' }) })).body.id;
+  await page.reload(); await box().waitFor();
+  await openSidebar();
+  await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+  await page.getByRole('menuitem', { name, exact: true }).click(); await page.waitForTimeout(1200);
+  const conversation = async () => (await get('/api/conversations')).body.conversations.find((c) => c.project_id === id);
+  const latest = async () => (await get(`/api/conversations/${(await conversation()).id}`)).body.turns.at(-1);
+  const send = async (text) => {
+    await box().fill(text);
+    await page.getByRole('button', { name: L('composer.send'), exact: true }).click();
+    await until('the answer saved', async () => { const turn = (await conversation()) && await latest(); return turn?.message?.text === text && turn.status === 'succeeded' && turn; });
+    await page.waitForTimeout(1500); // the live turn hands over to its record
+    return latest();
+  };
+  const history = async (value) => { // read with its hash, as the settings page saves
+    const read = (await get('/api/settings')).body;
+    const saved = await get('/api/settings', { method: 'PUT', body: JSON.stringify({ hash: read.hash, updates: { 'context.history': value } }) });
+    if (saved.status !== 200) throw new Error(`the history budget was not saved (${saved.status})`);
+    return read.values.context.history;
+  };
+  const saved = await history(1600);
+  try {
+    await step('94-compaction', async () => {
+      const compacted = () => requests().filter((r) => r.role === 'compact').length;
+      const before = compacted();
+      let turn;
+      for (let i = 1; i <= 4; i += 1) turn = await send(zh ? `第 ${i} 个问题（长对话，合成数据）` : `Question ${i} (long conversation, synthetic)`);
+      check('the earlier turns were summarized once, by one call', compacted() === before + 1);
+      const trace = (await get(`/api/runs/${turn.run_id}/trace?after=-1`)).body.events;
+      check('the compaction is recorded with the turns it covers (read back)',
+        trace.some((e) => e.type === 'compaction' && e.data.outcome === 'ok' && e.data.turns.join() === '0,1'));
+      const answer = page.locator('li', { has: page.getByRole('button', { name: L('turn.details') }) }).last();
+      await answer.getByRole('button', { name: L('turn.details') }).click();
+      await answer.getByText(L('trace.summary'), { exact: true }).waitFor();
+      await answer.getByText(L('trace.summary'), { exact: true }).scrollIntoViewIfNeeded(); // shown in the screenshot
+      check('Details says the answer used a summary of turns 1 and 2',
+        (await answer.innerText()).includes(L('trace.summaryUsed').other.replace('{turns}', '1–2')));
+      check('Details lists the summarizing step', (await answer.innerText()).split(L('trace.phaseCompact')).length === 2);
+    });
+  } finally {
+    await history(saved);
+  }
+}
+
 // Samples an element's open or close animation frame by frame: its box and opacity at each tenth
 // of its animations, read with them paused (Web Animations API). The box shows the composed
 // motion, whichever properties (transform, translate) carry it.
@@ -2792,6 +2850,7 @@ async function run(combo, build, outRoot) {
     if (C.zoteroState) await zotero(ctx);  // S1-15: the Zotero browser, an import and a re-import
     if (C.materials) await s119(ctx);  // S1-19b: cited answers; its stand-in helper and provider are the test server's
     if (C.memoryClock) await memoryFlow(ctx);  // S1-21a: memory and Where we left off, on the test server's clock
+    if (server) await compactionFlow(ctx);  // S1-21b: compaction, on the test server's synthetic provider
     if (server) {  // S1-36: the gold sets' review pages, in a tab of their own
       const appPage = page;
       page = await appPage.context().newPage();

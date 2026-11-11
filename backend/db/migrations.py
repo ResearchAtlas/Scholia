@@ -670,4 +670,17 @@ CREATE INDEX memory_records_by_supersedes ON memory_records (supersedes_id);
 CREATE INDEX memory_sources_by_source ON memory_sources (source_id);
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008)
+# S1-21b (fix batch 2): the memory records whose text a stored copy holds, as run_body_materials keeps its papers: a
+# compaction summary (the records the turns it covers held) and a memory tool's kept output and the pages served from
+# it (the records it holds). Deleting or forgetting one deletes every body that holds its text, in every run
+# (backend/db/deletion.py RULES), and the content store then collects the file.
+_0009 = r"""
+CREATE TABLE run_body_memory (
+    sha256 TEXT NOT NULL,
+    memory_id TEXT NOT NULL REFERENCES memory_records (id),
+    PRIMARY KEY (sha256, memory_id)
+) STRICT;
+CREATE INDEX run_body_memory_by_memory ON run_body_memory (memory_id);
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009)

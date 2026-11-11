@@ -34,7 +34,8 @@ async def test_a_turn_runs_tool_calls_until_the_model_answers_and_records_each_c
         first, second = provider.agent_steps
         assert {t["function"]["name"] for t in first["tools"]} == {
             "list_materials", "search_passages", "read_passage", "answer_from_library", "use_skill", "read_skill_file",
-            "ask", "open_place", "read_project_state", "read_memory", "update_progress"}  # S1-21a's three
+            "ask", "open_place", "read_project_state", "read_memory", "update_progress",  # S1-21a's three
+            "read_output"}  # and S1-21b's paging tool
         assert "tool_choice" not in first  # never forced (model-route rule 4)
         [result] = tool_messages(second)
         assert result["tool_call_id"] == "call_search_passages" and "[S1.1] Wage Floors" in result["content"]
@@ -118,7 +119,8 @@ async def test_read_passage_reads_whole_passages_in_order_within_its_bounds_and_
         conversation = await conversation_in(client, project)
         await send(client, conversation, "Read it")
         first, second = (tool_messages(b)[-1]["content"] for b in provider.agent_steps[1:3])
-        assert len(first) <= 8000 + 200 and "Passages left out, by ordinal:" in first
+        # S1-21b: whole passages up to the 50,000-character bound, the first 8,000 characters shown with a handle for more
+        assert len(first) <= 8000 and "Read on with read_output" in first
         assert first.index("Paragraph 0") < first.index("Paragraph 1")
         assert "Paragraph 5 " in second and "Paragraph 4 " not in second
 
@@ -243,7 +245,8 @@ def test_every_tool_declares_section_six_three_s_facts_and_a_closed_argument_sch
     tools = agent.REGISTRY.list_tools()
     assert {t.name for t in tools} == {"list_materials", "search_passages", "read_passage", "answer_from_library",
                                        "use_skill", "read_skill_file", "ask", "open_place",  # section 6.3, S1-19's
-                                       "read_project_state", "read_memory", "update_progress"}  # and S1-21a's
+                                       "read_project_state", "read_memory", "update_progress",  # and S1-21a's
+                                       "read_output"}  # and S1-21b's
     for tool in tools:
         assert all(getattr(tool, name) is not None for name in declared), tool.name
         assert tool.args_schema["type"] == "object" and tool.args_schema["additionalProperties"] is False
@@ -359,7 +362,8 @@ async def test_only_passages_a_model_was_shown_count_as_read_in_the_run(tmp_path
         conversation = await conversation_in(client, project)
         await send(client, conversation, "Hello there")
         [shown] = tool_messages(provider.agent_steps[1])
-        assert "more passages matched" in shown["content"] and len(shown["content"]) <= 8000
+        # S1-21b: the rest is kept and paged; only what a served page shows is read
+        assert "Read on with read_output" in shown["content"] and len(shown["content"]) <= 8000
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         found = {c["marker"]: c["existence"] for c in turn["citations"]}
         assert found["[S1.8]" if "[S1.8]" not in shown["content"] else "[S1.1]"] in ("not_found", "ok")
@@ -859,8 +863,13 @@ async def test_ct2_list_materials_past_its_read_limit_reports_every_paper_it_lef
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, "Which papers do I have?")
         [done] = [d for k, d, _ in await events_of(client, stream[0]["run_id"]) if k == "tool_result"]
-        omitted = extra + 1 - len(done["meta"]["materials"])
-        assert tool_messages(provider.agent_steps[1])[-1]["content"].endswith(f"({omitted} more papers not shown.)")
+        # S1-21b: every paper up to the read limit is kept and paged, and the papers past it are counted at its end
+        assert "Read on with read_output" in tool_messages(provider.agent_steps[1])[-1]["content"]
+        [(sha,)] = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt >= 4000",
+                              stream[0]["run_id"])
+        whole = (client.state["db"].data_dir / "content" / sha[:2] / sha).read_text()
+        assert whole.endswith(f"({extra + 1 - agent.LIST_LIMIT} more papers not listed.)")
+        assert whole.count("\n") == agent.LIST_LIMIT and 0 < len(done["meta"]["materials"]) < agent.LIST_LIMIT
 
 
 @pytest.mark.asyncio

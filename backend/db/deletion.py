@@ -94,6 +94,7 @@ ON_DELETE = {
     # material), and shows that the source was removed.
     ("material_versions", "material_id"): DELETE,
     ("run_body_materials", "material_id"): DELETE,  # and every body that holds its text goes (RULES)
+    ("run_body_memory", "memory_id"): DELETE,  # S1-21b: and every stored copy holding a memory record's text (RULES)
     ("passages", "extraction_id"): DELETE,
     ("candidates", "material_id"): "material_id = NULL",
     ("citations", "material_id"): _SOURCE_REMOVED,
@@ -161,6 +162,17 @@ RULES = (
     WHERE b.sha256 IN (SELECT sha256 FROM run_body_materials WHERE rowid IN {_doomed('run_body_materials')})
     OR (b.sha256 IN (SELECT sha256 FROM run_bodies WHERE rowid IN {_doomed('run_bodies')})
         AND NOT EXISTS (SELECT 1 FROM run_bodies r WHERE r.sha256 = b.sha256 AND r.rowid NOT IN {_doomed('run_bodies')}))""",
+    # S1-21b (backend/compaction.py): a stored copy holding a deleted or forgotten memory record's text (a compaction
+    # summary, a memory tool's kept output, a page served from it) goes, in every run, with its links to its papers and
+    # records; and a body's memory links once no run is left to name it.
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'run_bodies', rowid FROM run_bodies
+    WHERE sha256 IN (SELECT sha256 FROM run_body_memory WHERE rowid IN {_doomed('run_body_memory')})""",
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'run_body_memory', b.rowid FROM run_body_memory b
+    WHERE b.sha256 IN (SELECT sha256 FROM run_body_memory WHERE rowid IN {_doomed('run_body_memory')})
+    OR (b.sha256 IN (SELECT sha256 FROM run_bodies WHERE rowid IN {_doomed('run_bodies')})
+        AND NOT EXISTS (SELECT 1 FROM run_bodies r WHERE r.sha256 = b.sha256 AND r.rowid NOT IN {_doomed('run_bodies')}))""",
     # A project's own memory.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', rowid FROM memory_records
@@ -208,6 +220,13 @@ SCOPE_LINKS: tuple[str, ...] = (
 # records: inputs.memory_ids) is revoked when the record is deleted (section 10: "material, passage and memory record").
 SCOPE_LINKS += (
     f"""SELECT r.id FROM runs r, json_each(r.inputs, '$.memory_ids') j
+    WHERE r.status = 'running' AND j.value IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')})""",
+)
+
+# S1-21b: a run whose request carries a compaction summary is revoked when a memory record the summary follows is deleted
+# (inputs.summary_memory; its papers are in inputs.material_ids, above).
+SCOPE_LINKS += (
+    f"""SELECT r.id FROM runs r, json_each(r.inputs, '$.summary_memory') j
     WHERE r.status = 'running' AND j.value IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')})""",
 )
 

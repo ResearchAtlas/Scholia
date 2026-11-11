@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import Answer, { Chip, backedSentences } from '../src/markdown.js';
-import { readTrace, summarize } from '../src/trace.js';
+import { readTrace, summarize, turnRanges } from '../src/trace.js';
 import { MAX_CHOSEN, choosePapers, chosenPapers, openPaperAt, readGuard, takeOpening, watchChosen } from '../src/library.js';
 import { NOTICES } from '../src/live.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
@@ -198,6 +198,30 @@ test('Details sums up the trace from its events, read a page at a time', async (
   assert.deepEqual(found.pairs, { judged: 5, failed: 1, budget: 2 }); // every outcome, shown in Details
   assert.equal(found.historyLeftOut, 2); // earlier answers left out with a deleted paper, shown in Details
   assert.equal(found.finished, 'succeeded');
+});
+
+test('Details says when an answer used a summary, and of which turns (S1-21b)', () => {
+  const found = summarize([
+    { type: 'step_started', data: { step: 0, phase: 'compact' } },
+    { type: 'model_attempt', data: { step: 0, dispatched: true, outcome: 'ok' } },
+    { type: 'compaction', data: { step: 0, outcome: 'ok', turns: [0, 1, 3] } },
+    { type: 'step_started', data: { step: 1, phase: 'answer', summary: { turns: [0, 1, 3] } } },
+    { type: 'model_attempt', data: { step: 1, dispatched: true, outcome: 'ok' } },
+    { type: 'step_started', data: { step: 2, phase: 'answer' } }, // a later step without it: its reply is still carried
+    { type: 'model_attempt', data: { step: 2, dispatched: true, outcome: 'ok' } },
+    { type: 'step_started', data: { step: 3, phase: 'judge' } },
+  ]);
+  assert.deepEqual(found.steps.map((s) => s.phase), ['compact', 'answer', 'answer', 'judge']);
+  assert.deepEqual(found.summary, [0, 1, 3]); // gpt-6-astra review 1 (3): any dispatched step that carried it
+  assert.equal(turnRanges(found.summary), '1–2, 4'); // counted from 1, in runs
+  assert.equal(summarize([{ type: 'step_started', data: { step: 0, phase: 'answer' } }]).summary, null);
+  const unsent = summarize([ // a step refused before it left never carried it anywhere
+    { type: 'step_started', data: { step: 0, phase: 'answer', summary: { turns: [0] } } },
+    { type: 'model_attempt', data: { step: 0, dispatched: false, outcome: 'turn_deadline' } },
+  ]);
+  assert.equal(unsent.summary, null);
+  assert.match(en['trace.summaryUsed'].one, /\{turns\}/);
+  assert.match(zhCN['trace.summaryUsed'].other, /\{turns\}/);
 });
 
 test('Details names each step\'s tool calls and outcomes and the skills used, never their text (S1-19c)', () => {

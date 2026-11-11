@@ -23,11 +23,12 @@ its non-text arguments and its result's ids and counts, never the text (section 
 
 import asyncio
 import hashlib
+import itertools
 import json
 
 from fastapi import APIRouter
 
-from backend import citations, memory, skills
+from backend import citations, compaction, memory, skills
 from backend.settings import visible
 from backend.tools.registry import ToolRegistry
 from backend.tools.router import failed
@@ -48,34 +49,85 @@ _IDS = {"type": "array", "items": {"type": "string", "maxLength": 64}, "maxItems
 
 class Evidence:
     """The turn's evidence: {(source, passage): record}, the router's pre-load first, then every passage a
-    tool gave the model, each paper keeping its source number and each passage its marker once given."""
+    tool gave the model, each paper keeping its source number and each passage its marker once given. S1-21b: pending
+    holds passages numbered in a paged output past its preview (read_passage), read in the run only once a page showing
+    their marker is served (read_output), so their markers are never given to another passage meanwhile. Fix batch 4:
+    an index of the markers given (by passage and paper), each paper's source and each source's last passage number,
+    so numbering a passage, or sizing one before it is numbered (keys_for), costs the same however much the turn has
+    read; it is built whole only when markers are taken back (keep)."""
 
-    def __init__(self, numbered):
+    def __init__(self, numbered, pending=None):
         self.numbered = dict(numbered)
+        self.pending = dict(pending or {})
+        self.revealed = set()  # pending keys a later tool's add gave out (keep can return them to pending)
+        self._index()
 
-    def add(self, records):
-        """The markers of records (given in order), numbering those not yet in the evidence."""
+    def _index(self):
+        self._keys, self._source, self._last, self._top = {}, {}, {}, 0
+        for key, record in {**self.numbered, **self.pending}.items():
+            self._note(key, record)
+
+    def _note(self, key, record):
+        self._keys[(record["passage_id"], record["material_id"])] = key
+        self._source.setdefault(record["material_id"], key[0])  # its first source, as the evidence lists it
+        self._last[key[0]] = max(self._last.get(key[0], 0), key[1])
+        self._top = max(self._top, key[0])
+
+    def keys_for(self, records):
+        """The markers add(records) would give them, one at a time, numbering nothing: what read_passage sizes its
+        candidates by before it numbers those it keeps."""
+        keys, sources, last, top = {}, {}, {}, self._top
+        for record in records:
+            ident = (record["passage_id"], record["material_id"])
+            key = self._keys.get(ident) or keys.get(ident)
+            if key is None:
+                source = self._source.get(record["material_id"]) or sources.get(record["material_id"])
+                if source is None:
+                    top += 1
+                    source = sources[record["material_id"]] = top
+                last[source] = max(self._last.get(source, 0), last.get(source, 0)) + 1
+                key = keys[ident] = (source, last[source])
+            yield key
+
+    def add(self, records, shown=True):
+        """The markers of records (given in order), numbering those not yet in the evidence (pending ones unless shown)."""
         keys = []
         for record in records:
-            key = next((k for k, r in self.numbered.items() if r["passage_id"] == record["passage_id"]
-                        and r["material_id"] == record["material_id"]), None)
+            key = self._keys.get((record["passage_id"], record["material_id"]))
             if key is None:
-                source = next((k[0] for k, r in self.numbered.items() if r["material_id"] == record["material_id"]),
-                              max((k[0] for k in self.numbered), default=0) + 1)
-                key = (source, max((k[1] for k in self.numbered if k[0] == source), default=0) + 1)
-                self.numbered[key] = record
+                [key] = self.keys_for([record])
+                (self.numbered if shown else self.pending)[key] = record
+                self._note(key, record)
+            elif shown and key in self.pending:
+                self.show([key])
+                self.revealed.add(key)
             keys.append(key)
         return keys
 
+    def show(self, keys):
+        """Pending passages a page now shows the model: read in the run from here."""
+        for key in keys:
+            if key in self.pending:
+                self.numbered[key] = self.pending.pop(key)
+
+    def record(self, key):
+        return self.numbered.get(key) or self.pending[key]
+
     def lines(self, keys):
-        return citations.bundle({k: self.numbered[k] for k in dict.fromkeys(keys)})
+        return citations.bundle({k: self.record(k) for k in dict.fromkeys(keys)})
 
     def keep(self, keys, kept, before):
         """Take back the markers of keys that were new (not in before) and are not in kept: passages retrieved but
-        never shown to a model are not read in the run."""
+        never shown to a model are not read in the run (their numbers given again, as before the index)."""
+        taken = False
         for key in keys:
             if key not in kept and key not in before:
-                self.numbered.pop(key, None)
+                record = self.numbered.pop(key, None)
+                if record is not None and key in self.revealed:  # still in a paged output: its marker stays its own
+                    self.pending[key] = record
+                taken = taken or record is not None
+        if taken:
+            self._index()
 
 
 class Turn:
@@ -87,6 +139,8 @@ class Turn:
         self.step = step
         self.listed = set()
         self.activated = set()  # the skills activated in this turn
+        self.outputs = {}  # S1-21b: handle -> a paged output of this turn (its run_bodies slot, length, pending markers)
+        self.segments = {}  # call id -> [(character offset, pending passage key)] of an output past its preview
 
     async def read(self, fn):
         return await asyncio.to_thread(self.harness.db.read, fn)
@@ -129,14 +183,6 @@ async def _selection(turn, ids):
     return ids if found == set(ids) else None
 
 
-def _shown(turn, call_id, keys, meta=None):
-    """A result giving the model these passages, with their markers."""
-    lines = turn.evidence.lines(keys)
-    return ToolResult(id=call_id, ok=True, text="\n\n".join(lines),
-                      meta={"passages": [turn.evidence.numbered[k]["passage_id"] for k in dict.fromkeys(keys)],
-                            **(meta or {})})
-
-
 # Read the library
 
 
@@ -151,20 +197,14 @@ async def list_materials(call, turn):
         "SELECT m.id, m.title, json_extract(m.csl, '$.issued.\"date-parts\"[0][0]'), coalesce(m.evidence_type, 'full_text'),"
         " m.retraction, count(*) OVER () FROM materials m WHERE m.project_id = ? ORDER BY m.created_at, m.id LIMIT ?",
         (turn.ctx["project_id"], LIST_LIMIT)).fetchall())  # each row also counts every paper, past the limit too
-    lines, used, shown = [], 0, []
-    for material, title, year, kind, retraction, _ in rows:
-        line = " | ".join(str(x) for x in (material, title or "(untitled)", year or "n.d.", kind.replace("_", " "),
-                                            "RETRACTED" if retraction == "retracted" else None) if x)
-        if used + len(line) + 1 > 7000:
-            break
-        lines.append(line)
-        shown.append(material)
-        used += len(line) + 1
-    if rows and rows[0][5] > len(shown):
-        lines.append(f"({rows[0][5] - len(shown)} more papers not shown.)")
-    turn.listed.update(shown)
-    return ToolResult(id=call.id, ok=True, text="\n".join(lines) if lines else "The library has no papers yet.",
-                      meta={"materials": shown})
+    if not rows:
+        return ToolResult(id=call.id, ok=True, text="The library has no papers yet.", meta={"materials": []})
+    items = [(line, line[:LABEL_CHARS], "paper", material) for material, title, year, kind, retraction, _ in rows
+             for line in [" | ".join(str(x) for x in (material, title or "(untitled)", year or "n.d.", kind.replace(
+                 "_", " "), "RETRACTED" if retraction == "retracted" else None) if x)]]
+    more = rows[0][5] - len(rows)
+    text, shown, _ = _paged(turn, call.id, items, "\n", tail=f"\n({more} more papers not listed.)" if more > 0 else "")
+    return ToolResult(id=call.id, ok=True, text=text, meta={"materials": [v for *_, v in shown]})
 
 
 @REGISTRY.register(
@@ -191,24 +231,14 @@ async def search_passages(call, turn):
     found = await pipeline.evidence(state, turn.ctx["project_id"], query, materials=selection or None,
                                     whole=lambda records: _preview_fits(citations.bundle(citations.sources(records))))
     await turn.harness._trace_retrieval(turn.claim, found, call.id)
-    before = set(turn.evidence.numbered)
-    keys = list(dict.fromkeys(turn.evidence.add(found["records"])))
+    keys = list(dict.fromkeys(turn.evidence.add(found["records"], shown=False)))
     if not keys:
         return ToolResult(id=call.id, ok=True, text="No passage matched.", meta={"passages": [], "mode": found["mode"]})
-    shown, used = [], 0
-    for key in keys:  # whole passages, best first, within the output preview
-        size = len(turn.evidence.lines([key])[0]) + 2
-        if shown and used + size > PREVIEW_ROOM:
-            break
-        shown.append(key)
-        used += size
-    turn.evidence.keep(keys, shown, before)
-    result = _shown(turn, call.id, shown, {"mode": found["mode"]})
-    if len(shown) < len(keys):
-        result.text += f"\n\n({len(keys) - len(shown)} more passages matched; search more narrowly to see them.)"
-    if found["mode"] == "keyword_only":
-        result.text += "\n\n(Meaning search was unavailable: these come from keyword search only.)"
-    return result
+    # S1-21b: whole passages, best first; past the preview, kept and paged, each read once a page shows its marker
+    head = "(Meaning search was unavailable: these come from keyword search only.)\n\n" \
+        if found["mode"] == "keyword_only" else ""
+    text, _, read = _paged(turn, call.id, _passage_items(turn, keys), "\n\n", head=head)
+    return ToolResult(id=call.id, ok=True, text=text, meta={"passages": read, "mode": found["mode"]})
 
 
 @REGISTRY.register(
@@ -238,21 +268,120 @@ async def read_passage(call, turn):
         records = [r for r in records if r["ordinal"] == ordinal]
         if not records:
             return failed(call.id, "not_found", "That paper has no passage at that ordinal.")
-    # Whole passages in order within the preview (the read bound is larger; paging comes with S1-21).
-    room, kept = min(READ_CHARS, 7000), []
-    for record in records:
-        if room < len(record["text"]) + 200 and kept:
+    # Whole passages in order within the read bound (S1-21b: past the 8,000-character preview, paged with read_output),
+    # counted as they are emitted: each passage's line with its marker, title and facts, and the separators between them
+    # (fix batch 3: the title repeats on every passage); when some are left out, their note, at most NOTE_MAX characters,
+    # is reserved too (fix batch 4). The candidates are sized one at a time and only until the bound is passed, so the
+    # work follows what is kept, never the whole paper; the probe numbers them as the turn will. A first passage longer
+    # than the bound alone is cut at it, said so.
+    sizes, used = [], 0
+    for record, key in zip(records, turn.evidence.keys_for(records)):  # numbered as the turn will number them
+        size = len(citations.bundle({key: record})[0]) + (2 if sizes else 0)
+        if used + size > READ_CHARS:
             break
-        kept.append(record)
-        room -= len(record["text"]) + 200
-    left = [r["ordinal"] for r in records[len(kept):]]
-    result = _shown(turn, call.id, turn.evidence.add(kept), {"version_id": rows[0][1][7], "left_out": len(left)})  # only those shown
-    if left:
-        result.text += f"\n\n(Passages left out, by ordinal: {_ranges(left)}. Read one with its ordinal.)"
-    return result
+        sizes.append(size)
+        used += size
+    count = len(sizes)
+    if count < len(records):  # some are left out: room for their note
+        while count > 1 and sum(sizes[:count]) > READ_CHARS - NOTE_MAX:
+            count -= 1
+        count = max(count, 1)
+    kept = records[:count]
+    keys = list(dict.fromkeys(turn.evidence.add(kept, shown=False)))
+    tail = _left_out(records, count)
+    items = _passage_items(turn, keys)
+    room = READ_CHARS - len(tail)
+    if len(items[0][0]) > room:  # one passage longer than the bound: cut at it, said so (the note under CUT_NOTE)
+        items[0] = (items[0][0][:room - CUT_NOTE]
+                    + f"\n(Cut at {room - CUT_NOTE} characters: this passage is longer than the read bound.)",
+                    *items[0][1:])
+    text, _, read = _paged(turn, call.id, items, "\n\n", tail=tail)
+    return ToolResult(id=call.id, ok=True, text=text, meta={
+        "passages": read, "version_id": rows[0][1][7], "left_out": len(records) - count})
 
 
-PREVIEW_ROOM = 7000  # characters of whole passages a search result shows, within the 8,000-character preview
+PREVIEW_ROOM = 7000  # characters of whole passages a selection read directly must fit (B40), within the 8,000 preview
+NOTE_RANGES = 400  # characters of left-out ordinal ranges read_passage's note lists before it says "and more"
+NOTE_MAX = NOTE_RANGES + 120  # the most characters that note takes (_left_out)
+CUT_NOTE = 80  # room kept for the note on a passage cut at the read bound
+
+
+def _left_out(records, count):
+    """read_passage's note of the passages after the first count that it leaves out: how many, and their ordinals as
+    ranges, at most NOTE_RANGES characters of them, then "and more" (fix batch 4: gaps left by reference passages made
+    the list as long as the paper). At most NOTE_MAX characters; its work stops with the list."""
+    left = len(records) - count
+    if left <= 0:
+        return ""
+    listed, used, more = [], 0, False
+    for part in _ranges_of(r["ordinal"] for r in itertools.islice(records, count, None)):
+        if used + len(part) + 2 > NOTE_RANGES:
+            more = True
+            break
+        listed.append(part)
+        used += len(part) + 2
+    return (f"\n\n({left} passage{'s' if left != 1 else ''} left out, by ordinal: {', '.join(listed)}"
+            f"{', and more' if more else ''}. Read one with its ordinal.)")
+
+
+def _ranges_of(numbers):
+    """Runs of consecutive numbers as "a" or "a-b", one at a time."""
+    start = previous = None
+    for n in numbers:
+        if start is not None and n == previous + 1:
+            previous = n
+            continue
+        if start is not None:
+            yield str(start) if start == previous else f"{start}-{previous}"
+        start = previous = n
+    if start is not None:
+        yield str(start) if start == previous else f"{start}-{previous}"
+LABEL_CHARS = 60  # S1-21b: a listed paper or memory record is shown once a page holds this much of its line (or all)
+
+
+def _passage_items(turn, keys):
+    return [(line, f"[S{key[0]}.{key[1]}]", "passage", key) for key, line in zip(keys, turn.evidence.lines(keys))]
+
+
+def _paged(turn, call_id, items, sep, head="", tail=""):
+    """S1-21b (section 8, Paging): a result's text of items [(line, label, kind, value)], kept as the call's segments
+    [(start, length, label, kind, value)] for read_output (the harness keeps the whole text and pages it), and what the
+    preview shows of them given to the run now (reveal). Returns (the text, the segments the preview shows any of)."""
+    at, segments = len(head), []
+    for line, label, kind, value in items:
+        segments.append((at, len(line), label, kind, value))
+        at += len(line) + len(sep)
+    turn.segments[call_id] = segments
+    text = head + sep.join(line for line, *_ in items) + tail
+    # what the model is shown now: all of it, or a preview's part (the harness pages the rest, compaction.preview)
+    return (text, *reveal(turn, segments, 0, len(text) if len(text) <= compaction.PREVIEW
+                          else compaction.shown_of(compaction.PREVIEW)))
+
+
+def reveal(turn, segments, offset, size=compaction.PREVIEW, served=()):
+    """What a page from offset (the preview: 0) of size characters gives the run of the items it shows any character of,
+    so nothing it shows is sent unregistered (fix batch 1 review, P1-2): a paper listed, its title in the request; a
+    memory record held by the request; a passage's paper registered, and the passage read in the run (citable) only once
+    this turn's served pages of the output, this one and those served before it (served: [(start, end)]), cover every
+    character of its marker (fix batch 4, P9: a page may start inside a marker). Returns (the segments it shows, the
+    passages it reads, by passage id)."""
+    pages = [*served, (offset, offset + size)]
+    shown = [s for s in segments if compaction.shows(s[0], s[1], offset, size)]
+    complete = [s for s in shown if s[3] == "passage" and compaction.covered(pages, s[0], s[0] + len(s[2]))]
+    for segment in shown:
+        *_, kind, value = segment
+        if kind == "passage":
+            if segment in complete:
+                turn.evidence.show([value])
+            record = turn.evidence.numbered.get(value) or turn.evidence.pending.get(value)
+            if record is not None:
+                turn.listed.add(record["material_id"])
+        elif kind == "paper":
+            turn.listed.add(value)
+    held = [v for _, _, _, k, v in shown if k == "memory"]
+    if held:
+        _remembered(turn, [record for record, _ in held], {m for _, materials in held for m in materials})
+    return shown, [turn.evidence.numbered[v]["passage_id"] for *_, v in complete]
 _MARKER_SLACK = 8  # a marker the turn numbers ([S12.30]) may be longer than one numbered from 1
 
 
@@ -390,22 +519,10 @@ async def open_place(call, turn):
 # they may carry pass the dispatch check before the next step); with memory off in the project they read and write
 # nothing.
 
-MEMORY_ROOM = 7000  # characters of whole records a memory tool shows, within the 8,000-character preview
-
-
 def _remembered(turn, records, materials):
     turn.ctx["memory_ids"] = sorted({*turn.ctx.get("memory_ids", ()), *records})
     turn.ctx["memory_materials"] = sorted({*turn.ctx.get("memory_materials", ()), *materials})
 
-
-def _within(lines):
-    shown, used = [], 0
-    for line in lines:
-        if used + len(line) + 1 > MEMORY_ROOM:
-            break
-        shown.append(line)
-        used += len(line) + 1
-    return shown
 
 
 @REGISTRY.register(
@@ -421,13 +538,12 @@ async def read_project_state(call, turn):
 
     def read(conn):
         lines, ids = memory.project_state(conn, turn.ctx["project_id"])
-        return lines, ids, memory.materials_of(conn, ids)
-    lines, ids, materials = await turn.read(read)
-    shown = _within(lines)
-    ids = ids[:len(shown)]
-    _remembered(turn, ids, materials)
-    return ToolResult(id=call.id, ok=True, text="\n".join(shown) if shown else "The project state is empty so far.",
-                      meta={"memory": ids})
+        return lines, [(i, tuple(memory.materials_of(conn, [i]))) for i in ids]
+    lines, held = await turn.read(read)
+    if not lines:
+        return ToolResult(id=call.id, ok=True, text="The project state is empty so far.", meta={"memory": []})
+    text, shown, _ = _paged(turn, call.id, [(line, line[:LABEL_CHARS], "memory", h) for line, h in zip(lines, held)], "\n")
+    return ToolResult(id=call.id, ok=True, text=text, meta={"memory": [v[0] for *_, v in shown]})
 
 
 @REGISTRY.register(
@@ -448,13 +564,12 @@ async def read_memory(call, turn):
         if query is not None:
             found.sort(key=lambda r: -memory.likeness(query, r["content"]))
         found = found[:memory.RECALL_LIMIT]
-        return found, memory.materials_of(conn, [r["id"] for r in found])
-    found, materials = await turn.read(read)
-    shown = _within([memory.memory_line(r) for r in found])
-    ids = [r["id"] for r in found[:len(shown)]]
-    _remembered(turn, ids, materials)
-    return ToolResult(id=call.id, ok=True, text="\n".join(shown) if shown else "No memory record is recorded for this.",
-                      meta={"memory": ids})
+        return [(memory.memory_line(r), (r["id"], tuple(memory.materials_of(conn, [r["id"]])))) for r in found]
+    found = await turn.read(read)
+    if not found:
+        return ToolResult(id=call.id, ok=True, text="No memory record is recorded for this.", meta={"memory": []})
+    text, shown, _ = _paged(turn, call.id, [(line, line[:LABEL_CHARS], "memory", h) for line, h in found], "\n")
+    return ToolResult(id=call.id, ok=True, text=text, meta={"memory": [v[0] for *_, v in shown]})
 
 
 @REGISTRY.register(
@@ -482,6 +597,41 @@ async def update_progress(call, turn):
     await turn.harness._record(turn.claim, None, None, also=keep)
     turn.emit({"type": "memory", "action": "noted", "count": 1})
     return ToolResult(id=call.id, ok=True, text="Noted in the project state as your note.", meta={"noted": written[0]})
+
+
+# S1-21b: paged outputs (section 8, Paging; backend/compaction.py)
+
+
+@REGISTRY.register(
+    "read_output",
+    "Read more of a tool result that was cut at its preview: give the handle and the offset the result named. Returns "
+    "the next 8,000 characters. Handles are valid only within this turn.",
+    {"type": "object", "properties": {"handle": {"type": "string", "maxLength": 64},
+                                      "offset": {"type": "integer", "minimum": 0, "maximum": 1_000_000}},
+     "required": ["handle", "offset"], "additionalProperties": False},
+    read_only=True, repeat_safe=True, network=False, output_chars=compaction.PREVIEW + 200, tool_class="agent_control",
+    spends=False)
+async def read_output(call, turn):
+    handle, offset = call.arguments["handle"], call.arguments["offset"]
+    kept = turn.outputs.get(handle)  # this turn's own outputs only
+    if kept is None:
+        return failed(call.id, "not_found", "No output of this turn has that handle.")
+    if offset >= kept["length"]:
+        return failed(call.id, "validation_error", f"That output has {kept['length']} characters; give a smaller offset.")
+    sha = await turn.read(lambda conn: compaction.kept_output(conn, turn.claim.run_id, kept["step"], kept["number"]))
+    text = None
+    if sha is not None and turn.harness.content is not None:
+        try:
+            text = (await asyncio.to_thread(turn.harness.content.read, sha)).decode("utf-8")
+        except Exception:  # missing or damaged: as if not kept
+            text = None
+    if text is None:  # gone with a paper or memory record whose text it held, or never kept
+        return failed(call.id, "not_found", "That output is no longer kept.")
+    shown, read = reveal(turn, kept["segments"], offset, compaction.PREVIEW, kept["served"])
+    kept["served"].append((offset, min(offset + compaction.PREVIEW, len(text))))  # what this turn has been shown of it
+    return ToolResult(id=call.id, ok=True, text=compaction.page(text, offset, handle), meta={
+        "passages": read, "materials": [v for *_, k, v in shown if k == "paper"],
+        "memory": [v[0] for *_, k, v in shown if k == "memory"], "page": True})
 
 
 def definitions():
