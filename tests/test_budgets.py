@@ -1211,3 +1211,140 @@ async def test_spend_gives_each_budgets_settled_spend_by_basis(tmp_path):
             "settled_usd": 0.395494, "reported_usd": 0.35, "estimated_usd": 0.045494}
         assert {k: spend["conversation"][k] for k in ("settled_usd", "reported_usd", "estimated_usd")} == {
             "settled_usd": 0.145494, "reported_usd": 0.1, "estimated_usd": 0.045494}
+
+
+# S1-33 fix batch 2 (D20): the checklist's named tests not yet written (B1, P1, L3 d, L4)
+
+
+@pytest.mark.asyncio
+async def test_the_routers_and_compactions_calls_ask_at_a_budget_as_any_step_does(tmp_path):
+    # B1: every turn call goes through _reserve: the router's small model (phase route) and compaction (phase compact)
+    # ask at the cap like an agent step, and once answered the call is made and the turn goes on.
+    from backend import budget_router
+    from scholia_app import MockProvider
+    from test_compaction import Long, put_settings, small_history
+    provider = MockProvider()
+    async with await _app(tmp_path, provider) as client:
+        await put_settings(client, {"models.router": sorted(budget_router.RECOMMENDED)[0]})
+        provider.replies.append(lambda body: provider.answer("none"))
+        conversation, _ = await _conversation(client, budget=0)
+        sending, ask = await _asking(client, conversation)
+        assert (ask["params"]["phase"], ask["params"]["form"]) == ("route", "cap")
+        await _answer(client, ask, option="continue")
+        assert (await sending)[-1]["status"] == "succeeded"
+        [route] = await _rows(client, "SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_started'"
+                                      " AND json_extract(data, '$.phase') = 'route'", ask["run_id"])
+        assert route == (1,)
+    provider = Long()
+    (tmp_path / "second").mkdir()
+    async with await _app(tmp_path / "second", provider) as client:
+        from scholia_app import send
+        await small_history(client)
+        conversation, _ = await _conversation(client)
+        for i in range(3):
+            assert (await send(client, conversation, f"QUESTION-{i} about cohorts"))[-1]["status"] == "succeeded"
+        [(spent,)] = await _rows(client, "SELECT sum(settled_usd) FROM budget_reservations WHERE paying_conversation_id = ?",
+                                 conversation)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = ? WHERE id = ?", (spent, conversation)))  # at its cap
+        sending, ask = await _asking(client, conversation, "QUESTION-3 about cohorts")
+        assert (ask["params"]["phase"], ask["params"]["form"]) == ("compact", "cap")
+        await _answer(client, ask, text="5")  # a limit the rest of the turn fits in, so nothing asks again
+        stream = await sending
+        assert stream[-1]["status"] == "succeeded" and len(provider.summaries) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_evaluation_bound_holds_for_titles_extractions_citation_checks_and_the_judges_share(tmp_path):
+    # P1 (SPEC:1223): in the evaluation project every reservation is the request's bound times the attempts one call
+    # may make: a title, a memory extraction, a citation check, and the support judge's share held with its answer.
+    from backend import openrouter
+    from cited import Provider, cited, events_of
+    from scholia_app import background_idle, run_finished, send
+    from test_materials import added
+    from test_search import WAGES, idle
+    async with cited(tmp_path, Provider()) as client:
+        project = (await client.post("/api/projects", json={"name": "Evaluation", "evaluation": True})).json()["id"]
+        await added(client, project, WAGES)
+        await idle(client, project)
+        conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]  # untitled
+        run_id = (await send(client, conversation, "What do minimum wages do to earnings?"))[0]["run_id"]
+        await background_idle(client)
+        [check] = (await client.post("/api/citations/check", json={"run_id": run_id})).json()["run_ids"]
+        assert (await run_finished(client, check))["status"] == "succeeded"
+        steps = [(d["phase"], d) for (r,) in await _rows(client, "SELECT id FROM runs WHERE project_id = ?", project)
+                 for kind, d, _ in await events_of(client, r) if kind == "step_started"]
+        phases = {phase for phase, _ in steps}
+        assert {"answer", "judge", "title", "extract_memory", "citation_check"} <= phases, phases
+        for phase, step in steps:
+            if phase in ("title", "extract_memory", "citation_check", "answer"):
+                assert step["estimate_usd"] == pytest.approx(step["request_usd"] * openrouter.MAX_ATTEMPTS), phase
+            if phase == "answer":  # the judge's share, held with it, is bounded the same way
+                assert step["allowance_usd"] == pytest.approx(step["judge_estimate_usd"] * openrouter.MAX_ATTEMPTS)
+
+
+async def _paper_turn_at_its_cap(client):
+    """A project with one paper read, its budget at the cap, and a turn about it waiting on the cap ask: (project,
+    material, the send's task, the ask)."""
+    from test_materials import added
+    from test_search import WAGES, idle
+    conversation, project = await _project_conversation(client)
+    [material] = [m["id"] for m in (await added(client, project, WAGES))["materials"]]
+    await idle(client, project)
+    await _project_budget(client, project, 1.0)
+    await _spent(client, project, 1.0)
+    sending, ask = await _asking(client, conversation, "What do minimum wages do to earnings?")
+    assert ask["params"]["form"] == "cap"
+    return project, material, sending, ask
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["paper_deleted", "tightened"])
+async def test_a_change_between_a_continue_answer_and_the_resumed_step_sends_nothing(tmp_path, monkeypatch, change):
+    # L3 (d), L4: the Continue answer commits; then, before the resumed step is reserved and dispatched, a paper its
+    # request carries is deleted, or the project is tightened: the step is never sent and the run ends revoked.
+    from backend import runs
+    from cited import Provider, cited
+    asking, where = runs.Harness._budget_ask, {}
+
+    async def then_change(self, active, *args):
+        reply = await asking(self, active, *args)  # the answer has committed: the step is about to be reserved again
+        client = where["client"]  # the change runs beside the turn (it waits for the runs it stops to end)
+        where["changing"] = asyncio.create_task(
+            client.delete(f"/api/materials/{where['material']}") if where["change"] == "paper_deleted"
+            else client.post(f"/api/projects/{where['project']}/sensitivity", json={"level": "local_only"}))
+        deadline = asyncio.get_running_loop().time() + 10
+        while not active.cancel_requested.is_set():  # the change has revoked the run
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        return reply
+    monkeypatch.setattr(runs.Harness, "_budget_ask", then_change)
+    async with cited(tmp_path, Provider()) as client:
+        where.update(change=change, client=client)
+        project, material, sending, ask = await _paper_turn_at_its_cap(client)
+        where.update(project=project, material=material)
+        before = len(client.provider.answers)
+        assert (await _answer(client, ask, option="continue")).status_code == 200
+        stream = await sending
+        assert (await where["changing"]).status_code == 200
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")
+        assert len(client.provider.answers) == before  # nothing sent after the change
+        assert await _rows(client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'") == [(0,)]
+
+
+@pytest.mark.asyncio
+async def test_a_queued_message_admitted_after_a_tightening_is_built_under_the_new_policy(tmp_path):
+    # L4: a message queued under Normal, then the project made Local only, then sent: its turn is admitted under Local
+    # only, so nothing goes to a cloud provider.
+    from scholia_app import send
+    async with await _app(tmp_path) as client:
+        conversation, project = await _project_conversation(client)
+        await send(client, conversation, "First?")
+        queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})).json()
+        assert (await client.post(f"/api/projects/{project}/sensitivity", json={"level": "local_only"})).status_code == 200
+        before = len(client.provider.answers)
+        sent = await client.post(f"/api/conversations/{conversation}/queue/{queued['id']}/send", json={})
+        assert len(client.provider.answers) == before  # no cloud call under Local only
+        if sent.status_code == 200:  # admitted, and refused a route under the new policy
+            from scholia_app import events
+            assert events(sent)[-1]["status"] != "succeeded"
