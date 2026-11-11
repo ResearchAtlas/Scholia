@@ -13,7 +13,9 @@ from FILE: {"responses": {message id: [step, ...]}}, each step {"calls": [{"name
 Without FILE the oracle replies are replayed (the labels' own skill and tools), which checks the replay and its
 scoring, never a model. A message passes on skill when the run activated exactly its expected skill (none for none),
 and on tools when it called every required tool and no forbidden one, read from the run's record (skill_activated,
-tool_call_started).
+tool_call_started). Only a turn that succeeded on its recording, step for step, is evidence: a message with no
+recording, one whose recording ran out (no reply is invented for it), one with steps the turn never took, and one whose
+turn did not succeed fail both, each with its problem.
 
 It prints, as integer counts with English and Chinese apart, the preview's score (messages whose expected skill ships,
 `help` and `literature-review`, or none: SPEC:1195 "The preview is evaluated only on the skills it ships") and every
@@ -87,7 +89,7 @@ class Replay:
     answer_from_library's own answer step, a memory extraction)."""
 
     def __init__(self):
-        self.steps = []
+        self.steps, self.ran_out = [], False
 
     async def __call__(self, request):
         from backend import budget_router
@@ -115,8 +117,11 @@ class Replay:
             text = '{"records": []}'
         elif not body.get("tools"):  # answer_from_library's own answer step
             text = "The library holds nothing on this."
+        elif not self.steps:  # a step the recording has no reply for: it fails, never answered by an invented one
+            self.ran_out = True
+            return httpx.Response(500, json={"error": {"message": "no recorded step"}})
         else:
-            step = self.steps.pop(0) if self.steps else {"text": "Done."}
+            step = self.steps.pop(0)
             if "calls" in step:
                 calls = [{"id": f"call_{n}_{c['name']}", "type": "function",
                           "function": {"name": c["name"], "arguments": json.dumps(c.get("arguments", {}))}}
@@ -127,14 +132,16 @@ class Replay:
         return answer({"choices": [{"message": {"role": "assistant", "content": text}}], "usage": usage})
 
 
-def score(row, activated, called):
+def score(row, activated, called, problem=None):
     expected = {row["expected_skill"]} if row["expected_skill"] else set()
-    return {"skill": set(activated) == expected,
-            "tools": set(row["required_tools"]) <= set(called) and not set(row["forbidden_tools"]) & set(called)}
+    return {"skill": problem is None and set(activated) == expected, "problem": problem,
+            "tools": problem is None and set(row["required_tools"]) <= set(called)
+            and not set(row["forbidden_tools"]) & set(called)}
 
 
 async def replay(rows, recorded=None):
-    """Each row's turn replayed: [{"id", "language", "preview", "skill", "tools", "activated", "called", "status"}]."""
+    """Each row's turn replayed: [{"id", "language", "preview", "skill", "tools", "problem", "activated", "called",
+    "status"}]; problem is None, no_recording, recording_ran_out, recording_left_over or run_<status>."""
     from backend.app import create_app
     from backend.self_test import _Keys
     provider = Replay()
@@ -152,9 +159,16 @@ async def replay(rows, recorded=None):
                                                         "updates": {"memory.enabled": False}})
                 read = app.app.state.scholia["db"].read
                 for row in rows:
+                    preview = row["expected_skill"] in (*SHIPPED, None)
+                    if recorded is not None and row["id"] not in recorded:
+                        results.append({"id": row["id"], "language": row["language"], "preview": preview,
+                                        **score(row, [], [], "no_recording"), "activated": [], "called": [],
+                                        "status": None})
+                        continue
                     conversation = (await client.post("/api/conversations", json={
                         "project_id": project, "title": row["id"]})).json()["id"]
                     provider.steps = list(recorded[row["id"]] if recorded is not None else oracle(row))
+                    provider.ran_out = False
                     response = await client.post(f"/api/conversations/{conversation}/message/stream",
                                                  json={"content": row["message"]})
                     events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
@@ -164,10 +178,12 @@ async def replay(rows, recorded=None):
                         " AND type IN ('skill_activated', 'tool_call_started') ORDER BY seq", (run_id,)).fetchall())
                     activated = [n for kind, n in record if kind == "skill_activated"]
                     called = [n for kind, n in record if kind == "tool_call_started" and n]
-                    results.append({"id": row["id"], "language": row["language"],
-                                    "preview": row["expected_skill"] in (*SHIPPED, None), **score(row, activated, called),
-                                    "activated": activated, "called": called,
-                                    "status": events[-1].get("status") if events else response.status_code})
+                    status = events[-1].get("status") if events else response.status_code
+                    problem = ("recording_ran_out" if provider.ran_out else "recording_left_over" if provider.steps
+                               else None if status == "succeeded" else f"run_{status}")
+                    results.append({"id": row["id"], "language": row["language"], "preview": preview,
+                                    **score(row, activated, called, problem), "activated": activated, "called": called,
+                                    "status": status})
     return results
 
 
@@ -177,7 +193,7 @@ def report(results, recorded_name):
         for language in LANGUAGES:
             mine = [r for r in chosen if r["language"] == language]
             found[language] = {"messages": len(mine), "skill": sum(r["skill"] for r in mine),
-                               "tools": sum(r["tools"] for r in mine)}
+                               "tools": sum(r["tools"] for r in mine), "invalid": sum(bool(r["problem"]) for r in mine)}
         return found
     preview = [r for r in results if r["preview"]]
     total = Counter()
@@ -201,11 +217,12 @@ def main(argv=None):
     results = asyncio.run(replay(rows, recorded))
     found = report(results, Path(args.recorded).name if args.recorded else "oracle")
     for failure in (f for f in found["failures"] if f["preview"]):  # a skill that does not ship cannot be activated
-        print(f"{failure['id']}: skill {'ok' if failure['skill'] else 'wrong'}, tools {'ok' if failure['tools'] else 'wrong'}"
-              f" (activated {failure['activated']}, called {failure['called']})")
+        print(f"{failure['id']}: " + (f"not evidence ({failure['problem']})" if failure["problem"] else
+              f"skill {'ok' if failure['skill'] else 'wrong'}, tools {'ok' if failure['tools'] else 'wrong'}"
+              f" (activated {failure['activated']}, called {failure['called']})"))
     for name in ("preview", "all"):
-        print(name, ", ".join(f"{lang}: skill {c['skill']}/{c['messages']}, tools {c['tools']}/{c['messages']}"
-                              for lang, c in found[name].items()))
+        print(name, ", ".join(f"{lang}: skill {c['skill']}/{c['messages']}, tools {c['tools']}/{c['messages']},"
+                              f" not evidence {c['invalid']}" for lang, c in found[name].items()))
     print("versions:", json.dumps(found["versions"]))
     if args.json:
         Path(args.json).write_text(json.dumps(found, ensure_ascii=False, indent=1), encoding="utf-8")

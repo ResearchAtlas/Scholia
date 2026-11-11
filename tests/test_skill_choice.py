@@ -48,8 +48,33 @@ async def test_the_replay_scores_skills_and_tools_from_the_runs_record(tmp_path)
         "en-001": (True, True), "en-016": (True, False), "zh-016": (False, True), "en-036": (True, True)}
     assert results["en-016"]["called"] == ["use_skill", "answer_from_library", "open_place"]
     found = skill_choice.report(list(results.values()), "test")
-    assert found["preview"]["en"] == {"messages": 3, "skill": 3, "tools": 2}
-    assert found["preview"]["zh-CN"] == {"messages": 1, "skill": 0, "tools": 1}
+    assert found["preview"]["en"] == {"messages": 3, "skill": 3, "tools": 2, "invalid": 0}
+    assert found["preview"]["zh-CN"] == {"messages": 1, "skill": 0, "tools": 1, "invalid": 0}
     assert found["met"] is False  # a forbidden call is never within the 100% the tools row needs
     # the versions replayed: the core prompt's and each shipped skill's (SPEC:761, reading 14)
     assert set(found["versions"]["skills"]) == set(skill_choice.SHIPPED) and len(found["versions"]["core_prompt"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_a_replay_whose_recording_is_missing_runs_out_is_left_over_or_whose_turn_fails_never_passes(tmp_path):
+    # D16 (Q2): only a turn that succeeded on its recording, step for step, is evidence: a message with no recording,
+    # one whose recording ran out (no reply is invented for it), one with steps the turn never took, and one whose turn
+    # did not succeed each fail both rows, said by their problem, and the set is not met.
+    rows = {r["id"]: r for r in skill_choice.load()}
+    chosen = [rows["en-036"], rows["en-037"], rows["en-038"], rows["zh-036"], rows["en-001"]]
+    assert all(r["expected_skill"] is None and not r["required_tools"] for r in chosen[:4])
+    recorded = {
+        "en-036": [],  # ran out at the first step
+        "en-037": [{"text": ""}],  # an empty answer: the turn fails
+        "en-038": [{"text": "Done."}, {"calls": [{"name": "open_place", "arguments": {"place": "library"}}]}],
+        # zh-036: no recording at all
+        "en-001": skill_choice.oracle(rows["en-001"]),
+    }
+    results = {r["id"]: r for r in await skill_choice.replay(chosen, recorded)}
+    assert {i: (r["skill"], r["tools"], r["problem"]) for i, r in results.items()} == {
+        "en-036": (False, False, "recording_ran_out"), "en-037": (False, False, "run_failed"),
+        "en-038": (False, False, "recording_left_over"), "zh-036": (False, False, "no_recording"),
+        "en-001": (True, True, None)}
+    found = skill_choice.report(list(results.values()), "test")
+    assert found["met"] is False and {f["id"] for f in found["failures"]} == {"en-036", "en-037", "en-038", "zh-036"}
+    assert found["preview"]["en"]["invalid"] == 3 and found["preview"]["zh-CN"]["invalid"] == 1
