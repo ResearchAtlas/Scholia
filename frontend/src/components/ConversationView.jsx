@@ -21,6 +21,8 @@ import { ACCEPT, afterAsksRead, asksChanged, choosePapers, chosenPapers, followA
 import { addTo } from './Library.jsx';
 import { actionLines, composerFill } from '../memory.js'; // S1-21a
 import { Ask } from './Ask.jsx';
+import { BudgetBar, Queued, SteeringNotes } from './FollowUp.jsx'; // S1-33
+import { follow, isActiveRun, nextQueued } from '../followup.js';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
@@ -71,6 +73,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   // a turn opens a place only while shown here (live.js), said in the commit that shows it: never a passive effect's delay
   useLayoutEffect(() => showing(projectId, id), [projectId, id]);
   const [turns, setTurns] = useState(conversation ? null : []);
+  const [queued, setQueued] = useState([]); // S1-33: messages waiting as the next turn, as last read
   const [failed, setFailed] = useState(false);
   const [problem, setProblem] = useState(null);
   const [reads, setReads] = useState(0); // each read, failed or not, so polling goes on
@@ -97,6 +100,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       const [read] = await Promise.all([get(`/api/conversations/${id}`), markdownReady()]);
       if (!settle(true)) return false; // asked before the library changed: never shown
       setTurns(read.turns);
+      setQueued(read.queued ?? []);
       setFailed(false);
       setStale(false);
       return true;
@@ -140,10 +144,46 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   useEffect(() => {
     if (!waiting) return undefined;
     const timer = setTimeout(async () => {
-      if ((await load()) && handoff) clear(id);
+      if ((await load()) && handoff) {
+        const finished = live?.status === 'succeeded' ? live.runId : null;
+        clear(id);
+        if (finished) drain(finished);
+      }
     }, handoff && !failed ? 0 : POLL_MS);
     return () => clearTimeout(timer);
   }, [waiting, handoff, failed, reads, id, load]);
+
+  // S1-33: a steering note read, or a budget notice reached, is shown from the record
+  useEffect(() => { if (live?.steered) load(); }, [live?.steered, load]);
+
+  // S1-33 (F11, queue): after a turn that succeeded the oldest queued message starts as the next turn; the backend
+  // starts it only if that turn is still the latest and succeeded, and once. After any other ending it waits with Send.
+  const drained = useRef(new Set()); // the turns a queued message was started after, from this window
+  async function drain(runId) {
+    if (!runId || drained.current.has(runId)) return;
+    try {
+      const next = nextQueued(await get(`/api/conversations/${id}`), runId);
+      if (next && !drained.current.has(runId)) {
+        drained.current.add(runId);
+        await sendQueued(next, runId);
+      }
+    } catch {
+      load(); // read again: it waits with Send
+    }
+  }
+  async function sendQueued(item, after = null) {
+    setProblem(null);
+    try {
+      await readChoice();
+      await send(id, `/api/conversations/${id}/queue/${encodeURIComponent(item.id)}/send`,
+        { ...messageRoute(currentChoice()), ...(after ? { after } : {}) }, item.text);
+    } catch (error) {
+      if (!(error instanceof ApiError && ['not_queued', 'not_after_success', 'active_run'].includes(error.code))) {
+        setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
+      }
+    }
+    load();
+  }
 
   useEffect(() => {
     const still = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
@@ -152,6 +192,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
 
   async function submit(text) {
     setProblem(null);
+    if (running) return followUp(text);
     try {
       const target = id ?? (await post('/api/conversations', { project_id: projectId })).id;
       setDraft(target); // shown here from now on, so Stop works while it is admitted
@@ -161,6 +202,21 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
         ...(papers.length ? { material_ids: papers.map((paper) => paper.id) } : {}) }, text);
       if (papers.length) choosePapers(projectId, []); // they went with this message
       if (!conversation && here.current) onCreated(target);
+      return true;
+    } catch (error) {
+      if (isActiveRun(error)) return followUp(text); // a turn started meanwhile: the message follows the setting
+      setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
+      return false;
+    }
+  }
+
+  // S1-33 (F11): a message sent while a turn runs, steered or queued as the setting says; said once read back.
+  async function followUp(text) {
+    const runId = live?.runId ?? shown.find((turn) => turn.status === 'running')?.run_id ?? null;
+    try {
+      const sent = await follow(id, runId, text);
+      await load();
+      if (sent.queued) drain(runId ?? (turns ?? []).at(-1)?.run_id); // its turn may have ended: started if it succeeded
       return true;
     } catch (error) {
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
@@ -251,7 +307,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
               <Turn key={turn.run_id} turn={turn} onOpen={openCited}
                 onContinue={turn === latest && continuable(turn) && !running ? () => resume(turn) : null} />
             ))}
-            {live && !saved && <LiveTurn turn={live} />}
+            {live && !saved && <LiveTurn turn={live} notes={(turns ?? []).find((turn) => turn.run_id === live.runId)?.steering} />}
           </ol>
           <div ref={end} />
         </div>
@@ -267,10 +323,17 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
                 {t('conversation.showLibrary')}</button>}
             </p>
           )}
-          {asks.map((ask) => <Ask key={ask.ask_id} ask={ask} onAnswered={loadAsks} />)}
+          {asks.map((ask) => <Ask key={ask.ask_id} ask={ask} onAnswered={(done) => {
+            if (done?.budget?.error) setProblem(t('ask.budget.notSaved')); // S1-33: asked again at the next look
+            loadAsks();
+          }} />)}
         </div>
       )}
       <Composer running={running} problem={problem} onSend={submit} projectId={projectId} onAttach={attach}
+        above={<>
+          <Queued conversationId={id} queued={queued} running={running} onChanged={load} onSend={(item) => sendQueued(item)} />
+          <BudgetBar projectId={projectId} conversationId={id} seen={`${reads}.${live?.budget ?? 0}`} />
+        </>}
         onStop={() => Promise.resolve(stop(id, live?.runId ?? shown.find((turn) => turn.status === 'running')?.run_id))
           .then(load).catch(() => {})} />
     </section>
@@ -333,6 +396,7 @@ function Turn({ turn, onContinue, onOpen }) {
     <li className="space-y-3">
       <Question text={turn.message?.text ?? ''} />
       <MemoryNotes items={turn.memory} />
+      <SteeringNotes notes={turn.steering} />
       {turn.status === 'running' && <Working />}
       {turn.answer?.text && <Answer text={turn.answer.text} citations={turn.result_saved ? turn.citations ?? [] : null} onOpen={onOpen} />}
       {turn.answer && !turn.result_saved && <p className="text-xs text-warning">{t('turn.unsaved')}</p>}
@@ -383,12 +447,13 @@ function Notices({ notices }) {
   );
 }
 
-function LiveTurn({ turn }) {
+function LiveTurn({ turn, notes }) {
   const t = useT();
   return (
     <li className="space-y-3">
       <Question text={turn.text} />
       <MemoryNotes items={turn.memory} />
+      <SteeringNotes notes={notes} />
       {turn.answer ? <Answer text={turn.answer} /> : !turn.done && <Working tool={turn.tool} />}
       {turn.answer && turn.resultSaved === false && <p className="text-xs text-warning">{t('turn.unsaved')}</p>}
       {turn.answer && turn.cut && <p className="text-xs text-muted-foreground">{t('turn.cut')}</p>}
@@ -408,7 +473,7 @@ function Answer({ text, citations = null, onOpen }) {
   );
 }
 
-function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
+function Composer({ running, problem, onSend, onStop, projectId, onAttach, above }) {
   const t = useT();
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
@@ -431,7 +496,7 @@ function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
 
   async function submit(event) {
     event?.preventDefault();
-    if (running || busy || !text.trim()) return;
+    if (busy || !text.trim()) return; // S1-33: while a turn runs it steers or waits, as the setting says
     setBusy(true);
     const sent = text;
     setText('');
@@ -449,6 +514,7 @@ function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
     <form onSubmit={submit} className="shrink-0 px-4 pb-4">
       <div className="mx-auto w-full max-w-3xl">
         {problem && <p role="alert" className="mb-2 text-sm text-destructive">{problem}</p>}
+        {above}
         <div className="relative rounded-2xl border bg-card p-2 shadow-xs transition-shadow focus-within:border-brand/50 focus-within:shadow-md focus-within:shadow-brand/5">
           {chosen.length > 0 && (
             <ul className="flex flex-wrap gap-1 px-1 pb-1" aria-label={t('composer.chosen')}>
@@ -475,7 +541,7 @@ function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
             </ul>
           )}
           <label htmlFor="composer" className="sr-only">{t('composer.label')}</label>
-          <textarea id="composer" ref={box} rows={1} value={text} placeholder={t('composer.placeholder')}
+          <textarea id="composer" ref={box} rows={1} value={text} placeholder={t(running ? 'composer.whileRunning' : 'composer.placeholder')}
             role={mention.open ? 'combobox' : undefined} aria-expanded={mention.open ? true : undefined}
             aria-controls={mention.open ? 'composer-mentions' : undefined} aria-autocomplete={mention.open ? 'list' : undefined}
             aria-activedescendant={mention.open && mention.papers.length ? `composer-mention-${mention.active}` : undefined}
@@ -491,16 +557,19 @@ function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
             </Button>
             <ModelPicker projectId={projectId} />
           </div>
-          {running ? (
-            <Button type="button" size="icon" variant="secondary" className="size-9 shrink-0 rounded-xl" onClick={onStop} aria-label={t('composer.stop')}>
-              <Square className="fill-current" aria-hidden="true" />
-            </Button>
-          ) : (
-            <Button type="submit" size="icon" className="size-9 shrink-0 rounded-xl bg-brand text-brand-foreground hover:bg-brand/90"
-              disabled={busy || !text.trim()} aria-label={t('composer.send')}>
-              <ArrowUp aria-hidden="true" />
-            </Button>
-          )}
+          <div className="flex shrink-0 items-center gap-1">
+            {running && (
+              <Button type="button" size="icon" variant="secondary" className="size-9 shrink-0 rounded-xl" onClick={onStop} aria-label={t('composer.stop')}>
+                <Square className="fill-current" aria-hidden="true" />
+              </Button>
+            )}
+            {(!running || text.trim()) && (
+              <Button type="submit" size="icon" className="size-9 shrink-0 rounded-xl bg-brand text-brand-foreground hover:bg-brand/90"
+                disabled={busy || !text.trim()} aria-label={t('composer.send')}>
+                <ArrowUp aria-hidden="true" />
+              </Button>
+            )}
+          </div>
           </div>
         </div>
         <p className="mt-1.5 px-2 text-[11px] text-muted-foreground">{t('composer.hint')}</p>

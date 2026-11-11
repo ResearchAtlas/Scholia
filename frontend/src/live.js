@@ -35,7 +35,10 @@ export function apply(turn, event) {
     case 'step': { const { tool, ...rest } = turn; return rest; } // the next model call: no tool is in use (CT3)
     case 'skill': return { ...turn, skills: [...(turn.skills ?? []), event.name] };
     case 'memory': return { ...turn, memory: [...(turn.memory ?? []), { action: event.action, count: event.count }] }; // S1-21a
-    case 'run_finished': return { ...turn, done: true };
+    // S1-33: a step carried steering notes, or a settlement reached a budget notice: the view reads the record again
+    case 'steering_note': return { ...turn, steered: (turn.steered ?? 0) + 1 };
+    case 'budget': return { ...turn, budget: (turn.budget ?? 0) + 1 };
+    case 'run_finished': return { ...turn, done: true, status: event.status };
     default: return turn;
   }
 }

@@ -154,7 +154,7 @@ test('a live turn follows its events', () => {
   turn = apply(turn, { type: 'run_started', run_id: 'r1' });
   turn = apply(turn, { type: 'chat_response', content: 'A', result_saved: false });
   turn = apply(turn, { type: 'run_finished', status: 'failed' });
-  assert.deepEqual(turn, { text: 'Q', runId: 'r1', answer: 'A', resultSaved: false, done: true });
+  assert.deepEqual(turn, { text: 'Q', runId: 'r1', answer: 'A', resultSaved: false, done: true, status: 'failed' }); // S1-33: how it ended
   assert.equal(apply(turn, { type: 'limit_reached', budget: 'conversation' }).limit, 'budget');
   // S1-19c: a turn limit is named; the tool in use and the skills used are followed
   assert.equal(apply(turn, { type: 'limit_reached', limit: 'agent_steps' }).limit, 'agent_steps');
