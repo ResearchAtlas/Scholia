@@ -683,4 +683,28 @@ CREATE TABLE run_body_memory (
 CREATE INDEX run_body_memory_by_memory ON run_body_memory (memory_id);
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009)
+# S1-33: messages sent while a turn runs that wait as the next turn (slice-1 spec F11, queue): the researcher's text,
+# in the order queued, until one starts as a turn (its admission deletes the row in the same transaction) or is
+# removed; deleted with their conversation (backend/db/deletion.py). And the preview's evaluation project (SPEC:1223),
+# marked in the database when it is created and never after, so no settings file or later change loosens its
+# conservative admission.
+_0010 = r"""
+CREATE TABLE queued_messages (
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
+    conversation_id TEXT NOT NULL REFERENCES conversations (id),
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) CHECK (created_at IS strftime('%Y-%m-%dT%H:%M:%fZ', created_at)),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) CHECK (updated_at IS strftime('%Y-%m-%dT%H:%M:%fZ', updated_at))
+) STRICT;
+CREATE INDEX queued_messages_by_conversation ON queued_messages (conversation_id);
+
+ALTER TABLE projects ADD COLUMN evaluation INTEGER NOT NULL DEFAULT 0 CHECK (evaluation IN (0, 1));
+
+CREATE TRIGGER projects_evaluation_at_creation BEFORE UPDATE OF evaluation ON projects
+WHEN NEW.evaluation IS NOT OLD.evaluation
+BEGIN
+    SELECT RAISE(ABORT, 'a project is marked for evaluation only when it is created');
+END;
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009, _0010)

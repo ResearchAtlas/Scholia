@@ -113,6 +113,8 @@ def populate(db, store, project, tag, paper=None):
             "INSERT INTO candidates (id, run_id, project_id, source, material_id, status) VALUES (?, ?, ?, 'openalex', ?, 'added')",
             (x["k1"], x["r1"], project, x["m1"]))
         conn.execute("INSERT INTO search_plans (run_id, version, plan) VALUES (?, 0, '{}')", (x["r1"],))
+        conn.execute("INSERT INTO queued_messages (id, conversation_id, text) VALUES (?, ?, ?)",  # S1-33
+                     (new_id(), x["c1"], f"next {tag}"))
         conn.execute(
             "INSERT INTO budget_reservations (id, run_id, step_seq, paying_conversation_id, project_id, estimate_usd)"
             " VALUES (?, ?, 0, ?, ?, 0.5)",
