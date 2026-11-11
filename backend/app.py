@@ -1403,7 +1403,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             route, effort, model = await read(lambda conn: conn.execute(
                 "SELECT json_extract(r.inputs, '$.route'), json_extract(r.inputs, '$.effort'), json_extract(e.data,"
                 " '$.plan.model') FROM runs r LEFT JOIN run_events e ON e.run_id = r.id AND e.type = 'route'"
-                " WHERE r.id = ? AND r.conversation_id = ?", (body.after, conversation_id)).fetchone()) or (None,) * 3
+                " WHERE r.id = ? AND r.conversation_id = ? ORDER BY e.seq LIMIT 1", (body.after, conversation_id)
+            ).fetchone()) or (None,) * 3
             # "<provider>:<model>", split at its recorded model (either may hold a colon; as recent_models splits it)
             provider = route[:-len(model) - 1] if route and model and route.endswith(":" + model) else None
         # the papers it names, checked as any message's are (a paper deleted since: selection_invalid, and it waits)

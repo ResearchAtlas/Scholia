@@ -1,6 +1,8 @@
 """The run plan and the pre-send estimate (budget_router.py), per-endpoint prices (endpoint_pricing.py) and what a
 request can reach (reach.py)."""
 
+import sys
+
 import httpx
 import pytest
 
@@ -50,6 +52,7 @@ def test_an_estimate_counts_the_request_and_its_whole_output_limit_at_the_given_
     # PR 52 cycle 4 (design review A2): a count no float can hold is no count, never an OverflowError
     ({"prompt_tokens": 10 ** 400, "completion_tokens": 5}, None),
     ({"prompt_tokens": 5, "completion_tokens": 10 ** 400}, None),
+    ({"prompt_tokens": int(sys.float_info.max) + 1, "completion_tokens": 5}, None),  # as the record's counts (recheck)
 ])
 def test_cost_from_reported_tokens(usage, expected):
     assert budget_router.cost_from_usage(budget_router.UNKNOWN_RATES, usage) == expected

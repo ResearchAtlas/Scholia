@@ -1673,7 +1673,7 @@ async def test_a_reply_whose_cost_or_token_count_no_float_holds_is_delivered_and
     # Design review A2 (G1, new): a reported cost or token count of 401 digits raised OverflowError in the receipt and
     # again in the turn's cleanup, leaving the turn with no end and its reservation open until the next start. Neither
     # is a number the record can use: the answer is delivered, and the call is charged from its readable token counts
-    # at the step's rates, or else at its estimate, marked estimated either way.
+    # at the step's rates, or else at its estimate (its attempt's charge then unknown), settled as estimated either way.
     reply = (200, {"choices": [{"message": {"role": "assistant", "content": "Hi."}}], "usage": usage})
     async with started(tmp_path / "data", MockProvider(reply)) as client:
         conversation = await new_conversation(client, title="t")
