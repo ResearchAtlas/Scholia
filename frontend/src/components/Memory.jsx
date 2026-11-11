@@ -38,9 +38,9 @@ export function MemorySection({ project }) {
       {!found ? <LoadState problem={problem} onRetry={load} /> : (
         <div className="grid gap-6">
           {found.memory_enabled === false && <p className="text-sm text-muted-foreground">{t('memory.offNote')}</p>}
-          <Records title={t('memory.personal')} records={found.personal} onChanged={() => memoryChanged(project?.id ?? null)}
+          <Records title={t('memory.personal')} records={found.personal}
             onFailed={(failed, id) => setUnsaved((kept) => settled(kept, failed, id))} />
-          {project && <Records title={t('memory.project')} records={found.project} onChanged={() => memoryChanged(project.id)}
+          {project && <Records title={t('memory.project')} records={found.project}
             onFailed={(failed, id) => setUnsaved((kept) => settled(kept, failed, id))} />}
         </div>
       )}
@@ -75,8 +75,10 @@ export function Unsaved({ unsaved, onKeep }) {
 // An action from a row or a proposal: what it could not save goes to onFailed(failed, id), outside the rows a reread
 // replaces, and so does its success (onFailed(null, id)), which clears a notice kept for the same record. The views read
 // again after it, but for a failure the server gives only before any write (readsAgain), which leaves the view and its
-// open editor as they are. Returns whether it was done.
-function useMemoryAction(onChanged, onFailed) {
+// open editor as they are. The change names no project, whichever view started it: other projects show these records too
+// (personal memory; a moved conversation's read back), and one may be on screen by the time it ends (MB12). Returns
+// whether it was done.
+function useMemoryAction(onFailed) {
   const t = useT();
   const [busy, setBusy] = useState(false);
   async function act(action, edit = false, id = null) {
@@ -84,13 +86,13 @@ function useMemoryAction(onChanged, onFailed) {
     const failed = await attempt(t, action, edit, id);
     setBusy(false);
     onFailed?.(failed, id);
-    if (readsAgain(failed)) onChanged?.();
+    if (readsAgain(failed)) memoryChanged(null);
     return !failed;
   }
   return { busy, act };
 }
 
-function Records({ title, records, onChanged, onFailed }) {
+function Records({ title, records, onFailed }) {
   const t = useT();
   const pending = records.filter((r) => r.status === 'proposed');
   const kept = records.filter((r) => r.status !== 'proposed');
@@ -101,19 +103,19 @@ function Records({ title, records, onChanged, onFailed }) {
       {pending.length > 0 && (
         <div className="grid gap-2">
           <p className="text-xs font-medium text-muted-foreground">{t('leftOff.confirm')}</p>
-          <ul className="grid gap-2">{pending.map((r) => <Proposal key={r.id} proposal={r} onChanged={onChanged} onFailed={onFailed} />)}</ul>
+          <ul className="grid gap-2">{pending.map((r) => <Proposal key={r.id} proposal={r} onFailed={onFailed} />)}</ul>
         </div>
       )}
-      {kept.length > 0 && <ul className="divide-y rounded-lg border">{kept.map((r) => <Row key={r.id} record={r} onChanged={onChanged}
+      {kept.length > 0 && <ul className="divide-y rounded-lg border">{kept.map((r) => <Row key={r.id} record={r}
         onFailed={onFailed} />)}</ul>}
     </div>
   );
 }
 
-function Row({ record, onChanged, onFailed }) {
+function Row({ record, onFailed }) {
   const t = useT();
   const language = useContext(LanguageContext);
-  const { busy, act } = useMemoryAction(onChanged, onFailed);
+  const { busy, act } = useMemoryAction(onFailed);
   const [editing, setEditing] = useState(null);
   const written = record.type === 'progress' || record.type === 'agent_note'; // by the app or the agent: never confirmed
   const since = record.valid_from ? new Intl.DateTimeFormat(language, { dateStyle: 'medium' }).format(new Date(record.valid_from)) : null;
@@ -156,9 +158,9 @@ function Row({ record, onChanged, onFailed }) {
 
 // One proposal in Things to confirm: Keep confirms it at the version shown (one whose record changed meanwhile comes
 // back marked out of date); Edit saves the researcher's own words for it, confirmed; Forget deletes it.
-export function Proposal({ proposal, onChanged, onFailed }) {
+export function Proposal({ proposal, onFailed }) {
   const t = useT();
-  const { busy, act: acted } = useMemoryAction(onChanged, onFailed);
+  const { busy, act: acted } = useMemoryAction(onFailed);
   const [editing, setEditing] = useState(null);
   const act = (body) => acted(() => review({ id: proposal.id, version: proposal.version, ...body }), body.action === 'edit',
     proposal.id);

@@ -218,3 +218,55 @@ test('the text typed lives only in its open editor', async () => {
   assert.match(view, /t\('memory\.editNotSaved'\)/);
   assert.match(readFileSync(join(SRC, 'components', 'LeftOff.jsx'), 'utf8'), /return unsaved \? /); // said unshown too
 });
+
+// MB12 (PR 51 recheck 6): a record's action can change what other projects show (personal memory is every project's; a
+// moved conversation reads back records its old project keeps), so it names no project, whichever project's view started
+// it: an action still pending when the researcher switches project reaches the one now shown.
+test('an action on a memory record tells every project, once done or of unknown outcome', async () => {
+  const { createServer } = await import('vite');
+  const { createElement: h } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const server = await createServer({ root: join(SRC, '..'), appType: 'custom', logLevel: 'silent',
+    server: { middlewareMode: true, ws: false, watch: null }, optimizeDeps: { noDiscovery: true } });
+  const answer = globalThis.fetch;
+  try {
+    const { Proposal } = await server.ssrLoadModule('/src/components/Memory.jsx');
+    const { libraryEvents: events } = await server.ssrLoadModule('/src/library.js');
+    const click = async (label, reply) => { // the real component's real button, drawn once; its state after that is a no-op
+      let tree;
+      renderToStaticMarkup(h(function Drawn() {
+        tree = Proposal({ proposal: { id: 'r1', version: 1, content: 'x', structured: {} }, onFailed: () => {} });
+        return null;
+      }));
+      const buttons = tree.props.children.flat().at(-1).props.children;
+      const button = buttons.find((b) => b.props.children === t(label));
+      globalThis.fetch = reply;
+      const heard = [];
+      const listen = (event) => heard.push(event.detail);
+      events.addEventListener('changed', listen);
+      try { await button.props.onClick(); } finally { events.removeEventListener('changed', listen); }
+      return heard;
+    };
+    const json = (status, body) => async () => new Response(JSON.stringify(body), { status });
+    assert.deepEqual(await click('memory.forget', json(200, { ok: true })), [null]);
+    assert.deepEqual(await click('memory.keep', json(200, { project_id: 'p1' })), [null]);
+    assert.deepEqual(await click('memory.forget', async () => { throw new TypeError('dropped'); }), [null]); // unknown outcome
+    assert.deepEqual(await click('memory.keep', json(409, { code: 'version_changed' })), [null]); // the record changed
+    assert.deepEqual(await click('memory.keep', json(400, { code: 'personal_from_strict' })), []); // refused: nothing changed
+  } finally {
+    globalThis.fetch = answer;
+    await server.close();
+  }
+});
+
+// MB12: every change that names a project, and why it may: the change stays in that project. A new one is decided here.
+test('a memory change names a project only where the change is confined to it', () => {
+  const files = readdirSync(join(SRC, 'components')).filter((name) => /\.jsx?$/.test(name)).map((name) => join('components', name)).concat(['live.js']);
+  const named = files.flatMap((name) => [...readFileSync(join(SRC, name), 'utf8').matchAll(/memoryChanged\(([^)]*)\)/g)]
+    .filter((call) => call[1] !== 'null').map((call) => `${name}: ${call[1]}`));
+  assert.deepEqual(named.sort(), [
+    'components/Governance.jsx: project.id', // its protection: no record is written, and no other project's read depends on it (backend/memory.py valid)
+    'components/LeftOff.jsx: projectId', // the project's allowance notice (backend/memory.py notice)
+    'components/Settings.jsx: project.id', // the project's own memory switch
+  ]);
+});
