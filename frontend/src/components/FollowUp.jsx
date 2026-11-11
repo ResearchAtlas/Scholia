@@ -29,7 +29,7 @@ export function BudgetBar({ projectId, conversationId, seen }) {
   const label = t(`budget.bar.${bar.budget}`, { spent: money(bar.settled, language), limit: money(bar.limit, language) });
   return (
     <div className="grid gap-1 px-2 pb-1.5 text-[11px] text-muted-foreground">
-      <div role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(bar.percent)}
+      <div role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={bar.meter}
         className="relative h-1 overflow-hidden rounded-full bg-muted">
         <div className={cn('h-full rounded-full', bar.percent >= 90 ? 'bg-warning' : 'bg-brand/70')}
           style={{ width: `${Math.min(bar.percent, 100)}%` }} />

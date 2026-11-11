@@ -15,6 +15,7 @@ const replaced = new WeakMap(); // and the stream it replaced
 const notAdmitted = new WeakSet(); // the streams known never to have started a turn: refused, or stopped before it
 const ended = new WeakSet(); // the streams whose own end (their finally) has run
 const owed = new WeakMap(); // a stream that succeeded while a newer one was sent over it: the drain it left to that one
+const routes = new Map(); // run id -> the route its turn was sent on here ({ model, provider, effort })
 
 // What a stream not admitted gives the conversation back to: the latest stream it replaced still under way (one whose
 // first event is unread may be an admitted turn), else the latest that finished; never one known not admitted.
@@ -79,6 +80,7 @@ export function send(conversationId, path, body, text) {
   return new Promise((admitted, refused) => {
     stream(path, body, (event) => {
       turn = apply(turn, event);
+      if (event.type === 'run_started') routes.set(event.run_id, { model: body?.model, provider: body?.provider, effort: body?.effort });
       if (event.type === 'ask') asksChanged(conversationId); // S1-19c: the agent asks; the conversation shows it
       if (event.type === 'memory') memoryChanged(null); // S1-21a: a command or the agent's note changed memory
       // S1-19c: the help skill opens a place, only while its turn's conversation and project are shown (CT4)
@@ -149,6 +151,12 @@ export async function drain(conversationId, runId, route = {}) {
   } catch {
     // refused (started meanwhile, or no longer after a turn that succeeded): it waits, as the conversation shows
   }
+}
+
+// S1-33: the route a turn was sent on from this window, which a message waiting behind it starts on (Harold,
+// 2026-11-11: a waiting message keeps the finished turn's route); null for a turn sent elsewhere.
+export function sentRoute(runId) {
+  return routes.get(runId) ?? null;
 }
 
 // Stop: cancels the run, which then finishes its stream; before the run has started,

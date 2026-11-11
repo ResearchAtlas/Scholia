@@ -636,8 +636,10 @@ class Harness:
         """S1-33 (F11, steer): a message sent while a turn runs becomes a steering note its next step reads
         ({"steering": {"run_id", "seq"}}), in one transaction ordered with the turn's terminal write by the single
         writer; one for a turn that has ended, will not run here, or offers no tools (it has no next step) waits as
-        the conversation's next turn instead ({"queued": row}). Never a second run. AdmissionError for a run that is
-        not a turn, or a message that is empty or too long."""
+        the conversation's next turn instead ({"queued": row}), never lost; for a turn that has ended or will not run
+        here, "ended" says so, and the interface then starts it as a new turn if the conversation is free (reading
+        12). Never a second run. AdmissionError for a run that is not a turn, or a message that is empty or too
+        long."""
         from backend import budgets  # it imports this module
         if visible(text) is None:
             raise AdmissionError(400, "empty_message", "The message is empty")
@@ -651,12 +653,14 @@ class Harness:
                                (run_id,)).fetchone()
             if row is None or row[0] is None:
                 raise AdmissionError(404, "not_found", "No such turn")
-            if agentic and row[1] == "running" and row[2] is None and not active.cancel_requested.is_set():
+            under_way = row[1] == "running" and row[2] is None and active is not None \
+                and not active.cancel_requested.is_set()
+            if agentic and under_way:
                 (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM run_events WHERE run_id = ?",
                                       (run_id,)).fetchone()
                 _event(conn, run_id, "steering_note", {"text": text})
                 return {"steering": {"run_id": run_id, "seq": seq}}
-            return {"queued": budgets.queue(conn, row[0], text)}
+            return {"queued": budgets.queue(conn, row[0], text), **({} if under_way else {"ended": True})}
         done = await self._write(write)
         if "queued" in done and active is not None:  # the turn's stream says so too (SPEC:641)
             active.events.put_nowait({"type": "queued"})

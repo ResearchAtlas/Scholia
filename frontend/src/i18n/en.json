@@ -1435,6 +1435,7 @@
   "followUp.state.unread": "Not read by Scholia: this turn stopped before its next step",
   "errors.invalid_limit": "Type a budget in US dollars, more than zero.",
   "errors.limit_too_low": "That limit does not cover this step. Type a larger one.",
+  "errors.limitNeeded": "That limit does not cover this step, which needs at least {needed}. Type that or more.",
   "errors.not_queued": "This message is no longer waiting.",
   "errors.not_after_success": "The turn before it did not finish, so send it yourself.",
   "audit.event.budget_decision": "Budget decision",

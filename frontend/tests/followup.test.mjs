@@ -451,3 +451,73 @@ test('a queued stream event marks the live turn, so the view reads the waiting m
   const source = readFileSync(fileURLToPath(new URL('../src/components/ConversationView.jsx', import.meta.url)), 'utf8');
   assert.match(source, /if \(live\?\.steered \|\| live\?\.queued\) load\(\)/);
 });
+
+// Fix batch 2 (PR 52 cycle 2): the follow-up's setting, the amount a budget needs, a waiting message's route, small
+// amounts, the bar's edges, and a steer whose turn had ended.
+const VIEW = () => readFileSync(fileURLToPath(new URL('../src/components/ConversationView.jsx', import.meta.url)), 'utf8');
+
+test('a failed read of the follow-up setting sends nothing: neither steer nor queue is chosen for the researcher (D12)', async (t) => {
+  const posts = [];
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    if (init?.method === 'POST') posts.push(String(url));
+    if (String(url).endsWith('/api/settings')) return Response.json({ code: 'internal' }, { status: 500 });
+    return Response.json({});
+  });
+  await assert.rejects(follow('c1', 'r1', 'Only 2020'), (error) => error.code === 'internal');
+  assert.deepEqual(posts, []);
+});
+
+test('a limit too low for the step says the least amount it needs, rounded up so typing it fits (D13)', async (t) => {
+  const { api } = await import('../src/api.js');
+  const { problemText } = await import('../src/action.js');
+  const { makeT } = await import('../src/i18n/index.js');
+  const zh = JSON.parse(readFileSync(fileURLToPath(new URL('../src/i18n/zh-CN.json', import.meta.url)), 'utf8'));
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ code: 'limit_too_low', message: 'x', needed_usd: 1.2301 },
+    { status: 400 }));
+  const error = await api('POST', '/api/runs/r/asks/a', { text: '1' }).catch((e) => e);
+  assert.equal(error.neededUsd, 1.2301);
+  assert.match(problemText(makeT('en'), error, 'en'), /\$1\.24/);
+  assert.match(problemText(makeT('zh-CN', { 'zh-CN': zh }), error, 'zh-CN'), /US\$1\.24/);
+  assert.equal(problemText(makeT('en'), Object.assign(new Error('x'), { code: 'x' }), 'en'), makeT('en')('errors.internal'));
+});
+
+test('a follow-up queued behind a turn drains on the route that turn was sent on, never the picker\'s choice now (D15)', async (t) => {
+  const { sentRoute } = await import('../src/live.js');
+  const stream = controlledStream();
+  t.mock.method(globalThis, 'fetch', async () => new Response(stream.body));
+  const sending = send('c-d15', '/x', { content: 'Q', model: 'm-a', provider: 'openrouter', effort: 'high', material_ids: ['p'] }, 'Q');
+  stream.event('{"type":"run_started","run_id":"r-d15"}');
+  await sending;
+  assert.deepEqual(sentRoute('r-d15'), { model: 'm-a', provider: 'openrouter', effort: 'high' });
+  assert.equal(sentRoute('r-unknown'), null); // a turn sent elsewhere: its own window drains it, or it waits with Send
+  stream.close();
+  const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
+  assert.ok(!followUp.includes('currentChoice'), followUp);
+  assert.match(followUp, /sentRoute\(after\)/);
+});
+
+test('a positive amount too small for four decimals is never shown as $0 (D17)', async () => {
+  const { money } = await import('../src/text.js');
+  const { auditDetail } = await import('../src/audit.js');
+  const { makeT } = await import('../src/i18n/index.js');
+  assert.equal(money(0.00001, 'en'), '$0.00001');
+  assert.equal(money(0.0000123, 'zh-CN'), 'US$0.000012');
+  assert.equal(money(0.0042, 'en'), '$0.0042'); // unchanged above it
+  assert.equal(money(0, 'en'), '$0.00'); // nothing spent, or reported as zero
+  const details = auditDetail(makeT('en'), { event: 'budget_decision', data: { to_usd: 0.00001 } }, new Intl.DateTimeFormat('en'));
+  assert.ok(!/\$0\.00(?![0-9])/.test(JSON.stringify(details)) && /0\.00001/.test(JSON.stringify(details)), JSON.stringify(details));
+});
+
+test('the bar\'s edges: no notice percents, no bar; its meter never above its maximum; read again after a budget answer (D19)', () => {
+  assert.equal(budgetBar(spend(9, 0, [])), null);
+  assert.equal(budgetBar(spend(12, 0)).meter, 100);
+  assert.equal(budgetBar(spend(5.04, 0)).meter, 50);
+  const bar = readFileSync(fileURLToPath(new URL('../src/components/FollowUp.jsx', import.meta.url)), 'utf8');
+  assert.match(bar, /aria-valuenow=\{bar\.meter\}/);
+  assert.match(VIEW(), /if \(done\?\.budget\) load\(\)/);
+});
+
+test('a steer whose turn had ended starts as a new turn, as Send does, if the conversation is free (D22, reading 12)', () => {
+  const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
+  assert.match(followUp, /if \(sent\.ended\) await sendQueued\(sent\.queued\)/);
+});

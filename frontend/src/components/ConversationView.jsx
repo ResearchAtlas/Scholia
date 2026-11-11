@@ -11,7 +11,7 @@ import { LeftOff, Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
-import { NOTICES, clear, drain, limitText, send, showing, stop, unsavedAnswer, useLiveTurn } from '../live.js';
+import { NOTICES, clear, drain, limitText, send, sentRoute, showing, stop, unsavedAnswer, useLiveTurn } from '../live.js';
 import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
@@ -198,9 +198,11 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     try {
       const sent = await follow(id, runId, text);
       await load();
-      if (sent.queued) { // its turn may have ended already: started if that turn succeeded
-        await readChoice();
-        drain(id, runId ?? (turns ?? []).at(-1)?.run_id, messageRoute(currentChoice()));
+      if (sent.ended) await sendQueued(sent.queued); // a steer whose turn had ended: a new turn if the conversation is free
+      else if (sent.queued) { // its turn may have ended already: started if that turn succeeded, on that turn's route
+        const after = runId ?? (turns ?? []).at(-1)?.run_id;
+        const route = sentRoute(after); // a turn sent from another window: that one starts it, or it waits with Send
+        if (route) drain(id, after, route);
       }
       return true;
     } catch (error) {
@@ -311,6 +313,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
           )}
           {asks.map((ask) => <Ask key={ask.ask_id} ask={ask} onAnswered={(done) => {
             if (done?.budget?.error) setProblem(t('ask.budget.notSaved')); // S1-33: asked again at the next look
+            if (done?.budget) load(); // the record read again, and with it the bar, whose limit may have changed
             loadAsks();
           }} />)}
         </div>

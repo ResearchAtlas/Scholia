@@ -134,6 +134,7 @@ async def test_a_steer_after_its_turn_ended_or_on_a_route_without_tools_is_queue
         stream = await send(client, conversation, "Hello?")
         ended = await steer(client, stream[0]["run_id"], "And another thing")
         assert ended.status_code == 200 and ended.json()["queued"]["text"] == "And another thing"
+        assert ended.json()["ended"] is True  # D22, reading 12: the interface starts it as a new turn if it can
         release = asyncio.Event()
 
         async def held(body):
@@ -145,7 +146,7 @@ async def test_a_steer_after_its_turn_ended_or_on_a_route_without_tools_is_queue
         while not provider.answers[1:]:
             await asyncio.sleep(0.01)
         no_tools = await steer(client, run_id, "Shorter, please")
-        assert no_tools.json()["queued"]["text"] == "Shorter, please"
+        assert no_tools.json()["queued"]["text"] == "Shorter, please" and "ended" not in no_tools.json()
         release.set()
         await sending
         assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == [

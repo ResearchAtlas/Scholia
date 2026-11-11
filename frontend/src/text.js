@@ -8,12 +8,12 @@ export function errorText(t, code) {
 }
 
 // A cost in dollars, as the interface shows it ("about $0.0042"); never shown as $0 when
-// something was spent but rounds to nothing.
+// something was spent but rounds to nothing: one too small for four decimals keeps two significant digits.
 export function money(value, language) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return null;
   const digits = value > 0 && value < 0.01 ? 4 : 2;
-  return new Intl.NumberFormat(language, { style: 'currency', currency: 'USD', minimumFractionDigits: digits,
-    maximumFractionDigits: digits }).format(value);
+  return new Intl.NumberFormat(language, { style: 'currency', currency: 'USD', ...(value > 0 && value < 0.00005
+    ? { maximumSignificantDigits: 2 } : { minimumFractionDigits: digits, maximumFractionDigits: digits }) }).format(value);
 }
 
 // The text trimmed, or null when it has no visible character, as the backend reads names and

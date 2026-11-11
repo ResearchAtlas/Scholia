@@ -11,10 +11,11 @@ export function startSession(win = window) {
 }
 
 export class ApiError extends Error {
-  constructor(status, code) {
+  constructor(status, code, neededUsd) {
     super(code);
     this.status = status;
     this.code = code;
+    if (typeof neededUsd === 'number') this.neededUsd = neededUsd; // S1-33: the least budget limit a step needs
   }
 }
 
@@ -30,10 +31,10 @@ export function headers(json) {
 // undone): the window is told, and the app checks its health and offers the restore (App.jsx).
 const LIMITED = new Set(['database_damaged', 'restore_interrupted', 'database_unavailable', 'restart_required']);
 
-function failure(status, code) {
+function failure(status, code, data) {
   // by code, whatever the status: a backup that first finds the damage answers 409 database_damaged
   if (LIMITED.has(code)) globalThis.dispatchEvent?.(new Event('scholia:limited'));
-  return new ApiError(status, code);
+  return new ApiError(status, code, data?.needed_usd);
 }
 
 export async function api(method, path, body, { signal } = {}) {
@@ -50,7 +51,7 @@ export async function api(method, path, body, { signal } = {}) {
     throw new ApiError(0, 'unreachable');
   }
   const data = await response.json().catch(() => null);
-  if (!response.ok) throw failure(response.status, data?.code ?? 'http_error');
+  if (!response.ok) throw failure(response.status, data?.code ?? 'http_error', data);
   return data;
 }
 
