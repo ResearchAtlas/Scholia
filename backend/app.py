@@ -1396,9 +1396,17 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             (queued_id, conversation_id)).fetchone())
         if row is None:
             raise ApiError(409, "not_queued", "This message is no longer waiting")
+        provider, model, effort = body.provider, body.model, body.effort
+        if body.after is not None:  # started on its own: on the route and effort that turn ran on, whatever the request
+            # names or the default is now (Harold, 2026-11-11: a waiting message keeps the finished turn's route; PR 52
+            # cycle 4, G8); the admission refuses it unless that turn is the latest and succeeded
+            route, effort = await read(lambda conn: conn.execute(
+                "SELECT json_extract(inputs, '$.route'), json_extract(inputs, '$.effort') FROM runs"
+                " WHERE id = ? AND conversation_id = ?", (body.after, conversation_id)).fetchone()) or (None, None)
+            provider, _, model = (route or ":").partition(":")  # "<provider>:<model>", as answers.check splits it
         # the papers it names, checked as any message's are (a paper deleted since: selection_invalid, and it waits)
-        claim = await harness().admit_turn(conversation_id, row[0], model=body.model, provider=body.provider,
-                                           effort=body.effort, material_ids=json.loads(row[1]) if row[1] else None,
+        claim = await harness().admit_turn(conversation_id, row[0], model=model or None, provider=provider or None,
+                                           effort=effort, material_ids=json.loads(row[1]) if row[1] else None,
                                            queued=(queued_id, body.after))
         return stream(claim)
 

@@ -245,6 +245,33 @@ async def test_a_queued_message_starts_on_its_own_only_after_a_turn_that_succeed
         assert sent.status_code == 200 and events(sent)[-1]["status"] == "succeeded"
 
 
+@pytest.mark.parametrize("named_route", [False, True])
+async def test_a_waiting_message_started_after_a_turn_runs_on_that_turns_recorded_route_whatever_the_request_says(
+        tmp_path, named_route):
+    # PR 52 cycle 4 (G8; Harold, 2026-11-11: a waiting message keeps the finished turn's route; cycle 4 C's probe): a
+    # turn sent on the default route (Auto), then the default changed in Settings. The waiting message started after
+    # it (after) runs on the route and effort that turn recorded (runs.inputs), never the new default, nor a model,
+    # provider or effort its request names.
+    from backend import budget_router
+    async with started(tmp_path / "data", MockProvider()) as client:
+        conversation = await named(client)
+        first = await send(client, conversation, "First?")
+        assert first[-1]["status"] == "succeeded"
+        run_id = first[0]["run_id"]
+        [(route,)] = await rows(client, "SELECT json_extract(inputs, '$.route') FROM runs WHERE id = ?", run_id)
+        other = next(m for m in sorted(budget_router.RECOMMENDED) if route != f"openrouter:{m}")
+        queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})).json()
+        settings = (await client.get("/api/settings")).json()
+        assert (await client.put("/api/settings", json={"hash": settings["hash"],
+                                                        "updates": {"models.default": other}})).status_code == 200
+        body = {"after": run_id, **({"provider": "openrouter", "model": other, "effort": "high"} if named_route else {})}
+        sent = await client.post(f"/api/conversations/{conversation}/queue/{queued['id']}/send", json=body)
+        assert sent.status_code == 200 and events(sent)[-1]["status"] == "succeeded"
+        assert await rows(client, "SELECT json_extract(inputs, '$.route'), json_extract(inputs, '$.effort') FROM runs"
+                                  " WHERE conversation_id = ? AND kind = 'turn' ORDER BY started_at", conversation) == [
+            (route, None), (route, None)]
+
+
 async def test_the_queue_drains_once_whatever_arrives_at_the_same_moment(tmp_path):
     # L8, I1: two starts of the same queued message, and a new message, at once: exactly one turn starts.
     async with started(tmp_path / "data") as client:
