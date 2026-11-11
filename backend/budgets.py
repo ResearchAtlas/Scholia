@@ -21,7 +21,7 @@ import re
 import unicodedata
 
 from backend import governance, openrouter, spending
-from backend.runs import _budgets_now, _event
+from backend.runs import _budget_unread, _budgets_now, _event
 from backend.settings import PERSONAL, PROJECT, load_settings
 
 _EPSILON = 1e-9
@@ -89,7 +89,8 @@ def spend(conn, data_dir, project_id, conversation_id=None):
         return None
     limits = _limits(conn, data_dir, project_id, conversation_id)
     settled, held = totals(conn, project_id=project_id)
-    found = {"project": {"limit_usd": limits["project"][0], "settled_usd": settled, "open_usd": held,
+    unread = _budget_unread(load_settings(data_dir, project_id))  # no limit shown that its file does not give (E4)
+    found = {"project": {"limit_usd": None if unread else limits["project"][0], "settled_usd": settled, "open_usd": held,
                          **bases(conn, project_id=project_id)}, "conversation": None,
              "notice_percents": sorted(load_settings(data_dir).values["budget"]["notice_percents"])}
     if conversation_id is not None:
@@ -199,7 +200,9 @@ def decide(conn, run_id, ask, option, text, data_dir):
     else:
         decision = option
         wanted = {"continue": round(current + amount, 9), "go_ahead": max(current, needed)}.get(option, current)
-    stale = abs(current - params["limit_usd"]) > _EPSILON
+    # An ask raised while the project's file did not give its budget (unread, PR 52 cycle 3, E4): only a typed limit
+    # means anything; Continue and Go ahead have no amount to add to, so they apply nothing and the step is checked again
+    stale = abs(current - params["limit_usd"]) > _EPSILON or (bool(params.get("unread")) and text is None)
     applied = not stale and decision not in STOPS and abs(wanted - current) > _EPSILON
     to = wanted if applied else current
     pending = applied and budget == "project"

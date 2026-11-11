@@ -39,6 +39,7 @@ export function Ask({ ask, onAnswered }) {
   const budget = ask.kind === 'budget' ? ask.params : null; // S1-33: at the cap, or one step over what is left
   const question = approval ? t('ask.approval.question', { tool: toolName(t, approval) })
     : failures ? t('ask.toolErrors.question', { count: failures })
+      : budget?.unread ? t('ask.budget.unread') // its file does not give the project's budget: never said to be $0
       : budget ? t(`ask.budget.${budget.form}.${budget.budget}`, {
         limit: money(budget.limit_usd, language), estimate: money(budget.estimate_usd, language),
         left: money(Math.max(budget.limit_usd - budget.spent_usd, 0), language),

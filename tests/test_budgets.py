@@ -1000,6 +1000,53 @@ async def test_a_failed_write_that_leaves_an_unreadable_file_is_never_taken_as_s
             await sending
 
 
+@pytest.mark.asyncio
+async def test_after_a_failed_save_leaves_the_file_unreadable_the_waiting_step_asks_again_never_at_the_default(
+        tmp_path, monkeypatch):
+    # S1-33 fix batch 3 (E4; Harold, 2026-10-21: if the write fails nothing is raised and the next step asks again): the
+    # answer's write left the project's config.toml unreadable, whose loader then gives the shipped $50 default. That is
+    # never the limit: the waiting step does not go out, it asks again, saying the budget could not be read (never that
+    # it is $0); Continue has no amount to add to and applies nothing; the bar shows no project limit; and every
+    # admission (a turn's, a title's, an extraction's, a judge's unspent held again) reads no room (runs._budgets_now).
+    from backend import settings
+    from test_agent_loop import asked
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 1.0)
+        await _spent(client, project, 1.0)
+        sending, ask = await _asking(client, conversation)
+        real = settings.write_private
+
+        def broken(path, data):
+            real(path, b"[project\nbudget_usd = ")
+            raise OSError("fsync of the folder failed")
+        monkeypatch.setattr(settings, "write_private", broken)
+        answered = (await _answer(client, ask, text="2")).json()["budget"]
+        monkeypatch.setattr(settings, "write_private", real)
+        assert (answered["applied"], answered.get("error"), answered["limit_usd"]) == (False, "not_saved", 1.0)
+        again = await asked(client, conversation)
+        while again["ask_id"] == ask["ask_id"]:
+            assert not sending.done(), (await sending)[-1]
+            await asyncio.sleep(0.02)
+            again = await asked(client, conversation)
+        assert (again["params"]["budget"], again["params"].get("unread")) == ("project", True)
+        assert client.provider.answers == []  # the step never went out
+        spend = (await client.get(f"/api/projects/{project}/spend", params={"conversation_id": conversation})).json()
+        assert spend["project"]["limit_usd"] is None
+        assert (await _answer(client, again, option="continue")).json()["budget"]["applied"] is False
+        third = await asked(client, conversation)
+        while third["ask_id"] == again["ask_id"]:
+            await asyncio.sleep(0.02)
+            third = await asked(client, conversation)
+        assert third["params"].get("unread") is True and client.provider.answers == []
+        await _answer(client, third, option="stop")
+        stream = await sending
+        assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "limit")
+        assert client.provider.answers == []
+        from backend import runs
+        assert (await asyncio.to_thread(runs._budgets_now, tmp_path / "data", project))[0] == 0.0
+
+
 # S1-33 fix batch 2 (PR 52 cycle 2 on 4769f6e): lifecycle first (charter section 10)
 
 
@@ -1130,6 +1177,54 @@ async def test_a_settings_edit_makes_the_project_limit_continues_amount_even_bac
         sending, ask = await _asking(client, conversation, "Again?")
         assert ask["params"]["form"] == "cap"
         assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == after
+        await sending
+
+
+@pytest.mark.asyncio
+async def test_a_settings_edit_cancelled_once_its_file_is_written_still_makes_the_limit_continues_amount(
+        tmp_path, monkeypatch):
+    # S1-33 fix batch 3 (E3, reading 3): as D3's test, but each Settings save is cancelled once its config.toml write
+    # has completed. The clear of the last decision runs inside the save's own protection, so it is never skipped: the
+    # next Continue adds $2 (to $4), not the $1 the old decision added.
+    import contextlib
+    import threading
+    from backend import settings as settings_module
+    real_save, written, release = settings_module.Settings.save, threading.Event(), threading.Event()
+
+    def saving(self, updates):
+        result = real_save(self, updates)
+        if "project.budget_usd" in updates and armed:
+            written.set()
+            release.wait(10)  # the request is cancelled here, its file already written
+        return result
+    armed = False
+    monkeypatch.setattr(settings_module.Settings, "save", saving)
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 1.0)
+        await _spent(client, project, 1.0)
+        sending, ask = await _asking(client, conversation)
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 2.0
+        await sending
+        armed = True
+        for usd in (5.0, 2.0):
+            read = (await client.get("/api/settings", params={"project_id": project})).json()
+            written.clear()
+            release.clear()
+            editing = asyncio.create_task(client.put("/api/settings", json={
+                "project_id": project, "hash": read["hash"], "updates": {"project.budget_usd": usd}}))
+            assert await asyncio.to_thread(written.wait, 10)
+            editing.cancel()
+            release.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await editing
+            assert await _project_budget(client, project) == usd  # its file was written
+        armed = False
+        [(spent,)] = await _rows(client, "SELECT sum(settled_usd) FROM budget_reservations WHERE project_id = ?", project)
+        await _spent(client, project, round(2.0 - spent, 9))  # the cap again
+        sending, ask = await _asking(client, conversation, "Again?")
+        assert ask["params"]["form"] == "cap"
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 4.0
         await sending
 
 

@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from backend import governance
 from backend.db import new_id
-from backend.runs import _event
+from backend.runs import _budget_unread, _event
 from backend.settings import load_settings, visible
 
 log = logging.getLogger(__name__)
@@ -284,8 +284,8 @@ def _save_project_budget(data_dir, decided):
         loaded = load_settings(data_dir, decided["project_id"])
     except Exception:
         return False
-    if any(p["key"] in (None, "project.budget_usd") for p in loaded.problems):  # an unreadable file, or this value,
-        return False  # gives the default, never what it holds: unknown, so not saved
+    if _budget_unread(loaded):  # an unreadable file, or this value, gives the default, never what it holds: unknown,
+        return False  # so not saved
     return abs(loaded.values["project"]["budget_usd"] - decided["to_usd"]) <= 1e-9
 
 
