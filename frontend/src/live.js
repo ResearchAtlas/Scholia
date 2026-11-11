@@ -11,6 +11,7 @@ import { memoryChanged } from './memory.js';
 const turns = new Map(); // conversation id -> { text, runId, answer, resultSaved, error, limit, done }
 const aborts = new Map();
 const latest = new WeakMap(); // S1-33: each stream's own latest state (by its abort controller), owned or not
+const replaced = new WeakMap(); // and the stream it replaced
 const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut, notices }, for this window
 const listeners = new Set();
 
@@ -57,6 +58,7 @@ export function send(conversationId, path, body, text) {
   const mine = () => aborts.get(conversationId) === abort;
   aborts.set(conversationId, abort);
   latest.set(abort, turn);
+  replaced.set(abort, before.abort);
   set(conversationId, turn, 'send');
   return new Promise((admitted, refused) => {
     stream(path, body, (event) => {
@@ -76,9 +78,11 @@ export function send(conversationId, path, body, text) {
     }, abort.signal).catch((error) => {
       if (turn.runId || error.name === 'AbortError') return;
       if (mine()) {
-        const prior = before.abort ? latest.get(before.abort) ?? before.turn : before.turn;
+        let owner = before.abort; // past any stream that was itself refused, never admitted
+        while (owner && !latest.get(owner)?.runId) owner = replaced.get(owner);
+        const prior = owner ? latest.get(owner) : null;
         if (prior) { // the turn it replaced comes back as it is now, finished or under way
-          if (prior.done) aborts.delete(conversationId); else aborts.set(conversationId, before.abort);
+          if (prior.done) aborts.delete(conversationId); else aborts.set(conversationId, owner);
           set(conversationId, prior, 'restored');
         } else {
           set(conversationId, null, 'refused');

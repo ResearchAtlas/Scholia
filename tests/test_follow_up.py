@@ -397,3 +397,31 @@ async def test_a_read_note_stays_in_the_conversations_history_and_an_unread_one_
         said = [m["content"] for m in later if m["role"] == "user"]
         assert said[0].startswith("Which papers do I have?") and "Only the ones from 2020" in said[0]
         assert said[-1] == "And now?"
+
+
+async def test_continue_carries_the_notes_its_turn_read(tmp_path):
+    # Fix batch 1 recheck (P2): a turn stopped at a limit after a step read a note: Continue sends its message with the
+    # note, since the stopped turn is not in history and a read note is not queued.
+    from test_agent_loop import asked
+    gate = Gate(0)
+    provider = Scripted(None, [call("list_materials", "c2")], cost=0.04)
+    provider.script[0] = gate.wrap(provider, {"calls": [call("list_materials")]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = 0.1 WHERE id = ?", (conversation,)))
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await gate.reached.wait()
+        run_id = await running_run(client, conversation)
+        await steer(client, run_id, "Only the ones from 2020")
+        gate.open.set()
+        ask = await asked(client, conversation)  # the third step does not fit; the second carried the note
+        await client.post(f"/api/runs/{run_id}/asks/{ask['ask_id']}", json={"option": ask["options"][-1]})
+        assert (await sending)[-1]["cancel_reason"] == "limit"
+        assert [n["state"] for n in (await conversation_read(client, conversation))["turns"][-1]["steering"]] == ["read"]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = 5 WHERE id = ?", (conversation,)))
+        continued = await client.post(f"/api/runs/{run_id}/continue", json={})
+        assert events(continued)[-1]["status"] == "succeeded"
+        said = [m["content"] for m in provider.steps[-1]["messages"] if m["role"] == "user"]
+        assert said[-1] == "Which papers do I have?\n\nOnly the ones from 2020"

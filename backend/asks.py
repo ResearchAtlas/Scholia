@@ -273,8 +273,8 @@ def _save_project_budget(data_dir, decided):
         loaded = load_settings(data_dir, decided["project_id"])
     except Exception:
         return False
-    if loaded.problems:  # a file it cannot read gives defaults, never what it holds: unknown, so not saved
-        return False
+    if any(p["key"] in (None, "project.budget_usd") for p in loaded.problems):  # an unreadable file, or this value,
+        return False  # gives the default, never what it holds: unknown, so not saved
     return abs(loaded.values["project"]["budget_usd"] - decided["to_usd"]) <= 1e-9
 
 

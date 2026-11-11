@@ -175,3 +175,27 @@ test('an older turn that finishes while a newer send is pending is shown finishe
   assert.equal(last?.runId, 'r-old');
   assert.equal(last?.done, true); // never left showing a turn that runs
 });
+
+test('three overlapping sends: when the later two are refused, the running turn keeps its state and Stop', async (t) => {
+  const posts = [];
+  const refusals = {};
+  const running = openStream('r-run');
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    url = String(url);
+    if (init?.method === 'POST' && url.includes('/cancel')) posts.push(url);
+    if (url === '/run') return new Response(running.body);
+    if (url === '/two' || url === '/three') return new Promise((resolve) => { refusals[url] = resolve; });
+    return Response.json({});
+  });
+  await send('c-four', '/run', {}, 'Running');
+  const two = send('c-four', '/two', {}, 'Two').catch((error) => error);
+  const three = send('c-four', '/three', {}, 'Three').catch((error) => error);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  refusals['/two'](Response.json({ code: 'active_run' }, { status: 409 }));
+  await two;
+  refusals['/three'](Response.json({ code: 'active_run' }, { status: 409 }));
+  await three;
+  await stop('c-four');
+  assert.deepEqual(posts, ['/api/runs/r-run/cancel']);
+  running.close();
+});

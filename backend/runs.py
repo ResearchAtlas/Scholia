@@ -600,10 +600,12 @@ class Harness:
         revoked by a change to its project, from the conversation as it is now. It is the
         conversation's latest turn; the new turn sends its message again and records
         which run it continues. Its recorded steps are not reused."""
-        row = await self._read(lambda conn: conn.execute(
+        from backend import budgets  # it imports this module
+        row, notes = await self._read(lambda conn: (conn.execute(
             "SELECT t.conversation_id, t.user_message, r.status, r.cancel_reason,"
             " t.seq = (SELECT max(seq) FROM turns WHERE conversation_id = t.conversation_id)"
-            " FROM turns t JOIN runs r ON r.id = t.run_id WHERE t.run_id = ?", (run_id,)).fetchone())
+            " FROM turns t JOIN runs r ON r.id = t.run_id WHERE t.run_id = ?", (run_id,)).fetchone(),
+            budgets.read_notes(conn, run_id)))
         if row is None:
             raise AdmissionError(404, "not_found", "No such turn")
         conversation_id, message, status, cancel_reason, latest = row
@@ -611,7 +613,11 @@ class Harness:
         if not latest or not (status == "interrupted" or (status == "cancelled" and cancel_reason in ("limit", "revoked"))):
             raise AdmissionError(409, "not_continuable", "Only the latest interrupted or stopped turn can be continued")
         message = json.loads(message)
-        return await self.admit_turn(conversation_id, message.get("text", ""), model=model, provider=provider,
+        # S1-33: the notes its steps read are its researcher's words too; the stopped turn is not in later history
+        text = "\n\n".join([message.get("text", ""), *notes])
+        # shortcut: a message and notes together over the limit go without the notes, still shown on the stopped turn
+        text = text if len(text) <= MAX_MESSAGE_CHARS else message.get("text", "")
+        return await self.admit_turn(conversation_id, text, model=model, provider=provider,
                                      effort=effort, retry_of=run_id, material_ids=message.get("material_ids"))
 
     async def steer(self, run_id: str, text: str) -> dict:
