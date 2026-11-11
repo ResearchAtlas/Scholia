@@ -1205,6 +1205,8 @@ async def test_a_stop_that_comes_before_a_failed_or_limited_turn_commits_wins(tm
         assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == outcome
         assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", claim.run_id) == [outcome]
         if reason == "shutdown":  # interrupted by closing the app: Continue is offered
+            if ending == "limit":  # the continued turn's step fits again (S1-33: one that does not would ask)
+                monkeypatch.setattr(runs_module.spending, "reserve", real)
             assert (await client.post(f"/api/runs/{claim.run_id}/continue")).status_code == 200
 
 
