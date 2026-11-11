@@ -919,3 +919,54 @@ async def test_continue_on_a_zero_budget_adds_the_configured_default(tmp_path):
         sending, ask = await _asking(client, conversation)
         assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 25
         assert (await sending)[-1]["status"] == "succeeded"
+
+
+# S1-33 fix batch 1 (PR 52 review 1)
+
+
+@pytest.mark.asyncio
+async def test_the_projects_continue_amount_survives_deleting_the_conversation_that_set_it(tmp_path):
+    # Finding 1 (A5, reading 3): $1 becomes $2, the conversation that asked is deleted, and the next Continue still
+    # adds $1: never compounding, whatever history is deleted.
+    async with await _app(tmp_path) as client:
+        first, project = await _conversation(client)
+        await _project_budget(client, project, 1.0)
+        await _spent(client, project, 1.0)
+        sending, ask = await _asking(client, first)
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 2.0
+        await sending
+        assert (await client.delete(f"/api/conversations/{first}")).status_code == 200
+        second, _ = await _conversation(client, title="Other")
+        [(spent,)] = await _rows(client, "SELECT sum(settled_usd) FROM budget_reservations WHERE project_id = ?", project)
+        await _spent(client, project, round(2.0 - spent, 9))  # the cap again
+        sending, ask = await _asking(client, second)
+        assert ask["params"]["form"] == "cap"
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 3.0
+        await sending
+
+
+@pytest.mark.asyncio
+async def test_a_settings_write_that_fails_after_replacing_the_file_is_judged_by_what_the_file_says(tmp_path, monkeypatch):
+    # Finding 3 (L5 b, U2): the file was replaced and then its folder's sync failed: the budget did change, so the
+    # reply, the record and the audit say it was applied, and the step goes on with the new limit.
+    import json
+    from backend import settings
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 1.0)
+        await _spent(client, project, 1.0)
+        sending, ask = await _asking(client, conversation)
+        real = settings.write_private
+
+        def replaced_then_failed(path, data):
+            real(path, data)
+            raise OSError("fsync of the folder failed")
+        monkeypatch.setattr(settings, "write_private", replaced_then_failed)
+        answered = (await _answer(client, ask, option="continue")).json()["budget"]
+        monkeypatch.setattr(settings, "write_private", real)
+        assert answered == {"applied": True, "budget": "project", "limit_usd": 2.0}
+        assert await _project_budget(client, project) == 2.0
+        assert (await sending)[-1]["status"] == "succeeded"
+        assert [(d["applied"], d["to_usd"]) for d in await _decisions(client, ask["run_id"])] == [(False, 1.0), (True, 2.0)]
+        audited = [json.loads(d) for (d,) in await _rows(client, "SELECT data FROM audit_log WHERE event = 'budget_decision'")]
+        assert [(a["to_usd"], a["applied"]) for a in audited] == [(2.0, True)]

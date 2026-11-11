@@ -687,7 +687,8 @@ CREATE INDEX run_body_memory_by_memory ON run_body_memory (memory_id);
 # in the order queued, until one starts as a turn (its admission deletes the row in the same transaction) or is
 # removed; deleted with their conversation (backend/db/deletion.py). And the preview's evaluation project (SPEC:1223),
 # marked in the database when it is created and never after, so no settings file or later change loosens its
-# conservative admission.
+# conservative admission. A project's last applied budget decision ({"to_usd", "amount_usd"}): what Continue adds again
+# while its budget is still what that decision left, kept with the project so deleting a conversation never changes it.
 _0010 = r"""
 CREATE TABLE queued_messages (
     id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
@@ -699,6 +700,7 @@ CREATE TABLE queued_messages (
 CREATE INDEX queued_messages_by_conversation ON queued_messages (conversation_id);
 
 ALTER TABLE projects ADD COLUMN evaluation INTEGER NOT NULL DEFAULT 0 CHECK (evaluation IN (0, 1));
+ALTER TABLE projects ADD COLUMN budget_decided TEXT CHECK (budget_decided IS NULL OR json_valid(budget_decided));
 
 CREATE TRIGGER projects_evaluation_at_creation BEFORE UPDATE OF evaluation ON projects
 WHEN NEW.evaluation IS NOT OLD.evaluation

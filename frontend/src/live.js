@@ -47,9 +47,13 @@ export function apply(turn, event) {
 // Sends a message (or continues a turn) and follows its stream. Resolves once the turn is
 // admitted, or rejects with the refusal when it was not; an admitted turn ends done
 // however its stream ends, and the conversation's saved turns tell what happened.
+// A stream owns its conversation's live state while it is the latest sent there: an older one never overwrites or clears
+// a newer one's, and one refused gives back what it replaced (S1-33, PR 52 review 1), so Stop always reaches the turn shown.
 export function send(conversationId, path, body, text) {
   const abort = new AbortController();
   let turn = { text, runId: null, answer: null, done: false };
+  const before = { abort: aborts.get(conversationId), turn: turns.get(conversationId) };
+  const mine = () => aborts.get(conversationId) === abort;
   aborts.set(conversationId, abort);
   set(conversationId, turn, 'send');
   return new Promise((admitted, refused) => {
@@ -64,13 +68,21 @@ export function send(conversationId, path, body, text) {
       if (event.type === 'chat_response' && event.result_saved === false && turn.runId) {
         unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut), ...(event.notices ? { notices: event.notices } : {}) });
       }
-      set(conversationId, turn, event.type);
+      if (mine()) set(conversationId, turn, event.type);
       if (turn.runId) admitted();
     }, abort.signal).catch((error) => {
       if (turn.runId || error.name === 'AbortError') return;
-      set(conversationId, null, 'refused');
+      if (mine()) {
+        if (before.turn && !before.turn.done) { // a turn still under way here: its state comes back
+          aborts.set(conversationId, before.abort);
+          set(conversationId, before.turn, 'restored');
+        } else {
+          set(conversationId, null, 'refused');
+        }
+      }
       refused(error);
     }).finally(() => {
+      if (!mine()) return admitted();
       aborts.delete(conversationId);
       if (turns.get(conversationId) && !turn.done) set(conversationId, { ...turn, done: true }, 'run_finished');
       admitted();
@@ -88,6 +100,8 @@ export async function drain(conversationId, runId, route = {}) {
 
   try {
     const next = nextQueued(await get(`/api/conversations/${encodeURIComponent(conversationId)}`), runId);
+    const now = turns.get(conversationId);
+    if (now && !now.done) return; // a turn started here while the conversation was read: it is never disturbed
     const { model, provider, effort } = route;
     if (next) {
       await send(conversationId, `/api/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(next.id)}/send`,

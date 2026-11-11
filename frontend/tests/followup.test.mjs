@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { budgetBar, follow, nextQueued } from '../src/followup.js';
-import { send } from '../src/live.js';
+import { drain, send, stop } from '../src/live.js';
 
 const spend = (conversation, project, percents = [50, 85, 90]) => ({
   conversation: { limit_usd: 10, settled_usd: conversation, open_usd: 0, own: false },
@@ -100,3 +100,54 @@ for (const [status, started] of [['succeeded', true], ['failed', false], ['cance
       { model: 'm1', provider: 'openrouter', after: `r1-${status}` }]] : []);
   });
 }
+
+// PR 52 review 1 (finding 4): a drain whose read was asked before a manual send started never starts its message, and a
+// stream refused never clears or orphans a newer stream's state, so Stop still cancels the newer turn.
+function openStream(runId) { // a stream that has started its run and stays open until close()
+  let controller;
+  const body = new ReadableStream({ start(c) { controller = c; c.enqueue(new TextEncoder().encode(`data: {"type":"run_started","run_id":"${runId}"}\n\n`)); } });
+  return { body, close: () => controller.close() };
+}
+
+test('a drain whose read was asked before a manual send starts nothing, and Stop still cancels the manual turn', async (t) => {
+  const posts = [];
+  let answerRead;
+  const manual = openStream('r-manual');
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    url = String(url);
+    if (init?.method === 'POST') posts.push(url);
+    if (url === '/api/conversations/c-race') return new Promise((resolve) => { answerRead = resolve; });
+    if (url === '/manual') return new Response(manual.body);
+    return Response.json({ run_id: 'r-manual', status: 'cancelled' });
+  });
+  const draining = drain('c-race', 'r1', {});
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await send('c-race', '/manual', {}, 'Typed now'); // admitted: its run started
+  answerRead(Response.json({ turns: [{ run_id: 'r1', status: 'succeeded' }], queued: [{ id: 'q1', text: 'Next' }] }));
+  await draining;
+  assert.deepEqual(posts.filter((url) => url.includes('/queue/')), []);
+  await stop('c-race');
+  assert.ok(posts.includes('/api/runs/r-manual/cancel'));
+  manual.close();
+});
+
+test('a stream refused after a newer one started leaves the newer one\'s state and Stop alone', async (t) => {
+  const posts = [];
+  let refuse;
+  const newer = openStream('r-new');
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    url = String(url);
+    if (init?.method === 'POST' && url.includes('/cancel')) posts.push(url);
+    if (url === '/older') return new Promise((resolve) => { refuse = resolve; });
+    if (url === '/newer') return new Response(newer.body);
+    return Response.json({});
+  });
+  const older = send('c-two', '/older', {}, 'Older').catch((error) => error);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await send('c-two', '/newer', {}, 'Newer');
+  refuse(Response.json({ code: 'active_run' }, { status: 409 }));
+  assert.equal((await older).code, 'active_run');
+  await stop('c-two');
+  assert.deepEqual(posts, ['/api/runs/r-new/cancel']);
+  newer.close();
+});

@@ -671,6 +671,7 @@ class Harness:
             raise
 
     async def _admit(self, claim, message, *, model, provider, effort, retry_of, material_ids=None, queued=None):
+        from backend import budgets as budget_rules  # it imports this module
         conversation = await self._read(lambda conn: conn.execute(
             "SELECT project_id FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone())
         if conversation is None:
@@ -797,8 +798,9 @@ class Harness:
                 " AND t.answer IS NOT NULL ORDER BY t.seq DESC", (claim.conversation_id,))]
             kept_turns = [turn for turn in earlier if provenance.sendable(conn, project_id, turn[2])]
             history_left_out = len(earlier) - len(kept_turns)  # traced with the answer's step
-            history = [(json.loads(u).get("text", ""), historical_citations(json.loads(a).get("text", "")))
-                       for u, a, _, _ in kept_turns]
+            # S1-33: a turn's steering notes a step read are its researcher's words too, after its message
+            history = [("\n\n".join([json.loads(u).get("text", ""), *budget_rules.read_notes(conn, run)]),
+                        historical_citations(json.loads(a).get("text", ""))) for u, a, _, run in kept_turns]
             history_materials = [held for _, _, held, _ in kept_turns]  # newest first, as history is
             history_ids = [run for *_, run in kept_turns]  # S1-21b: their runs, for compaction
             # The skills its earlier turns activated, most recently used first: ACTIVE SKILLS, each loaded once. A skill

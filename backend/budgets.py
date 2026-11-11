@@ -130,13 +130,19 @@ def _typed(text):
 
 def _amount(conn, budget, scope_id, current, default):
     """What Continue adds: the amount the budget's last decision recorded while its limit is what that decision left,
-    else the limit itself; for a limit of zero, the budget's default as configured (so Continue never adds nothing)."""
-    column = "r.conversation_id" if budget == "conversation" else "r.project_id"
-    row = conn.execute(
-        "SELECT json_extract(e.data, '$.to_usd'), json_extract(e.data, '$.amount_usd') FROM run_events e"
-        f" JOIN runs r ON r.id = e.run_id WHERE e.type = 'budget_decision' AND {column} = ?"
-        " AND json_extract(e.data, '$.budget') = ? AND json_extract(e.data, '$.amount_usd') IS NOT NULL"
-        " ORDER BY e.rowid DESC LIMIT 1", (scope_id, budget)).fetchone()
+    else the limit itself; for a limit of zero, the budget's default as configured (so Continue never adds nothing).
+    A conversation's decisions are its runs' events, deleted only with it; a project's last applied one is kept on the
+    project (projects.budget_decided), since its conversations, and their runs, may be deleted (review 1 of PR 52)."""
+    if budget == "project":
+        row = conn.execute("SELECT json_extract(budget_decided, '$.to_usd'), json_extract(budget_decided, '$.amount_usd')"
+                           " FROM projects WHERE id = ?", (scope_id,)).fetchone()
+        row = row if row is not None and row[1] is not None else None
+    else:
+        row = conn.execute(
+            "SELECT json_extract(e.data, '$.to_usd'), json_extract(e.data, '$.amount_usd') FROM run_events e"
+            " JOIN runs r ON r.id = e.run_id WHERE e.type = 'budget_decision' AND r.conversation_id = ?"
+            " AND json_extract(e.data, '$.budget') = ? AND json_extract(e.data, '$.amount_usd') IS NOT NULL"
+            " ORDER BY e.rowid DESC LIMIT 1", (scope_id, budget)).fetchone()
     found = row[1] if row is not None and abs(row[0] - current) <= _EPSILON else current
     return found if found > 0 else default
 
@@ -192,6 +198,9 @@ def saved(conn, run_id, decided, ok):
     record.pop("project_id")
     if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is not None:
         _event(conn, run_id, "budget_decision", record)
+    if ok:  # what the next Continue adds again, kept with the project
+        conn.execute("UPDATE projects SET budget_decided = json(?) WHERE id = ?", (json.dumps(
+            {"to_usd": decided["to_usd"], "amount_usd": decided["amount_usd"]}), decided["project_id"]))
     governance.record(conn, "budget_decision", decided["project_id"], budget="project", decision=decided["decision"],
                       from_usd=decided["from_usd"], to_usd=record["to_usd"], applied=ok)
 
@@ -217,15 +226,27 @@ def queued(conn, conversation_id):
 
 
 def carried_notes(conn, run_id):
-    """The steering notes (their seq) a step of the run carried in a request that was dispatched: read by the agent."""
+    """The steering notes (their seq) a step of the run carried in a request that went out: read by the agent. Known by
+    a recorded attempt of that step the gate let out (`model_attempt` dispatched true), never by its `dispatch` event,
+    which is written before the gate's check and the connection (PR 52 review 1); an attempt whose fate a crash left
+    unknown counts as not sent, so its note is queued rather than lost."""
     carried = set()
     for (data,) in conn.execute(
             "SELECT s.data FROM run_events s WHERE s.run_id = ? AND s.type = 'step_started'"
             " AND json_extract(s.data, '$.steering') IS NOT NULL AND EXISTS (SELECT 1 FROM run_events d"
-            " WHERE d.run_id = s.run_id AND d.type = 'dispatch' AND json_extract(d.data, '$.step') = json_extract(s.data, '$.step'))",
-            (run_id,)):
+            " WHERE d.run_id = s.run_id AND d.type = 'model_attempt' AND json_extract(d.data, '$.dispatched') = 1"
+            " AND json_extract(d.data, '$.step') = json_extract(s.data, '$.step'))", (run_id,)):
         carried.update(json.loads(data)["steering"])
     return carried
+
+
+def read_notes(conn, run_id):
+    """The texts of the turn's steering notes a step read, in order: the researcher's own words in that turn, which
+    later turns' history (and compaction) carry after its message (the connector's finding on PR 52; T15:84)."""
+    carried = carried_notes(conn, run_id)
+    return [text for seq, text in conn.execute("SELECT seq, json_extract(data, '$.text') FROM run_events WHERE run_id = ?"
+                                               " AND type = 'steering_note' ORDER BY seq", (run_id,))
+            if seq in carried and text]
 
 
 def queue_unread_notes(conn, run_id):

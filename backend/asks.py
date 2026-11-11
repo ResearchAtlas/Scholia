@@ -247,13 +247,8 @@ async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
                 {"needed_usd": refused.needed_usd} if getattr(refused, "needed_usd", None) else {})},
                 status_code=refused.status)
         if (decided := answered.pop("project_budget", None)) is not None:
-            try:
-                await asyncio.to_thread(lambda: load_settings(state["data_dir"], decided["project_id"]).save(
-                    {"project.budget_usd": decided["to_usd"]}))
-                saved = True
-            except Exception as error:
-                log.warning("a project budget answered in an ask was not saved (%s)", type(error).__name__)
-                saved = False
+            saved = await asyncio.to_thread(_save_project_budget, state["data_dir"], decided)
+            if not saved:
                 answered["budget"] = {**answered["budget"], "applied": False, "error": "not_saved",
                                       "limit_usd": decided["from_usd"]}
             try:  # its record and audit row; a project deleted meanwhile keeps none
@@ -263,6 +258,22 @@ async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
     if (active := registry.runs.get(run_id)) is not None:  # a run waiting on it wakes now
         active.answered.set()
     return answered
+
+
+def _save_project_budget(data_dir, decided):
+    """Write a project budget's decision to its config.toml: whether the file now holds it. A write that fails may
+    have replaced the file already (its folder's sync failing after the rename): the outcome is what the file says,
+    read again, so no record says it unchanged when it changed, nor the reverse (PR 52 review 1)."""
+    try:
+        load_settings(data_dir, decided["project_id"]).save({"project.budget_usd": decided["to_usd"]})
+        return True
+    except Exception as error:
+        log.warning("a project budget answered in an ask may not be saved (%s)", type(error).__name__)
+    try:
+        now = load_settings(data_dir, decided["project_id"]).values["project"]["budget_usd"]
+    except Exception:
+        return False
+    return abs(now - decided["to_usd"]) <= 1e-9
 
 
 def _budget_saved(conn, run_id, decided, saved):

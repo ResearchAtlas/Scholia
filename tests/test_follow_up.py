@@ -347,3 +347,53 @@ async def test_a_note_unread_when_the_app_stopped_is_queued_by_recovery(tmp_path
         assert [q["text"] for q in read["queued"]] == ["Left at the crash"]
         await client.state["harness"].recover(kick=False)  # recovering again queues nothing twice
         assert len((await conversation_read(client, conversation))["queued"]) == 1
+
+
+# S1-33 fix batch 1 (PR 52 review 1)
+
+
+async def test_a_note_on_a_step_that_never_left_is_queued_not_read(tmp_path):
+    # Finding 2 (L7, F6, U2): the step carrying the note failed to connect, so nothing carried it out: it waits as the
+    # next turn, and is never said to have been read.
+    import httpx
+
+    def unreachable(body):
+        raise httpx.ConnectError("connection refused")
+    gate = Gate(0)
+    provider = Scripted(None, unreachable)
+    provider.script[0] = gate.wrap(provider, {"calls": [call("list_materials")]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await gate.reached.wait()
+        run_id = await running_run(client, conversation)
+        await steer(client, run_id, "Only recent ones")
+        gate.open.set()
+        stream = await sending
+        assert stream[-1]["status"] == "failed" and not [e for e in stream if e["type"] == "steering_note"]
+        attempts = await rows(client, "SELECT json_extract(data, '$.dispatched') FROM run_events WHERE run_id = ?"
+                                      " AND type = 'model_attempt' AND json_extract(data, '$.step') = 1", run_id)
+        assert attempts and all(not d for (d,) in attempts)
+        read = await conversation_read(client, conversation)
+        assert [n["state"] for n in read["turns"][-1]["steering"]] == ["queued"]
+        assert [q["text"] for q in read["queued"]] == ["Only recent ones"]
+
+
+async def test_a_read_note_stays_in_the_conversations_history_and_an_unread_one_does_not(tmp_path):
+    # Finding 5 (the connector's; SPEC:414, T15:84): a note a step read is part of that turn's researcher messages for
+    # every later turn (and compaction); one no step read waits queued and is not history.
+    gate = Gate(0)
+    provider = Scripted(None, "Done.", "Second.")
+    provider.script[0] = gate.wrap(provider, {"calls": [call("list_materials")]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await gate.reached.wait()
+        await steer(client, await running_run(client, conversation), "Only the ones from 2020")
+        gate.open.set()
+        assert (await sending)[-1]["status"] == "succeeded"
+        assert (await send(client, conversation, "And now?"))[-1]["status"] == "succeeded"
+        later = provider.steps[-1]["messages"]
+        said = [m["content"] for m in later if m["role"] == "user"]
+        assert said[0].startswith("Which papers do I have?") and "Only the ones from 2020" in said[0]
+        assert said[-1] == "And now?"
