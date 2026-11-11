@@ -988,7 +988,7 @@ class Harness:
                 raise _LimitReached(result)
             if not result.ok or visible(result.content) is None:  # tool calls alone where none were offered
                 code = result.error_kind or "malformed"
-                final = await self._ended(claim, lambda conn: self._finish_turn(
+                final = await self._end_turn(claim, lambda conn: self._finish_turn(
                     conn, claim.run_id, "failed", None, code, claim=claim))
                 if final["status"] == "failed":  # not a Stop that came first
                     emit({"type": "error", "code": code})
@@ -1012,7 +1012,9 @@ class Harness:
                       **({"cut": True} if result.cut else {}),  # saved, and marked as stopped at its output limit
                       **({"notices": notices} if notices else {})}
             try:
-                final = await self._ended(claim, lambda conn: self._commit_answer(conn, claim, answer, ctx))
+                # To its end, whatever cancellations arrive meanwhile: a Stop that lands once its transaction began comes
+                # after the answer, which is then said on the stream as it is recorded (PR 52 cycle 4, G5's class)
+                final, _ = await _through(self._ended(claim, lambda conn: self._commit_answer(conn, claim, answer, ctx)))
             except _Cancelled:  # the Stop came first: no answer is published
                 raise asyncio.CancelledError() from None
             except Exception as error:  # the answer could not be saved: it is still shown, marked unsaved

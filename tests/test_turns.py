@@ -966,7 +966,9 @@ async def test_a_terminal_write_that_commits_while_its_turn_is_stopped_marks_it_
         tmp_path, monkeypatch, write):
     """PR 46 recheck 3: a Stop during a turn's terminal write (its answer, or a provider failure) cancelled the await
     while the writer went on and committed; when the Stop's own write then failed, the turn was released never known
-    finished, and a read taken before that commit read it interrupted. The writer marks it finished as it commits."""
+    finished, and a read taken before that commit read it interrupted. The writer marks it finished as it commits.
+    (PR 52 cycle 4: a Stop that lands once the write began now waits for it, so the turn ends as that write recorded
+    it and the Stop has no write of its own; the stub that fails it stays to show none is made.)"""
     from backend.runs import Registry, derived_status
     real_release, real_commit, real_finish = Registry.release, runs_module.Harness._commit_answer, \
         runs_module.Harness._finish_turn
@@ -1008,8 +1010,8 @@ async def test_a_terminal_write_that_commits_while_its_turn_is_stopped_marks_it_
         harness._request_cancel(claim, "researcher")  # the Stop, while the terminal write is still to commit
         await asyncio.sleep(0.05)  # the turn's await is cancelled and the Stop's own write is queued
         gate.set()
-        with pytest.raises(RuntimeError):
-            await claim.task
+        await claim.task
+        assert len(calls) == (0 if write == "answer" else 1)  # only the turn's own terminal write
         await reader
         assert seen == ["running"] and claim.run_id in harness.registry.finished
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
@@ -1721,3 +1723,36 @@ async def test_while_a_turns_request_is_at_the_provider_its_call_already_says_it
         assert call.dispatched and [(a.outcome, a.dispatched) for a in call.attempts] == [("other", True)]
         release.set()
         assert (await sending)[-1]["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("ending", ["answer", "failed"])
+async def test_a_stop_landing_while_a_turns_end_is_written_still_gets_that_end_on_the_stream(tmp_path, monkeypatch, ending):
+    # PR 52 cycle 4 (G5's class, batch 4 part 2 item 3): Stop lands while the turn's terminal write runs, once it began.
+    # The answer (or the failure) commits, and the stream says so as the record does, before it ends: chat_response,
+    # saved (or the error), then run_finished with the recorded status. Before, the answer was saved but never sent.
+    import time
+    method = "_commit_answer" if ending == "answer" else "_finish_turn"
+    real = getattr(runs_module.Harness, method)
+    provider = MockProvider() if ending == "answer" else MockProvider((200, {"choices": [{"message": {"content": " "}}]}))
+    async with started(tmp_path / "data", provider) as client:
+        harness, loop = client.state["harness"], asyncio.get_running_loop()
+
+        def writing(self, conn, *args, **kwargs):
+            done = real(self, conn, *args, **kwargs)
+            if not getattr(writing, "stopped", False):
+                writing.stopped = True
+                claim = harness.registry.turns[conversation]
+                loop.call_soon_threadsafe(lambda: harness._request_cancel(claim, "researcher"))
+                time.sleep(0.3)  # the Stop lands while this write is still to commit
+            return done
+        monkeypatch.setattr(runs_module.Harness, method, writing)
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        if ending == "answer":
+            assert turn["status"] == "succeeded" and turn["answer"] == {"text": "An answer."}
+            assert [e["type"] for e in stream][-2:] == ["chat_response", "run_finished"]
+            assert (stream[-2]["content"], stream[-2]["result_saved"], stream[-1]["status"]) == ("An answer.", True, "succeeded")
+        else:
+            assert turn["status"] == "failed"
+            assert stream[-2:] == [{"type": "error", "code": "malformed"}, {**stream[-1], "status": "failed"}]

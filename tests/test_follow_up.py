@@ -831,4 +831,4 @@ async def test_a_note_queued_by_the_answers_commit_is_said_queued_when_stop_land
         gate.open.set()
         stream = await sending
         assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["Also say how many"]
-        assert [e["type"] for e in stream][-2:] == ["queued", "run_finished"]
+        assert [e["type"] for e in stream][-3:] == ["queued", "chat_response", "run_finished"]  # and the answer (item 3)
