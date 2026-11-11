@@ -757,6 +757,23 @@ async def test_a_message_naming_papers_waits_with_them_and_starts_narrowed_to_th
 # says once a write committed is said on the turn's stream too, even when Stop lands just after it.
 
 
+async def test_a_note_carried_by_a_step_whose_reply_cannot_be_decoded_stays_read(tmp_path):
+    # PR 52 cycle 4 (G1; design review A2, its test 2): the step that carried the note went out, and its reply is nested
+    # too deeply to decode. The attempt is recorded as sent, so the note stays read, never queued again to be sent twice.
+    gate = Gate(0)
+    provider = Scripted(None, (200, b"[" * 10000 + b"]" * 10000))
+    provider.script[0] = gate.wrap(provider, {"calls": [call("list_materials")]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await gate.reached.wait()
+        assert (await steer(client, await running_run(client, conversation), "Only 2020")).status_code == 200
+        gate.open.set()
+        assert (await sending)[-1]["status"] == "failed" and len(provider.steps) == 2
+        read = await conversation_read(client, conversation)
+        assert [n["state"] for n in read["turns"][-1]["steering"]] == ["read"] and read["queued"] == []
+
+
 async def test_a_note_read_by_a_step_that_went_out_is_said_read_when_stop_lands_as_its_client_closes(tmp_path,
                                                                                                    monkeypatch):
     # The step carrying the note went out and its receipt committed (the note is read in the record); Stop lands while

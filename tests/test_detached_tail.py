@@ -531,6 +531,35 @@ async def test_a_background_call_that_never_connected_is_released_when_its_recei
         assert cost == 0
 
 
+@pytest.mark.parametrize("workflow", ["title", "memory"])
+async def test_a_background_call_whose_reply_cannot_be_decoded_is_sent_once_and_charged_its_estimate(tmp_path, workflow):
+    # PR 52 cycle 4 (G1; design review A2, its test 3): a title's or an extraction's reply nested too deeply to decode.
+    # Before, its request was released at $0 and sent again (a title after the next turn, an extraction each turn).
+    # Now its attempt is recorded as sent: the call is charged its estimate and the run ends from its record, and
+    # neither the next turn nor recovery sends it again.
+    provider = MockProvider()
+    (provider.title_replies if workflow == "title" else provider.memory_replies).append(
+        (200, b"[" * 10000 + b"]" * 10000))
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client, **({} if workflow == "title" else {"title": "Named"}))
+        await send(client, conversation_id)
+        await background_idle(client)
+        [(run_id,)] = await rows(client, "SELECT id FROM runs WHERE kind = 'background' AND workflow = ?", workflow)
+        [(estimate, status, settled, basis)] = await rows(
+            client, "SELECT estimate_usd, status, settled_usd, basis FROM budget_reservations WHERE run_id = ?", run_id)
+        assert (status, settled, basis) == ("settled", estimate, "estimated")
+        assert await rows(client, "SELECT json_extract(data, '$.outcome'), json_extract(data, '$.dispatched')"
+                                  " FROM run_events WHERE run_id = ? AND type = 'model_attempt'", run_id) == [("malformed", 1)]
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", run_id) != [("running",)]
+        await send(client, conversation_id, "And then?")
+        await background_idle(client)
+        await client.state["harness"].recover(kick=False)
+        assert await rows(client, "SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'model_attempt'",
+                          run_id) == [(1,)]
+        # the title's one request; an extraction's, one each turn
+        assert len(provider.titles if workflow == "title" else provider.extractions) == (1 if workflow == "title" else 2)
+
+
 async def test_a_reported_background_call_whose_receipt_write_fails_keeps_its_reported_charge(tmp_path, monkeypatch):
     # E2's other side: the extraction's request went out and reported its cost, then the receipt's write failed once.
     # Its run's handler settles it at that reported cost, never left open for recovery's estimate.

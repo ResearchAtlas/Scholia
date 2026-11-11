@@ -289,3 +289,67 @@ def test_the_recorder_check_finds_a_second_settlement_and_a_sticky_flag():
     assert old in sources["runs.py"]
     unrecorded = {**sources, "runs.py": sources["runs.py"].replace(old, "spending.release(conn, call.reservation_id)")}
     assert any("_close_call does not record" in p for p in recorder_problems(unrecorded))
+
+
+# S1-33 (PR 52 cycle 4, design review A2's Option 2): what an attempt did has one store, written when the request
+# leaves. The gate's notice (the post's DISPATCHED extension) adds the attempt to the caller's list itself, as sent;
+# only that notice and the attempt's ending (end) add to the list or decide whether an attempt was sent, so no exit
+# between the notice and the ending can leave a request that went out unrecorded.
+
+
+def adapter_problems(source):
+    """What breaks that rule in openrouter.py's source."""
+    tree = ast.parse(source)
+    adapter = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "query_model")
+    notice = next((value.id for node in ast.walk(adapter) if isinstance(node, ast.Dict)
+                   for key, value in zip(node.keys, node.values)
+                   if isinstance(key, ast.Name) and key.id == "DISPATCHED" and isinstance(value, ast.Name)), None)
+    nested = {n.name: n for n in adapter.body if isinstance(n, ast.FunctionDef)}
+
+    def appends(node):
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("append", "extend", "insert") and ast.unparse(node.func.value) == "attempts") \
+            or (isinstance(node, ast.AugAssign) and ast.unparse(node.target) == "attempts")
+
+    def decides(node):
+        return (isinstance(node, ast.Call) and any(k.arg == "dispatched" for k in node.keywords)) or (
+            isinstance(node, (ast.Assign, ast.AugAssign)) and any(
+                isinstance(t, ast.Attribute) and t.attr == "dispatched"
+                for whole in (node.targets if isinstance(node, ast.Assign) else [node.target]) for t in ast.walk(whole)))
+
+    problems = []
+    if notice not in nested:
+        problems.append("the post's DISPATCHED extension is not a function of query_model")
+    elif not any(appends(n) for n in ast.walk(nested[notice])):
+        problems.append(f"the gate's notice ({notice}) does not add the attempt to the caller's list")
+    allowed = {("query_model", notice), ("query_model", "end")}
+
+    def visit(node, chain):
+        for child in ast.iter_child_nodes(node):
+            inner = (*chain, child.name) if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else chain
+            if chain not in allowed and appends(child):
+                problems.append(f"openrouter.py:{child.lineno} adds to attempts outside the notice and end")
+            if chain not in allowed and decides(child):
+                problems.append(f"openrouter.py:{child.lineno} decides whether an attempt was sent outside the notice"
+                                " and end")
+            visit(child, inner)
+
+    visit(tree, ())
+    return problems
+
+
+def test_the_gates_notice_records_each_attempt_as_sent_and_only_its_ending_completes_it():
+    assert adapter_problems(_sources()["openrouter.py"]) == []
+
+
+def test_the_notice_check_finds_a_second_append_a_notice_kept_aside_and_a_flag_set_elsewhere():
+    source = _sources()["openrouter.py"]
+    ending, notice = 'end("ok", response.status_code, usage)', "extensions = {DISPATCHED: dispatched}"
+    assert ending in source and notice in source
+    second = source.replace(ending, 'attempts.append(Attempt("ok", response.status_code, 0, usage))')
+    assert any("adds to attempts outside" in p for p in adapter_problems(second))
+    aside = source.replace(notice, "kept = []\n\n    def aside(terms=None):\n        kept.append(terms)\n\n"
+                                   "    extensions = {DISPATCHED: aside}")
+    assert any("does not add the attempt" in p for p in adapter_problems(aside))
+    flagged = source.replace(ending, ending + "\n        attempts[-1].dispatched = bool(kept)")
+    assert any("decides whether an attempt was sent outside" in p for p in adapter_problems(flagged))

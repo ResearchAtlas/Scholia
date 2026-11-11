@@ -162,6 +162,53 @@ async def test_a_reply_too_deeply_nested_to_decode_is_a_malformed_attempt_that_w
         (result.error_kind, status, True, None)]
 
 
+class Halted(BaseException):
+    """Neither an Exception nor a cancellation (as SystemExit or KeyboardInterrupt): no handler in the adapter takes it."""
+
+
+@pytest.mark.parametrize("exit", ["base_exception", "decoder"])
+async def test_an_attempt_whose_ending_is_never_reached_stays_sent_with_an_unknown_charge(monkeypatch, exit):
+    # PR 52 cycle 4 (design review A2's Option 2, its tests 4 and 7): from the gate's notice on, the caller's list says
+    # the attempt went out. An exit no handler takes (a BaseException out of the post), or a failure between the reply
+    # and its ending (the decoder made to raise), leaves that entry as it was written: sent, nothing reported (outcome
+    # "other"), so the call is charged its estimate (SPEC:425), never released at $0.
+    if exit == "decoder":
+        def broken(response):
+            raise RuntimeError("the decoder failed")
+        monkeypatch.setattr(openrouter, "_json", broken)
+    client, sent = client_for(ok() if exit == "decoder" else Halted())
+    attempts = []
+    with pytest.raises(RuntimeError if exit == "decoder" else Halted):
+        await openrouter.query_model(client, OPENROUTER, "key", MESSAGES, attempts=attempts)
+    assert len(sent) == 1
+    assert [(a.outcome, a.http_status, a.dispatched, a.reported_cost, a.record()["charge"]) for a in attempts] == [
+        ("other", None, True, None, "unknown")]
+
+
+async def test_while_a_request_is_at_the_provider_the_callers_list_already_says_it_went_out():
+    # Design review A2 (its test 7): the entry is written by the gate's notice, once an attempt however often the
+    # notice comes, and the attempt's ending completes that same entry.
+    release = asyncio.Event()
+
+    async def held(request):
+        request.extensions[DISPATCHED]()  # a second notice for the same attempt adds nothing
+        await release.wait()
+        return ok("Hello.", cost=0.001)
+
+    client, sent = client_for(held)
+    attempts = []
+    task = asyncio.create_task(openrouter.query_model(client, OPENROUTER, "key", MESSAGES, attempts=attempts))
+    while not sent:
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.01)
+    assert [(a.outcome, a.dispatched, a.reported_cost) for a in attempts] == [("other", True, None)]
+    entry = attempts[0]
+    release.set()
+    result = await task
+    assert result.attempts is attempts and attempts == [entry]
+    assert (entry.outcome, entry.http_status, entry.dispatched, entry.reported_cost) == ("ok", 200, True, 0.001)
+
+
 async def test_an_ok_attempt_without_usage_has_no_reported_cost():
     client, _ = client_for(ok())
     result = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES)

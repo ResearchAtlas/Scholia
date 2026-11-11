@@ -1682,3 +1682,42 @@ async def test_a_reply_whose_cost_or_token_count_no_float_holds_is_delivered_and
         assert (status, basis) == ("settled", "estimated") and 0 < settled <= estimate
         if "cost" not in usage:  # no count the step's rates can price: its estimate
             assert settled == estimate
+
+
+async def test_a_turn_whose_reply_a_defect_left_unread_settles_at_its_estimate_with_its_attempt_sent(tmp_path, monkeypatch):
+    # Design review A2's Option 2 (its test 7): the decoder made to raise, a failure between the reply and the attempt's
+    # ending. The gate's notice had already put the attempt in the call's list as sent, so the turn's cleanup settles
+    # the call at its estimate with that attempt sent, its body kept and its charge unknown, never released at $0.
+    from backend import openrouter
+
+    def broken(response):
+        raise RuntimeError("the decoder failed")
+    monkeypatch.setattr(openrouter, "_json", broken)
+    async with started(tmp_path / "data", MockProvider()) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        assert stream[-1]["status"] == "failed"
+        run_id = stream[0]["run_id"]
+        estimate, *settled = await reservation(client, run_id)
+        assert settled == ["settled", estimate, "estimated"]
+        assert await attempts_of(client, run_id) == [(0, "other", True, "unknown", None, True)]
+
+
+async def test_while_a_turns_request_is_at_the_provider_its_call_already_says_it_went_out(tmp_path):
+    # Design review A2 (its test 7): in flight, the call's own list holds the attempt as sent (no stand-in says "never
+    # left" while the provider has the request).
+    arrived, release = asyncio.Event(), asyncio.Event()
+
+    async def held(body):
+        arrived.set()
+        await release.wait()
+        return provider.answer("An answer.")
+    provider = MockProvider(held)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        sending = asyncio.create_task(send(client, conversation))
+        await asyncio.wait_for(arrived.wait(), 10)
+        call = active_turn(client, conversation).call
+        assert call.dispatched and [(a.outcome, a.dispatched) for a in call.attempts] == [("other", True)]
+        release.set()
+        assert (await sending)[-1]["status"] == "succeeded"

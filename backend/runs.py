@@ -391,8 +391,9 @@ class _Call:
     reservation_id: str
     route: str | None = None  # the route key, once the call is under way
     rates: dict | None = None  # the step's rates, which settle an attempt that reported tokens and no cost
-    # S1-33 (PR 52 cycle 3): the adapter's own list of the call's attempts (openrouter.Attempt), each joining it as it
-    # ends, one cut off by a cancellation included: the one record of what the call did, which _record_attempts reads
+    # S1-33 (PR 52 cycles 3 and 4): the adapter's own list of the call's attempts (openrouter.Attempt): the one record
+    # of what the call did, which _record_attempts reads. An attempt joins it, as sent, when the gate lets it out, and
+    # its ending completes it; so an entry is missing only for an attempt that never went out
     attempts: list = field(default_factory=list)
     bodies: list = field(default_factory=list)  # S1-19: each attempt's request body as stored (its sha256, or None)
     materials: tuple = ()  # the papers whose text its request holds, for the bodies' deletion links
@@ -3353,7 +3354,9 @@ def _normalized(sentence):
 
 def _record_attempts(conn, call, events, reply=None):
     """S1-33 (PR 52 cycle 3): the one recorder of what a call's attempts did, from the adapter's own list
-    (call.attempts): a body kept but never sent is not kept; with events (its run is still there), one content-free
+    (call.attempts), where each attempt the gate let out is, as sent, from that moment (cycle 4, design review A2): one
+    whose ending was never reached says sent with nothing reported, so it settles at the estimate, never released. A
+    body kept but never sent is not kept; with events (its run is still there), one content-free
     model_attempt each, naming its body, and reply (what the last one's event says of its kept reply); then its
     reservation settled from the attempts that went out (_settle_attempts), or released when none did. The receipt
     (Harness._call) and _close_call both record a call through it, so each says the same of every attempt."""
