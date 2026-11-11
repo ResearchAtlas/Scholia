@@ -162,8 +162,8 @@ test('Where we left off is read again once a turn of this conversation starts', 
 // shown; nothing resets it but Dismiss, or a later failure in the same view.
 test('a failed action\'s notice outlives a remount of the view that shows it', async () => {
   const { keepUnsaved, keptUnsaved } = await import('../src/memory.js');
-  keepUnsaved('leftOff:p1', { problem: 'Not saved', draft: 'my words', id: 'r1' });
-  assert.deepEqual(keptUnsaved('leftOff:p1'), { problem: 'Not saved', draft: 'my words', id: 'r1' });
+  keepUnsaved('leftOff:p1', { problem: 'Not saved', code: 'empty', edit: true, id: 'r1' });
+  assert.deepEqual(keptUnsaved('leftOff:p1'), { problem: 'Not saved', code: 'empty', edit: true, id: 'r1' });
   assert.equal(keptUnsaved('leftOff:p2'), null);
   assert.equal(keptUnsaved('settings:p1'), null);
   keepUnsaved('leftOff:p1', null);
@@ -175,21 +175,20 @@ test('a failed action\'s notice outlives a remount of the view that shows it', a
   }
 });
 
-// PR 51 fix batch 3, internal review: a kept notice goes once the same record's action succeeds, and a kept draft is
-// let go (not only hidden) once a completed read no longer holds its record or any later version of it
+// PR 51 fix batch 3, internal review: a kept notice goes once the same record's action succeeds
 test('a kept notice is cleared by a later success on the same record', async () => {
   const { settled } = await import('../src/memory.js');
-  const kept = { problem: 'Not saved', draft: 'my words', id: 'r1' };
+  const kept = { problem: 'Not saved', code: 'empty', edit: true, id: 'r1' };
   assert.equal(settled(kept, null, 'r1'), null); // the same record's action succeeded
   assert.equal(settled(kept, null, 'r2'), kept); // another record's
-  const failed = { problem: 'Again', draft: null, id: 'r2' };
+  const failed = { problem: 'Again', code: 'empty', edit: false, id: 'r2' };
   assert.equal(settled(kept, failed, 'r2'), failed);
 });
 
 // PR 51 fix batch 3, internal recheck: every action names its record, and an unnamed one clears nothing
 test('a notice is cleared only by a success on the record it names', async () => {
   const { settled } = await import('../src/memory.js');
-  const unnamed = { problem: 'Not saved', draft: null, id: null };
+  const unnamed = { problem: 'Not saved', code: 'empty', edit: false, id: null };
   assert.equal(settled(unnamed, null, null), unnamed);
   const source = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
   assert.match(source, /act\(\(\) => changeRecord\(record, \{ status: 'confirmed' \}\), false, record\.id\)/);
@@ -203,8 +202,12 @@ test('a notice is cleared only by a success on the record it names', async () =>
 test('the text typed lives only in its open editor', async () => {
   const { readsAgain } = await import('../src/memory.js');
   assert.equal(readsAgain(null), true); // done: the views read again
-  assert.equal(readsAgain({ code: 'personal_from_strict' }), false); // nothing changed: the editor stays open
-  for (const code of ['version_changed', 'out_of_date', 'not_found']) assert.equal(readsAgain({ code }), true, code);
+  // refused before any write: nothing changed, the editor stays open
+  for (const code of ['personal_from_strict', 'invalid_request', 'empty', 'not_confirmable']) {
+    assert.equal(readsAgain({ code }), false, code);
+  }
+  // the record changed, or the outcome is unknown (a dropped connection, an error after a commit): read again
+  for (const code of ['version_changed', 'out_of_date', 'not_found', 'internal']) assert.equal(readsAgain({ code }), true, code);
   const memory = readFileSync(join(SRC, 'memory.js'), 'utf8');
   const view = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
   for (const gone of [/memoryState/, /draftShown/, /withState/, /api\/memory\/state/, /\.draft\b/]) {

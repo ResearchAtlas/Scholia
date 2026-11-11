@@ -65,10 +65,11 @@ export async function attempt(t, action, edit = false, id = null) {
   }
 }
 
-// Whether the views read again after an action: once done, or when it failed because the record changed (then the
-// editor closes, with the notice). A failure that changed nothing leaves the view, and its open editor, as it is.
-const CHANGED = new Set(['version_changed', 'out_of_date', 'not_found']);
-export const readsAgain = (failed) => !failed || CHANGED.has(failed.code);
+// Whether the views read again after an action: always, but for a failure the server gives only before any write
+// (nothing changed: the view, and its open editor, stay as they are). A record changed meanwhile, or an outcome unknown
+// (a dropped connection, an error after a commit), reads again, which closes the editor, with the notice.
+const REFUSED_BEFORE_WRITING = new Set(['personal_from_strict', 'invalid_request', 'empty', 'not_confirmable']);
+export const readsAgain = (failed) => !failed || !REFUSED_BEFORE_WRITING.has(failed.code);
 
 // What an action could not save, kept by view and project (`settings:<project>`, `leftOff:<project>`) outside the
 // components that show it, so a remount never drops it (Q12, PR 51 recheck 3); only Dismiss, or a later failure in the
