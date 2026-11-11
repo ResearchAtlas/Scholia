@@ -359,7 +359,7 @@ def _ms(started):
 def _json(response):
     try:
         return response.json()
-    except ValueError:
+    except Exception:  # not JSON, or nested deeper than the decoder follows (RecursionError): malformed (PR 52 cycle 4)
         return None
 
 

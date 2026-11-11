@@ -120,8 +120,10 @@ def test_spend_counts_settled_and_open_but_not_released(db):
     assert db.read(lambda conn: spending.run_cost(conn, run)) == 1.4
 
 
-@pytest.mark.parametrize("estimate", [-0.01, float("nan"), float("inf"), None, "0.1", True])
+@pytest.mark.parametrize("estimate", [-0.01, float("nan"), float("inf"), None, "0.1", True,
+                                      pytest.param(10 ** 400, id="1e400")])
 def test_an_invalid_estimate_is_refused(db, estimate):
+    # 10 ** 400: an amount no float can hold is no amount (spending.amount; PR 52 cycle 4, design review A2)
     project = add_project(db)
     conversation, run = add_turn(db, project)
     with pytest.raises(ValueError):

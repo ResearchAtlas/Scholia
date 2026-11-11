@@ -148,6 +148,20 @@ async def test_usage_survives_a_malformed_answer(body):
     assert (result.error_kind, result.reported_cost) == ("malformed", 0.003)
 
 
+@pytest.mark.parametrize("status", [200, 400])
+async def test_a_reply_too_deeply_nested_to_decode_is_a_malformed_attempt_that_went_out(status):
+    # PR 52 cycle 4 (G1, design review A2): a reply nested deeper than the decoder can follow raises RecursionError,
+    # not ValueError. It is a reply like any other that cannot be read: the call ends malformed (or as its status says)
+    # with one attempt that went out, in the caller's list, never an exception out of the adapter.
+    nested = b"[" * 10000 + b"]" * 10000
+    client, sent = client_for(httpx.Response(status, content=nested, headers={"content-type": "application/json"}))
+    attempts = []
+    result = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES, attempts=attempts)
+    assert (result.error_kind, len(sent)) == ("malformed" if status == 200 else "request", 1)
+    assert [(a.outcome, a.http_status, a.dispatched, a.reported_cost) for a in attempts] == [
+        (result.error_kind, status, True, None)]
+
+
 async def test_an_ok_attempt_without_usage_has_no_reported_cost():
     client, _ = client_for(ok())
     result = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES)

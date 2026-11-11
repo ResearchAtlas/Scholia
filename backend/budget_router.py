@@ -110,8 +110,11 @@ def request_cost(rates, input_tokens: int, output_tokens: int) -> float:
 
 def cost_from_usage(rates, usage: dict) -> float | None:
     """An estimate from reported token counts, at the step's rates, when the provider reported tokens
-    but no cost; None when it reported neither."""
+    but no cost; None when it reported neither, or a count no float can hold."""
     prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
     if not all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in (prompt, completion)):
         return None
-    return request_cost(rates, prompt, completion)
+    try:
+        return request_cost(rates, prompt, completion)
+    except OverflowError:  # a reply's 401-digit count (PR 52 cycle 4, design review A2)
+        return None

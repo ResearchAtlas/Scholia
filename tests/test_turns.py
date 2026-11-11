@@ -1643,3 +1643,42 @@ async def test_a_call_whose_outcome_could_not_be_written_before_the_app_stopped_
         estimate, *settled = await reservation(client, run_id)
         assert settled == ["settled", estimate, "estimated"]
         assert await rows(client, "SELECT status FROM runs WHERE id = ?", run_id) == [("interrupted",)]
+
+
+# PR 52 cycle 4 (design review A2): a reply the adapter can read nothing from, or whose numbers no float can hold, is a
+# reply like any other: its call is recorded as the attempt went, and charged at an estimate when nothing says its cost.
+
+
+async def test_a_reply_too_deeply_nested_to_decode_is_charged_at_its_estimate_as_a_request_that_went_out(tmp_path):
+    # G1 (cycle 4 A's F1): a 200 reply of 10,000 nested arrays. The decoder's RecursionError escaped the adapter before
+    # the attempt joined the call's list, so the request that went out was released at $0 and its kept body deleted. It
+    # is now the malformed reply it is: the turn fails malformed, its one attempt went out, its body is kept, and the
+    # call is charged its estimate, marked estimated, the charge unknown (SPEC:425).
+    async with started(tmp_path / "data", MockProvider((200, b"[" * 10000 + b"]" * 10000))) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        assert stream[-1]["status"] == "failed" and {"type": "error", "code": "malformed"} in stream
+        run_id = stream[0]["run_id"]
+        estimate, *settled = await reservation(client, run_id)
+        assert settled == ["settled", estimate, "estimated"]
+        assert await attempts_of(client, run_id) == [(0, "malformed", True, "unknown", None, True)]
+        assert stream[-1]["accounting"]["unknown_attempts"] == 1
+
+
+@pytest.mark.parametrize("usage", [{"prompt_tokens": 12, "completion_tokens": 5, "cost": 10 ** 400},
+                                   {"prompt_tokens": 10 ** 400, "completion_tokens": 5}])
+async def test_a_reply_whose_cost_or_token_count_no_float_holds_is_delivered_and_charged_at_an_estimate(tmp_path, usage):
+    # Design review A2 (G1, new): a reported cost or token count of 401 digits raised OverflowError in the receipt and
+    # again in the turn's cleanup, leaving the turn with no end and its reservation open until the next start. Neither
+    # is a number the record can use: the answer is delivered, and the call is charged from its readable token counts
+    # at the step's rates, or else at its estimate, marked estimated either way.
+    reply = (200, {"choices": [{"message": {"role": "assistant", "content": "Hi."}}], "usage": usage})
+    async with started(tmp_path / "data", MockProvider(reply)) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        assert stream[-1]["status"] == "succeeded"
+        assert [e["content"] for e in stream if e["type"] == "chat_response"] == ["Hi."]
+        estimate, status, settled, basis = await reservation(client, stream[0]["run_id"])
+        assert (status, basis) == ("settled", "estimated") and 0 < settled <= estimate
+        if "cost" not in usage:  # no count the step's rates can price: its estimate
+            assert settled == estimate

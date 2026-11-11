@@ -39,12 +39,15 @@ class BudgetExceeded(Exception):
 
 def amount(value) -> float | None:
     """A cost as a non-negative finite float rounded to the kept precision, or None
-    for anything else (missing, negative, NaN, infinite, not a number)."""
+    for anything else (missing, negative, NaN, infinite, not a number, an integer no float can hold)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not math.isfinite(value) or value < 0:
+    try:
+        if not math.isfinite(value) or value < 0:
+            return None
+        return round(float(value), _DECIMALS)
+    except OverflowError:  # a reply's 401-digit cost (PR 52 cycle 4, design review A2)
         return None
-    return round(float(value), _DECIMALS)
 
 
 def spent(conn, *, project_id: str | None = None, conversation_id: str | None = None) -> float:
