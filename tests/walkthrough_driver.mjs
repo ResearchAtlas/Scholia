@@ -1884,6 +1884,17 @@ async function zotero(ctx) {
     // The collections listed: the library's collections request has been answered, so it is in the request log.
     const listed = () => browser().getByRole('navigation', { name: L('zotero.collections'), exact: true })
       .getByText(L('common.loading'), { exact: true }).waitFor({ state: 'detached', timeout: 15000 });
+    // The browser's Zotero browse requests not yet answered, superseded ones too (a superseded one is ignored, not stopped).
+    const browsing = new Set();
+    const browse = (request) => new URL(request.url()).pathname.startsWith('/api/zotero/');
+    page.on('request', (request) => { if (browse(request)) browsing.add(request); });
+    for (const ended of ['requestfinished', 'requestfailed']) page.on(ended, (request) => browsing.delete(request));
+    const answered = async () => {  // each answered browse request reached Zotero before its answer, so it is in the log
+      for (let i = 0; browsing.size; i += 1) {
+        if (i === 150) throw new Error('the Zotero browse requests: not answered in time');
+        await page.waitForTimeout(100);
+      }
+    };
     const again = async (text) => {  // the requests Zotero got from this Check again on
       state(text);
       const from = zoteroRequests().length;
@@ -1891,6 +1902,7 @@ async function zotero(ctx) {
       await browser().getByText(L('zotero.status.ready'), { exact: true }).waitFor({ timeout: 15000 });
       await browser().getByText(plural('zotero.itemCount', 6), { exact: true }).waitFor({ timeout: 15000 });
       await listed();
+      await answered();  // every browse request this Check again started, whichever library it was for
       return zoteroRequests().slice(from);
     };
     await browser().getByRole('button', { name: 'Linked files', exact: true }).click();
