@@ -1884,16 +1884,21 @@ async function zotero(ctx) {
     // The collections listed: the library's collections request has been answered, so it is in the request log.
     const listed = () => browser().getByRole('navigation', { name: L('zotero.collections'), exact: true })
       .getByText(L('common.loading'), { exact: true }).waitFor({ state: 'detached', timeout: 15000 });
-    // The browser's Zotero browse requests not yet answered, superseded ones too (a superseded one is ignored, not stopped).
+    // The browser's Zotero browse requests not yet finished, superseded ones too (a superseded one is ignored, not stopped).
     const browsing = new Set();
+    const failed = [];
     const browse = (request) => new URL(request.url()).pathname.startsWith('/api/zotero/');
     page.on('request', (request) => { if (browse(request)) browsing.add(request); });
-    for (const ended of ['requestfinished', 'requestfailed']) page.on(ended, (request) => browsing.delete(request));
-    const answered = async () => {  // each answered browse request reached Zotero before its answer, so it is in the log
+    // Finished: the backend sent its whole answer, so its handler is done and every Zotero request it made is in the log.
+    page.on('requestfinished', (request) => browsing.delete(request));
+    // Failed (aborted, say): the browser stopped waiting, but the backend's handler may go on and reach Zotero later.
+    page.on('requestfailed', (request) => { if (browsing.delete(request)) failed.push(`${request.url()} (${request.failure()?.errorText})`); });
+    const answered = async () => {  // every browse request finished, none failed: the log holds all they sent
       for (let i = 0; browsing.size; i += 1) {
-        if (i === 150) throw new Error('the Zotero browse requests: not answered in time');
+        if (i === 150) throw new Error('the Zotero browse requests: not finished in time');
         await page.waitForTimeout(100);
       }
+      if (failed.length) throw new Error(`a Zotero browse request failed, so what it sent may come later: ${failed.join(', ')}`);
     };
     const again = async (text) => {  // the requests Zotero got from this Check again on
       state(text);
