@@ -11,7 +11,7 @@ import { LeftOff, Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
-import { NOTICES, clear, drain, idle, limitText, send, showing, stop, stopsAt, unsavedAnswer, useLiveTurn } from '../live.js';
+import { NOTICES, clear, drain, halt, idle, limitText, send, showing, stop, stopsAt, unsavedAnswer, useLiveTurn } from '../live.js';
 import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
@@ -205,9 +205,9 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       const sent = await follow(id, runId, text, papers.map((paper) => paper.id));
       if (papers.length) choosePapers(projectId, []); // they went with this message
       await load();
-      if (sent.ended) { // a steer whose turn had ended: a new turn once nothing runs here, unless Stop was pressed since
-        await idle(id);
-        if (stopsAt(id) === pressed) await sendQueued(sent.queued);
+      if (sent.ended) { // a steer whose turn had ended: a new turn once nothing runs here, unless Stop was pressed there
+        await idle(id); // since the researcher's last turn started, or since this was sent (Harold, 2026-11-11, item 4)
+        if (stopsAt(id) === pressed && !halt(id)) await sendQueued(sent.queued);
       } else if (sent.queued) drain(id); // its turn may have ended already: started if it succeeded here (live.js)
       return true;
     } catch (error) {

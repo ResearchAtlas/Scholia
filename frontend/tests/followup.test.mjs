@@ -274,7 +274,9 @@ test('after Stop, a drain whose read was still out starts nothing more (C1a)', a
   t.mock.method(globalThis, 'fetch', run.fetch);
   await send('c-c1a', '/a', { model: 'm1' }, 'A');
   await settle(); // its end's drain reads the conversation
-  drain('c-c1a', 'r-c1a', { model: 'm1' }); // a second drain, as a follow-up queued meanwhile asks for one
+  // a second drain, as a follow-up queued meanwhile asks for one; drain(conversation) reads the record itself, and the
+  // run id and route given here are what it took before PR 52 cycle 3, so this test runs against that code too
+  drain('c-c1a', 'r-c1a', { model: 'm1' });
   await settle();
   assert.equal(answers.length, 2);
   answers[0](record('r-c1a', 'succeeded'));
@@ -329,7 +331,9 @@ test('a follow-up queued while the turn\'s first event is unread starts once tha
   const run = backend({ streams: { '/a': () => new Response(a.body) }, read: () => record('r-c3', 'succeeded') });
   t.mock.method(globalThis, 'fetch', run.fetch);
   const sending = send('c-c3', '/a', { model: 'm1' }, 'A');
-  drain('c-c3', null, {}); // the follow-up's queue reply came back: a turn is being admitted here, so it waits
+  // the follow-up's queue reply came back: a turn is being admitted here, so it waits (null and {}: what the view
+  // passed before PR 52 cycle 3, its run id still unread)
+  drain('c-c3', null, {});
   await settle();
   assert.deepEqual(run.calls.queueSends, []);
   a.event('{"type":"run_started","run_id":"r-c3"}');
@@ -397,7 +401,15 @@ test('a steer answered "ended" after Stop waits with Send; one answered so with 
   assert.equal(free, true);
   const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
   assert.match(followUp, /const pressed = stopsAt\(id\)/);
-  assert.match(followUp, /await idle\(id\);\s*if \(stopsAt\(id\) === pressed\) await sendQueued\(sent\.queued\)/);
+  assert.match(followUp, /await idle\(id\);[^\n]*\n\s*if \(stopsAt\(id\) === pressed && !halt\(id\)\) await sendQueued\(sent\.queued\)/);
+  // item 4 as Harold worded it (internal review P3-2): a Stop pressed before the submit counts too, until a turn the
+  // researcher starts there is admitted, so steer and queue alike leave the message waiting with Send
+  const { halt } = await import('../src/live.js');
+  assert.equal(halt('c-n1'), true);
+  t.mock.method(globalThis, 'fetch', async () => new Response(streamOf('data: {"type":"run_started","run_id":"r-n1b"}\n\n',
+    'data: {"type":"run_finished","status":"failed"}\n\n')));
+  await send('c-n1', '/b', {}, 'B');
+  assert.equal(halt('c-n1'), false);
 });
 
 test('Stop with a send pending here also stops the turn the record shows running from another window', async (t) => {
@@ -521,7 +533,7 @@ test('the bar\'s edges: no notice percents, no bar; its meter never above its ma
 
 test('a steer whose turn had ended starts as a new turn, as Send does, once nothing runs here (D22, reading 12)', () => {
   const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
-  assert.match(followUp, /if \(sent\.ended\) \{[^}]*await idle\(id\);\s*if \(stopsAt\(id\) === pressed\) await sendQueued\(sent\.queued\)/);
+  assert.match(followUp, /if \(sent\.ended\) \{[^}]*await idle\(id\);[^\n]*\n\s*if \(stopsAt\(id\) === pressed && !halt\(id\)\) await sendQueued\(sent\.queued\)/);
 });
 
 test('a budget ask whose project budget could not be read says so, never that the budget is $0 (E4), in both catalogs', () => {

@@ -588,9 +588,9 @@ class Harness:
         has not ended within CANCEL_WAIT_SECONDS. Repeating it is safe; a finished run
         is left as it is."""
         await self._record_dropped()
-        self.stopped.add(run_id)
         active = self.registry.runs.get(run_id)
         if active is not None:
+            self.stopped.add(run_id)
             self._request_cancel(active, reason)
             if active.closing is not None:  # its response never started: recorded now
                 # Shielded: a request cancelled while it waits never cancels the write, its finished mark or its release.
@@ -602,6 +602,7 @@ class Harness:
         row = await self._read(lambda conn: conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone())
         if row is None:
             return None
+        self.stopped.add(run_id)  # one that had ended too: a Stop from another window after its answer committed
         return {"run_id": run_id, "status": derived_status(row[0], run_id, self.registry)}
 
     async def _record_dropped(self):

@@ -1034,6 +1034,8 @@ async def test_after_a_failed_save_leaves_the_file_unreadable_the_waiting_step_a
         spend = (await client.get(f"/api/projects/{project}/spend", params={"conversation_id": conversation})).json()
         assert spend["project"]["limit_usd"] is None
         assert (await _answer(client, again, option="continue")).json()["budget"]["applied"] is False
+        decided = (await _decisions(client, again["run_id"]))[-1]
+        assert (decided["from_usd"], decided["to_usd"], decided["applied"]) == (None, None, False)  # unknown, never $0
         third = await asked(client, conversation)
         while third["ask_id"] == again["ask_id"]:
             await asyncio.sleep(0.02)
@@ -1045,6 +1047,32 @@ async def test_after_a_failed_save_leaves_the_file_unreadable_the_waiting_step_a
         assert client.provider.answers == []
         from backend import runs
         assert (await asyncio.to_thread(runs._budgets_now, tmp_path / "data", project))[0] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_limit_typed_while_the_project_budget_cannot_be_read_is_saved_and_recorded_from_an_unknown_limit(tmp_path):
+    # Fix batch 3 internal review (P3-1): the file is valid TOML but its budget is not a number, so the loader gives the
+    # default; the step asks, saying the budget could not be read; a typed limit is saved over it, and the records say
+    # it came from an unknown limit, never from $0.
+    import json
+    from scholia_app import send
+    from test_agent_loop import asked
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        config = tmp_path / "data" / "projects" / project / "config.toml"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('[project]\nbudget_usd = "abc"\n')
+        sending = asyncio.create_task(send(client, conversation, "Short?"))
+        ask = await asked(client, conversation)
+        assert (ask["params"]["budget"], ask["params"].get("unread")) == ("project", True)
+        assert (await _answer(client, ask, text="3")).json()["budget"] == {"applied": True, "budget": "project",
+                                                                             "limit_usd": 3.0}
+        assert (await sending)[-1]["status"] == "succeeded"
+        assert await _project_budget(client, project) == 3.0
+        assert [(d["from_usd"], d["to_usd"], d["applied"]) for d in await _decisions(client, ask["run_id"])] == [
+            (None, None, False), (None, 3.0, True)]  # decided, then saved
+        audited = [json.loads(d) for (d,) in await _rows(client, "SELECT data FROM audit_log WHERE event = 'budget_decision'")]
+        assert [(a["from_usd"], a["to_usd"], a["applied"]) for a in audited] == [(None, 3.0, True)]
 
 
 # S1-33 fix batch 2 (PR 52 cycle 2 on 4769f6e): lifecycle first (charter section 10)

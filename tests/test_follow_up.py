@@ -688,6 +688,9 @@ async def test_a_stop_pressed_after_the_answer_committed_starts_nothing_waiting_
         sent = await client.post(path, json={})
         assert sent.status_code == 200 and events(sent)[-1]["status"] == "succeeded"
         await background_idle(client)
+        unknown = "00000000-0000-4000-8000-000000000000"
+        assert (await client.post(f"/api/runs/{unknown}/cancel")).status_code == 404
+        assert run_id in client.state["harness"].stopped and unknown not in client.state["harness"].stopped
 
 
 async def test_a_message_naming_papers_waits_with_them_and_starts_narrowed_to_them_or_refused_once_one_is_deleted(tmp_path):

@@ -156,6 +156,11 @@ export function stopsAt(conversationId) {
   return stops.get(conversationId) ?? 0;
 }
 
+// S1-33: whether Stop was pressed in the conversation here since a turn the researcher started there was admitted.
+export function halt(conversationId) {
+  return halted.has(conversationId);
+}
+
 // S1-33: resolves once no turn is being admitted or running here in the conversation.
 export function idle(conversationId) {
   if (!aborts.has(conversationId)) return Promise.resolve();

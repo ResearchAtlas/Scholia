@@ -204,15 +204,18 @@ def decide(conn, run_id, ask, option, text, data_dir):
     # means anything; Continue and Go ahead have no amount to add to, so they apply nothing and the step is checked again
     stale = abs(current - params["limit_usd"]) > _EPSILON or (bool(params.get("unread")) and text is None)
     applied = not stale and decision not in STOPS and abs(wanted - current) > _EPSILON
-    to = wanted if applied else current
+    # what the records say the limit was: nothing when its file does not give it, never $0 (and no amount to add to)
+    known = None if budget == "project" and _budget_unread(load_settings(data_dir, project_id)) else current
+    amount = amount if known is not None or text is not None else None
+    to = wanted if applied else known
     pending = applied and budget == "project"
-    decided = {"ask_id": ask["ask_id"], "budget": budget, "decision": decision, "from_usd": current, "to_usd": to,
+    decided = {"ask_id": ask["ask_id"], "budget": budget, "decision": decision, "from_usd": known, "to_usd": to,
                "amount_usd": amount}
     _event(conn, run_id, "budget_decision", {
-        **decided, **({"to_usd": current, "applied": False, "pending_usd": to} if pending else {"applied": applied}),
+        **decided, **({"to_usd": known, "applied": False, "pending_usd": to} if pending else {"applied": applied}),
         **({"stale": True} if stale else {})})
     if not pending:
-        governance.record(conn, "budget_decision", project_id, budget=budget, decision=decision, from_usd=current,
+        governance.record(conn, "budget_decision", project_id, budget=budget, decision=decision, from_usd=known,
                           to_usd=to, applied=applied)
     if applied and budget == "conversation":
         conn.execute("UPDATE conversations SET budget_usd = ? WHERE id = ?", (to, conversation_id))

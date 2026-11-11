@@ -1430,7 +1430,7 @@
   "followUp.save": "Save",
   "followUp.send": "Send",
   "followUp.remove": "Remove",
-  "followUp.paperGone": "A paper this message names is no longer in this project, so it was not sent. Remove it, then send it again with the papers you want.",
+  "followUp.paperGone": "A paper this message names is no longer in this project, so it was not sent. Remove the message, then send it again with the papers you want.",
   "followUp.note": "Note for Scholia",
   "followUp.state.pending": "Scholia reads this at its next step",
   "followUp.state.read": "Read by Scholia",

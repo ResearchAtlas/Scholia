@@ -1382,7 +1382,7 @@
   "followUp.save": "保存",
   "followUp.send": "发送",
   "followUp.remove": "移除",
-  "followUp.paperGone": "这条消息指定的一篇论文已不在这个项目中，因此没有发送。请移除它，再选择需要的论文重新发送。",
+  "followUp.paperGone": "这条消息指定的一篇论文已不在这个项目中，因此没有发送。请移除这条消息，再选择需要的论文重新发送。",
   "followUp.note": "给 Scholia 的提示",
   "followUp.state.pending": "Scholia 会在下一步读到",
   "followUp.state.read": "Scholia 已读到",
