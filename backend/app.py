@@ -1219,14 +1219,33 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 (body.project_id, conversation_id, conversation_id))
             # S1-21a: the project's memory records drawn only from this conversation (every turn or run they name is
             # one of its turns or their post-answer runs) move with it, so its words stay under the stricter project
-            conn.execute(
-                "UPDATE memory_records SET project_id = ?, sensitivity = ?, updated_at = ? WHERE scope = 'project'"
-                " AND project_id = ? AND EXISTS (SELECT 1 FROM memory_sources s WHERE s.memory_id = memory_records.id"
+            moved = json.dumps([m for (m,) in conn.execute(
+                "SELECT id FROM memory_records WHERE scope = 'project'"
+                " AND project_id = ?1 AND EXISTS (SELECT 1 FROM memory_sources s WHERE s.memory_id = memory_records.id"
                 " AND s.source_kind IN ('turn', 'run')) AND NOT EXISTS (SELECT 1 FROM memory_sources s"
                 " WHERE s.memory_id = memory_records.id AND s.source_kind IN ('turn', 'run') AND s.source_id NOT IN"
-                " (SELECT run_id FROM turns WHERE conversation_id = ?5 UNION SELECT r.id FROM runs r JOIN turns t"
-                " ON t.run_id = r.source_turn_id WHERE t.conversation_id = ?5))",
-                (body.project_id, target[0], now, source, conversation_id))
+                " (SELECT run_id FROM turns WHERE conversation_id = ?2 UNION SELECT r.id FROM runs r JOIN turns t"
+                " ON t.run_id = r.source_turn_id WHERE t.conversation_id = ?2))", (source, conversation_id))])
+            # each its next version: every view, ask or request that showed it in the source project is stale (PR 51)
+            conn.execute("UPDATE memory_records SET project_id = ?, sensitivity = ?, updated_at = ?, version = version + 1"
+                         " WHERE id IN (SELECT value FROM json_each(?))", (body.project_id, target[0], now, moved))
+            # a moved proposal whose record moved too saw it one version earlier, as the record now is
+            conn.execute("UPDATE memory_records SET structured = json_set(structured, '$.seen',"
+                         " json_extract(structured, '$.seen') + 1) WHERE id IN (SELECT value FROM json_each(?1))"
+                         " AND status = 'proposed' AND json_extract(structured, '$.seen') IS NOT NULL"
+                         " AND supersedes_id IN (SELECT value FROM json_each(?1))", (moved,))
+            # their vectors leave the source project's partition; the destination's next index run makes them again
+            # under its own (S1-21a follow-up MB2; requested once the move has ended)
+            conn.execute("INSERT INTO index_queue (target, target_id, project_id, op) SELECT 'memory', value, ?,"
+                         " 'remove' FROM json_each(?)", (source, moved))
+            # A pending proposal now in another project than the record it would replace (one moved, the other not)
+            # names it no more and waits marked out of date: Keep never changes another project's record (MB6)
+            conn.execute(
+                "UPDATE memory_records SET supersedes_id = NULL, updated_at = ?, version = version + 1, structured = json_set(coalesce("
+                "structured, '{}'), '$.out_of_date', json('true')) WHERE status = 'proposed' AND project_id IN (?, ?)"
+                " AND EXISTS (SELECT 1 FROM memory_records t WHERE t.id = memory_records.supersedes_id"
+                " AND t.scope = 'project' AND t.project_id IS NOT memory_records.project_id)",
+                (now, source, body.project_id))
             conn.execute("INSERT INTO audit_log (event, project_id, data) VALUES ('conversation_moved', ?, ?)",
                          (body.project_id, json.dumps({"conversation_id": conversation_id, "from": source})))
             return True
@@ -1247,6 +1266,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 break
             if await _to_end(moved_from(row[0])):
                 break
+        await memory._embed_soon(state, body.project_id)  # the moved records' vectors, under its partition (MB2)
         return await get_conversation(conversation_id)
 
     @app.delete("/api/conversations/{conversation_id}")

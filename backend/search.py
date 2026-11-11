@@ -574,11 +574,14 @@ def memory_scopes(project_id):
     return ["personal", f"project:{project_id}"]
 
 
-def _active_memory(conn, ids):
+def _active_memory(conn, ids, project_id=None):
+    """The ones of ids that are active recalled records; with project_id, only while still of its scope (personal, or
+    the project's own: one moved to another project since is not, PR 51 review 1)."""
     from backend import memory
     return {m for (m,) in conn.execute(
         "SELECT id FROM memory_records WHERE status IN ('confirmed', 'inferred') AND type IN (SELECT value FROM json_each(?))"
-        " AND id IN (SELECT value FROM json_each(?))", (json.dumps(list(memory.RECALLED)), json.dumps(list(ids))))}
+        " AND id IN (SELECT value FROM json_each(?)) AND (?3 IS NULL OR scope = 'personal' OR project_id = ?3)",
+        (json.dumps(list(memory.RECALLED)), json.dumps(list(ids)), project_id))}
 
 
 async def _embed_memory(state, harness, active, project_id, drained):
@@ -594,7 +597,7 @@ async def _embed_memory(state, harness, active, project_id, drained):
     for memory_id, scope, content in (r for r in records if r[0] not in have):
         def admit(conn, memory_id=memory_id):
             row = conn.execute("SELECT status, cancel_reason FROM runs WHERE id = ?", (run_id,)).fetchone()
-            return tuple(row or ()) == ("running", None) and memory_id in _active_memory(conn, [memory_id])
+            return tuple(row or ()) == ("running", None) and memory_id in _active_memory(conn, [memory_id], project_id)
         try:
             [vector] = await local_helper.embed(state, [content], project_id=project_id, admit=admit)
         except InputRefused:
@@ -602,8 +605,10 @@ async def _embed_memory(state, harness, active, project_id, drained):
         except HelperUnavailable:  # refused by the check (forgotten meanwhile) or the helper stopped: the next run
             continue
         if len(vector) == DIMENSIONS:
+            # stored only while the record is still of this scope, read as it is written (a move meanwhile queues its
+            # vector's removal; this one is then never written to the old partition)
             stored += await drained(index.store_memory, [(memory_id, scope, vector)],
-                                    lambda ids: db.read(lambda conn: _active_memory(conn, ids))) or 0
+                                    lambda ids: db.read(lambda conn: _active_memory(conn, ids, project_id))) or 0
     return stored
 
 

@@ -17,7 +17,7 @@ from backend import memory, runs
 from scholia_app import MockProvider, background_idle, send, started
 from test_detached_tail import wait_for
 from test_materials import project_of
-from test_memory import candidate, conversation_in, extracted, memory_off, rows, set_project
+from test_memory import candidate, conversation_in, extracted, forget, memory_off, rows, set_project
 
 pytestmark = pytest.mark.asyncio
 
@@ -103,7 +103,7 @@ async def test_a_forget_in_the_views_counts_as_later_too(tmp_path):
         a = await project_of(client, "A")
         run = await turn_in(client, a, "I prefer tables")
         record = await personal(client, a, "I prefer tables")
-        assert (await client.delete(f"/api/memory/{record}")).json() == {"ok": True}
+        assert (await forget(client, record)).json() == {"ok": True}
         await asyncio.to_thread(client.state["db"].write, lambda conn: memory.apply_extraction(conn, run, [
             {"type": "preference", "content": "I prefer tables", "status": "confirmed", "span": "i prefer tables",
              "replaces": ""}]))
@@ -311,7 +311,7 @@ async def test_forgetting_a_record_never_deletes_one_confirmed_from_the_research
         await extraction_shown(client, project, "The sample is thirty nurses", [shown], [
             {"type": "project_state", "content": "The sample is thirty nurses", "status": "confirmed",
              "span": "the sample is thirty nurses", "replaces": ""}])
-        assert (await client.delete(f"/api/memory/{shown}")).json() == {"ok": True}
+        assert (await forget(client, shown)).json() == {"ok": True}
         assert await rows(client, "SELECT content FROM memory_records WHERE type = 'project_state'") == [
             ("The sample is thirty nurses",)]
 
@@ -510,7 +510,7 @@ async def test_r5_forget_removes_a_held_extraction_output_that_was_shown_the_rec
         await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
             "UPDATE runs SET inputs = json_set(inputs, '$.memory_ids', json(?), '$.held.output', json(?)) WHERE id = ?",
             (json.dumps([shown]), json.dumps({"records": [{"content": "CANARY restating Decision A"}]}), run)))
-        assert (await client.delete(f"/api/memory/{shown}")).json() == {"ok": True}
+        assert (await forget(client, shown)).json() == {"ok": True}
         assert "CANARY" not in json.dumps(await rows(client, "SELECT inputs FROM runs"))
 
 
@@ -631,7 +631,7 @@ async def test_forgetting_an_edited_proposal_takes_what_an_extraction_held_for_i
             (json.dumps([proposal]), json.dumps({"records": [{"content": "CANARY interviews"}]}), run)))
         await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
         [(current,)] = await rows(client, "SELECT id FROM memory_records WHERE type = 'decision'")
-        assert (await client.delete(f"/api/memory/{current}")).json() == {"ok": True}
+        assert (await forget(client, current)).json() == {"ok": True}
         assert "CANARY" not in json.dumps(await rows(client, "SELECT inputs FROM runs"))
         assert await asyncio.to_thread(client.state["db"].write, lambda conn: memory.apply_extraction(conn, run, [
             {"type": "decision", "content": "We use interviews", "status": "proposed", "span": "",
@@ -739,3 +739,313 @@ async def test_forgetting_an_out_of_date_proposal_never_takes_the_record_another
         assert forgot.json() == {"ok": True}
         assert sorted(await rows(client, "SELECT content, status FROM memory_records")) == [
             ("We use interviews", "superseded"), ("We use surveys", "confirmed")]
+
+
+# S1-21a follow-up MB11 (gpt-6-astra recheck 7): memory edited or superseded before dispatch ends the run revoked
+
+
+async def test_recalled_memory_edited_mid_turn_ends_the_turn_revoked_with_continue(tmp_path):
+    from cited import cited, with_papers
+    from test_search import WAGES
+    held = {}
+
+    async def edit_then_list(body):
+        changed = await held["client"].patch(f"/api/memory/{held['record']}", json={"version": 1, "content": "Changed"})
+        assert changed.status_code == 200
+        return steps_reply(provider, [call("list_materials")])
+    provider = Scripted(edit_then_list, "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "SECRET decision"})).json()["id"]
+        held.update(client=client, record=record)
+        stream = await send(client, await conversation_in(client, project), "What did we decide last time?")
+        assert "SECRET" in json.dumps(provider.agent_steps[0]) and len(provider.agent_steps) == 1
+        assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "revoked")
+
+
+async def test_an_extraction_whose_shown_proposal_was_edited_ends_revoked(tmp_path, monkeypatch):
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use interviews", status="proposed",
+            sources=[("project", project)]))
+        dispatch = runs.Harness._call
+
+        async def edited_meanwhile(self, *args, **kwargs):  # after its request (and the versions it holds) was built
+            if sys._getframe(1).f_code.co_name == "_extraction_call":
+                edited = await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
+                assert edited.status_code == 200
+            return await dispatch(self, *args, **kwargs)
+        monkeypatch.setattr(runs.Harness, "_call", edited_meanwhile)
+        await send(client, await conversation_in(client, project), "We sample thirty nurses")
+        await background_idle(client)
+        assert provider.extractions == []
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
+            ("cancelled", "revoked")]
+
+
+async def test_forget_in_the_memory_views_acts_on_the_version_shown(tmp_path):
+    # S1-21a follow-up MB10: a record edited in another window is not forgotten from a stale view
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "We use interviews"})).json()["id"]
+        assert (await client.patch(f"/api/memory/{record}", json={"version": 1, "content": "We use surveys"})).status_code == 200
+        stale = await client.delete(f"/api/memory/{record}", params={"version": 1})
+        assert (stale.status_code, stale.json()["code"]) == (409, "version_changed")
+        assert sorted(await rows(client, "SELECT content, status FROM memory_records")) == [
+            ("We use interviews", "superseded"), ("We use surveys", "confirmed")]
+        [(current, version)] = await rows(client, "SELECT id, version FROM memory_records WHERE status = 'confirmed'")
+        assert (await client.delete(f"/api/memory/{current}", params={"version": version})).json() == {"ok": True}
+
+
+# PR 51 review 1
+
+
+async def test_forget_without_the_version_shown_is_refused(tmp_path):
+    # P2 4: an unversioned Forget cannot say which version the researcher saw
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "We use interviews"})).json()["id"]
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use surveys", status="proposed",
+            sources=[("project", project)]))
+        assert (await client.delete(f"/api/memory/{record}")).status_code == 400
+        for action in ("forget", "keep"):
+            refused = await client.post("/api/memory/review", json={"id": proposal, "action": action})
+            assert refused.status_code == 400, action
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE type = 'decision'") == [(2,)]
+
+
+async def test_a_progress_record_counted_up_takes_its_next_version(tmp_path):
+    # P2 5: every change to a record's content raises its version, so an as-shown check sees it
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: memory.materials_added(conn, project, ["m1"]))
+        [(record, version)] = await rows(client, "SELECT id, version FROM memory_records WHERE type = 'progress'")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: memory.materials_added(conn, project, ["m2"]))
+        assert await rows(client, "SELECT version FROM memory_records WHERE id = ?", record) == [(version + 1,)]
+        stale = await client.delete(f"/api/memory/{record}", params={"version": version})
+        assert (stale.status_code, stale.json()["code"]) == (409, "version_changed")
+
+
+async def test_keeping_a_proposal_always_takes_its_next_version(tmp_path):
+    # PR 51 fix batch 1, internal review: Keep changes the record in place, so its version rises past every one shown
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        target = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "We use interviews"})).json()["id"]
+
+        def proposed(content, replaces=None):
+            def write(conn):
+                record = memory.write(conn, project_id=project, scope="project", kind="decision", content=content,
+                                      status="proposed", sources=[("project", project)])
+                if replaces:
+                    conn.execute("UPDATE memory_records SET supersedes_id = ? WHERE id = ?", (replaces, record))
+                return record
+            return asyncio.to_thread(client.state["db"].write, write)
+        alone, replacing = await proposed("We sample nurses"), await proposed("We use surveys", target)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # at its second version, as an
+            "UPDATE memory_records SET version = 2 WHERE id = ?", (replacing,)))  # edit leaves one; its target is at 1
+        for record in (alone, replacing):
+            [(shown,)] = await rows(client, "SELECT version FROM memory_records WHERE id = ?", record)
+            kept = await client.post("/api/memory/review", json={"id": record, "action": "keep", "version": shown})
+            assert kept.status_code == 200, kept.text
+            assert kept.json()["version"] > shown, record
+
+
+async def test_a_record_moved_since_it_was_shown_is_not_forgotten_from_the_old_view(tmp_path):
+    # PR 51 recheck 2 (P1 1, swept): a move is a change to the record, so every as-shown action (here the views'
+    # Forget, which carries no project) sees it
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        private = await project_of(client, "Private one", level="private")
+        moving = await conversation_in(client, project)
+        await send(client, moving, "Remember: we exclude studies before 2000")
+        [(record, shown)] = await rows(client, "SELECT id, version FROM memory_records WHERE type != 'progress'")
+        assert (await client.post(f"/api/conversations/{moving}/move", json={"project_id": private})).status_code == 200
+        stale = await client.delete(f"/api/memory/{record}", params={"version": shown})
+        assert (stale.status_code, stale.json()["code"]) == (409, "version_changed")
+        assert await rows(client, "SELECT project_id FROM memory_records WHERE id = ?", record) == [(private,)]
+
+
+# PR 51 fix batch 3 (Q11, recheck 3): a memory refusal's revoked ending is durable
+
+
+async def test_a_revoked_extraction_stays_revoked_when_its_ending_failed_and_it_is_recovered(tmp_path, monkeypatch):
+    # the reviewer's case: the proposal is edited before dispatch, and the cancellation's write fails once; the run is
+    # then recovered (kick_background) and must end cancelled/revoked, as the record says, never failed
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use interviews", status="proposed",
+            sources=[("project", project)]))
+        dispatch, finish, failed = runs.Harness._call, runs.Harness._finish_background, []
+
+        async def edited_meanwhile(self, *args, **kwargs):
+            if sys._getframe(1).f_code.co_name == "_extraction_call":
+                edited = await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
+                assert edited.status_code == 200
+            return await dispatch(self, *args, **kwargs)
+
+        def failing_once(self, conn, active, status, *args, **kwargs):
+            if status == "cancelled" and not failed:
+                failed.append(active.run_id)
+                raise RuntimeError("the cancellation's write failed")
+            return finish(self, conn, active, status, *args, **kwargs)
+        monkeypatch.setattr(runs.Harness, "_call", edited_meanwhile)
+        monkeypatch.setattr(runs.Harness, "_finish_background", failing_once)
+        await send(client, await conversation_in(client, project), "We sample thirty nurses")
+        await background_idle(client)
+        assert failed and await rows(client, "SELECT status FROM runs WHERE workflow = 'memory'") == [("running",)]
+        await client.state["harness"].kick_background()
+        await background_idle(client)
+        assert provider.extractions == []
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
+            ("cancelled", "revoked")]
+
+
+async def test_a_revoked_turn_stays_revoked_when_its_ending_failed_and_it_is_recovered(tmp_path, monkeypatch):
+    from cited import cited, with_papers
+    from test_search import WAGES
+    held, finish, failed = {}, runs.Harness._finish_turn, []
+
+    async def edit_then_list(body):
+        changed = await held["client"].patch(f"/api/memory/{held['record']}", json={"version": 1, "content": "Changed"})
+        assert changed.status_code == 200
+        return steps_reply(provider, [call("list_materials")])
+
+    def failing_once(self, conn, run_id, status, cancel_reason, *args, **kwargs):
+        if status == "cancelled" or kwargs.get("claim") is not None and kwargs["claim"].cancel_requested.is_set():
+            if not failed:
+                failed.append(run_id)
+                raise RuntimeError("the cancellation's write failed")
+        return finish(self, conn, run_id, status, cancel_reason, *args, **kwargs)
+    provider = Scripted(edit_then_list, "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "SECRET decision"})).json()["id"]
+        held.update(client=client, record=record)
+        monkeypatch.setattr(runs.Harness, "_finish_turn", failing_once)
+        await send(client, await conversation_in(client, project), "What did we decide last time?")
+        assert failed and len(provider.agent_steps) == 1
+        await client.state["harness"].recover(kick=False)  # as the next start does
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", failed[0]) == [
+            ("cancelled", "revoked")]
+
+
+async def test_no_record_state_read_is_left_for_unsaved_drafts(tmp_path):
+    # Q16 (PR 51 recheck 5; the simplification, for Harold): with no unsaved text kept outside the editor, nothing asks
+    # whether a kept draft's record exists: the state read Q15 added is gone
+    async with started(tmp_path / "data") as client:
+        assert (await client.get("/api/memory/state", params={"ids": "x"})).status_code == 404
+
+
+# PR 51 fix batch 4 (Q14, recheck 4): the revocation is durable from the refusal itself, before any await
+
+
+async def test_a_refused_extraction_whose_receipt_was_never_recorded_is_never_sent_again(tmp_path, monkeypatch):
+    # the reviewer's case: refused for memory, then the refusal's receipt is never recorded (here its write fails);
+    # resumed, it must end cancelled/revoked with no request, never be sent again
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use interviews", status="proposed",
+            sources=[("project", project)]))
+        dispatch, write, failed, edited = runs.Harness._call, runs.Harness._write, [], []
+
+        async def edited_meanwhile(self, *args, **kwargs):
+            if sys._getframe(1).f_code.co_name == "_extraction_call" and not edited:
+                response = await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
+                assert response.status_code == 200
+                edited.append(True)
+            return await dispatch(self, *args, **kwargs)
+
+        async def receipt_failing_once(self, fn):  # the extraction's refused step, whose receipt is never recorded
+            if edited and fn.__qualname__.endswith("_call.<locals>.record") and not failed:
+                failed.append(True)
+                raise RuntimeError("the receipt's write failed")
+            return await write(self, fn)
+        monkeypatch.setattr(runs.Harness, "_call", edited_meanwhile)
+        monkeypatch.setattr(runs.Harness, "_write", receipt_failing_once)
+        await send(client, await conversation_in(client, project), "We sample thirty nurses")
+        await background_idle(client)
+        await client.state["harness"].kick_background()
+        await background_idle(client)
+        assert failed and provider.extractions == []
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
+            ("cancelled", "revoked")]
+
+
+async def test_a_refused_turn_whose_receipt_failed_ends_revoked_with_continue(tmp_path, monkeypatch):
+    from cited import cited, with_papers
+    from test_search import WAGES
+    held, write, failed = {}, runs.Harness._write, []
+
+    async def edit_then_list(body):
+        changed = await held["client"].patch(f"/api/memory/{held['record']}", json={"version": 1, "content": "Changed"})
+        assert changed.status_code == 200
+        held["edited"] = True
+        return steps_reply(provider, [call("list_materials")])
+
+    async def receipt_failing_once(self, fn):  # the second step's: refused (its first step's reply was recorded)
+        if held.get("edited") and fn.__qualname__.endswith("_call.<locals>.record") and not failed:
+            held["receipts"] = held.get("receipts", 0) + 1
+            if held["receipts"] == 2:
+                failed.append(True)
+                raise RuntimeError("the receipt's write failed")
+        return await write(self, fn)
+    provider = Scripted(edit_then_list, "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "SECRET decision"})).json()["id"]
+        held.update(client=client, record=record)
+        monkeypatch.setattr(runs.Harness, "_write", receipt_failing_once)
+        stream = await send(client, await conversation_in(client, project), "What did we decide last time?")
+        assert failed and len(provider.agent_steps) == 1
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")
+
+
+async def test_a_refused_extraction_stopped_by_a_shutdown_before_its_receipt_is_never_sent_again(tmp_path, monkeypatch):
+    # Q14, the reviewer's first case (internal review P3 1): refused for memory, then a shutdown stops it before the
+    # refusal's receipt is recorded; restarted (kick_background, as the next launch does) it ends revoked, with no call
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        harness = client.state["harness"]
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use interviews", status="proposed",
+            sources=[("project", project)]))
+        dispatch, write, stopped, edited = runs.Harness._call, runs.Harness._write, [], []
+
+        async def edited_meanwhile(self, *args, **kwargs):
+            if sys._getframe(1).f_code.co_name == "_extraction_call" and not edited:
+                response = await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
+                assert response.status_code == 200
+                edited.append(True)
+            return await dispatch(self, *args, **kwargs)
+
+        async def shut_down_before_the_receipt(self, fn):
+            if edited and fn.__qualname__.endswith("_call.<locals>.record") and not stopped:
+                [(run,)] = await rows(client, "SELECT id FROM runs WHERE workflow = 'memory'")
+                stopped.append(run)
+                self._request_cancel(self.registry.runs[run], "shutdown")  # as the app's shutdown does
+                raise asyncio.CancelledError()
+            return await write(self, fn)
+        monkeypatch.setattr(runs.Harness, "_call", edited_meanwhile)
+        monkeypatch.setattr(runs.Harness, "_write", shut_down_before_the_receipt)
+        await send(client, await conversation_in(client, project), "We sample thirty nurses")
+        await background_idle(client)
+        assert stopped
+        await harness.kick_background()
+        await background_idle(client)
+        assert provider.extractions == []
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
+            ("cancelled", "revoked")]

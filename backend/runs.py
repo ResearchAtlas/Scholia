@@ -324,7 +324,7 @@ def _let_go(conn, run_id):
                  " AND json_type(inputs, '$.held') IS NOT NULL", (run_id,))
 
 
-def may_dispatch(conn, run_id, past_deadline=None, memory_off=None):
+def may_dispatch(conn, run_id, past_deadline=None, memory_off=None, memory_changed=None):
     """The check before every dispatch (slice-1 spec section 10, Revocation), which the outbound
     gate reads in its decision transaction, so retries are covered too: the run is still running
     and not revoked; every owner it has still exists (a turn's project and conversation; detached
@@ -337,7 +337,12 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None):
     the gate's decision transaction just before the request is sent, whatever it waited for before (its body's
     storage, the gate, the stream's reader): past it the request is refused, "turn_deadline". memory_off(), if given,
     reads the project's memory switch as it is now (S1-21a fix batch 3, R4): a request holding memory is refused once it
-    is off, whichever step of the run sends it (a nested tool's included), and so is a memory extraction's."""
+    is off, whichever step of the run sends it (a nested tool's included), and so is a memory extraction's.
+    memory_changed(), if given, is told when a memory record the request holds is no longer allowed (edited, superseded,
+    forgotten or out of scope since): the caller ends the run revoked, as for memory off (S1-21a follow-up MB11). With
+    it (the dispatch path, Harness._call), a refusal for memory revokes the run in the record here, in the gate's
+    decision transaction (conn), so the revocation is durable before anything after the refusal can be cancelled, fail
+    or wait: a terminal write, a shutdown, a receipt that is never recorded and recovery all find it revoked (Q14)."""
     row = conn.execute(
         "SELECT r.status, r.cancel_reason, r.kind, p.review_lock,"
         " r.conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM conversations WHERE id = r.conversation_id),"
@@ -362,10 +367,15 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None):
     # S1-21a: every memory record the request holds still exists and is still allowed in it (memory.allowed: a
     # personal record whose project was tightened or locked since it was recalled is not)
     remembered = json.loads(remembered or "[]")
-    if remembered and not memory.allowed(conn, project_id, remembered, json.loads(versions or "{}")):
+    refused = bool(remembered) and not memory.allowed(conn, project_id, remembered, json.loads(versions or "{}"))
+    if not refused and (remembered or workflow == "memory") and memory_off is not None:  # an extraction holds memory
+        refused = memory_off()  # work even when it was shown no record
+    if refused:
+        if memory_changed is not None:
+            conn.execute("UPDATE runs SET cancel_reason = 'revoked' WHERE id = ? AND status = 'running'"
+                         " AND cancel_reason IS NULL", (run_id,))
+            memory_changed()
         return False
-    if (remembered or workflow == "memory") and memory_off is not None and memory_off():  # an extraction holds memory
-        return False  # work even when it was shown no record
     if held and not provenance.sendable(conn, project_id, json.loads(held)):  # a paper whose text it carries is
         return False  # gone, or its project no longer allows this request (tightened, or review-locked)
     if not compaction.sendable(conn, run_id):  # S1-21b: a memory record a summary it carries follows is gone
@@ -385,7 +395,8 @@ class _Call:
     bodies: list = field(default_factory=list)  # S1-19: each attempt's request body as stored (its sha256, or None)
     materials: tuple = ()  # the papers whose text its request holds, for the bodies' deletion links
     declined: bool = False  # S1-19c: an attempt refused at dispatch because the turn's time limit had passed
-    memory_off: bool = False  # S1-21a: an attempt holding memory refused at dispatch because memory was switched off
+    memory_off: bool = False  # S1-21a: an attempt holding memory refused at dispatch: memory switched off, or a record
+    # it holds changed since (MB11)
 
 
 class Harness:
@@ -1466,6 +1477,14 @@ class Harness:
 
     # S1-21a: memory commands and recall
 
+    async def _index_memory(self, project_id):
+        """An index run for the project once memory was written, when the search model is installed (the index queue
+        never embeds a memory addition: an index run does), so a new record gets its vector (S1-21a follow-up MB7)."""
+        from backend import search  # search imports this module
+        state = search._STATES.get(self)
+        if state is not None:
+            await memory._embed_soon(state, project_id)
+
     async def memory_on(self, project_id):
         """Whether memory is on in the project now, from its settings as they are (never a snapshot taken earlier)."""
         return memory.enabled((await asyncio.to_thread(load_settings, self.data_dir, project_id)).values)
@@ -1504,6 +1523,8 @@ class Harness:
                     **({"records": outcome["ids"]} if outcome["ids"] else {}), **({"count": count} if count else {}),
                     **(data or {})})
             await self._record(claim, None, None, also=apply)
+            if outcome["ids"]:
+                await self._index_memory(project_id)
             turn.emit({"type": "memory", "action": outcome["what"], "count": count or len(outcome["ids"])})
             said = line(outcome["what"]) if callable(line) else line
             if outcome["what"] == "no_candidate" and change is not None:
@@ -1522,6 +1543,7 @@ class Harness:
         if action == "forget":
             scored = await self._read(lambda conn: memory.forget_candidates(conn, project_id, text, previous and previous[0]))
             ids = [r["id"] for _, r in scored]
+            seen = {r["id"]: (r["version"], r["status"]) for _, r in scored}  # as decided, and as the ask names them
             if text is not None and memory.clear(scored):
                 ids = ids[:1]
             elif not ids:
@@ -1533,14 +1555,27 @@ class Harness:
                     return await done("declined", line="Nothing was forgotten: the researcher chose not now.")
             if not await self.memory_on(project_id):
                 return await done("memory_off", line="Memory is off in this project: nothing was saved, changed or forgotten.")
-            count = 0
+            count = changed = 0
             for record in ids:
-                with suppress(LookupError):  # forgotten meanwhile
+                def as_seen(conn, record=record):  # in the deletion's own transaction (MB9): edited, kept or replaced
+                    found = memory.row(conn, record)  # since, it is not what the researcher chose to forget
+                    if found is None:
+                        raise LookupError(record)
+                    if (found["version"], found["status"]) != seen[record] or (
+                            found["scope"] == "project" and found["project_id"] != project_id):
+                        raise ValueError("changed")  # (or moved to another project with its conversation since)
+                try:
                     await asyncio.to_thread(deletion.delete, self.db, self.content, "memory", record,
-                                            on_committed=self.revoke)
+                                            on_committed=self.revoke, check=as_seen)
                     count += 1
+                except LookupError:  # forgotten meanwhile
+                    pass
+                except ValueError:
+                    changed += 1
             return await done("forgotten", count=count, line=f"Forgotten at the researcher's request: {count} memory "
-                                                             f"record{'s' if count != 1 else ''}. Do not use it.")
+                                                             f"record{'s' if count != 1 else ''}. Do not use it."
+                              + (f" {changed} record{'s' if changed != 1 else ''} changed since the researcher chose and "
+                                 f"{'were' if changed != 1 else 'was'} not forgotten." if changed else ""))
         if action == "save":
             if previous is None:
                 return await done("no_candidate", line="The researcher asked to save something, but there is no "
@@ -2276,7 +2311,11 @@ class Harness:
             call.memory_off = not memory.enabled(load_settings(self.data_dir, project_id[0]).values)
             return call.memory_off
 
-        async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id, past, off),
+        def changed():  # a memory record the request holds changed since it was assembled: the run ends revoked
+            call.memory_off = True
+
+        async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id, past, off,
+                                                                                         changed),
                                           provider=route.provider.name) as client:
             result = await openrouter.query_model(
                 client, route, key, request.messages, timeout=timeout or MODEL_CALL_SECONDS, effort=facts["effort"],
@@ -2353,7 +2392,8 @@ class Harness:
             raise _LimitReached("turn_minutes")
         if call.memory_off:
             # Refused at dispatch: memory was switched off while the run's requests held it (recalled, or a memory
-            # tool's result in a chain that is never cut or rewritten: model-route rule 5). The run ends here as a
+            # tool's result in a chain that is never cut or rewritten: model-route rule 5), or a record it holds was
+            # edited, superseded or forgotten since (MB11). The run ends here as a
             # change to its project ends a run (section 10): cancelled, revoked; a turn offers Continue, which builds
             # the next turn with memory off.
             active.cancel_reason = "revoked"
@@ -2437,6 +2477,8 @@ class Harness:
                 raise RunOutcome("cancelled", "memory_off")  # switched off during its call, or before a restart
             await self._ended(active, lambda conn: self._finish_background(
                 conn, active, "succeeded" if output is not None else "failed", output, inputs))
+            if workflow == "memory" and output:  # it had candidates: it may have written or confirmed records
+                await self._index_memory(project_id)
         except asyncio.CancelledError:
             call = active.call
 

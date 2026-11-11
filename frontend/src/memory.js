@@ -2,8 +2,9 @@
 // agent's note did, read back from the record (the conversation's turns carry it); project state's progress in words;
 // Where we left off's dismissal for this return; and the message box filled by its next-step button (nothing is sent
 // until Send).
-import { del, get, patch, post } from './api.js';
+import { ApiError, del, get, patch, post } from './api.js';
 import { libraryChanged } from './library.js';
+import { errorText } from './text.js';
 
 // A turn's memory actions (backend/runs.py Harness._memory_command, update_progress), as catalog keys.
 export const MEMORY_ACTIONS = { saved: 'memory.saved', updated: 'memory.updated', forgotten: 'memory.forgotten',
@@ -49,5 +50,39 @@ export function fillComposer(text) {
 export const readLeftOff = (projectId) => get(`/api/projects/${encodeURIComponent(projectId)}/left-off`);
 export const readMemory = (projectId) => get(`/api/memory${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`);
 export const changeRecord = (record, body) => patch(`/api/memory/${encodeURIComponent(record.id)}`, { version: record.version, ...body });
-export const forgetRecord = (record) => del(`/api/memory/${encodeURIComponent(record.id)}`);
+export const forgetRecord = (record) => del(`/api/memory/${encodeURIComponent(record.id)}?version=${record.version}`);
 export const review = (body) => post('/api/memory/review', body);
+
+// A memory action from the views: null once done, else what was not saved: the error in words and its code, whether it
+// was an edit (edit), and the record it was for (id). Never the text typed: that stays in its open editor (MB1, Q16).
+export async function attempt(t, action, edit = false, id = null) {
+  try {
+    await action();
+    return null;
+  } catch (error) {
+    const code = error instanceof ApiError ? error.code : 'internal';
+    return { problem: errorText(t, code), code, edit: Boolean(edit), id };
+  }
+}
+
+// Whether the views read again after an action: always, but for a failure the server gives only before any write
+// (nothing changed: the view, and its open editor, stay as they are). A record changed meanwhile, or an outcome unknown
+// (a dropped connection, an error after a commit), reads again, which closes the editor, with the notice.
+const REFUSED_BEFORE_WRITING = new Set(['personal_from_strict', 'invalid_request', 'empty', 'not_confirmable']);
+export const readsAgain = (failed) => !failed || !REFUSED_BEFORE_WRITING.has(failed.code);
+
+// What an action could not save, kept by view and project (`settings:<project>`, `leftOff:<project>`) outside the
+// components that show it, so a remount never drops it (Q12, PR 51 recheck 3); only Dismiss, or a later failure in the
+// same view, replaces it. keptEvents tells the views when one changes.
+const kept = new Map();
+export const keptEvents = new EventTarget();
+export const keptUnsaved = (key) => kept.get(key) ?? null;
+export function keepUnsaved(key, value) {
+  if (value) kept.set(key, value);
+  else kept.delete(key);
+  keptEvents.dispatchEvent(new Event('changed'));
+}
+
+// The kept notice after an action on record id: what it could not save (failed), or, once that record's action
+// succeeded, nothing; another record's success leaves it.
+export const settled = (kept, failed, id) => failed ?? (id != null && kept?.id === id ? null : kept);

@@ -11,7 +11,7 @@ from agentic import Scripted, call, tool_messages
 from backend import agent
 from cited import cited, conversation_in, events_of, rows, with_papers
 from scholia_app import send
-from test_memory import set_project
+from test_memory import forget, set_project
 from test_search import WAGES
 
 pytestmark = pytest.mark.asyncio
@@ -82,6 +82,26 @@ async def test_update_progress_refuses_a_blank_note_and_never_takes_a_confirmed_
     for name in ("read_project_state", "read_memory"):
         found = agent.REGISTRY.get_definition(name)
         assert (found.read_only, found.tool_class, found.output_chars) == (True, "read_library", 8000)
+
+
+# S1-21a follow-up
+
+
+async def test_forgetting_the_agents_note_mid_turn_revokes_the_turn_that_wrote_it(tmp_path):
+    # MB5: the note joins the turn's memory scope, so its Forget revokes the running turn before its next request
+    held = {}
+
+    async def forget_then_list(body):
+        [(note,)] = await rows(held["client"], "SELECT id FROM memory_records WHERE type = 'agent_note'")
+        assert (await forget(held["client"], note)).json() == {"ok": True}
+        return {"calls": [call("list_materials", "c2")]}
+    provider = Scripted([call("update_progress", kind="next_step", text="Ask Alice")], forget_then_list, "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        held["client"] = client
+        stream = await send(client, await conversation_in(client, project), "Translate this: hello")
+        assert len(provider.agent_steps) == 2
+        assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "revoked")
 
 
 async def test_a_memory_tool_registers_only_the_papers_of_the_records_it_shows(tmp_path):

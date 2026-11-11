@@ -1316,6 +1316,8 @@
   "memory.edit": "Edit",
   "memory.save": "Save",
   "memory.cancel": "Cancel",
+  "memory.editNotSaved": "Your edit was not saved.",
+  "memory.dismiss": "Dismiss",
   "memory.confirm": "Confirm",
   "memory.forget": "Forget",
   "memory.keep": "Keep",

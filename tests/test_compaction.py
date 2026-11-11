@@ -17,6 +17,7 @@ from cited import Provider, cited, conversation_in, events_of, rows, with_papers
 from scholia_app import background_idle, events, send, started
 from test_materials import project_of
 from test_search import WAGES
+from test_memory import forget
 
 pytestmark = pytest.mark.asyncio
 FILLER = "Cohort studies follow a group of people over time to see who develops an outcome, and when. "
@@ -323,7 +324,7 @@ async def test_forgetting_a_memory_record_a_covered_turn_held_deletes_the_summar
         assert set(event["memory_ids"]) == {  # fix batch 2: linked as papers are (run_body_memory)
             m for (m,) in await rows(client, "SELECT memory_id FROM run_body_memory WHERE sha256 = ?", sha)}
         assert (await client.get(f"/api/runs/{run}/trace/bodies/{sha}")).status_code == 200
-        assert (await client.delete(f"/api/memory/{record}")).status_code in (200, 204)
+        assert (await forget(client, record)).status_code in (200, 204)
         assert await summary_rows(client) == []
         assert (await client.get(f"/api/runs/{run}/trace/bodies/{sha}")).status_code == 410  # fix batch 2: removed
         assert await rows(client, "SELECT count(*) FROM run_body_memory WHERE sha256 = ?", sha) == [(0,)]

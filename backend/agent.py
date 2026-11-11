@@ -595,8 +595,10 @@ async def update_progress(call, turn):
         from backend.runs import _event  # it imports this module
         _event(conn, turn.claim.run_id, "memory_proposed", {"tool": "update_progress", "records": list(written)})
     await turn.harness._record(turn.claim, None, None, also=keep)
+    _remembered(turn, written, ())  # the note's text is in the chain now: forgetting it revokes this turn (MB5)
     turn.emit({"type": "memory", "action": "noted", "count": 1})
-    return ToolResult(id=call.id, ok=True, text="Noted in the project state as your note.", meta={"noted": written[0]})
+    return ToolResult(id=call.id, ok=True, text="Noted in the project state as your note.",
+                      meta={"noted": written[0], "memory": list(written)})
 
 
 # S1-21b: paged outputs (section 8, Paging; backend/compaction.py)
