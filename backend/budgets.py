@@ -276,12 +276,15 @@ def read_notes(conn, run_id):
 
 def queue_unread_notes(conn, run_id):
     """As a turn ends, in its terminal transaction: each steering note no dispatched step carried waits as the
-    conversation's next turn instead, in order, so a note is never lost and never both read and queued (reading 10)."""
+    conversation's next turn instead, in order, so a note is never lost and never both read and queued (reading 10).
+    Returns how many it queued."""
     row = conn.execute("SELECT conversation_id FROM runs WHERE id = ?", (run_id,)).fetchone()
     if row is None or row[0] is None:
-        return
-    carried = carried_notes(conn, run_id)
+        return 0
+    carried, queued = carried_notes(conn, run_id), 0
     for seq, text in conn.execute("SELECT seq, json_extract(data, '$.text') FROM run_events WHERE run_id = ?"
                                   " AND type = 'steering_note' ORDER BY seq", (run_id,)).fetchall():
         if seq not in carried and text:
             queue(conn, row[0], text)
+            queued += 1
+    return queued

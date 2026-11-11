@@ -444,3 +444,10 @@ test('an older send still pending is given the conversation back when a newer on
   assert.deepEqual(cancels, ['/api/runs/r-older/cancel']);
   older.close();
 });
+
+test('a queued stream event marks the live turn, so the view reads the waiting messages again (D11)', async () => {
+  const { apply } = await import('../src/live.js');
+  assert.equal(apply(apply({ text: 'Q' }, { type: 'queued' }), { type: 'queued' }).queued, 2);
+  const source = readFileSync(fileURLToPath(new URL('../src/components/ConversationView.jsx', import.meta.url)), 'utf8');
+  assert.match(source, /if \(live\?\.steered \|\| live\?\.queued\) load\(\)/);
+});

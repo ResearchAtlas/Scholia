@@ -657,7 +657,10 @@ class Harness:
                 _event(conn, run_id, "steering_note", {"text": text})
                 return {"steering": {"run_id": run_id, "seq": seq}}
             return {"queued": budgets.queue(conn, row[0], text)}
-        return await self._write(write)
+        done = await self._write(write)
+        if "queued" in done and active is not None:  # the turn's stream says so too (SPEC:641)
+            active.events.put_nowait({"type": "queued"})
+        return done
 
     async def admit_turn(self, conversation_id: str, message, *, model=None, provider=None, effort=None,
                          retry_of=None, material_ids=None, queued=None) -> ActiveRun:
@@ -1081,8 +1084,9 @@ class Harness:
         if _revoked(conn, run_id):  # revoked in the record, which this process may not have heard yet
             status, cancel_reason, reason_code, limit = "cancelled", "revoked", "cancelled", None
         _release_allowances(conn, run_id)
+        queued = 0
         if _running(conn, run_id):
-            _queue_unread_notes(conn, run_id)  # S1-33: a steering note no step read waits as the next turn
+            queued = _queue_unread_notes(conn, run_id)  # S1-33: a steering note no step read waits as the next turn
             _close_asks(conn, run_id)  # an ask outlives no run: a late answer changes nothing (asks.answer refuses it)
             _let_go(conn, run_id)  # nor does the agent's question's text (Harness._ask)
             if limit is not None:
@@ -1100,7 +1104,7 @@ class Harness:
         if row is None:
             return {"run_id": run_id, "status": "deleted"}
         return {"run_id": run_id, "status": row[0], **({"cancel_reason": row[1]} if row[1] else {}),
-                "cost_usd": row[2], "accounting": _accounting(conn, run_id)}
+                "cost_usd": row[2], "accounting": _accounting(conn, run_id), **({"queued": queued} if queued else {})}
 
     def _commit_answer(self, conn, claim, answer, ctx):
         """The primary commit. Refused if cancellation was requested, so no answer is
@@ -1111,7 +1115,7 @@ class Harness:
             raise _Cancelled()
         _release_allowances(conn, claim.run_id)
         _let_go(conn, claim.run_id)  # an agent's question's text, held while it ran (Harness._ask)
-        _queue_unread_notes(conn, claim.run_id)  # S1-33: a note that came after the last step waits as the next turn
+        queued = _queue_unread_notes(conn, claim.run_id)  # S1-33: a note that came after the last step waits as the next turn
         cost = spending.run_cost(conn, claim.run_id)
         # Existence and mapping again, in this transaction: a passage re-read or removed while the judge ran is
         # mapped by its quote or marked source_removed (its verdict then unchecked), never a row that fails.
@@ -1163,7 +1167,7 @@ class Harness:
                     "model": ctx.get("extractor") or ctx["route"].model, "inherited": not ctx.get("extractor")})))
             conn.execute("UPDATE turns SET memory_status = 'pending' WHERE run_id = ?", (claim.run_id,))
         return {"run_id": claim.run_id, "status": "succeeded", "cost_usd": cost,
-                "accounting": _accounting(conn, claim.run_id)}
+                "accounting": _accounting(conn, claim.run_id), **({"queued": queued} if queued else {})}
 
     # Model calls
 
@@ -2461,7 +2465,10 @@ class Harness:
         the writer itself marks the run finished here (Registry.finished), so no cancellation of this await
         can separate the mark from the commit, and the run is known finished before it is released. A write
         that raises marks nothing."""
-        return await asyncio.to_thread(self.db.write, fn, committed=lambda: self.registry.finished.add(active.run_id))
+        final = await asyncio.to_thread(self.db.write, fn, committed=lambda: self.registry.finished.add(active.run_id))
+        if isinstance(final, dict) and final.pop("queued", None):  # S1-33: a note it queued, streamed once committed
+            active.events.put_nowait({"type": "queued"})
+        return final
 
     async def _background(self, active: ActiveRun) -> None:
         active.started = True
@@ -3245,7 +3252,7 @@ def _unread_notes(conn, run_id, taken):
 
 def _queue_unread_notes(conn, run_id):
     from backend import budgets  # it imports this module
-    budgets.queue_unread_notes(conn, run_id)
+    return budgets.queue_unread_notes(conn, run_id)
 
 
 def _close_asks(conn, run_id):

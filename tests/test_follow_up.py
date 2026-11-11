@@ -573,3 +573,46 @@ async def test_a_note_of_a_turn_whose_terminal_write_failed_is_not_said_to_be_qu
         read = await conversation_read(client, conversation)
         assert [q["text"] for q in read["queued"]] == ["Only the ones from 2020"]
         assert [n["state"] for n in read["turns"][-1]["steering"]] == ["queued"]
+
+
+# S1-33 fix batch 2: the stream says when a message was added to the queue
+
+
+async def test_each_way_a_message_joins_the_queue_is_streamed_as_queued(tmp_path):
+    # D11 (F4, SPEC:641): queued by the researcher while the turn runs, by a steer the turn has no step left to read,
+    # and by a note left unread at the turn's end: each streamed as `queued` on the running turn's stream, before its
+    # end, once its row has committed. The event carries no text.
+    gate = Gate(0)
+    provider = Scripted(None)
+    provider.script.append(gate.wrap(provider, "The answer."))
+    provider.script.pop(0)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await gate.reached.wait()  # the last step (an answer) is in flight
+        run_id = await running_run(client, conversation)
+        assert (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})).status_code == 201
+        assert "steering" in (await steer(client, run_id, "Also say how many")).json()  # read by no step: queued at the end
+        gate.open.set()
+        stream = await sending
+        kinds = [e["type"] for e in stream]
+        assert kinds.count("queued") == 2 and kinds.index("queued") < kinds.index("run_finished")
+        assert all(set(e) == {"type"} for e in stream if e["type"] == "queued")
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["Next?", "Also say how many"]
+    provider = MockProvider()
+    provider.parameters = ["max_tokens", "temperature"]  # no endpoint takes tools: the turn has no next step
+    release = asyncio.Event()
+
+    async def held(body):
+        await release.wait()
+        return provider.answer("Slow.")
+    provider.replies.append(held)
+    async with started(tmp_path / "data2", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Slow one?"))
+        run_id = await running_run(client, conversation)
+        while not provider.answers:
+            await asyncio.sleep(0.01)
+        assert "queued" in (await steer(client, run_id, "Shorter, please")).json()
+        release.set()
+        assert [e["type"] for e in await sending].count("queued") == 1

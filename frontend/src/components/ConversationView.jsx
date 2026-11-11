@@ -149,8 +149,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     return () => clearTimeout(timer);
   }, [waiting, handoff, failed, reads, id, load]);
 
-  // S1-33: a steering note read, or a budget notice reached, is shown from the record
-  useEffect(() => { if (live?.steered) load(); }, [live?.steered, load]);
+  // S1-33: a steering note read, or a message queued, is shown from the record (a budget notice: the bar reads again)
+  useEffect(() => { if (live?.steered || live?.queued) load(); }, [live?.steered, live?.queued, load]);
 
   // S1-33: a waiting message's Send (live.js drain starts the oldest on its own after a turn that succeeded)
   async function sendQueued(item) {

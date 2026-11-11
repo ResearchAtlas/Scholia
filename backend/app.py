@@ -1342,7 +1342,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             if conn.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone() is None:
                 raise ApiError(404, "not_found", "No such conversation")
             return budgets.queue(conn, conversation_id, text)
-        return await write(add)
+        added = await write(add)
+        if (running := harness().registry.turns.get(conversation_id)) is not None:  # its stream says so (SPEC:641)
+            running.events.put_nowait({"type": "queued"})
+        return added
 
     @app.put("/api/conversations/{conversation_id}/queue/{queued_id}")
     async def edit_queued(conversation_id: str, queued_id: str, body: FollowUp):
