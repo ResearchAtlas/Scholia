@@ -11,7 +11,7 @@ import { LeftOff, Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
-import { NOTICES, clear, drain, halt, idle, limitText, send, showing, stop, stopsAt, unsavedAnswer, useLiveTurn } from '../live.js';
+import { NOTICES, clear, drain, limitText, send, showing, stop, stopsAt, unsavedAnswer, useLiveTurn } from '../live.js';
 import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
@@ -154,17 +154,19 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   // and a waiting message started as the live turn is no longer listed as waiting (PR 52 cycle 3)
   useEffect(() => { if (live?.runId) load(); }, [live?.runId, load]);
 
-  // S1-33: a waiting message's Send (live.js drain starts the oldest on its own after a turn that succeeded)
-  async function sendQueued(item) {
+  // S1-33: a waiting message's Send (live.js drain starts the oldest on its own after a turn that succeeded). A Stop
+  // pressed here once Send was pressed is the researcher's last word: nothing is sent (live.js send, PR 52 cycle 4).
+  async function sendQueued(item, since = stopsAt(id)) {
     setProblem(null);
     try {
       await readChoice();
       await send(id, `/api/conversations/${id}/queue/${encodeURIComponent(item.id)}/send`, messageRoute(currentChoice()),
-        item.text);
+        item.text, since);
     } catch (error) {
       if (error instanceof ApiError && error.code === 'selection_invalid') { // a paper it names was deleted since
         setProblem(t('followUp.paperGone'));
-      } else if (!(error instanceof ApiError && ['not_queued', 'not_after_success', 'active_run'].includes(error.code))) {
+      } else if (!(error instanceof ApiError
+        && ['not_queued', 'not_after_success', 'active_run', 'stopped'].includes(error.code))) {
         setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
       }
     }
@@ -177,6 +179,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   }, [turns, live?.answer, live?.text]);
 
   async function submit(text) {
+    const since = stopsAt(id); // a Stop pressed once the researcher sent this keeps it in the box (PR 52 cycle 4)
     setProblem(null);
     if (running) return followUp(text);
     try {
@@ -185,12 +188,13 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       await readChoice(); // the model chosen at an earlier launch, before anything is sent
       const papers = chosenPapers(projectId);
       await send(target, `/api/conversations/${target}/message/stream`, { content: text, ...messageRoute(currentChoice()),
-        ...(papers.length ? { material_ids: papers.map((paper) => paper.id) } : {}) }, text);
+        ...(papers.length ? { material_ids: papers.map((paper) => paper.id) } : {}) }, text, since);
       if (papers.length) choosePapers(projectId, []); // they went with this message
       if (!conversation && here.current) onCreated(target);
       return true;
     } catch (error) {
       if (isActiveRun(error)) return followUp(text); // a turn started meanwhile: the message follows the setting
+      if (error instanceof ApiError && error.code === 'stopped') return false; // it stays in the box, unsent
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
       return false;
     }
@@ -199,16 +203,15 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   // S1-33 (F11): a message sent while a turn runs, steered or queued as the setting says; said once read back.
   async function followUp(text) {
     const runId = live?.runId ?? shown.find((turn) => turn.status === 'running')?.run_id ?? null;
-    const pressed = stopsAt(id); // a Stop from here on is the researcher's last word on what runs (PR 52 cycle 3)
     const papers = chosenPapers(projectId); // they go with it, and so it waits as the next turn (followup.js)
     try {
       const sent = await follow(id, runId, text, papers.map((paper) => paper.id));
       if (papers.length) choosePapers(projectId, []); // they went with this message
       await load();
-      if (sent.ended) { // a steer whose turn had ended: a new turn once nothing runs here, unless Stop was pressed there
-        await idle(id); // since the researcher's last turn started, or since this was sent (Harold, 2026-11-11, item 4)
-        if (stopsAt(id) === pressed && !halt(id)) await sendQueued(sent.queued);
-      } else if (sent.queued) drain(id); // its turn may have ended already: started if it succeeded here (live.js)
+      // Queued, or a steer whose turn had ended (it waits queued too): its turn may have ended already, and then it starts
+      // only as any waiting message does, after a turn that succeeded here (live.js drain); else it waits with Send
+      // (Harold, 2026-11-12, variant 1N)
+      if (sent.queued) drain(id);
       return true;
     } catch (error) {
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
@@ -249,11 +252,13 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   }, [attached?.lookup]);
 
   async function resume(turn) {
+    const since = stopsAt(id); // a Stop pressed once Continue was pressed sends nothing (PR 52 cycle 4)
     setProblem(null);
     try {
       await readChoice();
-      await send(id, `/api/runs/${turn.run_id}/continue`, messageRoute(currentChoice()), turn.message?.text ?? '');
+      await send(id, `/api/runs/${turn.run_id}/continue`, messageRoute(currentChoice()), turn.message?.text ?? '', since);
     } catch (error) {
+      if (error instanceof ApiError && error.code === 'stopped') return; // Continue is still offered
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
     }
   }

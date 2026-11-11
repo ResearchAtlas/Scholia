@@ -12,11 +12,10 @@ const turns = new Map(); // conversation id -> { text, runId, answer, resultSave
 // S1-33 (PR 52 cycle 3, design review B): one stream at a time per conversation here, its abort controller; while one is
 // being admitted or runs, a message is refused here (send), so nothing is ever handed back between streams.
 const aborts = new Map();
-const routes = new Map(); // run id -> the route its turn was sent on here ({ model, provider, effort })
+const routes = new Set(); // run ids of the turns sent from here (the backend starts a waiting message on its route)
 const halted = new Set(); // conversations Stop was pressed in here since a turn the researcher started was admitted
 const stops = new Map(); // conversation id -> how many times Stop was pressed in it here
 const followed = new Set(); // run ids a waiting message was started after, here (one start a turn)
-const idlers = new Map(); // conversation id -> what waits for its stream here to end (idle)
 const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut, notices }, for this window
 const listeners = new Set();
 
@@ -59,16 +58,21 @@ export function apply(turn, event) {
 // S1-33 (PR 52 cycle 3): while a turn is being admitted or runs here in the conversation, it is refused here at once,
 // with no request, as the backend refuses a second turn (409 active_run): the message then follows the setting, steered
 // or queued (ConversationView), and the one stream here keeps the conversation, so Stop always reaches the turn shown.
-export function send(conversationId, path, body, text) {
+// PR 52 cycle 4 (design review B2): every request that starts a turn leaves through here, so Stop is checked here, in the
+// same step as the request: one is refused here (409 stopped, no request) when Stop was pressed in the conversation here
+// since `since` (the count its caller read when the researcher acted), and a start of its own (auto, the drain) also
+// while the conversation is halted here. Only a turn the researcher started clears that.
+export function send(conversationId, path, body, text, since = stopsAt(conversationId), auto = false) {
+  if (stopsAt(conversationId) !== since || (auto && halted.has(conversationId))) {
+    return Promise.reject(new ApiError(409, 'stopped'));
+  }
   if (aborts.has(conversationId)) return Promise.reject(new ApiError(409, 'active_run'));
   const abort = new AbortController();
   let turn = { text, runId: null, answer: null, done: false };
   aborts.set(conversationId, abort);
-  const release = () => { // the conversation is free here again, said before anything awaiting this stream goes on
+  const release = () => { // the conversation is free here again
     if (aborts.get(conversationId) !== abort) return false;
     aborts.delete(conversationId);
-    for (const resolve of idlers.get(conversationId) ?? []) resolve();
-    idlers.delete(conversationId);
     return true;
   };
   set(conversationId, turn, 'send');
@@ -76,8 +80,8 @@ export function send(conversationId, path, body, text) {
     stream(path, body, (event) => {
       turn = apply(turn, event);
       if (event.type === 'run_started') {
-        routes.set(event.run_id, { model: body?.model, provider: body?.provider, effort: body?.effort });
-        if (!body?.after) halted.delete(conversationId); // the researcher's own turn, admitted: waiting ones may follow it
+        routes.add(event.run_id);
+        if (!auto) halted.delete(conversationId); // the researcher's own turn, admitted: waiting ones may follow it
       }
       if (event.type === 'ask') asksChanged(conversationId); // S1-19c: the agent asks; the conversation shows it
       if (event.type === 'memory') memoryChanged(null); // S1-21a: a command or the agent's note changed memory
@@ -100,18 +104,19 @@ export function send(conversationId, path, body, text) {
       if (!turn.done) turn = { ...turn, done: true };
       if (release() && turns.get(conversationId) && turns.get(conversationId) !== turn) set(conversationId, turn, 'run_finished');
       admitted();
-      if (turn.status === 'succeeded') drain(conversationId);
+      drain(conversationId); // the conversation is free here again, however the stream ended: the record says what follows
     });
   });
 }
 
-// S1-33 (F11, queue; PR 52 cycle 3, design review B): after a turn that succeeded, the oldest message waiting in its
-// conversation starts as the next turn, on the route that turn was sent on, wherever the window is. Each call reads the
-// conversation and acts on what the record says now: only while the latest turn there succeeded and was sent from this
-// window, no Stop was pressed here since, and nothing is being admitted or running here, checked before and after the
-// read; once a turn. A message edited or removed while it was being started (not_queued) gives way to the next, read
-// again. The backend starts it only while that turn is still the latest, succeeded and not stopped, and once. After any
-// other ending it waits with Send.
+// S1-33 (F11, queue; PR 52 cycles 3 and 4, design reviews B and B2): after a turn that succeeded, the oldest message
+// waiting in its conversation starts as the next turn, on the route that turn ran on (the backend reads it from that
+// turn's record), wherever the window is. Asked at every stream's end here, and after a message joins the queue. Each
+// call reads the conversation and acts on what the record says now: only while the latest turn there succeeded and was
+// sent from this window, no Stop was pressed here since, and nothing is being admitted or running here, checked before
+// and after the read, and again by send as the request leaves; once a turn. A message edited or removed while it was
+// being started (not_queued) gives way to the next, read again. The backend starts it only while that turn is still the
+// latest, succeeded and not stopped from any window, and once. After any other ending it waits with Send.
 export async function drain(conversationId) {
   const pressed = stopsAt(conversationId);
   const free = () => !aborts.has(conversationId) && !halted.has(conversationId) && stopsAt(conversationId) === pressed;
@@ -128,7 +133,7 @@ export async function drain(conversationId) {
     followed.add(after);
     try {
       await send(conversationId, `/api/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(next.id)}/send`,
-        { ...routes.get(after), after }, next.text);
+        { after }, next.text, pressed, true);
       return;
     } catch (error) {
       if (!(error instanceof ApiError && error.code === 'not_queued')) return; // refused otherwise: it waits with Send
@@ -154,17 +159,6 @@ export async function stop(conversationId, runId) {
 // S1-33: how many times Stop was pressed in the conversation here, so the view can tell whether one came meanwhile.
 export function stopsAt(conversationId) {
   return stops.get(conversationId) ?? 0;
-}
-
-// S1-33: whether Stop was pressed in the conversation here since a turn the researcher started there was admitted.
-export function halt(conversationId) {
-  return halted.has(conversationId);
-}
-
-// S1-33: resolves once no turn is being admitted or running here in the conversation.
-export function idle(conversationId) {
-  if (!aborts.has(conversationId)) return Promise.resolve();
-  return new Promise((resolve) => idlers.set(conversationId, [...(idlers.get(conversationId) ?? []), resolve]));
 }
 
 // S1-19c: open_place's places (backend/agent.py PLACES): the window opens the one named (Shell.jsx).

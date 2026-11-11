@@ -4,8 +4,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { budgetBar, follow, nextQueued } from '../src/followup.js';
-import { drain, send, stop, subscribe } from '../src/live.js';
+import { budgetBar, follow, isActiveRun, nextQueued } from '../src/followup.js';
+import { drain, send, stop, stopsAt, subscribe } from '../src/live.js';
+import * as live from '../src/live.js';
+import { ApiError, post } from '../src/api.js';
 
 const spend = (conversation, project, percents = [50, 85, 90]) => ({
   conversation: { limit_usd: 10, settled_usd: conversation, open_usd: 0, own: false },
@@ -77,7 +79,7 @@ function streamOf(...chunks) {
 }
 
 // Review recheck 1: a turn that succeeded starts the oldest waiting message on its own route, once; another ending
-// starts nothing.
+// starts nothing. (PR 52 cycle 4, G8: the start names the turn it follows only; the backend runs it on that turn's route.)
 for (const [status, started] of [['succeeded', true], ['failed', false], ['cancelled', false]]) {
   test(`after a turn that ended ${status}, ${started ? 'the oldest waiting message starts once' : 'nothing starts'}`, async (t) => {
     const posts = [];
@@ -96,8 +98,7 @@ for (const [status, started] of [['succeeded', true], ['failed', false], ['cance
     await send(`c-${status}`, '/x', { model: 'm1', provider: 'openrouter' }, 'Q');
     await new Promise((resolve) => setTimeout(resolve, 30));
     const started_ = posts.filter(([url]) => url.includes('/queue/'));
-    assert.deepEqual(started_, started ? [[`/api/conversations/c-${status}/queue/q1/send`,
-      { model: 'm1', provider: 'openrouter', after: `r1-${status}` }]] : []);
+    assert.deepEqual(started_, started ? [[`/api/conversations/c-${status}/queue/q1/send`, { after: `r1-${status}` }]] : []);
   });
 }
 
@@ -232,7 +233,7 @@ test('a message sent while a turn is admitted or runs here is refused here with 
   a.event('{"type":"run_finished","status":"succeeded"}');
   a.close();
   await settle();
-  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-c2/queue/q1/send', { model: 'm1', after: 'r-c2' }]]);
+  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-c2/queue/q1/send', { after: 'r-c2' }]]);
 });
 
 test('Stop reaches the one turn here, admitted or still unread, and a send still pending; nothing waiting starts after it', async (t) => {
@@ -323,7 +324,7 @@ test('Stop after a success: nothing starts, nor after a refused message; after a
   assert.deepEqual(run.calls.queueSends, []);
   await send('c-s', '/b', { model: 'm2' }, 'B');
   await settle();
-  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-s/queue/q1/send', { model: 'm2', after: 'r-s2' }]]);
+  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-s/queue/q1/send', { after: 'r-s2' }]]);
 });
 
 test('a follow-up queued while the turn\'s first event is unread starts once that turn succeeds, from the record (C3)', async (t) => {
@@ -343,7 +344,7 @@ test('a follow-up queued while the turn\'s first event is unread starts once tha
   await settle();
   assert.deepEqual(run.calls.queueSends.map(([url]) => url), ['/api/conversations/c-c3/queue/q1/send']);
   const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
-  assert.match(followUp, /else if \(sent\.queued\) drain\(id\)/); // no turns or run id the handler captured
+  assert.match(followUp, /\n\s*if \(sent\.queued\) drain\(id\);/); // no turns or run id the handler captured
 });
 
 for (const change of ['edited', 'removed']) {
@@ -381,35 +382,197 @@ test('a message sent after the turn\'s last event but before its stream\'s end i
   }
 });
 
-test('a steer answered "ended" after Stop waits with Send; one answered so with no Stop since starts once nothing runs here (N1)', async (t) => {
-  const { idle, stopsAt } = await import('../src/live.js');
+// PR 52 cycle 4 (design review B2, Option 1 with variant 1N): the view's own handlers, taken from its source and run
+// against the real live.js and followup.js, with what they close over in the component stood in for. Each case is one
+// cycle 4 or design review B2 found.
+function viewHandlers(id, overrides = {}) {
+  const source = VIEW();
+  const handler = (name) => { // its text, from `async function name(` to its matching brace
+    const start = source.indexOf(`async function ${name}(`);
+    let depth = 0;
+    for (let i = source.indexOf('{', start); i < source.length; i += 1) {
+      depth += source[i] === '{' ? 1 : source[i] === '}' ? -1 : 0;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+    throw new Error(name);
+  };
+  const env = { id, projectId: 'p', conversation: { id }, here: { current: true }, running: false, live: null, shown: [],
+    setProblem: (problem) => { if (problem) env.problems.push(problem); }, problems: [], readChoice: async () => {},
+    currentChoice: () => null, messageRoute: () => ({}), t: (key) => key, errorText: (t, code) => code, load: async () => {},
+    post, setDraft: () => {}, chosenPapers: () => [], choosePapers: () => {}, onCreated: () => {}, isActiveRun, ApiError,
+    send, drain, stopsAt, follow, idle: live.idle, halt: live.halt, ...overrides }; // idle and halt: what the view used before
+  const names = Object.keys(env);
+  const made = new Function(...names, `${['sendQueued', 'submit', 'followUp', 'resume'].map(handler).join('\n')}
+    return { sendQueued, submit, followUp, resume };`)(...names.map((name) => env[name]));
+  return { ...made, problems: env.problems };
+}
+const held = () => { let release; const promise = new Promise((resolve) => { release = resolve; }); return { promise, release }; };
+const steering = (runId, reply) => ({ '/api/settings': () => Response.json({ values: { ui: { follow_up: 'steer' } } }),
+  [`/api/runs/${runId}/steering`]: () => Response.json(reply) });
+
+test('a late steer answered "ended" starts nothing on its own, and Send waiting on the saved choice sends nothing once Stop is pressed (B1/C1)', async (t) => {
+  // cycle 4 B1 (C1): a fresh window, the record showing another window's turn running; the steer is answered "ended" as
+  // that turn's cancellation settles, and Stop is pressed while the saved choice is still being read
+  const choice = held();
+  const run = backend({ read: () => record('r-b1', 'cancelled'),
+    streams: steering('r-b1', { queued: { id: 'q1', text: 'Late' }, ended: true }) });
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  const view = viewHandlers('c-b1', { readChoice: () => choice.promise, running: true, shown: [{ run_id: 'r-b1', status: 'running' }] });
+  const following = view.followUp('Late');
+  await settle();
+  await stop('c-b1');
+  choice.release();
+  await following;
+  await settle();
+  assert.deepEqual(run.calls.queueSends, []);
+  // Send pressed while the saved choice is read, then Stop: nothing is sent; its control, with no Stop, sends once
+  for (const pressStop of [true, false]) {
+    const conversation = `c-b1-send-${pressStop}`;
+    const reading = held();
+    const sends = backend({ read: () => record('r-old', 'cancelled'), starts: [() => succeeded(`${conversation}-r`)] });
+    t.mock.method(globalThis, 'fetch', sends.fetch);
+    const sending = viewHandlers(conversation, { readChoice: () => reading.promise }).sendQueued({ id: 'q1', text: 'Next' });
+    await settle();
+    if (pressStop) await stop(conversation);
+    reading.release();
+    await sending;
+    await settle();
+    assert.equal(sends.calls.queueSends.length, pressStop ? 0 : 1, conversation);
+  }
+});
+
+test('a send refused after a success, while that turn\'s drain read is out, never loses the waiting message\'s start, in either order (C2)', async (t) => {
+  for (const order of ['read first', 'refusal first']) {
+    const conversation = `c-c2b-${order.split(' ')[0]}`;
+    const first = held();
+    let refuse;
+    const run = backend({ read: (count) => (count === 1 ? first.promise : record(`${conversation}-a`, 'succeeded')), streams: {
+      '/a': () => succeeded(`${conversation}-a`),
+      '/b': () => new Promise((resolve) => { refuse = () => resolve(Response.json({ code: 'no_provider' }, { status: 400 })); }) } });
+    t.mock.method(globalThis, 'fetch', run.fetch);
+    await send(conversation, '/a', {}, 'A');
+    await settle(); // its end's drain is reading the conversation
+    const b = send(conversation, '/b', {}, 'B').catch((error) => error); // the researcher's own message, being admitted
+    await settle();
+    if (order === 'read first') { first.release(record(`${conversation}-a`, 'succeeded')); await settle(); refuse(); }
+    else { refuse(); await settle(); first.release(record(`${conversation}-a`, 'succeeded')); }
+    assert.equal((await b).code, 'no_provider');
+    await settle();
+    assert.deepEqual(run.calls.queueSends, [[`/api/conversations/${conversation}/queue/q1/send`, { after: `${conversation}-a` }]], order);
+    t.mock.restoreAll();
+  }
+});
+
+test('Send on a later message refused while the drain\'s read is out still lets the oldest start (B2 N1)', async (t) => {
+  const first = held();
+  const waiting = [{ id: 'q1', text: 'Oldest' }, { id: 'q2', text: 'Later' }];
+  const run = backend({ read: (count) => (count === 1 ? first.promise : record('r-n1s', 'succeeded', waiting)),
+    streams: { '/a': () => succeeded('r-n1s') },
+    starts: [() => Response.json({ code: 'selection_invalid' }, { status: 400 }), () => succeeded('r-n1s-next')] });
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  await send('c-n1s', '/a', {}, 'A');
+  await settle();
+  const view = viewHandlers('c-n1s');
+  const sending = view.sendQueued(waiting[1]); // a paper it names was deleted: refused
+  await settle();
+  first.release(record('r-n1s', 'succeeded', waiting));
+  await sending;
+  await settle();
+  assert.deepEqual(view.problems, ['followUp.paperGone']);
+  assert.deepEqual(run.calls.queueSends.map(([url, body]) => [url.split('/').at(-2), body]), [['q2', {}], ['q1', { after: 'r-n1s' }]]);
+});
+
+test('a late steer answered "ended" after a turn that succeeded here never starts before an older waiting message (B2 N2)', async (t) => {
   const a = controlledStream();
-  t.mock.method(globalThis, 'fetch', async (url) => (String(url) === '/a' ? new Response(a.body) : Response.json({ status: 'cancelled' })));
+  const run = backend({ read: () => record('r-n2', 'succeeded', [{ id: 'q0', text: 'Older' }, { id: 'q1', text: 'Late' }]),
+    streams: { '/a': () => new Response(a.body), ...steering('r-n2', { queued: { id: 'q1', text: 'Late' }, ended: true }) } });
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  const sending = send('c-n2', '/a', {}, 'A');
+  a.event('{"type":"run_started","run_id":"r-n2"}');
+  await sending;
+  const following = viewHandlers('c-n2', { running: true, live: { runId: 'r-n2', done: false } }).followUp('Late');
+  await settle();
+  a.event('{"type":"run_finished","status":"succeeded"}');
+  a.close();
+  await following;
+  await settle();
+  assert.deepEqual(run.calls.queueSends.map(([url, body]) => [url.split('/').at(-2), body]), [['q0', { after: 'r-n2' }]]);
+});
+
+test('a stream cut after its answer, with no end event, starts the waiting message once its record says it succeeded (B2 N3)', async (t) => {
+  const run = backend({ read: () => record('r-n3', 'succeeded'), streams: { '/a': () => new Response(streamOf(
+    'data: {"type":"run_started","run_id":"r-n3"}\n\n', 'data: {"type":"chat_response","content":"An answer.","result_saved":true}\n\n')) } });
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  await send('c-n3', '/a', {}, 'A');
+  await settle();
+  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-n3/queue/q1/send', { after: 'r-n3' }]]);
+});
+
+test('a message, a Continue or a Send pressed here, then Stop before its request left, sends nothing; the message stays in the box (B2 N4)', async (t) => {
+  for (const action of ['submit', 'resume', 'sendQueued']) {
+    const conversation = `c-n4-${action}`;
+    const reading = held();
+    const run = backend({ read: () => record('r-n4', 'cancelled'), streams: {
+      [`/api/conversations/${conversation}/message/stream`]: () => succeeded(`${conversation}-r`),
+      '/api/runs/r-n4/continue': () => succeeded(`${conversation}-r`) } });
+    t.mock.method(globalThis, 'fetch', run.fetch);
+    const view = viewHandlers(conversation, { readChoice: () => reading.promise });
+    const acting = action === 'submit' ? view.submit('Typed') : action === 'resume'
+      ? view.resume({ run_id: 'r-n4', message: { text: 'Typed' } }) : view.sendQueued({ id: 'q1', text: 'Next' });
+    await settle();
+    await stop(conversation);
+    reading.release();
+    const done = await acting;
+    await settle();
+    assert.deepEqual(run.calls.requests.filter((url) => /message\/stream|continue|\/queue\//.test(url)), [], action);
+    assert.deepEqual(view.problems, [], action); // nothing to say: the researcher stopped it
+    if (action === 'submit') assert.equal(done, false); // so the text stays in the box
+    t.mock.restoreAll();
+  }
+});
+
+test('after a Stop in another window, a late steer answered "ended" starts nothing here (B2 N5)', async (t) => {
+  // The turn was sent here and its answer committed; Stop was pressed in another window (the backend marks it stopped).
+  const a = controlledStream();
+  const started = [];
+  const run = backend({ read: () => record('r-n5', 'succeeded'), streams: { '/a': () => new Response(a.body),
+    ...steering('r-n5', { queued: { id: 'q1', text: 'Late' }, ended: true }) },
+  starts: [1, 2, 3].map(() => (init) => { // as Harness.stopped makes the backend answer
+    if (JSON.parse(init.body).after === 'r-n5') return Response.json({ code: 'not_after_success' }, { status: 409 });
+    started.push(init.body);
+    return succeeded('r-n5-next');
+  }) });
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  const sending = send('c-n5', '/a', {}, 'A');
+  a.event('{"type":"run_started","run_id":"r-n5"}');
+  await sending;
+  const following = viewHandlers('c-n5', { running: true, live: { runId: 'r-n5', done: false } }).followUp('Late');
+  await settle();
+  a.event('{"type":"run_finished","status":"succeeded"}');
+  a.close();
+  await following;
+  await settle();
+  assert.deepEqual(started, []);
+  assert.ok(run.calls.queueSends.every(([, body]) => body.after === 'r-n5'));
+});
+
+test('after Stop here, nothing waiting starts on its own until a turn the researcher starts here is admitted (N1, variant 1N)', async (t) => {
+  const a = controlledStream();
+  const run = backend({ read: () => record('r-n1', 'cancelled'),
+    streams: { '/a': () => new Response(a.body), ...steering('r-n1', { queued: { id: 'q1', text: 'Late' }, ended: true }) } });
+  t.mock.method(globalThis, 'fetch', run.fetch);
   const sending = send('c-n1', '/a', {}, 'A');
   a.event('{"type":"run_started","run_id":"r-n1"}');
   await sending;
-  const pressed = stopsAt('c-n1');
-  let free = false;
-  idle('c-n1').then(() => { free = true; });
   await stop('c-n1');
-  assert.equal(stopsAt('c-n1'), pressed + 1); // the view compares it with what it read at the submit
-  await settle();
-  assert.equal(free, false); // its stream is still under way here
+  await viewHandlers('c-n1', { running: true, live: { runId: 'r-n1', done: false } }).followUp('Late');
   a.event('{"type":"run_finished","status":"cancelled"}');
   a.close();
   await settle();
-  assert.equal(free, true);
-  const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
-  assert.match(followUp, /const pressed = stopsAt\(id\)/);
-  assert.match(followUp, /await idle\(id\);[^\n]*\n\s*if \(stopsAt\(id\) === pressed && !halt\(id\)\) await sendQueued\(sent\.queued\)/);
-  // item 4 as Harold worded it (internal review P3-2): a Stop pressed before the submit counts too, until a turn the
-  // researcher starts there is admitted, so steer and queue alike leave the message waiting with Send
-  const { halt } = await import('../src/live.js');
-  assert.equal(halt('c-n1'), true);
-  t.mock.method(globalThis, 'fetch', async () => new Response(streamOf('data: {"type":"run_started","run_id":"r-n1b"}\n\n',
-    'data: {"type":"run_finished","status":"failed"}\n\n')));
-  await send('c-n1', '/b', {}, 'B');
-  assert.equal(halt('c-n1'), false);
+  assert.deepEqual(run.calls.queueSends, []);
+  // a start of its own is refused here while the conversation is halted, with no request
+  assert.equal((await send('c-n1', '/auto', { after: 'r-n1' }, 'x', stopsAt('c-n1'), true).catch((error) => error)).code, 'stopped');
+  assert.ok(!run.calls.requests.includes('/auto'));
 });
 
 test('Stop with a send pending here also stops the turn the record shows running from another window', async (t) => {
@@ -495,14 +658,15 @@ test('a limit too low for the step says the least amount it needs, rounded up so
   assert.equal(problemText(makeT('en'), Object.assign(new Error('x'), { code: 'x' }), 'en'), makeT('en')('errors.internal'));
 });
 
-test('a waiting message starts on the route its turn was sent on, never the picker\'s choice now; after a turn sent elsewhere, nothing starts here (D15)', async (t) => {
+// PR 52 cycle 4 (G8, design review B2): the start names only the turn it follows, whose route the backend reads from that
+// turn's record (runs.inputs), so neither the picker's choice now nor a default changed since can reach it.
+test('a waiting message is started naming only the turn it follows, never the picker\'s choice; after a turn sent elsewhere, nothing starts here (D15)', async (t) => {
   let latest = 'r-d15';
   const run = backend({ streams: { '/x': () => succeeded('r-d15') }, read: () => record(latest, 'succeeded') });
   t.mock.method(globalThis, 'fetch', run.fetch);
   await send('c-d15', '/x', { content: 'Q', model: 'm-a', provider: 'openrouter', effort: 'high', material_ids: ['p'] }, 'Q');
   await settle();
-  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-d15/queue/q1/send',
-    { model: 'm-a', provider: 'openrouter', effort: 'high', after: 'r-d15' }]]);
+  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-d15/queue/q1/send', { after: 'r-d15' }]]);
   latest = 'r-elsewhere'; // the latest turn was sent from another window: that one starts it, or it waits with Send
   await drain('c-d15');
   assert.equal(run.calls.queueSends.length, 1);
@@ -539,9 +703,13 @@ test('a $0 cap shows the bar, over it at any spend; a limit the file does not gi
   assert.equal(budgetBar({ ...spend(1, 0), project: { limit_usd: null, settled_usd: 5, open_usd: 0 } }), null);
 });
 
-test('a steer whose turn had ended starts as a new turn, as Send does, once nothing runs here (D22, reading 12)', () => {
+// Harold, 2026-11-12 (variant 1N, which narrows reading 12 and replaces cycle 2's D22): a steer whose turn had ended waits
+// queued, as the backend keeps it, and starts only as any waiting message does: after a turn that succeeded here (drain),
+// which the backend refuses after a Stop from any window; after any other ending it waits with Send.
+test('a steer whose turn had ended waits queued and starts only as any waiting message does (D22 under variant 1N)', () => {
   const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
-  assert.match(followUp, /if \(sent\.ended\) \{[^}]*await idle\(id\);[^\n]*\n\s*if \(stopsAt\(id\) === pressed && !halt\(id\)\) await sendQueued\(sent\.queued\)/);
+  assert.ok(!/sent\.ended|sendQueued|idle\(|halt\(/.test(followUp), followUp);
+  assert.match(followUp, /\n\s*if \(sent\.queued\) drain\(id\);/);
 });
 
 test('a budget ask whose project budget could not be read says so, never that the budget is $0 (E4), in both catalogs', () => {
@@ -573,4 +741,154 @@ test('a message naming papers sent while a turn runs waits as the next turn with
     const catalog = JSON.parse(readFileSync(fileURLToPath(new URL(`../src/i18n/${language}.json`, import.meta.url)), 'utf8'));
     assert.ok(catalog['composer.papersWait'] && catalog['followUp.paperGone'], language);
   }
+});
+
+// PR 52 cycle 4 (design review B2): a seeded random matrix. The view's handlers and live.js run against a backend that
+// follows the backend's rules (one turn at a time; a start after a turn only while that turn is the latest, succeeded
+// and not stopped; a steer for an ended turn queued and answered "ended"; Stop marks the run), where every response, the
+// saved choice's read and every stream event arrive when the schedule releases them, in random order; Stop here and in
+// another window, the researcher's messages, steers, Sends and the turns' endings come in between. Checked: no request
+// leaves for an action the researcher took before a Stop here; nothing starts on its own after a Stop here until a turn
+// the researcher started is admitted; nothing starts on its own but through the drain; at most one start a turn, the
+// oldest waiting; and once all has arrived, a waiting message never waits behind a turn that succeeded here with no Stop.
+function seeded(seed) {
+  return () => { seed = (seed + 0x6d2b79f5) | 0; let x = Math.imul(seed ^ (seed >>> 15), 1 | seed); x ^= x + Math.imul(x ^ (x >>> 7), 61 | x); return ((x ^ (x >>> 14)) >>> 0) / 4294967296; };
+}
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+async function trial(seed, install) {
+  const random = seeded(seed);
+  const pick = (items) => items[Math.floor(random() * items.length)];
+  const conversation = `c-matrix-${seed}`;
+  const broken = [];
+  const state = { turns: [], queued: [], stopped: new Set(), runs: 0, items: 0, halted: false, started: new Map(), pressed: new Map(),
+    pending: [], streams: new Map() };
+  const latest = () => state.turns.at(-1);
+  const running = () => state.turns.find((turn) => turn.status === 'running');
+  const quietly = (fn) => { try { fn(); } catch { /* the stream was closed already: its reader stopped */ } };
+  const inOrder = (s, fn) => { s.queue.push(fn); state.pending.push(() => s.queue.shift()?.()); }; // one stream's events
+  const later = (fn) => new Promise((resolve, reject) => state.pending.push(() => { try { resolve(fn()); } catch (error) { reject(error); } }));
+  const end = (turn, status) => { // the run's terminal record, then its stream says so
+    if (turn.status !== 'running') return;
+    turn.status = status;
+    const s = state.streams.get(turn.run_id);
+    inOrder(s, () => { quietly(() => s.event(`{"type":"run_finished","status":"${status}"}`)); quietly(() => s.close()); });
+  };
+  const admit = (init, queued) => {
+    if (running()) return Response.json({ code: 'active_run' }, { status: 409 });
+    const turn = { run_id: `${conversation}-r${state.runs += 1}`, status: 'running' };
+    if (queued) state.queued = state.queued.filter((item) => item !== queued);
+    state.turns.push(turn);
+    const s = Object.assign(controlledStream(), { queue: [] });
+    state.streams.set(turn.run_id, s);
+    init.signal?.addEventListener('abort', () => { end(turn, 'cancelled'); quietly(() => s.close()); }); // closed: stopped
+    inOrder(s, () => quietly(() => s.event(`{"type":"run_started","run_id":"${turn.run_id}"}`)));
+    return new Response(s.body);
+  };
+  const fetch = (url, init = {}) => {
+    url = String(url);
+    const body = init.body ? JSON.parse(init.body) : {};
+    const sending = /message\/stream|\/continue|\/queue\/[^/]+\/send/.test(url);
+    if (sending && body.after) { // a start of its own, checked as it leaves
+      if (state.halted) broken.push(`${url}: started on its own after a Stop here`);
+    } else if (sending) {
+      const key = url.includes('/queue/') ? url.split('/').at(-2) : body.content ?? 'continue';
+      if (!state.pressed.has(key)) broken.push(`${url}: started with no action of the researcher's`);
+      else if (state.pressed.get(key) !== stopsAt(conversation)) broken.push(`${url}: left after a Stop pressed since its action`);
+      state.pressed.delete(key);
+    }
+    return later(() => {
+      if (init.signal?.aborted) throw abortError();
+      if (url.endsWith('/api/settings')) return Response.json({ values: { ui: { follow_up: state.mode } } });
+      if (url.includes('/cancel')) {
+        const turn = state.turns.find((t) => url.includes(t.run_id));
+        if (turn) { state.stopped.add(turn.run_id); end(turn, 'cancelled'); }
+        return Response.json({ status: 'cancelled' });
+      }
+      if (url.endsWith('/steering')) {
+        const turn = state.turns.find((t) => url.includes(t.run_id));
+        if (turn?.status === 'running') return Response.json({ steering: { run_id: turn.run_id, seq: 1 } });
+        const item = { id: `q${state.items += 1}`, text: body.content };
+        state.queued.push(item);
+        return Response.json({ queued: item, ended: true });
+      }
+      if (url.endsWith('/queue')) {
+        const item = { id: `q${state.items += 1}`, text: body.content };
+        state.queued.push(item);
+        return Response.json(item, { status: 201 });
+      }
+      if (url.includes('/queue/')) {
+        const item = state.queued.find((q) => q.id === url.split('/').at(-2));
+        if (body.after) {
+          const before = latest();
+          if (!before || before.run_id !== body.after || before.status !== 'succeeded' || state.stopped.has(body.after)) {
+            return Response.json({ code: 'not_after_success' }, { status: 409 });
+          }
+        }
+        if (!item) return Response.json({ code: 'not_queued' }, { status: 409 });
+        if (running()) return Response.json({ code: 'active_run' }, { status: 409 });
+        if (body.after) {
+          state.started.set(body.after, (state.started.get(body.after) ?? 0) + 1);
+          if (state.started.get(body.after) > 1) broken.push(`two starts after ${body.after}`);
+          if (state.queued[0] !== item) broken.push(`${item.id} started before an older waiting message`);
+        }
+        const response = admit(init, item);
+        if (response.ok && !body.after) state.halted = false; // a turn the researcher started (Send), admitted
+        return response;
+      }
+      if (sending) {
+        const response = admit(init);
+        if (response.ok) state.halted = false; // a turn the researcher started, admitted
+        return response;
+      }
+      return Response.json({ turns: state.turns.map((t) => ({ ...t })), queued: state.queued.map((q) => ({ ...q })) });
+    });
+  };
+  install(fetch);
+  let shownTurn = null;
+  const unsubscribe = subscribe((id, turn) => { if (id === conversation) shownTurn = turn; });
+  const view = () => {
+    const live_ = shownTurn;
+    const isRunning = Boolean(live_ && !live_.done) || Boolean(running());
+    return viewHandlers(conversation, { live: live_, running: isRunning, shown: state.turns.map((t) => ({ ...t })),
+      readChoice: () => (random() < 0.5 ? Promise.resolve() : later(() => {})) });
+  };
+  const actions = {
+    message: () => { const text = `m${state.items += 1}`; state.pressed.set(text, stopsAt(conversation)); view().submit(text); },
+    send: () => { if (!state.queued.length) return; const item = pick(state.queued); state.pressed.set(item.id, stopsAt(conversation)); view().sendQueued(item); },
+    stop: () => { state.halted = true; stop(conversation, running()?.run_id).catch(() => {}); },
+    stopElsewhere: () => { const turn = latest(); if (turn) { state.stopped.add(turn.run_id); end(turn, 'cancelled'); } },
+    finish: () => { const turn = running(); if (turn) end(turn, pick(['succeeded', 'succeeded', 'failed'])); },
+    mode: () => { state.mode = pick(['steer', 'queue']); },
+    deliver: () => { if (state.pending.length) state.pending.splice(Math.floor(random() * state.pending.length), 1)[0](); },
+  };
+  state.mode = pick(['steer', 'queue']);
+  const weights = ['message', 'message', 'send', 'stop', 'stopElsewhere', 'finish', 'finish', 'mode', 'deliver', 'deliver',
+    'deliver', 'deliver', 'deliver', 'deliver'];
+  for (let step = 0; step < 40; step += 1) {
+    actions[pick(weights)]();
+    await tick();
+  }
+  for (let rounds = 0; rounds < 200 && (state.pending.length || running()); rounds += 1) { // everything arrives
+    if (state.pending.length) state.pending.shift()(); else end(running(), 'succeeded');
+    await tick(); await tick();
+  }
+  for (let i = 0; i < 5; i += 1) await tick();
+  const last = latest();
+  if (!state.pending.length && !running() && last?.status === 'succeeded' && !state.halted && !state.stopped.has(last.run_id)
+    && state.queued.length && !state.started.get(last.run_id)) {
+    broken.push(`${state.queued.map((q) => q.id)} left waiting behind ${last.run_id}, which succeeded here`);
+  }
+  unsubscribe();
+  return broken;
+}
+
+test('a seeded random matrix of sends, steers, Sends, Stops here and elsewhere and late deliveries keeps every rule (B2)', async (t) => {
+  let current = null;
+  t.mock.method(globalThis, 'fetch', (...args) => current(...args));
+  const found = [];
+  for (let seed = 1; seed <= 400; seed += 1) {
+    found.push(...(await trial(seed, (fetch) => { current = fetch; })).map((problem) => `seed ${seed}: ${problem}`));
+  }
+  assert.deepEqual(found.slice(0, 10), []);
 });
