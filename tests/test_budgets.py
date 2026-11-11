@@ -979,8 +979,16 @@ async def test_a_settings_write_that_fails_after_replacing_the_file_is_judged_by
         assert [(a["to_usd"], a["applied"]) for a in audited] == [(2.0, True)]
 
 
+# What a failed write may leave that the loader reads as its defaults: not TOML (fix batch 1 review), and valid TOML whose
+# [project] is not a table, or whose budget is one, with a problem keyed by that table or below the budget (PR 52 cycle
+# 4, G2: the readers took these as the $50 default)
+UNREAD = [b"[project\nbudget_usd = ", b'project = "broken"\n', b"[[project]]\nbudget_usd = 2\n",
+          b"[project.budget_usd]\ntoken = 1\n"]
+
+
 @pytest.mark.asyncio
-async def test_a_failed_write_that_leaves_an_unreadable_file_is_never_taken_as_saved(tmp_path, monkeypatch):
+@pytest.mark.parametrize("left", UNREAD)
+async def test_a_failed_write_that_leaves_an_unreadable_file_is_never_taken_as_saved(tmp_path, monkeypatch, left):
     # Fix batch 1 review (P3): an unreadable file reads as defaults, which say nothing of what it holds.
     from backend import settings
     async with await _app(tmp_path) as client:
@@ -991,7 +999,7 @@ async def test_a_failed_write_that_leaves_an_unreadable_file_is_never_taken_as_s
         real = settings.write_private
 
         def broken(path, data):
-            real(path, b"[project\nbudget_usd = ")
+            real(path, left)
             raise OSError("fsync of the folder failed")
         monkeypatch.setattr(settings, "write_private", broken)
         answered = (await _answer(client, ask, text="50")).json()["budget"]  # 50 is also the shipped default
@@ -1003,8 +1011,9 @@ async def test_a_failed_write_that_leaves_an_unreadable_file_is_never_taken_as_s
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("left", UNREAD)
 async def test_after_a_failed_save_leaves_the_file_unreadable_the_waiting_step_asks_again_never_at_the_default(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, left):
     # S1-33 fix batch 3 (E4; Harold, 2026-10-21: if the write fails nothing is raised and the next step asks again): the
     # answer's write left the project's config.toml unreadable, whose loader then gives the shipped $50 default. That is
     # never the limit: the waiting step does not go out, it asks again, saying the budget could not be read (never that
@@ -1020,7 +1029,7 @@ async def test_after_a_failed_save_leaves_the_file_unreadable_the_waiting_step_a
         real = settings.write_private
 
         def broken(path, data):
-            real(path, b"[project\nbudget_usd = ")
+            real(path, left)
             raise OSError("fsync of the folder failed")
         monkeypatch.setattr(settings, "write_private", broken)
         answered = (await _answer(client, ask, text="2")).json()["budget"]
@@ -1075,6 +1084,58 @@ async def test_a_limit_typed_while_the_project_budget_cannot_be_read_is_saved_an
             (None, None, False), (None, 3.0, True)]  # decided, then saved
         audited = [json.loads(d) for (d,) in await _rows(client, "SELECT data FROM audit_log WHERE event = 'budget_decision'")]
         assert [(a["from_usd"], a["to_usd"], a["applied"]) for a in audited] == [(None, 3.0, True)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left", UNREAD[1:])
+async def test_a_project_budget_its_valid_toml_does_not_give_is_no_room_for_any_reader(tmp_path, left):
+    # PR 52 cycle 4 (G2, E4's class, cycle 4 A's probes): [project] not a table, or the budget a table, gives the loader's
+    # $50 default. Every reader takes it as a budget the file does not give: no room for any admission (_budgets_now)
+    # nor for a judge's unspent held again; no project notice against $50; a Continue decided at $50 applies nothing;
+    # /spend shows no project limit.
+    from types import SimpleNamespace
+    from backend import budgets, runs
+    from backend.db import utc_now
+    from scholia_app import background_idle, send
+    data = tmp_path / "data"
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        run_id = (await send(client, conversation, "Short?"))[0]["run_id"]
+        await background_idle(client)
+        await _spent(client, project, 30.0)  # 60% of the $50 default
+        config = data / "projects" / project / "config.toml"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_bytes(left)
+        assert (await asyncio.to_thread(runs._budgets_now, data, project))[0] == 0.0
+        answered = new_id()  # an answer's $1 reservation, $0.10 of it spent: $0.90 to hold again for its judge
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "INSERT INTO budget_reservations (id, run_id, step_seq, paying_conversation_id, project_id, estimate_usd,"
+            " status, settled_usd, basis, settled_at) VALUES (?, ?, 9, ?, ?, 1.0, 'settled', 0.1, 'reported', ?)",
+            (answered, run_id, conversation, project, utc_now())))
+        write = client.state["db"].write
+        assert await asyncio.to_thread(write, lambda conn: runs._hold_unspent(
+            conn, SimpleNamespace(reservation_id=answered), {}, data)) is None
+        assert await asyncio.to_thread(write, lambda conn: budgets.notices(conn, run_id, data)) == []
+        ask = {"ask_id": new_id(), "project_id": project,
+               "params": {"form": "cap", "budget": "project", "limit_usd": 50.0, "spent_usd": 50.0, "estimate_usd": 0.01}}
+        assert await asyncio.to_thread(write, lambda conn: budgets.decide(conn, run_id, ask, "continue", None, data)) == (
+            {"applied": False, "budget": "project", "limit_usd": None}, None)
+        spend = (await client.get(f"/api/projects/{project}/spend", params={"conversation_id": conversation})).json()
+        assert spend["project"]["limit_usd"] is None
+
+
+@pytest.mark.asyncio
+async def test_an_evaluation_project_whose_budget_its_file_does_not_give_stops_at_the_limit_and_sends_nothing(tmp_path):
+    # PR 52 cycle 4 (G2, P2): its mark makes no budget ask, and the loader's $50 default for a [project] that is not a
+    # table is no room: the turn stops at the limit, and nothing is sent.
+    from scholia_app import send
+    async with await _app(tmp_path) as client:
+        project = (await client.post("/api/projects", json={"name": "Evaluation", "evaluation": True})).json()["id"]
+        conversation = (await client.post("/api/conversations", json={"project_id": project, "title": "t"})).json()["id"]
+        (tmp_path / "data" / "projects" / project / "config.toml").write_text('project = "broken"\n')
+        stream = await send(client, conversation, "Short?")
+        assert {"type": "limit_reached", "budget": "project"} in stream and stream[-1]["cancel_reason"] == "limit"
+        assert not [e for e in stream if e["type"] == "ask"] and client.provider.answers == []
 
 
 # S1-33 fix batch 2 (PR 52 cycle 2 on 4769f6e): lifecycle first (charter section 10)
@@ -1255,6 +1316,30 @@ async def test_a_settings_edit_cancelled_once_its_file_is_written_still_makes_th
         sending, ask = await _asking(client, conversation, "Again?")
         assert ask["params"]["form"] == "cap"
         assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 4.0
+        await sending
+
+
+@pytest.mark.asyncio
+async def test_a_settings_save_over_a_budget_its_file_did_not_give_makes_the_limit_continues_amount(tmp_path):
+    # PR 52 cycle 4 (G3, reading 3; cycle 4 A's probe): $25, Continue to $50 (adding $25), the budget then made invalid
+    # by hand, and set to $50 in Settings. The save compares with what the file held, which gave no budget, never with
+    # the loader's $50 default: $50 is a limit set there, so the next Continue adds $50 (to $100), not the old $25.
+    import re
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 25.0)
+        await _spent(client, project, 25.0)
+        sending, ask = await _asking(client, conversation)
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 50.0
+        await sending
+        config = tmp_path / "data" / "projects" / project / "config.toml"
+        config.write_text(re.sub(r"budget_usd = .*", 'budget_usd = "abc"', config.read_text()))
+        await _project_budget(client, project, 50.0)
+        [(spent,)] = await _rows(client, "SELECT sum(settled_usd) FROM budget_reservations WHERE project_id = ?", project)
+        await _spent(client, project, round(50.0 - spent, 9))  # the cap again
+        sending, ask = await _asking(client, conversation, "Again?")
+        assert ask["params"]["form"] == "cap"
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 100.0
         await sending
 
 

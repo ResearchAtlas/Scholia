@@ -41,7 +41,7 @@ from backend.db import (ContentStore, Database, DatabaseCloseError, DatabaseClos
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
 from backend import governance
-from backend.runs import MAX_MESSAGE_CHARS, AdmissionError, Harness, _through, derived_status
+from backend.runs import MAX_MESSAGE_CHARS, AdmissionError, Harness, _budget_unread, _through, derived_status
 from backend import budgets  # S1-33: the budget bar's spend, queued messages and steering notes
 from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, instruction_file_size, instructions_size,
                               load_instructions, load_settings, visible, write_private)
@@ -633,11 +633,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             raise ApiError(409, "settings_changed", "The settings changed since they were read")
         changed = _providers_changed(body.updates, providers.configured(data_dir, include_off=True))
         refuse_if_busy(changed)  # before any field is written
-        limit_before = (loaded.values.get("project") or {}).get("budget_usd")  # S1-33: whether the save changes it
+
+        def limit():  # S1-33: the project budget its file gives, None for one it does not (never the loader's default)
+            return None if _budget_unread(loaded) else (loaded.values.get("project") or {}).get("budget_usd")
+        limit_before = limit()  # whether the save changes it (PR 52 cycle 4, G3: a repair of an unread budget does)
 
         async def saving():  # under the project-files lock, the save and what it changes run to their end together
             await asyncio.to_thread(loaded.save, body.updates)
-            if body.project_id is not None and (loaded.values.get("project") or {}).get("budget_usd") != limit_before:
+            if body.project_id is not None and limit() != limit_before:
                 # S1-33: a limit changed here is Continue's amount from now on, whatever an earlier answer decided (if
                 # this fails, the saved limit stands, and the old amount still applies only while the limit equals its
                 # result); saving the limit unchanged changes nothing. Inside the save's own protection, so a request

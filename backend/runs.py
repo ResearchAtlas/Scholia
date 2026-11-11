@@ -3192,9 +3192,11 @@ def _budgets_now(data_dir, project_id):
 
 
 def _budget_unread(project):
-    """Whether a project's loaded settings do not give its budget: the file unreadable or not valid TOML, or the value
-    not valid; either way the loader gives its default."""
-    return any(problem["key"] in (None, "project.budget_usd") for problem in project.problems)
+    """Whether a project's loaded settings do not give its budget: the file unreadable or not valid TOML, or a problem
+    with the [project] table itself (not a table: PR 52 cycle 4, G2), with the value, or with a key under it (a table
+    where the value belongs); any of these gives the loader's default."""
+    return any(problem["key"] in (None, "project") or (problem["key"] + ".").startswith("project.budget_usd.")
+               for problem in project.problems)
 
 
 def _notices(conn, run_id, data_dir):
