@@ -248,3 +248,199 @@ test('Stop reaches an admitted turn by closing its stream when its run_started i
   assert.equal(signal.aborted, true);
   admitted.close();
 });
+
+// Fix batch 2 (PR 52 cycle 2, D10 and D14): a send pending over a turn under way. A refused one gives the conversation
+// back and starts the drain a turn that succeeded meanwhile left to it, once; a stopped one starts nothing; and Stop,
+// pressed while it is pending, reaches every turn under way there, not only the latest stream.
+function controlledStream() { // a stream whose events and end the test sends, each when it chooses
+  let controller;
+  const body = new ReadableStream({ start(c) { controller = c; } });
+  const encoder = new TextEncoder();
+  return { body, event: (text) => controller.enqueue(encoder.encode(`data: ${text}\n\n`)), close: () => controller.close() };
+}
+
+function overlapping(conversation, turnStatus = 'succeeded') { // fetch for a turn /a and a send /b pending over it
+  const calls = { queueSends: [], cancels: [], signals: {} };
+  const a = controlledStream();
+  let answerB;
+  const fetch = async (url, init) => {
+    url = String(url);
+    if (url === '/a') { calls.signals.a = init.signal; return new Response(a.body); }
+    if (url === '/b') {
+      calls.signals.b = init.signal;
+      return new Promise((resolve, reject) => {
+        answerB = resolve;
+        init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+      });
+    }
+    if (url.includes('/cancel')) { calls.cancels.push(url); return Response.json({ status: 'cancelled' }); }
+    if (url.includes('/queue/')) {
+      calls.queueSends.push([url, JSON.parse(init.body)]);
+      return new Response(streamOf('data: {"type":"run_started","run_id":"r-next"}\n\n', 'data: {"type":"run_finished","status":"succeeded"}\n\n'));
+    }
+    return Response.json({ turns: [{ run_id: 'r-a', status: turnStatus }], queued: [{ id: 'q1', text: 'Next' }] });
+  };
+  return { calls, a, fetch, refuseB: () => answerB(Response.json({ code: 'active_run' }, { status: 409 })) };
+}
+const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+test('a turn that succeeds while a newer send is pending starts its waiting message once that send is refused', async (t) => {
+  const run = overlapping('c-d10a');
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  const a = send('c-d10a', '/a', { model: 'm1', provider: 'openrouter' }, 'A');
+  run.a.event('{"type":"run_started","run_id":"r-a"}');
+  await a;
+  const b = send('c-d10a', '/b', { model: 'm2' }, 'B').catch((error) => error);
+  await settle();
+  run.a.event('{"type":"run_finished","status":"succeeded"}');
+  run.a.close(); // its own end runs while B is the conversation's
+  await settle();
+  run.refuseB();
+  assert.equal((await b).code, 'active_run');
+  await settle();
+  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-d10a/queue/q1/send',
+    { model: 'm1', provider: 'openrouter', after: 'r-a' }]]); // once, on the route the turn was sent on
+});
+
+test('a newer send refused after the turn\'s last event but before its own end leaves that end to drain, once', async (t) => {
+  const run = overlapping('c-d10b');
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  const a = send('c-d10b', '/a', { model: 'm1' }, 'A');
+  run.a.event('{"type":"run_started","run_id":"r-a"}');
+  await a;
+  const b = send('c-d10b', '/b', {}, 'B').catch((error) => error);
+  await settle();
+  run.a.event('{"type":"run_finished","status":"succeeded"}'); // read, its stream not yet closed
+  await settle();
+  run.refuseB();
+  await b;
+  await settle();
+  assert.deepEqual(run.calls.queueSends, []);
+  run.a.close();
+  await settle();
+  assert.deepEqual(run.calls.queueSends.map(([url]) => url), ['/api/conversations/c-d10b/queue/q1/send']);
+});
+
+for (const status of ['failed', 'cancelled']) {
+  test(`a turn that ends ${status} while a newer send is pending starts nothing when that send is refused`, async (t) => {
+    const run = overlapping(`c-d10-${status}`, status);
+    t.mock.method(globalThis, 'fetch', run.fetch);
+    const a = send(`c-d10-${status}`, '/a', {}, 'A');
+    run.a.event('{"type":"run_started","run_id":"r-a"}');
+    await a;
+    const b = send(`c-d10-${status}`, '/b', {}, 'B').catch((error) => error);
+    await settle();
+    run.a.event(`{"type":"run_finished","status":"${status}"}`);
+    run.a.close();
+    await settle();
+    run.refuseB();
+    await b;
+    await settle();
+    assert.deepEqual(run.calls.queueSends, []);
+  });
+}
+
+test('Stop pressed while a newer send is pending stops the turn under way, and nothing waiting starts', async (t) => {
+  const run = overlapping('c-d14a');
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  const a = send('c-d14a', '/a', {}, 'A');
+  run.a.event('{"type":"run_started","run_id":"r-a"}');
+  await a;
+  const b = send('c-d14a', '/b', {}, 'B').catch((error) => error);
+  await settle();
+  await stop('c-d14a');
+  assert.deepEqual(run.calls.cancels, ['/api/runs/r-a/cancel']); // the turn that runs, not only the pending send
+  assert.equal(run.calls.signals.b.aborted, true);
+  await b;
+  run.a.event('{"type":"run_finished","status":"cancelled"}');
+  run.a.close();
+  await settle();
+  assert.deepEqual(run.calls.queueSends, []);
+});
+
+test('Stop pressed while a newer send is pending, after the turn under it succeeded, starts nothing', async (t) => {
+  const run = overlapping('c-d14b');
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  const a = send('c-d14b', '/a', {}, 'A');
+  run.a.event('{"type":"run_started","run_id":"r-a"}');
+  await a;
+  const b = send('c-d14b', '/b', {}, 'B').catch((error) => error);
+  await settle();
+  run.a.event('{"type":"run_finished","status":"succeeded"}');
+  run.a.close();
+  await settle();
+  await stop('c-d14b');
+  assert.deepEqual(run.calls.cancels, []); // it has ended
+  assert.equal(run.calls.signals.b.aborted, true);
+  await b;
+  await settle();
+  assert.deepEqual(run.calls.queueSends, []); // the researcher stopped: the message waits with Send
+});
+
+test('Stop pressed while a newer send is pending closes a turn whose first event is unread, and a send still pending', async (t) => {
+  for (const older of ['unread', 'pending']) {
+    const signals = {};
+    const unread = controlledStream();
+    t.mock.method(globalThis, 'fetch', async (url, init) => {
+      url = String(url);
+      signals[url] = init.signal;
+      if (url === '/older' && older === 'unread') return new Response(unread.body);
+      return new Promise((resolve, reject) => init.signal.addEventListener('abort',
+        () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
+    });
+    const conversation = `c-d14-${older}`;
+    send(conversation, '/older', {}, 'Older').catch(() => {});
+    await settle();
+    const b = send(conversation, '/newer', {}, 'Newer').catch((error) => error);
+    await settle();
+    await stop(conversation);
+    assert.equal(signals['/older'].aborted, true, older); // closing its stream stops a turn admitted or about to be
+    assert.equal(signals['/newer'].aborted, true, older);
+    await b;
+    t.mock.restoreAll();
+  }
+});
+
+test('Stop with a send pending here also stops the turn the record shows running from another window', async (t) => {
+  const cancels = [];
+  let signal;
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    url = String(url);
+    if (url.includes('/cancel')) { cancels.push(url); return Response.json({}); }
+    signal = init.signal;
+    return new Promise((resolve, reject) => init.signal.addEventListener('abort',
+      () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
+  });
+  const pending = send('c-d14c', '/pending', {}, 'Here').catch((error) => error);
+  await settle();
+  await stop('c-d14c', 'r-elsewhere');
+  assert.deepEqual(cancels, ['/api/runs/r-elsewhere/cancel']);
+  assert.equal(signal.aborted, true);
+  await pending;
+});
+
+test('an older send still pending is given the conversation back when a newer one is refused, and Stop reaches it', async (t) => {
+  const cancels = [];
+  const older = controlledStream();
+  let admit;
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    url = String(url);
+    if (url.includes('/cancel')) { cancels.push(url); return Response.json({}); }
+    if (url === '/older') return new Promise((resolve) => { admit = () => resolve(new Response(older.body)); });
+    return Response.json({ code: 'active_run' }, { status: 409 });
+  });
+  const seen = [];
+  const unsubscribe = subscribe((id, turn) => { if (id === 'c-pend') seen.push(turn?.runId ?? null); });
+  send('c-pend', '/older', {}, 'Older').catch(() => {});
+  await settle();
+  assert.equal((await send('c-pend', '/newer', {}, 'Newer').catch((error) => error)).code, 'active_run');
+  admit();
+  await settle();
+  older.event('{"type":"run_started","run_id":"r-older"}');
+  await settle();
+  unsubscribe();
+  assert.equal(seen.at(-1), 'r-older');
+  await stop('c-pend');
+  assert.deepEqual(cancels, ['/api/runs/r-older/cancel']);
+  older.close();
+});

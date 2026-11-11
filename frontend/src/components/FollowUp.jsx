@@ -74,7 +74,7 @@ function QueuedItem({ conversationId, item, running, onChanged, onSend }) {
       {problem && <p role="alert" className="text-xs text-destructive">{problem}</p>}
       <div className="flex flex-wrap gap-2">
         {!running && <Button type="button" size="sm" className="h-7 bg-brand text-brand-foreground hover:bg-brand/90"
-          disabled={busy} onClick={() => onSend(item)}>{t('followUp.send')}</Button>}
+          disabled={busy} onClick={() => run(() => onSend(item))}>{t('followUp.send')}</Button>}
         <Button type="button" size="sm" variant="ghost" className="h-7" disabled={busy}
           onClick={() => setEditing(editing === null ? item.text : null)}>{t(editing === null ? 'followUp.edit' : 'followUp.cancelEdit')}</Button>
         <Button type="button" size="sm" variant="ghost" className="h-7" disabled={busy}

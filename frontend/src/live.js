@@ -13,6 +13,8 @@ const aborts = new Map();
 const latest = new WeakMap(); // S1-33: each stream's own latest state (by its abort controller), owned or not
 const replaced = new WeakMap(); // and the stream it replaced
 const notAdmitted = new WeakSet(); // the streams known never to have started a turn: refused, or stopped before it
+const ended = new WeakSet(); // the streams whose own end (their finally) has run
+const owed = new WeakMap(); // a stream that succeeded while a newer one was sent over it: the drain it left to that one
 
 // What a stream not admitted gives the conversation back to: the latest stream it replaced still under way (one whose
 // first event is unread may be an admitted turn), else the latest that finished; never one known not admitted.
@@ -95,8 +97,16 @@ export function send(conversationId, path, body, text) {
         const owner = givenBack(abort);
         const prior = owner && latest.get(owner);
         if (prior && !(stopped && prior.done)) { // the turn it replaced comes back as it is now, finished or under way
-          if (prior.done) aborts.delete(conversationId); else aborts.set(conversationId, owner);
+          // One whose own end is still to come owns the conversation again, so that end finishes it here (and drains);
+          // one that ended while this was sent over it is done, and the drain it left starts now (PR 52 cycle 2)
+          const over = prior.done && ended.has(owner);
+          if (over) aborts.delete(conversationId); else aborts.set(conversationId, owner);
           set(conversationId, prior, 'restored');
+          if (over) {
+            const start = owed.get(owner);
+            owed.delete(owner);
+            start?.();
+          }
         } else if (!stopped) {
           set(conversationId, null, 'refused');
         }
@@ -105,7 +115,11 @@ export function send(conversationId, path, body, text) {
     }).finally(() => {
       if (!turn.done) turn = { ...turn, done: true };
       latest.set(abort, turn);
-      if (!mine()) return admitted();
+      ended.add(abort);
+      if (!mine()) { // a newer stream was sent over it: one refused gives it back and starts the drain it left
+        if (turn.status === 'succeeded') owed.set(abort, () => drain(conversationId, turn.runId, body));
+        return admitted();
+      }
       aborts.delete(conversationId);
       if (turns.get(conversationId) && turns.get(conversationId) !== turn) set(conversationId, turn, 'run_finished');
       admitted();
@@ -136,11 +150,18 @@ export async function drain(conversationId, runId, route = {}) {
 }
 
 // Stop: cancels the run, which then finishes its stream; before the run has started,
-// closing the stream stops it.
+// closing the stream stops it. runId, if given, is a turn the conversation's record shows running. A send still
+// waiting to be admitted may have been sent over a turn under way: Stop reaches every stream of the conversation under
+// way here, not only the latest, so the turn that runs is always stopped (S1-33, PR 52 cycle 2).
 export async function stop(conversationId, runId) {
-  const id = runId ?? turns.get(conversationId)?.runId;
-  if (id) await post(`/api/runs/${id}/cancel`);
-  else aborts.get(conversationId)?.abort();
+  const runs = new Set(runId ? [runId] : []);
+  const closing = [];
+  for (let owner = aborts.get(conversationId); owner; owner = replaced.get(owner)) {
+    if (notAdmitted.has(owner) || latest.get(owner).done) continue;
+    if (latest.get(owner).runId) runs.add(latest.get(owner).runId); else closing.push(owner);
+  }
+  for (const owner of closing) owner.abort();
+  await Promise.all([...runs].map((id) => post(`/api/runs/${id}/cancel`)));
 }
 
 // S1-19c: open_place's places (backend/agent.py PLACES): the window opens the one named (Shell.jsx).

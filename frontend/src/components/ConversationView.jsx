@@ -320,8 +320,9 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
         <Queued conversationId={id} queued={queued} running={running} onChanged={load} onSend={(item) => sendQueued(item)} />
         <BudgetBar projectId={projectId} conversationId={id} seen={`${reads}.${live?.budget ?? 0}`} />
       </div>
+      {/* Stop reaches the turn the record shows running and every stream under way here (live.js stop) */}
       <Composer running={running} problem={problem} onSend={submit} projectId={projectId} onAttach={attach}
-        onStop={() => Promise.resolve(stop(id, live?.runId ?? shown.find((turn) => turn.status === 'running')?.run_id))
+        onStop={() => Promise.resolve(stop(id, (turns ?? []).find((turn) => turn.status === 'running')?.run_id))
           .then(load).catch(() => {})} />
     </section>
   );
