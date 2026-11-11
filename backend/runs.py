@@ -2473,8 +2473,8 @@ class Harness:
         can separate the mark from the commit, and the run is known finished before it is released. A write
         that raises marks nothing. A cancellation meanwhile is raised at once, as before; the write goes on to its
         end, and what it queued is streamed once it commits all the same (PR 52 cycle 4, G5's class)."""
-        def said(final):
-            if isinstance(final, dict) and final.pop("queued", None):  # S1-33: a note it queued, streamed once committed
+        def said(final):  # S1-33: a note it queued, streamed once committed
+            if isinstance(final, dict) and final.pop("queued", None):
                 active.events.put_nowait({"type": "queued"})
             return final
         writing = asyncio.ensure_future(asyncio.to_thread(
