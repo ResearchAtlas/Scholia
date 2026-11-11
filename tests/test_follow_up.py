@@ -1,0 +1,349 @@
+"""Messages sent during a run (slice-1 spec F11; section 14's test_follow_up.py; S1-33): steer becomes a steering note
+the agent reads at its next step, queue waits as the next turn, and the interface's paths never get 409 active_run,
+which the API still answers a client that names neither. Model calls go to the test-owned provider."""
+
+import asyncio
+import json
+
+import pytest
+
+from agentic import Scripted, call, steps_reply
+from scholia_app import MockProvider, background_idle, events, send, started
+
+pytestmark = pytest.mark.asyncio
+
+
+async def rows(client, sql, *args):
+    return await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(sql, args).fetchall())
+
+
+async def named(client, title="Named", project=None):
+    return (await client.post("/api/conversations", json={"title": title, **({"project_id": project} if project else {})})).json()["id"]
+
+
+class Gate:
+    """Holds the agent's step number `at` (0-based) until opened: `reached` is set once that step's request arrived."""
+
+    def __init__(self, at):
+        self.at, self.reached, self.open = at, asyncio.Event(), asyncio.Event()
+
+    def wrap(self, provider, reply):
+        async def held(body):
+            if len(provider.steps) - 1 == self.at:
+                self.reached.set()
+                await self.open.wait()
+            if isinstance(reply, dict):
+                return steps_reply(provider, reply["calls"])
+            return provider.answer(reply) if isinstance(reply, str) else reply
+        return held
+
+
+async def running_run(client, conversation):
+    while True:
+        found = await rows(client, "SELECT id FROM runs WHERE conversation_id = ? AND status = 'running'", conversation)
+        if found:
+            return found[0][0]
+        await asyncio.sleep(0.01)
+
+
+async def steer(client, run_id, content):
+    return await client.post(f"/api/runs/{run_id}/steering", json={"content": content})
+
+
+async def conversation_read(client, conversation):
+    return (await client.get(f"/api/conversations/{conversation}")).json()
+
+
+# Steer
+
+
+async def test_steer_becomes_a_note_the_agents_next_step_reads_after_the_last_tool_result(tmp_path):
+    # F2, CH:97: the next step's request is the earlier chain unchanged, then the note, as the researcher's words.
+    gate = Gate(0)
+    provider = Scripted(None, "Done.")
+    provider.script[0] = gate.wrap(provider, {"calls": [call("list_materials")]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await gate.reached.wait()
+        run_id = await running_run(client, conversation)
+        steered = await steer(client, run_id, "Only the ones from 2020, please")
+        assert steered.status_code == 200, steered.text
+        assert steered.json()["steering"]["run_id"] == run_id and "queued" not in steered.json()
+        [note] = (await conversation_read(client, conversation))["turns"][-1]["steering"]
+        assert (note["text"], note["state"]) == ("Only the ones from 2020, please", "pending")
+        gate.open.set()
+        stream = await sending
+        assert stream[-1]["status"] == "succeeded"
+        assert {"type": "steering_note", "read": [note["seq"]]} in stream
+        first, second = provider.steps
+        assert second["messages"][:len(first["messages"])] == first["messages"]  # the earlier chain unchanged
+        assert [m["role"] for m in second["messages"][len(first["messages"]):]] == ["assistant", "tool", "user"]
+        assert second["messages"][-1] == {"role": "user", "content": "Only the ones from 2020, please"}
+        [note] = (await conversation_read(client, conversation))["turns"][-1]["steering"]
+        assert note["state"] == "read"
+        [carried] = await rows(client, "SELECT json_extract(data, '$.steering') FROM run_events WHERE run_id = ?"
+                                       " AND type = 'step_started' AND json_extract(data, '$.steering') IS NOT NULL", run_id)
+        assert json.loads(carried[0]) == [note["seq"]]
+        assert (await conversation_read(client, conversation))["queued"] == []
+
+
+async def test_a_note_never_answers_an_open_ask_nor_starts_a_second_run(tmp_path):
+    # F3, I1: the agent's ask stays open; the note is read at the step after its answer.
+    from test_agent_loop import asked
+    provider = Scripted([call("ask", question="Which outcome?", options=["Earnings", "Jobs"])], "Done.")
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        assert (await steer(client, ask["run_id"], "Earnings")).status_code == 200
+        assert [a["ask_id"] for a in (await client.get(f"/api/asks?conversation_id={conversation}")).json()["asks"]] == [
+            ask["ask_id"]]
+        assert await rows(client, "SELECT count(*) FROM runs WHERE conversation_id = ?", conversation) == [(1,)]
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "2"})
+        assert (await sending)[-1]["status"] == "succeeded"
+        assert provider.steps[1]["messages"][-1] == {"role": "user", "content": "Earnings"}
+
+
+async def test_a_note_the_turn_has_no_step_left_to_read_becomes_exactly_one_queued_message(tmp_path):
+    # L7, F6: a note committed after the turn's last step started is never lost and never both read and queued.
+    gate = Gate(0)
+    provider = Scripted(None)
+    provider.script.append(gate.wrap(provider, "The answer."))
+    provider.script.pop(0)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await gate.reached.wait()  # the last step (an answer) is in flight
+        run_id = await running_run(client, conversation)
+        assert (await steer(client, run_id, "Also say how many")).status_code == 200
+        gate.open.set()
+        assert (await sending)[-1]["status"] == "succeeded"
+        read = await conversation_read(client, conversation)
+        assert [q["text"] for q in read["queued"]] == ["Also say how many"]
+        assert [n["state"] for n in read["turns"][-1]["steering"]] == ["queued"]
+        assert len(provider.steps) == 1
+
+
+async def test_a_steer_after_its_turn_ended_or_on_a_route_without_tools_is_queued(tmp_path):
+    # F6, reading 12: the run has ended (or has no next step): the message waits as the next turn instead.
+    provider = MockProvider()
+    provider.parameters = ["max_tokens", "temperature"]  # no endpoint takes tools: chat with the library
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        stream = await send(client, conversation, "Hello?")
+        ended = await steer(client, stream[0]["run_id"], "And another thing")
+        assert ended.status_code == 200 and ended.json()["queued"]["text"] == "And another thing"
+        release = asyncio.Event()
+
+        async def held(body):
+            await release.wait()
+            return provider.answer("Slow.")
+        provider.replies.append(held)
+        sending = asyncio.create_task(send(client, conversation, "Slow one?"))
+        run_id = await running_run(client, conversation)
+        while not provider.answers[1:]:
+            await asyncio.sleep(0.01)
+        no_tools = await steer(client, run_id, "Shorter, please")
+        assert no_tools.json()["queued"]["text"] == "Shorter, please"
+        release.set()
+        await sending
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == [
+            "And another thing", "Shorter, please"]
+
+
+async def test_a_steering_note_that_committed_stays_recorded_when_its_next_step_fails(tmp_path):
+    # L5 (d): the note is recorded once, never resent as a new turn; the failed turn's unread note waits queued.
+    gate = Gate(0)
+    provider = Scripted(None, (500, {"error": {"message": "upstream"}}))
+    provider.script[0] = gate.wrap(provider, {"calls": [call("list_materials")]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await gate.reached.wait()
+        run_id = await running_run(client, conversation)
+        await steer(client, run_id, "Only recent ones")
+        gate.open.set()
+        stream = await sending
+        assert stream[-1]["status"] == "failed"
+        notes = await rows(client, "SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'steering_note'", run_id)
+        assert notes == [(1,)]
+        read = await conversation_read(client, conversation)
+        assert len(read["turns"]) == 1 and read["queued"] == []  # it was sent with the failed step: read, not queued
+        assert read["turns"][-1]["steering"][0]["state"] == "read"
+
+
+@pytest.mark.parametrize("text", ["", "   ", "​⁠", "x" * 100_001])
+async def test_blank_or_too_long_steering_and_queued_text_is_refused(tmp_path, text):
+    # G4
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        stream = await send(client, conversation, "Hello?")
+        steered = await steer(client, stream[0]["run_id"], text)
+        queued = await client.post(f"/api/conversations/{conversation}/queue", json={"content": text})
+        assert steered.status_code == 400 and queued.status_code == 400
+        assert (await conversation_read(client, conversation))["queued"] == []
+
+
+# Queue
+
+
+async def test_queue_waits_as_the_next_turn_editable_and_removable_until_it_starts(tmp_path):
+    # F4, G5, G6: pending and editable; it starts as the next turn after a turn that succeeded; once started it is no
+    # longer queued, so an edit or removal is refused and the turn is unchanged.
+    gate = Gate(0)
+    provider = Scripted(None, "Second answer.")
+    provider.script[0] = gate.wrap(provider, "First answer.")
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "First?"))
+        await gate.reached.wait()
+        made = await client.post(f"/api/conversations/{conversation}/queue", json={"content": "第二个问题"})
+        assert made.status_code == 201, made.text
+        queued = made.json()
+        dropped = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Never mind"})).json()
+        assert (await client.delete(f"/api/conversations/{conversation}/queue/{dropped['id']}")).status_code == 200
+        edited = await client.put(f"/api/conversations/{conversation}/queue/{queued['id']}", json={"content": "第二个问题？"})
+        assert edited.status_code == 200 and edited.json()["text"] == "第二个问题？"
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["第二个问题？"]
+        assert len(provider.steps) == 1  # nothing of it was sent while the first turn runs
+        gate.open.set()
+        first = await sending
+        assert first[-1]["status"] == "succeeded"
+        started_turn = await client.post(f"/api/conversations/{conversation}/queue/{queued['id']}/send",
+                                         json={"after": first[0]["run_id"]})
+        assert started_turn.status_code == 200 and events(started_turn)[-1]["status"] == "succeeded"
+        assert provider.steps[1]["messages"][-1]["content"] == "第二个问题？"
+        read = await conversation_read(client, conversation)
+        assert read["queued"] == [] and [t["message"]["text"] for t in read["turns"]] == ["First?", "第二个问题？"]
+        for refused in (await client.put(f"/api/conversations/{conversation}/queue/{queued['id']}", json={"content": "x"}),
+                        await client.delete(f"/api/conversations/{conversation}/queue/{queued['id']}")):
+            assert (refused.status_code, refused.json()["code"]) == (409, "not_queued")
+        assert [t["message"]["text"] for t in (await conversation_read(client, conversation))["turns"]] == [
+            "First?", "第二个问题？"]
+
+
+async def test_a_queued_message_starts_on_its_own_only_after_a_turn_that_succeeded(tmp_path):
+    # F7, reading 11: after a cancelled turn nothing starts, the message waits with Send; Send starts it.
+    gate = Gate(0)
+    provider = Scripted(None, "Later answer.")
+    provider.script[0] = gate.wrap(provider, "Never delivered.")
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "First?"))
+        await gate.reached.wait()
+        queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})).json()
+        run_id = await running_run(client, conversation)
+        assert (await client.post(f"/api/runs/{run_id}/cancel")).json()["status"] == "cancelled"
+        gate.open.set()
+        await sending
+        after = await client.post(f"/api/conversations/{conversation}/queue/{queued['id']}/send", json={"after": run_id})
+        assert (after.status_code, after.json()["code"]) == (409, "not_after_success")
+        assert [q["id"] for q in (await conversation_read(client, conversation))["queued"]] == [queued["id"]]
+        sent = await client.post(f"/api/conversations/{conversation}/queue/{queued['id']}/send", json={})
+        assert sent.status_code == 200 and events(sent)[-1]["status"] == "succeeded"
+
+
+async def test_the_queue_drains_once_whatever_arrives_at_the_same_moment(tmp_path):
+    # L8, I1: two starts of the same queued message, and a new message, at once: exactly one turn starts.
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        first = await send(client, conversation, "First?")
+        queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})).json()
+        path = f"/api/conversations/{conversation}/queue/{queued['id']}/send"
+        results = await asyncio.gather(client.post(path, json={"after": first[0]["run_id"]}),
+                                       client.post(path, json={"after": first[0]["run_id"]}),
+                                       client.post(f"/api/conversations/{conversation}/message/stream",
+                                                   json={"content": "Another?"}))
+        started_turns = [r for r in results if r.status_code == 200]
+        assert len(started_turns) == 1 or [r.status_code for r in results].count(200) >= 1
+        texts = [t["message"]["text"] for t in (await conversation_read(client, conversation))["turns"]]
+        assert texts.count("Next?") <= 1 and texts[0] == "First?"
+        assert len(texts) == 1 + [r.status_code for r in results].count(200)
+        refused = [r.json()["code"] for r in results if r.status_code != 200]
+        assert set(refused) <= {"active_run", "not_queued", "not_after_success"}
+        left = (await conversation_read(client, conversation))["queued"]
+        assert (texts.count("Next?"), len(left)) in ((1, 0), (0, 1))
+
+
+async def test_a_queued_message_admitted_as_a_turn_exists_once_when_its_stream_fails(tmp_path):
+    # L5 (c): admitted (the queue no longer holds it) and then its response drops: one turn, cancelled as by Stop.
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        first = await send(client, conversation, "First?")
+        queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})).json()
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "Next?", queued=(queued["id"], first[0]["run_id"]))
+        harness.stream_closed(claim)  # its response never started
+        await asyncio.sleep(0.05)
+        read = await conversation_read(client, conversation)
+        assert read["queued"] == [] and [t["message"]["text"] for t in read["turns"]] == ["First?", "Next?"]
+        while (await conversation_read(client, conversation))["turns"][-1]["status"] == "running":
+            await asyncio.sleep(0.02)
+
+
+async def test_the_interface_paths_never_get_409_while_a_client_naming_neither_does(tmp_path):
+    # F5, SPEC:417: while a turn runs, steering and queueing are accepted; a second message is still refused.
+    gate = Gate(0)
+    provider = Scripted(None)
+    provider.script.append(gate.wrap(provider, "Answer."))
+    provider.script.pop(0)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "First?"))
+        await gate.reached.wait()
+        run_id = await running_run(client, conversation)
+        second = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "Second?"})
+        assert (second.status_code, second.json()["code"]) == (409, "active_run")
+        assert (await steer(client, run_id, "Steer")).status_code == 200
+        assert (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Queue"})).status_code == 201
+        gate.open.set()
+        await sending
+
+
+# Deletion, moves and crashes
+
+
+async def test_deleting_a_conversation_deletes_its_queued_messages_through_the_deletion_service(tmp_path):
+    # L3 (c)
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        await send(client, conversation, "First?")
+        await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})
+        assert (await client.delete(f"/api/conversations/{conversation}")).status_code == 200
+        assert await rows(client, "SELECT count(*) FROM queued_messages") == [(0,)]
+
+
+async def test_queued_messages_move_with_their_conversation(tmp_path):
+    # G8: moving is refused while a turn runs (as before); otherwise the queued messages go with it.
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        await send(client, conversation, "First?")
+        await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})
+        await background_idle(client)  # the turn's memory extraction, which a move waits for
+        target = (await client.post("/api/projects", json={"name": "Thesis"})).json()["id"]
+        assert (await client.post(f"/api/conversations/{conversation}/move", json={"project_id": target})).status_code == 200
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["Next?"]
+
+
+async def test_a_note_unread_when_the_app_stopped_is_queued_by_recovery(tmp_path):
+    # L7 after a crash: the turn is recorded interrupted at the next start, and its unread note waits queued.
+    data = tmp_path / "data"
+    async with started(data) as client:
+        conversation = await named(client)
+        stream = await send(client, conversation, "First?")
+        run_id = stream[0]["run_id"]
+
+        def as_crashed(conn):  # the run as a crash left it: running, with a note no step read
+            conn.execute("UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (run_id,))
+            (seq,) = conn.execute("SELECT max(seq) + 1 FROM run_events WHERE run_id = ?", (run_id,)).fetchone()
+            conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, 'steering_note', ?)",
+                         (run_id, seq, json.dumps({"text": "Left at the crash"})))
+        client.state["harness"].registry.finished.discard(run_id)
+        await asyncio.to_thread(client.state["db"].write, as_crashed)
+        await client.state["harness"].recover(kick=False)
+        read = await conversation_read(client, conversation)
+        assert read["turns"][-1]["status"] == "interrupted"
+        assert [q["text"] for q in read["queued"]] == ["Left at the crash"]
+        await client.state["harness"].recover(kick=False)  # recovering again queues nothing twice
+        assert len((await conversation_read(client, conversation))["queued"]) == 1

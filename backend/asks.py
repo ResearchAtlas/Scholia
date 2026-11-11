@@ -13,7 +13,9 @@ endpoint; a turn's asks (the agent's, S1-19c) only in their conversation, where 
 """
 
 import asyncio
+import contextlib
 import json
+import logging
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -22,7 +24,9 @@ from pydantic import BaseModel, Field
 from backend import governance
 from backend.db import new_id
 from backend.runs import _event
-from backend.settings import visible
+from backend.settings import load_settings, visible
+
+log = logging.getLogger(__name__)
 
 # The kinds that rule the text box out, and how many options an ask may offer.
 NO_TEXT = {"identifier_lookup", "model_download"}
@@ -86,10 +90,13 @@ def _current_policy(conn, project_id):
     return None if row is None else {"level": row[0], "locked": bool(row[1])}
 
 
-def answer(conn, run_id, ask_id, option=None, text=None, registry=None):
+def answer(conn, run_id, ask_id, option=None, text=None, registry=None, data_dir=None):
     """The researcher's answer, in the caller's transaction, or AskRefused having changed nothing. A
     run with a cancel requested (registry's, read in this transaction) is ending: its ask is closed,
-    though its terminal record is not written yet."""
+    though its terminal record is not written yet. S1-33: a budget ask's answer applies its effect here too
+    (backend/budgets.py, read with data_dir's settings), its typed text a new limit; the reply's `budget` says what
+    it applied, and a new project budget is returned under `project_budget_usd` for the caller to write once this
+    has committed."""
     if (option is None) == (text is None):
         raise AskRefused(400, "invalid_answer", "Answer with one option or with text")
     run = conn.execute("SELECT status, cancel_reason, waiting FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -115,7 +122,16 @@ def answer(conn, run_id, ask_id, option=None, text=None, registry=None):
     conn.execute("UPDATE runs SET waiting = NULL WHERE id = ?", (run_id,))
     governance.record(conn, "ask_answered", ask["project_id"], question=ask["kind"],
                       answer=option if option is not None else "text")
-    return {"ask_id": ask_id, "option": option, "answered": True}
+    reply = {"ask_id": ask_id, "option": option, "answered": True}
+    if ask["kind"] == "budget":  # its effect, in this transaction (section 6.2, Effects)
+        from backend import budgets
+        try:
+            reply["budget"], reply["project_budget_usd"] = budgets.decide(conn, run_id, ask, option, text, data_dir)
+        except budgets.Refused as refused:
+            error = AskRefused(400, refused.code, refused.message)
+            error.needed_usd = refused.needed_usd  # the least limit this step needs
+            raise error from None
+    return reply
 
 
 def withdraw(conn, run_id, ask_id, reason):
@@ -212,14 +228,44 @@ async def list_asks(request: Request, project_id: str | None = None, conversatio
 
 @router.post("/api/runs/{run_id}/asks/{ask_id}")
 async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
-    """The one way an ask is answered: by the researcher, here."""
+    """The one way an ask is answered: by the researcher, here. S1-33: a budget ask's answer is ordered with settings
+    saves and the budget reads of call admission (settings_lock, after the project-files lock as a save takes them),
+    so its stale check and the project budget it writes land wholly before or after them; that write follows the
+    answer's commit (Harold, 2026-10-21): when it fails nothing is raised, the reply says so, and the step asks again."""
     state = request.app.state.scholia
     registry = state["harness"].registry
-    try:
-        answered = await asyncio.to_thread(state["db"].write,
-                                           lambda conn: answer(conn, run_id, ask_id, body.option, body.text, registry))
-    except AskRefused as refused:
-        return JSONResponse({"code": refused.code, "message": refused.message}, status_code=refused.status)
+    budget = await asyncio.to_thread(state["db"].read, lambda conn: (asked(conn, run_id)[0] or {}).get("kind") == "budget")
+    locks = (state["project_files"], state["harness"].settings_lock) if budget else ()
+    async with contextlib.AsyncExitStack() as held:
+        for lock in locks:
+            await held.enter_async_context(lock)
+        try:
+            answered = await asyncio.to_thread(state["db"].write, lambda conn: answer(
+                conn, run_id, ask_id, body.option, body.text, registry, state["data_dir"]))
+        except AskRefused as refused:
+            return JSONResponse({"code": refused.code, "message": refused.message, **(
+                {"needed_usd": refused.needed_usd} if getattr(refused, "needed_usd", None) else {})},
+                status_code=refused.status)
+        if (limit := answered.pop("project_budget_usd", None)) is not None:
+            project_id = await asyncio.to_thread(state["db"].read, lambda conn: conn.execute(
+                "SELECT project_id FROM runs WHERE id = ?", (run_id,)).fetchone())
+            try:
+                await asyncio.to_thread(lambda: load_settings(state["data_dir"], project_id[0]).save(
+                    {"project.budget_usd": limit}))
+                saved = True
+            except Exception as error:
+                log.warning("a project budget answered in an ask was not saved (%s)", type(error).__name__)
+                saved = False
+                answered["budget"] = {**answered["budget"], "applied": False, "error": "not_saved",
+                                      "limit_usd": answered["budget"]["from_usd"]}
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(state["db"].write, lambda conn: _budget_saved(conn, run_id, ask_id, saved))
+        answered.get("budget", {}).pop("from_usd", None)
     if (active := registry.runs.get(run_id)) is not None:  # a run waiting on it wakes now
         active.answered.set()
     return answered
+
+
+def _budget_saved(conn, run_id, ask_id, saved):
+    from backend import budgets
+    budgets.saved(conn, run_id, ask_id, saved)

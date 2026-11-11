@@ -41,7 +41,8 @@ from backend.db import (ContentStore, Database, DatabaseCloseError, DatabaseClos
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
 from backend import governance
-from backend.runs import AdmissionError, Harness, _through, derived_status
+from backend.runs import MAX_MESSAGE_CHARS, AdmissionError, Harness, _through, derived_status
+from backend import budgets  # S1-33: the budget bar's spend, queued messages and steering notes
 from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, instruction_file_size, instructions_size,
                               load_instructions, load_settings, visible, write_private)
 from backend import budget_router, reasoning_capability
@@ -114,6 +115,7 @@ class NewProject(BaseModel):
     sensitivity: Level = "normal"
     review_lock: bool = False
     review_venue: str | None = Field(default=None, max_length=200)
+    evaluation: bool = False  # S1-33: the preview's evaluation project (SPEC:1223), marked only now
     _name = field_validator("name")(classmethod(lambda cls, v: _visible(v)))
 
     @model_validator(mode="after")
@@ -204,6 +206,16 @@ class Continue(BaseModel):
     effort: str | None = None
 
 
+class FollowUp(BaseModel):
+    """S1-33: a message sent while a turn runs, as a steering note or a queued message (F11)."""
+    content: str
+
+
+class QueuedSend(Continue):
+    """S1-33: start a queued message as the next turn: by Send, or (after) on its own once that turn succeeded."""
+    after: str | None = Field(default=None, max_length=100)
+
+
 def _usable_key(key):
     """A provider key, trimmed (a pasted key often ends in a line break); it must be printable
     ASCII with no spaces, as a Bearer token in a request header needs."""
@@ -276,6 +288,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     # ponytail: one lock for every write to a project's folder and for deleting a project, so a
     # write can never recreate the folder of a project deleted meanwhile; such writes are rare.
     project_files = asyncio.Lock()
+    state["project_files"] = project_files  # S1-33: a budget ask's answer writes the project's config.toml too
 
     @contextlib.contextmanager
     def maintenance():
@@ -679,12 +692,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     def project_dict(row):
         keys = ("id", "name", "kind", "sensitivity", "review_lock", "target_venue", "created_at", "updated_at",
-                "review_venue")
+                "review_venue", "evaluation")
         project = dict(zip(keys, row))
-        project["review_lock"] = bool(project["review_lock"])
+        project["review_lock"], project["evaluation"] = bool(project["review_lock"]), bool(project["evaluation"])
         return project
 
-    _PROJECT_COLUMNS = "id, name, kind, sensitivity, review_lock, target_venue, created_at, updated_at, review_venue"
+    _PROJECT_COLUMNS = ("id, name, kind, sensitivity, review_lock, target_venue, created_at, updated_at, review_venue,"
+                        " evaluation")
 
     async def project_row(project_id):
         row = await read(lambda conn: conn.execute(
@@ -706,11 +720,12 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
         def insert(conn):
             conn.execute(
-                "INSERT INTO projects (id, name, kind, sensitivity, review_lock, review_venue)"
-                " VALUES (?, ?, 'research', ?, ?, ?)",
-                (project_id, body.name, body.sensitivity, int(body.review_lock), visible(body.review_venue)))
+                "INSERT INTO projects (id, name, kind, sensitivity, review_lock, review_venue, evaluation)"
+                " VALUES (?, ?, 'research', ?, ?, ?, ?)",
+                (project_id, body.name, body.sensitivity, int(body.review_lock), visible(body.review_venue),
+                 int(body.evaluation)))
             governance.record(conn, "project_created", project_id, sensitivity=body.sensitivity,
-                              review_lock=body.review_lock)
+                              review_lock=body.review_lock, **({"evaluation": True} if body.evaluation else {}))
 
         async def creating():  # the folder, then the record; a folder with no record is removed
             try:
@@ -726,6 +741,16 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     @app.get("/api/projects/{project_id}")
     async def get_project(project_id: str):
         return project_dict(await project_row(project_id))
+
+    @app.get("/api/projects/{project_id}/spend")
+    async def project_spend(project_id: str, conversation_id: str | None = None):
+        """S1-33 (SPEC:626): settled and open spend against the project's budget and, given one, the conversation's;
+        the budget bar reads it. No content."""
+        await project_row(project_id)
+        found = await read(lambda conn: budgets.spend(conn, data_dir, project_id, conversation_id))
+        if found is None:
+            raise ApiError(404, "not_found", "No such conversation in this project")
+        return found
 
     @app.patch("/api/projects/{project_id}")
     async def change_project(project_id: str, body: ProjectChange):
@@ -1111,18 +1136,33 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             for chip in (c for chips in cited.values() for c in chips):
                 if chip["existence"] == "ok" and now.get(chip["id"]) == "source_removed":
                     chip.update(existence=now[chip["id"]], support="unchecked", quote=None, passage_id=None, ordinal=None)
-            return row, turns, cited, remembered
-        row, turns, cited, remembered = await read(fetch)
+            # S1-33: each turn's steering notes, read by a step that went out or not (budgets.carried_notes), and the
+            # messages waiting as the next turn
+            steering = {}
+            for owner, seq, text in conn.execute(
+                    "SELECT e.run_id, e.seq, json_extract(e.data, '$.text') FROM run_events e JOIN turns t"
+                    " ON t.run_id = e.run_id WHERE t.conversation_id = ? AND e.type = 'steering_note' ORDER BY e.seq",
+                    (conversation_id,)):
+                steering.setdefault(owner, {"carried": budgets.carried_notes(conn, owner), "notes": []})["notes"].append(
+                    (seq, text))
+            return row, turns, cited, remembered, steering, budgets.queued(conn, conversation_id)
+        row, turns, cited, remembered, steering, queued = await read(fetch)
         if row is None:
             raise ApiError(404, "not_found", "No such conversation")
         registry = harness().registry
-        return {**conversation_dict(row), "running": conversation_id in registry.turns, "turns": [{
+
+        def notes(run_id, status):
+            held = steering.get(run_id)
+            return [{"seq": seq, "text": text, "state": "read" if seq in held["carried"] else
+                     "pending" if status == "running" else "queued"} for seq, text in held["notes"]] if held else []
+        return {**conversation_dict(row), "running": conversation_id in registry.turns, "queued": queued, "turns": [{
             "run_id": run_id, "seq": seq, "author": author, "message": json.loads(message),
             "answer": json.loads(answer) if answer else None, "result_saved": bool(saved),
             "status": derived_status(status, run_id, registry), "reason_code": reason, "cancel_reason": cancel,
             "cost_usd": cost, "accounting": json.loads(accounting) if accounting else None,
             "started_at": started, "finished_at": finished, "continues": retry_of,
             "citations": cited.get(run_id, []), "memory_status": memory_status, "memory": remembered.get(run_id, []),
+            "steering": notes(run_id, derived_status(status, run_id, registry)),
         } for run_id, seq, author, message, answer, saved, reason, status, cancel, cost, started, finished, retry_of,
             accounting, memory_status in turns]}
 
@@ -1245,6 +1285,62 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def continue_run(run_id: str, body: Continue | None = None):
         body = body or Continue()
         claim = await harness().continue_turn(run_id, model=body.model, provider=body.provider, effort=body.effort)
+        return stream(claim)
+
+    # S1-33: messages sent during a run (F11). The interface sends one as the `[ui] follow_up` setting says: steer or
+    # queue; neither ever answers 409 active_run, which a second message sent as a new turn still gets.
+
+    @app.post("/api/runs/{run_id}/steering")
+    async def steer_run(run_id: str, body: FollowUp):
+        return await harness().steer(run_id, body.content)
+
+    def _follow_up_text(content):
+        if visible(content) is None:
+            raise ApiError(400, "empty_message", "The message is empty")
+        if len(content) > MAX_MESSAGE_CHARS:
+            raise ApiError(400, "message_too_long", "The message is too long")
+        return content
+
+    @app.post("/api/conversations/{conversation_id}/queue", status_code=201)
+    async def queue_message(conversation_id: str, body: FollowUp):
+        text = _follow_up_text(body.content)
+
+        def add(conn):
+            if conn.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone() is None:
+                raise ApiError(404, "not_found", "No such conversation")
+            return budgets.queue(conn, conversation_id, text)
+        return await write(add)
+
+    @app.put("/api/conversations/{conversation_id}/queue/{queued_id}")
+    async def edit_queued(conversation_id: str, queued_id: str, body: FollowUp):
+        text = _follow_up_text(body.content)
+
+        def edit(conn):
+            if conn.execute("UPDATE queued_messages SET text = ?, updated_at = ? WHERE id = ? AND conversation_id = ?",
+                            (text, utc_now(), queued_id, conversation_id)).rowcount != 1:
+                raise ApiError(409, "not_queued", "This message is no longer waiting")
+            return budgets.queued_row(conn.execute("SELECT id, text, created_at, updated_at FROM queued_messages"
+                                                   " WHERE id = ?", (queued_id,)).fetchone())
+        return await write(edit)
+
+    @app.delete("/api/conversations/{conversation_id}/queue/{queued_id}")
+    async def remove_queued(conversation_id: str, queued_id: str):
+        def remove(conn):
+            if conn.execute("DELETE FROM queued_messages WHERE id = ? AND conversation_id = ?",
+                            (queued_id, conversation_id)).rowcount != 1:
+                raise ApiError(409, "not_queued", "This message is no longer waiting")
+        await write(remove)
+        return {"ok": True}
+
+    @app.post("/api/conversations/{conversation_id}/queue/{queued_id}/send")
+    async def send_queued(conversation_id: str, queued_id: str, body: QueuedSend | None = None):
+        body = body or QueuedSend()
+        row = await read(lambda conn: conn.execute("SELECT text FROM queued_messages WHERE id = ? AND conversation_id = ?",
+                                                   (queued_id, conversation_id)).fetchone())
+        if row is None:
+            raise ApiError(409, "not_queued", "This message is no longer waiting")
+        claim = await harness().admit_turn(conversation_id, row[0], model=body.model, provider=body.provider,
+                                           effort=body.effort, queued=(queued_id, body.after))
         return stream(claim)
 
     @app.post("/api/runs/{run_id}/cancel")

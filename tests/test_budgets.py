@@ -1,8 +1,5 @@
-"""Budget reservations and settlement (backend/spending.py) with the deletion service.
-
-The budget bar, notices and the asks at the cap come with the budgets PR; these
-tests cover admission, settling once, and spending that outlives deletion.
-"""
+"""Budget reservations and settlement (backend/spending.py) with the deletion service; S1-33's budget asks,
+notices, spend and the evaluation project's conservative admission (backend/budgets.py)."""
 
 import asyncio
 import sqlite3
@@ -276,6 +273,12 @@ async def test_a_budget_lowered_while_a_turn_waits_binds_its_next_call(tmp_path)
         response = await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
                                                            "updates": {"project.budget_usd": 0.000001}})
         assert response.status_code == 200, response.text
+        assert (await anext(stream))["type"] == "route"
+        ask = await anext(stream)  # S1-33: the lowered budget does not hold the step, so it asks first
+        assert ask["type"] == "ask"
+        [listed] = (await client.get("/api/asks", params={"conversation_id": conversation})).json()["asks"]
+        assert (listed["params"]["budget"], listed["params"]["limit_usd"]) == ("project", 0.000001)
+        await client.post(f"/api/runs/{claim.run_id}/asks/{listed['ask_id']}", json={"option": "not_now"})
         rest = [event async for event in stream]
         assert [e for e in rest if e["type"] == "limit_reached"] == [{"type": "limit_reached", "budget": "project"}]
         assert client.provider.answers == []  # nothing was sent
@@ -329,8 +332,12 @@ async def test_a_request_too_costly_for_the_budget_stops_at_the_limit_before_any
         # 8,000 output tokens at $5 per million alone is $0.04: more than this budget holds.
         await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
                                                 "updates": {"project.budget_usd": 0.03}})
-        stream = await send(client, conversation, "Short?")
-        assert [e["type"] for e in stream] == ["run_started", "route", "limit_reached", "run_finished"]
+        sending = asyncio.create_task(send(client, conversation, "Short?"))
+        from test_agent_loop import asked
+        ask = await asked(client, conversation)  # S1-33: it asks before the step; Not now ends it at the limit
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "not_now"})
+        stream = await sending
+        assert [e["type"] for e in stream] == ["run_started", "route", "ask", "limit_reached", "run_finished"]
         assert provider.chats == []
         assert await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
             "SELECT count(*) FROM budget_reservations").fetchone()) == (0,)
@@ -351,7 +358,12 @@ async def test_a_step_the_budget_cannot_hold_stops_the_loop_at_its_limit_and_sta
         conversation = await conversation_in(client, project)
         await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
             "UPDATE conversations SET budget_usd = 0.08 WHERE id = ?", (conversation,)))
-        stream = await send(client, conversation, "Which papers do I have?")
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        from test_agent_loop import asked
+        ask = await asked(client, conversation)  # S1-33: the second step asks first; Stop ends it at the limit
+        assert ask["kind"] == "budget" and len(provider.agent_steps) == 1
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": ask["options"][-1]})
+        stream = await sending
         assert {"type": "limit_reached", "budget": "conversation"} in stream
         assert stream[-1]["cancel_reason"] == "limit" and len(provider.agent_steps) == 1  # the admitted step finished
         reservations = await rows(client, "SELECT status, settled_usd FROM budget_reservations WHERE run_id = ?",
@@ -389,3 +401,476 @@ async def test_a_stop_during_a_tool_call_settles_its_model_call_once_and_publish
                                       " AND type = 'model_attempt'", run_id)
         assert attempts.count(("cancelled",)) == 1  # the call in flight, settled once at its estimate
         assert await rows(client, "SELECT answer FROM turns WHERE run_id = ?", run_id) == [(None,)]
+
+
+# S1-33: the budget asks (slice-1 spec F11, At the cap and Before a step; section 6.2, Effects), the bar's
+# notices and spend. A turn's model calls ask before a reservation that does not fit; background runs never ask.
+
+
+async def _app(tmp_path, provider=None):
+    from scholia_app import started
+    return started(tmp_path / "data", provider)
+
+
+async def _conversation(client, budget=None, title="Named"):
+    """A titled conversation (no title run beside its turns) in the General project: (conversation, project)."""
+    conversation = (await client.post("/api/conversations", json={"title": title})).json()["id"]
+    project = (await client.get(f"/api/conversations/{conversation}")).json()["project_id"]
+    if budget is not None:
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = ? WHERE id = ?", (budget, conversation)))
+    return conversation, project
+
+
+async def _spent(client, project, usd, conversation=None):
+    """Spending of an earlier, finished run, settled: counted toward the project (and the conversation, if given)."""
+    from backend.db import utc_now
+    await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+        "INSERT INTO budget_reservations (id, step_seq, paying_conversation_id, project_id, estimate_usd, status,"
+        " settled_usd, basis, settled_at) VALUES (?, 0, ?, ?, ?, 'settled', ?, 'reported', ?)",
+        (new_id(), conversation, project, usd, usd, utc_now())))
+
+
+async def _project_budget(client, project, usd=None):
+    """Set the project's budget in its config.toml (usd given), or read it."""
+    settings = (await client.get("/api/settings", params={"project_id": project})).json()
+    if usd is None:
+        return settings["values"]["project"]["budget_usd"]
+    response = await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                       "updates": {"project.budget_usd": usd}})
+    assert response.status_code == 200, response.text
+
+
+async def _rows(client, sql, *args):
+    return await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(sql, args).fetchall())
+
+
+async def _asking(client, conversation, text="Short?"):
+    """A turn sent and waiting on its first ask: (the send's task, the ask as the conversation lists it)."""
+    from scholia_app import send
+    from test_agent_loop import asked
+    sending = asyncio.create_task(send(client, conversation, text))
+    return sending, await asked(client, conversation)
+
+
+async def _answer(client, ask, **body):
+    return await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json=body)
+
+
+async def _decisions(client, run_id):
+    import json
+    return [json.loads(d) for (d,) in await _rows(
+        client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'budget_decision' ORDER BY seq", run_id)]
+
+
+async def _own_budget(client, conversation):
+    return (await _rows(client, "SELECT budget_usd FROM conversations WHERE id = ?", conversation))[0][0]
+
+
+@pytest.mark.asyncio
+async def test_a_step_alone_over_the_budget_left_asks_first_and_go_ahead_raises_the_limit_just_enough(tmp_path):
+    # A2, A6, B5: money is left, but this one step's estimate is more: asked before it is reserved or sent.
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client, budget=0.03)
+        sending, ask = await _asking(client, conversation)
+        assert (ask["kind"], ask["options"], ask["text_box"]) == ("budget", ["go_ahead", "not_now"], True)
+        params = ask["params"]
+        assert (params["form"], params["budget"], params["limit_usd"], params["spent_usd"], params["phase"]) == (
+            "step", "conversation", 0.03, 0, "answer")
+        assert client.provider.answers == []  # nothing sent, nothing reserved while it asks
+        assert await _rows(client, "SELECT count(*) FROM budget_reservations") == [(0,)]
+        answered = await _answer(client, ask, option="go_ahead")
+        assert answered.status_code == 200, answered.text
+        assert answered.json()["budget"] == {"applied": True, "budget": "conversation", "limit_usd": params["estimate_usd"]}
+        stream = await sending
+        assert stream[-1]["status"] == "succeeded"
+        assert await _own_budget(client, conversation) == params["estimate_usd"]  # exactly what the step needed
+        [step] = await _rows(client, "SELECT json_extract(data, '$.estimate_usd') FROM run_events WHERE run_id = ?"
+                                     " AND type = 'step_started'", ask["run_id"])
+        assert step[0] == params["estimate_usd"]  # the ask's estimate is the reservation's own amount (B5)
+        [decision] = await _decisions(client, ask["run_id"])
+        assert {k: decision[k] for k in ("ask_id", "budget", "decision", "from_usd", "to_usd", "applied")} == {
+            "ask_id": ask["ask_id"], "budget": "conversation", "decision": "go_ahead", "from_usd": 0.03,
+            "to_usd": params["estimate_usd"], "applied": True}
+        audited = await _rows(client, "SELECT data FROM audit_log WHERE event = 'budget_decision'")
+        assert len(audited) == 1 and "Short?" not in audited[0][0]
+
+
+@pytest.mark.asyncio
+async def test_at_the_cap_continue_adds_the_budgets_amount_again_never_compounding(tmp_path):
+    # A1, A5, G1: settled spend has reached the conversation's limit: Continue, Set a new limit, or Stop.
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client, budget=0.5)
+        await _spent(client, project, 0.5, conversation)
+        sending, ask = await _asking(client, conversation)
+        assert (ask["options"], ask["params"]["form"]) == (["continue", "stop"], "cap")
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 1.0
+        assert (await sending)[-1]["status"] == "succeeded"
+        assert await _own_budget(client, conversation) == 1.0
+        await _spent(client, project, 0.5, conversation)  # the cap again
+        sending, ask = await _asking(client, conversation, "Again?")
+        assert ask["params"]["form"] == "cap"
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 1.5  # $0.50 again
+        assert (await sending)[-1]["status"] == "succeeded"
+        decisions = await _decisions(client, ask["run_id"])
+        assert [(d["decision"], d["from_usd"], d["to_usd"], d["amount_usd"]) for d in decisions] == [
+            ("continue", 1.0, 1.5, 0.5)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("form, option", [("cap", "stop"), ("step", "not_now")])
+async def test_stop_and_not_now_end_the_turn_at_the_limit_with_continue_offered(tmp_path, form, option):
+    # A8: the run ends cancelled at the limit, keeping its settled costs, and Continue builds a new turn.
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client, budget=0.03)
+        if form == "cap":
+            await _spent(client, project, 0.03, conversation)
+        sending, ask = await _asking(client, conversation)
+        assert ask["params"]["form"] == form
+        assert (await _answer(client, ask, option=option)).json()["budget"]["applied"] is False
+        stream = await sending
+        assert {"type": "limit_reached", "budget": "conversation"} in stream
+        assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "limit")
+        assert await _own_budget(client, conversation) == 0.03 and client.provider.answers == []
+        [decision] = await _decisions(client, ask["run_id"])
+        assert (decision["decision"], decision["applied"]) == (option, False)
+        turn = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1]
+        assert (turn["status"], turn["cancel_reason"]) == ("cancelled", "limit")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = 5 WHERE id = ?", (conversation,)))
+        again = await client.post(f"/api/runs/{ask['run_id']}/continue", json={})
+        assert again.status_code == 200 and '"succeeded"' in again.text
+
+
+@pytest.mark.asyncio
+async def test_set_a_new_limit_takes_a_typed_amount_that_fits_the_step(tmp_path):
+    # A7, G4: a typed limit, checked through visible; one that is not a positive amount, or still does not fit
+    # the step, is refused, nothing changing and the ask staying open.
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client, budget=0.03)
+        sending, ask = await _asking(client, conversation)
+        for text, code in (("lots", "invalid_limit"), ("0", "invalid_limit"), ("-5", "invalid_limit"),
+                           ("inf", "invalid_limit"), ("nan", "invalid_limit"), ("​", "invalid_answer"),
+                           ("0.031", "limit_too_low")):
+            refused = await _answer(client, ask, text=text)
+            assert (refused.status_code, refused.json()["code"]) == (400, code), text
+        assert await _own_budget(client, conversation) == 0.03
+        assert await _decisions(client, ask["run_id"]) == []
+        assert (await _answer(client, ask, text=" $2.5 ")).json()["budget"] == {
+            "applied": True, "budget": "conversation", "limit_usd": 2.5}
+        assert (await sending)[-1]["status"] == "succeeded"
+        assert await _own_budget(client, conversation) == 2.5
+        [decision] = await _decisions(client, ask["run_id"])
+        assert (decision["decision"], decision["to_usd"]) == ("set_limit", 2.5)
+
+
+@pytest.mark.asyncio
+async def test_two_conversations_admitting_075_against_1_left_one_is_admitted_and_one_asks(tmp_path):
+    # SPEC:1197 end to end: two turns, each a $0.75 step, against $1 left of the project's budget.
+    from scholia_app import MockProvider
+    model = budget_router_model()
+    release = asyncio.Event()
+
+    async def held(body):
+        await release.wait()
+        return provider.answer("First.")
+    provider = MockProvider(held, endpoints={model: [{"tag": "a", "context_length": 128000,
+                                                      "pricing": {"prompt": "0", "completion": "0.00009375"}}]})
+    async with await _app(tmp_path, provider) as client:
+        first, project = await _conversation(client)
+        second, _ = await _conversation(client, title="Other")
+        await _spent(client, project, 49.0)
+        from scholia_app import send
+        from test_agent_loop import asked
+        sending = asyncio.create_task(send(client, first, "Short?"))
+        while not provider.answers:  # the first is admitted, its call in flight
+            await asyncio.sleep(0.01)
+        other, ask = await _asking(client, second)
+        assert (ask["params"]["form"], ask["params"]["budget"], ask["params"]["estimate_usd"]) == ("step", "project", 0.75)
+        release.set()
+        assert (await sending)[-1]["status"] == "succeeded"
+        await _answer(client, ask, option="not_now")
+        assert (await other)[-1]["cancel_reason"] == "limit"
+        assert len(provider.answers) == 1
+
+
+def budget_router_model():
+    from backend import budget_router
+    return budget_router.MODEL_TIERS["mid"][0]  # what Auto picks first
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["another_continue", "settings_edit"])
+async def test_a_stale_answer_applies_nothing_and_the_step_is_checked_again(tmp_path, change):
+    # L6: the limit an ask was raised against changed before its answer (another conversation's Continue, or a
+    # Settings edit): the answer applies nothing and its step is checked again, so the project's limit is never
+    # raised twice for one cap.
+    async with await _app(tmp_path) as client:
+        first, project = await _conversation(client)
+        second, _ = await _conversation(client, title="Other")
+        await _project_budget(client, project, 1.0)
+        await _spent(client, project, 1.0)
+        sending_a, ask_a = await _asking(client, first)
+        if change == "another_continue":
+            sending_b, ask_b = await _asking(client, second)
+            assert (await _answer(client, ask_a, option="continue")).json()["budget"]["limit_usd"] == 2.0
+            await sending_a
+            stale, sending = ask_b, sending_b
+        else:
+            await _project_budget(client, project, 3.0)
+            stale, sending = ask_a, sending_a
+        answered = (await _answer(client, stale, option="continue")).json()
+        assert answered["budget"]["applied"] is False
+        assert (await sending)[-1]["status"] == "succeeded"  # checked again: it fits the limit as it is now
+        assert await _project_budget(client, project) == (2.0 if change == "another_continue" else 3.0)
+        [decision] = await _decisions(client, stale["run_id"])
+        assert (decision["applied"], decision["stale"]) == (False, True)
+
+
+@pytest.mark.asyncio
+async def test_a_project_budget_answer_whose_settings_write_fails_raises_nothing_and_asks_again(tmp_path, monkeypatch):
+    # L5 (b), reading 4: the answer and its decision commit first; the settings file is then written; when that
+    # fails nothing is raised, the reply says so, and the step asks again.
+    from backend import settings
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 1.0)
+        await _spent(client, project, 1.0)
+        sending, ask = await _asking(client, conversation)
+        saving = settings.Settings.save
+
+        def failing(self, updates):
+            if "project.budget_usd" in updates:
+                raise OSError("disk full")
+            return saving(self, updates)
+        monkeypatch.setattr(settings.Settings, "save", failing)
+        answered = (await _answer(client, ask, option="continue")).json()
+        assert answered["budget"] == {"applied": False, "budget": "project", "limit_usd": 1.0, "error": "not_saved"}
+        from test_agent_loop import asked
+        deadline = asyncio.get_running_loop().time() + 10
+        while True:  # asked again, by a new ask
+            again = await asked(client, conversation)
+            if again["ask_id"] != ask["ask_id"]:
+                break
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.05)
+        assert await _project_budget(client, project) == 1.0
+        monkeypatch.setattr(settings.Settings, "save", saving)
+        await _answer(client, again, option="stop")
+        assert (await sending)[-1]["cancel_reason"] == "limit"
+
+
+@pytest.mark.asyncio
+async def test_a_budget_answer_and_its_effect_commit_together(tmp_path, monkeypatch):
+    # A4: a failure after the change, inside the answer's transaction, leaves neither the answer nor the change.
+    from backend import governance
+    async with await _app(tmp_path) as client:
+        conversation, _ = await _conversation(client, budget=0.03)
+        sending, ask = await _asking(client, conversation)
+        recording = governance.record
+
+        def failing(conn, event, *args, **kwargs):
+            if event == "budget_decision":
+                raise RuntimeError("audit failed")
+            return recording(conn, event, *args, **kwargs)
+        monkeypatch.setattr(governance, "record", failing)
+        with pytest.raises(RuntimeError):
+            await _answer(client, ask, option="go_ahead")
+        monkeypatch.setattr(governance, "record", recording)
+        assert await _own_budget(client, conversation) == 0.03
+        assert await _rows(client, "SELECT count(*) FROM run_events WHERE type IN ('ask_answered', 'budget_decision')"
+                                   " AND run_id = ?", ask["run_id"]) == [(0,)]
+        assert (await _answer(client, ask, option="not_now")).status_code == 200  # still open
+        await sending
+
+
+@pytest.mark.asyncio
+async def test_a_stop_while_waiting_on_a_budget_ask_settles_nothing_twice_and_a_late_answer_changes_nothing(tmp_path):
+    # L1, G9: the refused step was never reserved; the ask closes with its run; a late answer is refused.
+    async with await _app(tmp_path) as client:
+        conversation, _ = await _conversation(client, budget=0.03)
+        sending, ask = await _asking(client, conversation)
+        assert (await client.post(f"/api/runs/{ask['run_id']}/cancel")).json()["status"] == "cancelled"
+        stream = await sending
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "researcher")
+        late = await _answer(client, ask, option="go_ahead")
+        assert (late.status_code, late.json()["code"]) == (409, "ask_closed")
+        assert await _own_budget(client, conversation) == 0.03
+        assert await _rows(client, "SELECT count(*) FROM budget_reservations") == [(0,)]
+        assert await _rows(client, "SELECT count(*) FROM run_events WHERE type = 'budget_decision'") == [(0,)]
+
+
+@pytest.mark.asyncio
+async def test_a_stop_racing_a_continue_answer_takes_exactly_one_of_them(tmp_path):
+    # L1: either the answer is refused (the Stop came first), or it applies and the Stop ends the resumed run.
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client, budget=0.5)
+        await _spent(client, project, 0.5, conversation)
+        for _ in range(3):
+            sending, ask = await _asking(client, conversation)
+            stopped, answered = await asyncio.gather(client.post(f"/api/runs/{ask['run_id']}/cancel"),
+                                                     _answer(client, ask, option="continue"))
+            stream = await sending
+            assert stream[-1]["status"] in ("cancelled", "succeeded")
+            decisions = await _decisions(client, ask["run_id"])
+            answers = await _rows(client, "SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'ask_answered'"
+                                          " AND json_extract(data, '$.by') = 'researcher'", ask["run_id"])
+            assert answers == [(len(decisions),)] and len(decisions) == (answered.status_code == 200)
+            assert await _rows(client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'") == [(0,)]
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                "UPDATE conversations SET budget_usd = 0.5 WHERE id = ?", (conversation,)))
+
+
+@pytest.mark.asyncio
+async def test_deleting_the_conversation_while_its_turn_waits_on_a_budget_ask_keeps_its_spending(tmp_path):
+    # L3 (a): the ask goes with its run; the conversation's spending stays in the project's total.
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client, budget=0.5)
+        await _spent(client, project, 0.5, conversation)
+        sending, ask = await _asking(client, conversation)
+        assert (await client.delete(f"/api/conversations/{conversation}")).status_code == 200
+        await sending
+        assert (await _answer(client, ask, option="continue")).status_code in (404, 409)
+        assert (await client.get("/api/asks")).json()["asks"] == []
+        spend = (await client.get(f"/api/projects/{project}/spend")).json()
+        assert spend["project"]["settled_usd"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_tightening_the_project_while_a_budget_ask_waits_refuses_its_answer_and_revokes_the_run(tmp_path):
+    # L4: a policy change makes the ask invalid; the run is revoked by the change and sends nothing.
+    async with await _app(tmp_path) as client:
+        project = (await client.post("/api/projects", json={"name": "Thesis"})).json()["id"]
+        conversation = (await client.post("/api/conversations", json={"project_id": project, "title": "t"})).json()["id"]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = 0.03 WHERE id = ?", (conversation,)))
+        sending, ask = await _asking(client, conversation)
+        assert (await client.post(f"/api/projects/{project}/sensitivity", json={"level": "local_only"})).status_code == 200
+        refused = await _answer(client, ask, option="go_ahead")
+        assert refused.status_code == 409 and refused.json()["code"] in ("ask_invalid", "ask_closed")
+        stream = await sending
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")
+        assert client.provider.answers == [] and await _own_budget(client, conversation) == 0.03
+
+
+@pytest.mark.asyncio
+async def test_notices_at_50_85_and_90_percent_are_recorded_once_per_budget_and_limit(tmp_path):
+    # N2, G3: one settlement from 40% to 95% records each threshold it crossed once, streamed as `budget`; a
+    # raised limit rearms them.
+    from scholia_app import MockProvider, send
+    async with await _app(tmp_path, MockProvider(cost=0.055)) as client:
+        conversation, project = await _conversation(client, budget=0.1)
+        await _spent(client, project, 0.04, conversation)
+        stream = await send(client, conversation, "Short?")
+        shown = [e for e in stream if e["type"] == "budget"]
+        assert [(e["budget"], e["percent"]) for e in shown] == [("conversation", 50), ("conversation", 85),
+                                                                ("conversation", 90)]
+        assert shown[-1]["settled_usd"] == pytest.approx(0.095) and shown[-1]["limit_usd"] == 0.1
+        noticed = await _rows(client, "SELECT json_extract(data, '$.budget'), json_extract(data, '$.percent'),"
+                                      " json_extract(data, '$.limit_usd') FROM run_events WHERE type = 'budget_notice'")
+        assert sorted(noticed) == [("conversation", 50, 0.1), ("conversation", 85, 0.1), ("conversation", 90, 0.1)]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = 0.2 WHERE id = ?", (conversation,)))
+        stream = await send(client, conversation, "Again?")  # 0.15 of 0.2: 75%, a new limit's 50% only
+        assert [(e["budget"], e["percent"], e["limit_usd"]) for e in stream if e["type"] == "budget"] == [
+            ("conversation", 50, 0.2)]
+
+
+@pytest.mark.asyncio
+async def test_spend_reports_settled_and_open_spend_against_both_budgets_without_content(tmp_path):
+    # N3: GET /api/projects/{id}/spend, a deleted conversation's spending staying in the project's figure.
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client, budget=2.0)
+        await _project_budget(client, project, 20.0)
+        await _spent(client, project, 0.5, conversation)
+        other, _ = await _conversation(client, title="Other")
+        await _spent(client, project, 0.25, other)
+        spend = (await client.get(f"/api/projects/{project}/spend", params={"conversation_id": conversation})).json()
+        assert spend == {
+            "project": {"limit_usd": 20.0, "settled_usd": 0.75, "open_usd": 0},
+            "conversation": {"limit_usd": 2.0, "settled_usd": 0.5, "open_usd": 0, "own": True},
+            "notice_percents": [50, 85, 90]}
+        default = (await client.get(f"/api/projects/{project}/spend", params={"conversation_id": other})).json()
+        assert default["conversation"] == {"limit_usd": 10, "settled_usd": 0.25, "open_usd": 0, "own": False}
+        await client.delete(f"/api/conversations/{conversation}")
+        assert (await client.get(f"/api/projects/{project}/spend")).json()["project"]["settled_usd"] == 0.75
+        assert (await client.get(f"/api/projects/{project}/spend", params={"conversation_id": conversation})).status_code == 404
+        assert (await client.get(f"/api/projects/{new_id()}/spend")).status_code == 404
+
+
+# S1-33: conservative admission for the preview's evaluation project (SPEC:1223; T70:52-55; reading 15)
+
+
+@pytest.mark.asyncio
+async def test_an_evaluation_project_reserves_the_conservative_bound_and_never_asks(tmp_path):
+    # P1, P2: each request reserves its estimate times the attempts one call may make; at its budget the run stops
+    # at the limit with no ask; a normal project's reservation is unchanged.
+    from backend import openrouter
+    from scholia_app import send
+    async with await _app(tmp_path) as client:
+        made = await client.post("/api/projects", json={"name": "Evaluation", "evaluation": True})
+        assert made.status_code == 201 and made.json()["evaluation"] is True
+        project = made.json()["id"]
+        conversation = (await client.post("/api/conversations", json={"project_id": project, "title": "t"})).json()["id"]
+        stream = await send(client, conversation, "Short?")
+        assert stream[-1]["status"] == "succeeded"
+        [(estimate, reserved)] = await _rows(
+            client, "SELECT json_extract(e.data, '$.request_usd'), b.estimate_usd FROM run_events e"
+                    " JOIN budget_reservations b ON b.id = json_extract(e.data, '$.reservation_id')"
+                    " WHERE e.type = 'step_started' AND e.run_id = ?", stream[0]["run_id"])
+        assert reserved == pytest.approx(estimate * openrouter.MAX_ATTEMPTS)
+        await _project_budget(client, project, 0.05)
+        stream = await send(client, conversation, "Again?")
+        assert {"type": "limit_reached", "budget": "project"} in stream and stream[-1]["cancel_reason"] == "limit"
+        assert not [e for e in stream if e["type"] == "ask"]
+        assert await _rows(client, "SELECT count(*) FROM run_events WHERE type = 'ask'") == [(0,)]
+
+
+@pytest.mark.asyncio
+async def test_the_evaluation_mark_is_set_at_creation_only(tmp_path):
+    # P3: it lives in the database; no settings file or API change clears or sets it later.
+    import sqlite3
+    async with await _app(tmp_path) as client:
+        project = (await client.post("/api/projects", json={"name": "Evaluation", "evaluation": True})).json()["id"]
+        normal = (await client.post("/api/projects", json={"name": "Thesis"})).json()
+        assert normal["evaluation"] is False
+        changed = await client.patch(f"/api/projects/{project}", json={"evaluation": False})
+        assert (await client.get(f"/api/projects/{project}")).json()["evaluation"] is True
+        assert changed.status_code in (200, 400, 422)
+        with pytest.raises(sqlite3.IntegrityError, match="evaluation"):
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                "UPDATE projects SET evaluation = 0 WHERE id = ?", (project,)))
+
+
+def test_a_child_runs_reservation_pays_its_parents_conversation_and_a_background_runs_pays_none(db):
+    # B2, reading 16: the paying conversation is fixed at admission; S1-27 and S1-34 add the flows.
+    project = add_project(db)
+    conversation, parent = add_turn(db, project)
+    child, background = new_id(), new_id()
+    db.write(lambda conn: conn.execute(
+        "INSERT INTO runs (id, project_id, conversation_id, parent_run_id, kind) VALUES (?, ?, ?, ?, 'child'),"
+        " (?, ?, NULL, NULL, 'background')", (child, project, conversation, parent, background, project)))
+    reserve(db, project, conversation, child, 0.25)
+    reserve(db, project, None, background, 0.5)
+    assert db.read(lambda conn: spending.spent(conn, conversation_id=conversation)) == 0.25
+    assert project_spent(db, project) == 0.75
+    with pytest.raises(spending.BudgetExceeded) as refused:  # the child's next step meets its parent's budget
+        reserve(db, project, conversation, child, 0.5, conversation_budget=0.5, step=1)
+    assert refused.value.budget == "conversation"
+
+
+@pytest.mark.asyncio
+async def test_a_budget_of_zero_asks_at_the_cap_and_the_route_holds_through_the_ask(tmp_path):
+    # G2, I6: a zero budget is used up already; after Continue the step names the turn's own route and effort.
+    import json
+    async with await _app(tmp_path) as client:
+        conversation, _ = await _conversation(client, budget=0)
+        sending, ask = await _asking(client, conversation)
+        assert (ask["params"]["form"], ask["params"]["limit_usd"]) == ("cap", 0)
+        assert (await _answer(client, ask, text="1")).json()["budget"]["limit_usd"] == 1.0
+        assert (await sending)[-1]["status"] == "succeeded"
+        events = {kind: json.loads(data) for kind, data in await _rows(
+            client, "SELECT type, data FROM run_events WHERE run_id = ? AND type IN ('route', 'step_started')"
+                    " ORDER BY seq", ask["run_id"])}
+        assert (events["step_started"]["route"], events["step_started"]["effort"]) == (
+            events["route"]["route"], events["route"]["effort"])

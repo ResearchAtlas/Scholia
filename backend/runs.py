@@ -467,6 +467,7 @@ class Harness:
                     "SELECT id, cancel_reason = 'revoked' FROM runs WHERE status = 'running' AND kind IN ('turn', 'child')"
             ).fetchall():
                 status = "cancelled" if revoked else "interrupted"  # a revoked run stays revoked
+                _queue_unread_notes(conn, run_id)  # S1-33: a steering note no step read waits as the next turn
                 _close_asks(conn, run_id)  # an open ask closes with its run, its question's text going with it
                 _let_go(conn, run_id)
                 _event(conn, run_id, "run_finished", {"status": status, **({"cancel_reason": "revoked"} if revoked else {})})
@@ -613,11 +614,41 @@ class Harness:
         return await self.admit_turn(conversation_id, message.get("text", ""), model=model, provider=provider,
                                      effort=effort, retry_of=run_id, material_ids=message.get("material_ids"))
 
+    async def steer(self, run_id: str, text: str) -> dict:
+        """S1-33 (F11, steer): a message sent while a turn runs becomes a steering note its next step reads
+        ({"steering": {"run_id", "seq"}}), in one transaction ordered with the turn's terminal write by the single
+        writer; one for a turn that has ended, will not run here, or offers no tools (it has no next step) waits as
+        the conversation's next turn instead ({"queued": row}). Never a second run. AdmissionError for a run that is
+        not a turn, or a message that is empty or too long."""
+        from backend import budgets  # it imports this module
+        if visible(text) is None:
+            raise AdmissionError(400, "empty_message", "The message is empty")
+        if len(text) > MAX_MESSAGE_CHARS:
+            raise AdmissionError(400, "message_too_long", "The message is too long")
+        active = self.registry.runs.get(run_id)
+        agentic = active is not None and active.kind == "turn" and bool((active.context or {}).get("tools"))
+
+        def write(conn):
+            row = conn.execute("SELECT conversation_id, status, cancel_reason FROM runs WHERE id = ? AND kind = 'turn'",
+                               (run_id,)).fetchone()
+            if row is None or row[0] is None:
+                raise AdmissionError(404, "not_found", "No such turn")
+            if agentic and row[1] == "running" and row[2] is None and not active.cancel_requested.is_set():
+                (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM run_events WHERE run_id = ?",
+                                      (run_id,)).fetchone()
+                _event(conn, run_id, "steering_note", {"text": text})
+                return {"steering": {"run_id": run_id, "seq": seq}}
+            return {"queued": budgets.queue(conn, row[0], text)}
+        return await self._write(write)
+
     async def admit_turn(self, conversation_id: str, message, *, model=None, provider=None, effort=None,
-                         retry_of=None, material_ids=None) -> ActiveRun:
+                         retry_of=None, material_ids=None, queued=None) -> ActiveRun:
         """Validate a message and admit its turn, or raise AdmissionError having written nothing.
         material_ids is the papers it selects (the Library's selection or @-mentions): its literature is
-        restricted to them."""
+        restricted to them. queued (S1-33): (a queued message's id, the run it follows or None) when the message is
+        one waiting as the next turn: it is taken from the queue in the admission's transaction, so it starts once;
+        refused once it is no longer queued as it was read (not_queued), and, with a run it follows, unless that is
+        still the conversation's latest turn and succeeded (not_after_success)."""
         if material_ids is not None and (not isinstance(material_ids, list) or len(material_ids) > MAX_SELECTION
                                          or not all(isinstance(m, str) for m in material_ids)):
             raise AdmissionError(400, "selection_invalid", "Choose at most 50 papers")
@@ -634,12 +665,12 @@ class Harness:
         try:
             await self._record_dropped()
             return await self._admit(claim, message, model=model, provider=provider, effort=effort, retry_of=retry_of,
-                                     material_ids=material_ids)
+                                     material_ids=material_ids, queued=queued)
         except BaseException:
             self.registry.release(claim)
             raise
 
-    async def _admit(self, claim, message, *, model, provider, effort, retry_of, material_ids=None):
+    async def _admit(self, claim, message, *, model, provider, effort, retry_of, material_ids=None, queued=None):
         conversation = await self._read(lambda conn: conn.execute(
             "SELECT project_id FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone())
         if conversation is None:
@@ -750,6 +781,8 @@ class Harness:
                     else AdmissionError(409, "cancelled", "The message was cancelled")
             if not conn.execute("SELECT 1 FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone():
                 raise AdmissionError(404, "not_found", "No such conversation")
+            if queued is not None:
+                _take_queued(conn, claim.conversation_id, message, *queued)
             (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM turns WHERE conversation_id = ?",
                                   (claim.conversation_id,)).fetchone()
             # Only succeeded turns' answers: a failed, cancelled or revoked turn's text never enters a
@@ -1022,6 +1055,7 @@ class Harness:
             status, cancel_reason, reason_code, limit = "cancelled", "revoked", "cancelled", None
         _release_allowances(conn, run_id)
         if _running(conn, run_id):
+            _queue_unread_notes(conn, run_id)  # S1-33: a steering note no step read waits as the next turn
             _close_asks(conn, run_id)  # an ask outlives no run: a late answer changes nothing (asks.answer refuses it)
             _let_go(conn, run_id)  # nor does the agent's question's text (Harness._ask)
             if limit is not None:
@@ -1050,6 +1084,7 @@ class Harness:
             raise _Cancelled()
         _release_allowances(conn, claim.run_id)
         _let_go(conn, claim.run_id)  # an agent's question's text, held while it ran (Harness._ask)
+        _queue_unread_notes(conn, claim.run_id)  # S1-33: a note that came after the last step waits as the next turn
         cost = spending.run_cost(conn, claim.run_id)
         # Existence and mapping again, in this transaction: a passage re-read or removed while the judge ran is
         # mapped by its quote or marked source_removed (its verdict then unchecked), never a row that fails.
@@ -1123,13 +1158,22 @@ class Harness:
         what is left of each is held again apart (allowance_id, unspent_id), and its step records what
         funded it ("funded": share, answer_unspent or budget). No reservation is ever written past a
         budget: one that does not fit raises BudgetExceeded, writing nothing. An allowance left unspent is released when the turn ends
-        (_release_allowances)."""
+        (_release_allowances).
+
+        S1-33: a turn's call that does not fit asks first (backend/budgets.py), with the budget the refusal named and
+        the step's whole estimate (with its judge's share), outside settings_lock; once answered it is checked again
+        under the budgets as they are then, and asked again while it still does not fit, until Stop or Not now, which
+        raise BudgetExceeded (the turn ends at the limit). A judge's call never asks (option C: its pairs are then
+        unchecked for budget), nor does any call of the evaluation project, whose reservations are the conservative
+        bound (budgets.bound)."""
+        from backend import budgets as budget_rules  # it imports this module
         run_id = active.run_id
         context = active.context if active.context is not None else {}
         # A turn past its time limit reserves nothing more: an early form of the dispatch check's (may_dispatch), which
         # alone binds at the moment a request leaves; this one only saves a reservation and a step that never runs.
         if _past_deadline(context):
             raise _LimitReached("turn_minutes")
+        evaluation, request_usd, share_usd = {}, estimate, allowance
 
         def reserve(conn):
             if not _running(conn, run_id) or _revoked(conn, run_id):  # deleted, ended or revoked since it was admitted
@@ -1140,6 +1184,9 @@ class Harness:
                                   (run_id,)).fetchone()
             budgets = {"project_budget_usd": project_budget,
                        "conversation_budget_usd": own if own is not None else default_budget}
+            evaluation["on"] = budget_rules.evaluation(conn, project_id)
+            estimate = budget_rules.bound(conn, project_id, request_usd)
+            allowance = budget_rules.bound(conn, project_id, share_usd)
             held, funded = {}, {}
             for name in ("allowance", "unspent") if from_allowance else ():
                 held_id = context.get(name)
@@ -1173,17 +1220,28 @@ class Harness:
                         raise  # the share must fit with its answer (C5)
                     # a budget lowered meanwhile: this rest is not held again; this call still runs
             _event(conn, run_id, "step_started", {"step": seq, "phase": phase, "estimate_usd": estimate,
+                                                   **({"request_usd": request_usd} if evaluation["on"] else {}),
                                                    "reservation_id": reservation, **step, **funded,
                                                    **{f"{name}_{k}": v for name, (rid, usd) in kept.items()
                                                       for k, v in (("id", rid), ("usd", usd))}})
             return _Call(run_id, seq, reservation), kept
 
-        async with self.settings_lock:
-            project_budget, default_budget = await self._budgets(project_id)
-            try:
-                (call, kept), cancelled = await self._write_through(reserve)
-            except _Cancelled:
-                raise asyncio.CancelledError() from None
+        while True:
+            async with self.settings_lock:
+                project_budget, default_budget = await self._budgets(project_id)
+                try:
+                    (call, kept), cancelled = await self._write_through(reserve)
+                    break
+                except _Cancelled:
+                    raise asyncio.CancelledError() from None
+                except spending.BudgetExceeded as exceeded:
+                    if from_allowance or active.kind != "turn" or evaluation.get("on"):
+                        raise
+                    refused = exceeded
+            reply = await self._budget_ask(active, project_id, paying_conversation_id, refused,
+                                           round(request_usd + share_usd, 9), phase)
+            if reply is not None and reply.get("option") in budget_rules.STOPS:
+                raise refused
         active.call = call
         if allowance or from_allowance:
             context["allowance"] = (kept.get("allowance") or (None,))[0]
@@ -1192,6 +1250,21 @@ class Harness:
         if cancelled or active.cancel_requested.is_set():
             raise asyncio.CancelledError()
         return call
+
+    async def _budget_ask(self, active, project_id, paying_conversation_id, refused, estimate, phase):
+        """S1-33: ask the researcher about a turn's step its budget refused (backend/budgets.py), and wait for the answer,
+        which applies its effect itself: the cap ask when the budget's settled spend and open reservations have reached
+        its limit, else the step ask. Returns the answer, or None when it was withdrawn (its project's protection
+        changed)."""
+        from backend import budgets as budget_rules  # it imports this module
+        conversation_id = paying_conversation_id if refused.budget == "conversation" else None
+        spent = await self._read(lambda conn: spending.spent(
+            conn, **({"conversation_id": conversation_id} if conversation_id else {"project_id": project_id})))
+        form = "cap" if spent + 1e-9 >= refused.limit_usd else "step"
+        turn = agent.Turn(self, active, agent.Evidence({}), active.events.put_nowait)
+        return await self._ask(turn, "budget", budget_rules.options(form), {
+            "form": form, "budget": refused.budget, "limit_usd": refused.limit_usd, "spent_usd": spent,
+            "estimate_usd": estimate, "phase": phase, "conversation_id": paying_conversation_id}, None)
 
     # S1-19: the router's small model, the evidence, the cited request and the support judge
 
@@ -1681,11 +1754,16 @@ class Harness:
         limits, tools = ctx["limits"], ctx["tools"]
         chain, calls_made, failures = [], 0, 0
         for number in range(limits["agent_steps"]):
-            if number:
+            # S1-33: the researcher's steering notes sent since the last step, read at this one (F11, steer): after the
+            # chain so far, which is never rewritten (model-route rule 5), as their own words
+            notes = await self._read(lambda conn: _unread_notes(conn, claim.run_id, ctx.setdefault("steered", [])))
+            chain += [{"role": "user", "content": text} for _, text in notes]
+            if number or notes:
                 try:
                     _, request = self._cited_request(ctx, found, decision, chain=chain, read=turn.evidence.numbered)
                 except context.OverWindow:
                     return "chain_over_window"
+            if number:
                 await self._register_context(claim, turn.evidence.numbered, turn.listed)
                 await self._carry_summary(claim, ctx, turn.evidence.numbered, turn.listed)  # S1-21b: a summary this
                 # step's request is the first to carry
@@ -1703,12 +1781,16 @@ class Harness:
                                                              **({"summary": {"turns": ctx["summary_info"]["turns"]}}
                                                                 if ctx.get("summary_info") and (
                                                                     not request.cuts.get("summary")
-                                                                    or ctx.get("summary_carried")) else {})})
+                                                                    or ctx.get("summary_carried")) else {}),
+                                                             **({"steering": [seq for seq, _ in notes]} if notes else {})})
+            ctx["steered"] += [seq for seq, _ in notes]
             await handed({"type": "step", "seq": call.step, "phase": "answer"})
             result = await self._call(claim, call, ctx["route"], ctx["key"], request, ctx["facts"],
                                       zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
                                       rehold=ctx if judge_estimate else None)
             turn.step = call.step
+            if notes and result.dispatched:  # said only once the request that carried them went out
+                turn.emit({"type": "steering_note", "read": [seq for seq, _ in notes]})
             if result.dispatched and ctx.get("summary_info") and not request.cuts.get("summary"):
                 # its dependencies stay registered from here (context_materials and summary_memory are never taken back
                 # once a request carrying the summary left), and every later step's request carries this one's reply
@@ -2197,6 +2279,7 @@ class Harness:
             # S1-19c: an agent step's reply is kept whole as it arrives (model-route rule 5: each assistant step stored
             # whole), beside its request body and under the same deletion links, whatever the turn does next.
             kept_reply = {"ref": None}  # stored in the shielded recording below, so a Stop cannot skip the record
+            noticed = []
             if output is not None and result.ok:
                 finished["output"] = output(result)
 
@@ -2215,6 +2298,8 @@ class Harness:
                             **(_keep_reply(conn, call, number, kept_reply["ref"]) if answered else {})})
                 if result.dispatched:
                     _settle_attempts(conn, call.reservation_id, facts["rates"], result.attempts)
+                    if exists:  # S1-33: the bar's notices this settlement reached
+                        noticed.extend(_notices(conn, active.run_id, self.data_dir))
                     if rehold is not None and exists:  # the answer's unspent, held again for its judge (_reserve)
                         held = _hold_unspent(conn, call, rehold, self.data_dir)
                         if held:
@@ -2248,6 +2333,9 @@ class Harness:
             # Recorded before the client closes, and to its end even if cancelled meanwhile.
             _, cancelled = await _through(recording())
         active.call = None
+        if active.kind == "turn":  # streamed once recorded: the bar reads its figures again
+            for notice in noticed:
+                active.events.put_nowait({"type": "budget", **notice})
         if cancelled:
             raise asyncio.CancelledError()
         if call.declined:  # refused at dispatch for the turn's time limit: recorded and settled, the turn stops there
@@ -2400,6 +2488,7 @@ class Harness:
         `title`, and `citation_check` (S1-19: POST /api/citations/check, the support judge run again on the
         exact (sentence, passage) pairs its inputs name, one batch of up to `judge_pairs` a run; its output
         binds each verdict to the pair judged)."""
+        from backend import budgets as budget_rules  # it imports this module
         if workflow == "memory":
             return await self._extraction_call(active, project_id, inputs)
         if workflow not in ("title", "citation_check"):
@@ -2475,10 +2564,12 @@ class Harness:
                     conn.execute("UPDATE runs SET attempts = attempts + 1 WHERE id = ?", (active.run_id,))  # before the call
                 (step,) = conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_started'",
                                        (active.run_id,)).fetchone()
+                reserved = budget_rules.bound(conn, project_id, estimate)  # S1-33: the evaluation project's bound
                 reservation = spending.reserve(conn, run_id=active.run_id, step_seq=step, project_id=project_id,
-                                               paying_conversation_id=None, estimate_usd=estimate,
+                                               paying_conversation_id=None, estimate_usd=reserved,
                                                project_budget_usd=budget, conversation_budget_usd=None)
-                _event(conn, active.run_id, "step_started", {"step": step, "phase": workflow, "estimate_usd": estimate,
+                _event(conn, active.run_id, "step_started", {"step": step, "phase": workflow, "estimate_usd": reserved,
+                                                              **({"request_usd": estimate} if reserved != estimate else {}),
                                                               "reservation_id": reservation,
                                                               **_step(route, facts, request)})
                 return _Call(active.run_id, step, reservation)
@@ -2515,6 +2606,7 @@ class Harness:
         the attempts before it, and the project's budget; else it is skipped, with its reason. The request's papers
         (the answer's and the related records') and records are the run's scope and pass the dispatch check.
         Returns the candidates, or None (failed); raises RunOutcome when it is skipped."""
+        from backend import budgets as budget_rules  # it imports this module
         if not memory.enabled((await asyncio.to_thread(load_settings, self.data_dir, project_id)).values):
             raise RunOutcome("cancelled", "memory_off")
         policy = await self._read(lambda conn: governance.policy(conn, project_id))
@@ -2569,13 +2661,15 @@ class Harness:
                 (json.dumps(held), json.dumps(held), json.dumps(remembered), json.dumps(versions), active.run_id))
             (step,) = conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_started'",
                                    (active.run_id,)).fetchone()
+            reserved = budget_rules.bound(conn, project_id, estimate)  # S1-33: the evaluation project's bound
             try:
                 reservation = spending.reserve(conn, run_id=active.run_id, step_seq=step, project_id=project_id,
-                                               paying_conversation_id=None, estimate_usd=estimate,
+                                               paying_conversation_id=None, estimate_usd=reserved,
                                                project_budget_usd=budget, conversation_budget_usd=None)
             except spending.BudgetExceeded:
                 raise RunOutcome("cancelled", "budget", "limit") from None  # skipped, never asked about (S1-33)
-            _event(conn, active.run_id, "step_started", {"step": step, "phase": "extract_memory", "estimate_usd": estimate,
+            _event(conn, active.run_id, "step_started", {"step": step, "phase": "extract_memory", "estimate_usd": reserved,
+                                                          **({"request_usd": estimate} if reserved != estimate else {}),
                                                           "reservation_id": reservation, **_step(route, facts, request)})
             return _Call(active.run_id, step, reservation)
 
@@ -2998,6 +3092,20 @@ def _budgets_now(data_dir, project_id):
     return project.values["project"]["budget_usd"], personal.values["budget"]["conversation_usd"]
 
 
+def _notices(conn, run_id, data_dir):
+    """S1-33: budgets.notices, never failing the settlement it follows (a settings file unreadable now: none)."""
+    from backend import budgets  # it imports this module
+    conn.execute("SAVEPOINT notices")  # a notice that fails leaves the settlement as it is
+    try:
+        found = budgets.notices(conn, run_id, data_dir)
+    except Exception as error:
+        conn.execute("ROLLBACK TO notices")
+        log.warning("budget notices not recorded (%s)", type(error).__name__)
+        found = []
+    conn.execute("RELEASE notices")
+    return found
+
+
 def _hold_unspent(conn, call, ctx, data_dir):
     """The answer's reservation less its settled cost, held again for its judge, in the transaction that settles
     it, against the budgets as they are then, read under settings_lock (_call's recording; Harold's option C,
@@ -3034,6 +3142,30 @@ def _release_allowances(conn, run_id=None):
             " AND b.id IN (json_extract(e.data, '$.allowance_id'), json_extract(e.data, '$.unspent_id'))"
             " WHERE b.status = 'open' AND (? IS NULL OR b.run_id = ?)", (run_id, run_id)).fetchall():
         spending.release(conn, reservation)
+
+
+def _take_queued(conn, conversation_id, text, queued_id, after):
+    """S1-33: a queued message taken from the queue by the admission of its turn, in its transaction (Harness._admit)."""
+    if after is not None:
+        latest = conn.execute("SELECT t.run_id, r.status FROM turns t JOIN runs r ON r.id = t.run_id"
+                              " WHERE t.conversation_id = ? ORDER BY t.seq DESC LIMIT 1", (conversation_id,)).fetchone()
+        if latest is None or tuple(latest) != (after, "succeeded"):
+            raise AdmissionError(409, "not_after_success", "The turn before it did not succeed; send it yourself")
+    if conn.execute("DELETE FROM queued_messages WHERE id = ? AND conversation_id = ? AND text = ?",
+                    (queued_id, conversation_id, text)).rowcount != 1:
+        raise AdmissionError(409, "not_queued", "This message is no longer waiting")
+
+
+def _unread_notes(conn, run_id, taken):
+    """S1-33: the turn's steering notes no step has taken yet: [(seq, text)], in order."""
+    return [(seq, text) for seq, text in conn.execute(
+        "SELECT seq, json_extract(data, '$.text') FROM run_events WHERE run_id = ? AND type = 'steering_note' ORDER BY seq",
+        (run_id,)) if seq not in taken and text]
+
+
+def _queue_unread_notes(conn, run_id):
+    from backend import budgets  # it imports this module
+    budgets.queue_unread_notes(conn, run_id)
 
 
 def _close_asks(conn, run_id):

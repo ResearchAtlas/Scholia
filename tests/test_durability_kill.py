@@ -154,6 +154,27 @@ async def main():
                 conversation = (await client.post("/api/conversations", json={"title": "Named"})).json()["id"]
                 await client.post(f"/api/conversations/{conversation}/message/stream",
                                   json={"content": "For this project we use interviews"})
+            elif scenario.startswith("budget"):  # S1-33: a turn asking before a step its conversation's budget refuses
+                await client.post("/api/setup", json={"openrouter_key": "sk-or-test-not-a-real-key"})
+                general = [p for p in (await client.get("/api/projects")).json()["projects"] if p["kind"] == "general"]
+                await memory_off(client, general[0]["id"])
+                conversation = (await client.post("/api/conversations", json={"title": "Named"})).json()["id"]
+                await asyncio.to_thread(app.app.state.scholia["db"].write, lambda conn: conn.execute(
+                    "UPDATE conversations SET budget_usd = 0.01 WHERE id = ?", (conversation,)))
+                if scenario == "budget_after_answer":  # the answer committed, the step not yet reserved again
+                    asking = runs.Harness._budget_ask
+
+                    async def answered_then_crash(self, *args, **kwargs):
+                        await asking(self, *args, **kwargs)
+                        crash()
+                    runs.Harness._budget_ask = answered_then_crash
+                asyncio.ensure_future(client.post(f"/api/conversations/{conversation}/message/stream",
+                                                  json={"content": "What is a cohort study?"}))
+                while not (found := (await client.get(f"/api/asks?conversation_id={conversation}")).json()["asks"]):
+                    await asyncio.sleep(0.02)
+                if scenario == "budget_waiting":
+                    crash()
+                await client.post(f"/api/runs/{found[0]['run_id']}/asks/{found[0]['ask_id']}", json={"option": "go_ahead"})
             elif not scenario.startswith("restart"):
                 await client.post("/api/setup", json={"openrouter_key": "sk-or-test-not-a-real-key"})
                 general = [p for p in (await client.get("/api/projects")).json()["projects"] if p["kind"] == "general"]
@@ -429,3 +450,31 @@ async def test_killed_after_the_primary_commit_keeps_its_citations_once(tmp_path
         turn, citations, _ = await cited_state(client)
         assert turn == [("succeeded", 1)] and citations == [("ok", "supported")]
         assert provider.answers == []
+
+
+# S1-33: a crash while a turn waits on its budget ask, and after its answer committed (checklist L2)
+
+
+@pytest.mark.parametrize("scenario", ["budget_waiting", "budget_after_answer"])
+async def test_killed_while_a_turn_waits_on_its_budget_ask_or_after_its_answer(tmp_path, scenario):
+    data = tmp_path / "data"
+    run_child(data, scenario)
+    provider, app = await restart(data)
+    async with app as client:
+        [(run_id, status, waiting)] = await rows(client, "SELECT id, status, waiting FROM runs WHERE kind = 'turn'")
+        assert (status, waiting) == ("interrupted", None)
+        assert await rows(client, "SELECT count(*) FROM budget_reservations") == [(0,)]  # the refused step never reserved
+        decisions = await rows(client, "SELECT count(*) FROM run_events WHERE type = 'budget_decision'")
+        [(conversation, budget)] = await rows(client, "SELECT id, budget_usd FROM conversations")
+        if scenario == "budget_waiting":
+            assert decisions == [(0,)] and budget == 0.01
+        else:  # applied once, with its answer
+            assert decisions == [(1,)] and budget > 0.01
+        assert (await client.get("/api/asks")).json()["asks"] == []  # closed with its run
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert turn["status"] == "interrupted" and provider.chats == []
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = 5 WHERE id = ?", (conversation,)))
+        continued = await client.post(f"/api/runs/{run_id}/continue", json={})  # Continue is offered
+        assert continued.status_code == 200
+        await background_idle(client)

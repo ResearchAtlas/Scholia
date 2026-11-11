@@ -349,9 +349,13 @@ async def test_a_step_that_does_not_fit_the_budget_is_refused_before_any_call(tm
                                                            "updates": {"project.budget_usd": 0.0001}})
         assert response.status_code == 200, response.text
         conversation = await new_conversation(client, project_id=project)
-        stream = await send(client, conversation)
-        assert [e["type"] for e in stream] == ["run_started", "route", "limit_reached", "run_finished"]
-        assert stream[2]["budget"] == "project" and stream[-1]["status"] == "cancelled"
+        sending = asyncio.create_task(send(client, conversation))
+        from test_agent_loop import asked
+        ask = await asked(client, conversation)  # S1-33: it asks before the step; Not now ends it at the limit
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "not_now"})
+        stream = await sending
+        assert [e["type"] for e in stream] == ["run_started", "route", "ask", "limit_reached", "run_finished"]
+        assert stream[3]["budget"] == "project" and stream[-1]["status"] == "cancelled"
         assert provider.chats == []
         assert (await counts(client))["budget_reservations"] == 0
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
@@ -816,8 +820,12 @@ async def test_a_turn_whose_terminal_write_fails_reads_interrupted_once_released
         if handler == "cancelled":
             claim.task = asyncio.create_task(harness._turn(claim))
             harness._request_cancel(claim, "researcher")  # its cancellation handler writes the terminal record
-        else:  # a reader pulls it to its first step, which does not fit
-            assert [event["type"] async for event in harness.events(claim)] == ["run_started", "route"]
+        else:  # a reader pulls it to its first step, which does not fit: it asks (S1-33), and Not now ends it at the limit
+            stream = harness.events(claim)
+            assert [(await anext(stream))["type"] for _ in range(3)] == ["run_started", "route", "ask"]
+            [ask] = (await client.get("/api/asks", params={"conversation_id": conversation})).json()["asks"]
+            await client.post(f"/api/runs/{claim.run_id}/asks/{ask['ask_id']}", json={"option": "not_now"})
+            assert [event["type"] async for event in stream] == []
         with pytest.raises(RuntimeError):
             await claim.task
         assert not harness.registry.is_active(claim.run_id) and claim.run_id not in harness.registry.finished
