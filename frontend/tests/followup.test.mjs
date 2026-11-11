@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { budgetBar, follow, nextQueued } from '../src/followup.js';
+import { send } from '../src/live.js';
 
 const spend = (conversation, project, percents = [50, 85, 90]) => ({
   conversation: { limit_usd: 10, settled_usd: conversation, open_usd: 0, own: false },
@@ -69,3 +70,33 @@ test('the waiting messages and the bar are outside the message box\'s form, so t
   const composer = source.slice(source.indexOf('function Composer('), source.indexOf('const MENTION'));
   assert.ok(composer.length > 0 && !/<Queued|<BudgetBar/.test(composer));
 });
+
+function streamOf(...chunks) {
+  const encoder = new TextEncoder();
+  return new ReadableStream({ start(controller) { for (const c of chunks) controller.enqueue(encoder.encode(c)); controller.close(); } });
+}
+
+// Review recheck 1: a turn that succeeded starts the oldest waiting message on its own route, once; another ending
+// starts nothing.
+for (const [status, started] of [['succeeded', true], ['failed', false], ['cancelled', false]]) {
+  test(`after a turn that ended ${status}, ${started ? 'the oldest waiting message starts once' : 'nothing starts'}`, async (t) => {
+    const posts = [];
+    t.mock.method(globalThis, 'fetch', async (url, init) => {
+      url = String(url);
+      if (url === '/x') {
+        return new Response(streamOf(`data: {"type":"run_started","run_id":"r1-${status}"}\n\n`,
+          `data: {"type":"run_finished","status":"${status}"}\n\n`));
+      }
+      if (init?.method === 'POST') {
+        posts.push([url, JSON.parse(init.body)]);
+        return new Response(streamOf('data: {"type":"run_started","run_id":"r2"}\n\n', 'data: {"type":"run_finished","status":"succeeded"}\n\n'));
+      }
+      return Response.json({ turns: [{ run_id: `r1-${status}`, status }], queued: [{ id: 'q1', text: 'Next' }, { id: 'q2', text: 'Later' }] });
+    });
+    await send(`c-${status}`, '/x', { model: 'm1', provider: 'openrouter' }, 'Q');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const started_ = posts.filter(([url]) => url.includes('/queue/'));
+    assert.deepEqual(started_, started ? [[`/api/conversations/c-${status}/queue/q1/send`,
+      { model: 'm1', provider: 'openrouter', after: `r1-${status}` }]] : []);
+  });
+}

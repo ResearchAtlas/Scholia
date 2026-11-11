@@ -128,9 +128,9 @@ def _typed(text):
     return round(value, 9)
 
 
-def _amount(conn, budget, scope_id, current):
+def _amount(conn, budget, scope_id, current, default):
     """What Continue adds: the amount the budget's last decision recorded while its limit is what that decision left,
-    else the limit itself; for a limit of zero, the budget's default (so Continue never adds nothing)."""
+    else the limit itself; for a limit of zero, the budget's default as configured (so Continue never adds nothing)."""
     column = "r.conversation_id" if budget == "conversation" else "r.project_id"
     row = conn.execute(
         "SELECT json_extract(e.data, '$.to_usd'), json_extract(e.data, '$.amount_usd') FROM run_events e"
@@ -138,8 +138,7 @@ def _amount(conn, budget, scope_id, current):
         " AND json_extract(e.data, '$.budget') = ? AND json_extract(e.data, '$.amount_usd') IS NOT NULL"
         " ORDER BY e.rowid DESC LIMIT 1", (scope_id, budget)).fetchone()
     found = row[1] if row is not None and abs(row[0] - current) <= _EPSILON else current
-    return found if found > 0 else (PERSONAL if budget == "conversation" else PROJECT)[
-        ("budget", "conversation_usd") if budget == "conversation" else ("project", "budget_usd")][0]
+    return found if found > 0 else default
 
 
 def decide(conn, run_id, ask, option, text, data_dir):
@@ -157,7 +156,10 @@ def decide(conn, run_id, ask, option, text, data_dir):
     spent = spending.spent(conn, **({"conversation_id": conversation_id} if budget == "conversation"
                                     else {"project_id": project_id}))
     needed = round(spent + params["estimate_usd"], 9)
-    amount = _amount(conn, budget, conversation_id if budget == "conversation" else project_id, current)
+    # a zero limit's Continue adds the personal default (a conversation's) or the shipped project budget, never nothing
+    default = _budgets_now(data_dir, project_id)[1] if budget == "conversation" else PROJECT[("project", "budget_usd")][0]
+    amount = _amount(conn, budget, conversation_id if budget == "conversation" else project_id, current,
+                     default or PERSONAL[("budget", "conversation_usd")][0])
     if text is not None:
         typed = _typed(text)
         if typed + _EPSILON < needed:

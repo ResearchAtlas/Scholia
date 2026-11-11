@@ -256,8 +256,10 @@ async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
                 saved = False
                 answered["budget"] = {**answered["budget"], "applied": False, "error": "not_saved",
                                       "limit_usd": decided["from_usd"]}
-            with contextlib.suppress(Exception):  # a project deleted meanwhile keeps no record of it
+            try:  # its record and audit row; a project deleted meanwhile keeps none
                 await asyncio.to_thread(state["db"].write, lambda conn: _budget_saved(conn, run_id, decided, saved))
+            except Exception as error:
+                log.warning("a project budget decision's record was not written (%s)", type(error).__name__)
     if (active := registry.runs.get(run_id)) is not None:  # a run waiting on it wakes now
         active.answered.set()
     return answered

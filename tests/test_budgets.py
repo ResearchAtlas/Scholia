@@ -907,3 +907,15 @@ async def test_a_stop_landing_during_the_refused_reservation_ends_the_turn_and_r
         stream = await asyncio.wait_for(send(client, conversation, "Short?"), 10)
         assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "researcher")
         assert await _rows(client, "SELECT count(*) FROM run_events WHERE type = 'ask'") == [(0,)]
+
+
+@pytest.mark.asyncio
+async def test_continue_on_a_zero_budget_adds_the_configured_default(tmp_path):
+    # Recheck 1: the personal default as the researcher set it, not the shipped one.
+    async with await _app(tmp_path) as client:
+        read = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": read["hash"], "updates": {"budget.conversation_usd": 25}})
+        conversation, _ = await _conversation(client, budget=0)
+        sending, ask = await _asking(client, conversation)
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 25
+        assert (await sending)[-1]["status"] == "succeeded"

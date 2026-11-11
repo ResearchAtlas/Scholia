@@ -83,7 +83,9 @@ export function send(conversationId, path, body, text) {
 // turn, on the route the turn was sent on, wherever the window is; the backend starts it only while that turn is still
 // the latest and succeeded, and once. After any other ending it waits with Send.
 export async function drain(conversationId, runId, route = {}) {
-  if (!runId) return;
+  const current = turns.get(conversationId);
+  if (!runId || (current && !current.done)) return; // a turn is already starting or running here
+
   try {
     const next = nextQueued(await get(`/api/conversations/${encodeURIComponent(conversationId)}`), runId);
     const { model, provider, effort } = route;
