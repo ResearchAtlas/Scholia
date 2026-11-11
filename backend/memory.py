@@ -263,25 +263,6 @@ def listing(conn, project_id=None, statuses=None):
     return found
 
 
-def states(conn, record_ids):
-    """{id: state} for the records a view keeps a failed edit's text for (Q15, PR 51 recheck 4): {"state": "present",
-    "current": the id of its current version} while its row is there (its later versions by supersedes_id, a pending
-    proposal aside), or {"state": "gone"} once it is deleted (a Forget or a paper's deletion takes it with its earlier
-    versions). Whatever the memory switch, the view or the project; ids only, never text."""
-    found = {}
-    for record in record_ids:
-        if conn.execute("SELECT 1 FROM memory_records WHERE id = ?", (record,)).fetchone() is None:
-            found[record] = {"state": "gone"}
-            continue
-        current, seen = record, {record}
-        while (newer := conn.execute("SELECT id FROM memory_records WHERE supersedes_id = ? AND status != 'proposed'"
-                                     " ORDER BY version DESC LIMIT 1", (current,)).fetchone()) and newer[0] not in seen:
-            current = newer[0]
-            seen.add(current)
-        found[record] = {"state": "present", "current": current}
-    return found
-
-
 def edit(conn, record, version, *, content=None, confirm=False):
     """The researcher's change to a record at the version they saw (the memory views, Things to confirm). A pending
     proposal takes the new content and is kept (keep). An active record gets a new version that replaces it, with
@@ -1001,14 +982,6 @@ async def delete_memory(record_id: str, request: Request, version: int | None = 
     except ValueError as error:
         return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
     return {"ok": True}
-
-
-@router.get("/api/memory/state")
-async def memory_state(request: Request, ids: str = ""):
-    """The states of the records a view keeps text for (states): ids only, at most 100, comma-separated."""
-    wanted = [i for i in dict.fromkeys(ids.split(",")) if i][:100]
-    state = request.app.state.scholia
-    return await asyncio.to_thread(state["db"].read, lambda conn: states(conn, wanted))
 
 
 @router.get("/api/memory/review")

@@ -132,15 +132,14 @@ test('a memory change goes through the one invalidation path every view, ask and
   }
 });
 
-// S1-21a follow-up MB1: a failed action in the memory views keeps its error and the researcher's unsaved text across
-// the views' reread (the record is read again; what was not saved is said, and their own words stay with it).
-test('a failed memory action says what was not saved and keeps the researcher\'s text', async () => {
+// MB1, as simplified (Q16, PR 51 recheck 5, for Harold): a failed action's notice says what was not saved, kept outside
+// the views; the text typed stays only in its open editor, and no copy of a record's text is kept anywhere else.
+test('a failed memory action keeps its notice, never the text typed', async () => {
   const { attempt } = await import('../src/memory.js');
   const { ApiError } = await import('../src/api.js');
   assert.equal(await attempt(t, async () => ({ ok: true })), null);
-  const failed = await attempt(t, async () => { throw new ApiError(400, 'personal_from_strict', 'x'); }, 'I prefer tables');
-  assert.equal(failed.draft, 'I prefer tables');
-  assert.equal(failed.problem, t('errors.personal_from_strict'));
+  const failed = await attempt(t, async () => { throw new ApiError(400, 'personal_from_strict', 'x'); }, true, 'r1');
+  assert.deepEqual(failed, { problem: t('errors.personal_from_strict'), code: 'personal_from_strict', edit: true, id: 'r1' });
   for (const name of ['Memory.jsx', 'LeftOff.jsx']) {
     const source = readFileSync(join(SRC, 'components', name), 'utf8');
     assert.match(source, /<Unsaved /, name); // said outside the rows a reread replaces
@@ -148,7 +147,6 @@ test('a failed memory action says what was not saved and keeps the researcher\'s
   }
   assert.doesNotMatch(readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8'), /finally \{\s*onChanged/);
 });
-
 // S1-21a follow-up MB4: a turn started here makes the project's latest turn new, so Where we left off is read again
 // (the backend then says not to show it) rather than staying on screen from before.
 test('Where we left off is read again once a turn of this conversation starts', () => {
@@ -194,37 +192,26 @@ test('a notice is cleared only by a success on the record it names', async () =>
   const unnamed = { problem: 'Not saved', draft: null, id: null };
   assert.equal(settled(unnamed, null, null), unnamed);
   const source = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
-  assert.match(source, /act\(\(\) => changeRecord\(record, \{ status: 'confirmed' \}\), null, record\.id\)/);
-  assert.match(source, /act\(\(\) => forgetRecord\(record\), null, record\.id\)/);
+  assert.match(source, /act\(\(\) => changeRecord\(record, \{ status: 'confirmed' \}\), false, record\.id\)/);
+  assert.match(source, /act\(\(\) => forgetRecord\(record\), false, record\.id\)/);
 });
 
-// Q15 (PR 51 recheck 4; structural, for Harold): whether a kept draft's record still exists is the server's word
-// (GET /api/memory/state: present, with its current version, or gone), never inferred from what a view lists. The text
-// is shown beside the current version when the view lists it; kept but not shown while the record exists unlisted
-// (memory off, moved, filtered) or while the view reads again; let go only once the server says gone. The earlier cases
-// (one edit, Q13's two edits, a Forget, a paper's deletion, a reread) still hold.
-test('a kept draft follows the server\'s word on its record, not what the view lists', async () => {
-  const { attempt, draftShown, withState } = await import('../src/memory.js');
-  const { ApiError } = await import('../src/api.js');
-  const kept = await attempt(t, async () => { throw new ApiError(400, 'personal_from_strict'); }, 'my words', 'p1');
-  const present = (current) => ({ state: 'present', current });
-  // memory switched off: Things to confirm lists nothing, the proposal is still there: kept, not shown
-  assert.equal(draftShown(kept, [], present('p1')), null);
-  assert.equal(withState(kept, present('p1')), kept);
-  assert.equal(draftShown(kept, [{ id: 'p1' }], present('p1')), 'my words'); // listed again: shown again
-  // edited since, once or twice (r0, r1, r2): shown beside its current version
-  assert.equal(draftShown(kept, [{ id: 'r2' }], present('r2')), 'my words');
-  assert.equal(draftShown(kept, [{ id: 'r2' }], null), null); // not yet answered, or reading again
-  assert.equal(draftShown(kept, null, present('p1')), null);
-  // forgotten, or gone with its paper: let go
-  assert.deepEqual(withState(kept, { state: 'gone' }), { ...kept, draft: null });
-  assert.equal(withState(kept, null), kept);
-  const unsaved = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
-  assert.match(unsaved, /memoryState\(\[id\]\)/);
-  for (const name of ['Memory.jsx', 'LeftOff.jsx']) {
-    assert.match(readFileSync(join(SRC, 'components', name), 'utf8'), /<Unsaved [^>]*read=\{found\}/, name);
-  }
-  assert.match(readFileSync(join(SRC, 'components', 'LeftOff.jsx'), 'utf8'), /return unsaved \? /); // said unshown too
+// Q16 (PR 51 recheck 5; the simplification, for Harold): no unsaved text outside the editor. The editor keeps its text
+// while it is open: a failure that changed nothing neither closes it nor makes the view read again; one saying the record
+// changed (it is read again) closes it, and the notice says the edit was not saved. With no kept text and no state
+// request, a late answer for one draft cannot reach another's (the race cannot occur).
+test('the text typed lives only in its open editor', async () => {
+  const { readsAgain } = await import('../src/memory.js');
+  assert.equal(readsAgain(null), true); // done: the views read again
+  assert.equal(readsAgain({ code: 'personal_from_strict' }), false); // nothing changed: the editor stays open
+  for (const code of ['version_changed', 'out_of_date', 'not_found']) assert.equal(readsAgain({ code }), true, code);
   const memory = readFileSync(join(SRC, 'memory.js'), 'utf8');
-  assert.doesNotMatch(memory, /draftFor|purged|replaced/); // no inference from listings is left
+  const view = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
+  for (const gone of [/memoryState/, /draftShown/, /withState/, /api\/memory\/state/, /\.draft\b/]) {
+    assert.doesNotMatch(memory, gone);
+    assert.doesNotMatch(view, gone);
+  }
+  assert.match(view, /\.then\(\(saved\) => \{ if \(saved\) setEditing\(null\); \}\)/); // closed only once saved
+  assert.match(view, /t\('memory\.editNotSaved'\)/);
+  assert.match(readFileSync(join(SRC, 'components', 'LeftOff.jsx'), 'utf8'), /return unsaved \? /); // said unshown too
 });

@@ -53,17 +53,22 @@ export const changeRecord = (record, body) => patch(`/api/memory/${encodeURIComp
 export const forgetRecord = (record) => del(`/api/memory/${encodeURIComponent(record.id)}?version=${record.version}`);
 export const review = (body) => post('/api/memory/review', body);
 
-// A memory action from the views: null once done, else what was not saved, the error in words and the text in the box
-// (id: the record it was for), which the view keeps across its reread (S1-21a follow-up MB1; the record itself is
-// always read again).
-export async function attempt(t, action, draft = null, id = null) {
+// A memory action from the views: null once done, else what was not saved: the error in words and its code, whether it
+// was an edit (edit), and the record it was for (id). Never the text typed: that stays in its open editor (MB1, Q16).
+export async function attempt(t, action, edit = false, id = null) {
   try {
     await action();
     return null;
   } catch (error) {
-    return { problem: errorText(t, error instanceof ApiError ? error.code : 'internal'), draft, id };
+    const code = error instanceof ApiError ? error.code : 'internal';
+    return { problem: errorText(t, code), code, edit: Boolean(edit), id };
   }
 }
+
+// Whether the views read again after an action: once done, or when it failed because the record changed (then the
+// editor closes, with the notice). A failure that changed nothing leaves the view, and its open editor, as it is.
+const CHANGED = new Set(['version_changed', 'out_of_date', 'not_found']);
+export const readsAgain = (failed) => !failed || CHANGED.has(failed.code);
 
 // What an action could not save, kept by view and project (`settings:<project>`, `leftOff:<project>`) outside the
 // components that show it, so a remount never drops it (Q12, PR 51 recheck 3); only Dismiss, or a later failure in the
@@ -80,20 +85,3 @@ export function keepUnsaved(key, value) {
 // The kept notice after an action on record id: what it could not save (failed), or, once that record's action
 // succeeded, nothing; another record's success leaves it.
 export const settled = (kept, failed, id) => failed ?? (id != null && kept?.id === id ? null : kept);
-
-// Whether a kept text's record still exists is the server's word, never inferred from what a view lists (Q15, PR 51
-// recheck 4): memoryState([id]) answers, by id, {state: 'present', current} (its current version's id) or
-// {state: 'gone'}, whatever the memory switch, the view or the project; ids only.
-export const memoryState = (ids) => get(`/api/memory/state?ids=${ids.map(encodeURIComponent).join(',')}`);
-
-// The kept text to show: beside its record's current version when the view's read (records; null while it reads)
-// lists it; none while the record exists unlisted (memory off, moved, filtered) or the server has not yet answered.
-export function draftShown(kept, records, state) {
-  const listed = state?.state === 'present' && (records ?? []).some((record) => record.id === state.current
-    || record.id === kept?.id);
-  return kept?.draft && listed ? kept.draft : null;
-}
-
-// The kept notice once the server answered (state): its text let go only once its record is gone (a Forget, or a
-// paper's deletion, with every later version), never because a view does not list it (no client-held derived state).
-export const withState = (kept, state) => (kept?.draft && state?.state === 'gone' ? { ...kept, draft: null } : kept);

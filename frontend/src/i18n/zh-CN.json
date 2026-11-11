@@ -1272,7 +1272,7 @@
   "memory.edit": "编辑",
   "memory.save": "保存",
   "memory.cancel": "取消",
-  "memory.unsavedText": "未保存，你写的内容：{text}",
+  "memory.editNotSaved": "你的修改没有保存。",
   "memory.dismiss": "关闭",
   "memory.confirm": "确认",
   "memory.forget": "忘记",

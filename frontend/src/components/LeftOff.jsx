@@ -45,7 +45,7 @@ export function LeftOff({ projectId, turn = null }) {
     libraryEvents.addEventListener('changed', changed); // memory changes too (memory.js memoryChanged)
     return () => libraryEvents.removeEventListener('changed', changed);
   }, [projectId, load]);
-  const unsavedNotice = <Unsaved unsaved={unsaved} read={found} records={found?.to_confirm ?? null} onKeep={setUnsaved} />;
+  const unsavedNotice = <Unsaved unsaved={unsaved} onKeep={setUnsaved} />;
   const empty = found && !found.done.length && !found.questions.length && !found.next_step && !found.to_confirm.length
     && !found.notice;
   if (!found?.show || hidden || leftOffDismissed(projectId, found.latest_turn_at) || empty) {
