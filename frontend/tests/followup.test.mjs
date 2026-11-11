@@ -199,3 +199,52 @@ test('three overlapping sends: when the later two are refused, the running turn 
   assert.deepEqual(posts, ['/api/runs/r-run/cancel']);
   running.close();
 });
+
+// Fix batch 1 (F1): an older stream whose first event has not been read yet may be an admitted turn: a refused newer
+// stream gives the conversation back to it, so its events show and Stop reaches it.
+function lateStream() { // an admitted turn whose events have not arrived
+  let controller;
+  const body = new ReadableStream({ start(c) { controller = c; } });
+  const encoder = new TextEncoder();
+  return { body, event: (text) => controller.enqueue(encoder.encode(`data: ${text}\n\n`)), close: () => controller.close() };
+}
+
+test('a refused newer stream leaves an admitted turn whose run_started is unread showing, and Stop reaches it', async (t) => {
+  const posts = [];
+  const admitted = lateStream();
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    url = String(url);
+    if (init?.method === 'POST' && url.includes('/cancel')) posts.push(url);
+    if (url === '/admitted') return new Response(admitted.body);
+    if (url === '/refused') return Response.json({ code: 'active_run' }, { status: 409 });
+    return Response.json({});
+  });
+  const seen = [];
+  const unsubscribe = subscribe((id, turn, kind) => { if (id === 'c-five') seen.push([kind, turn?.runId ?? null]); });
+  send('c-five', '/admitted', {}, 'Admitted');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal((await send('c-five', '/refused', {}, 'Refused').catch((error) => error)).code, 'active_run');
+  admitted.event('{"type":"run_started","run_id":"r-five"}');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  unsubscribe();
+  assert.deepEqual(seen.at(-1), ['run_started', 'r-five']);
+  await stop('c-five');
+  assert.deepEqual(posts, ['/api/runs/r-five/cancel']);
+  admitted.close();
+});
+
+test('Stop reaches an admitted turn by closing its stream when its run_started is still unread', async (t) => {
+  let signal;
+  const admitted = lateStream();
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    url = String(url);
+    if (url === '/admitted2') { signal = init.signal; return new Response(admitted.body); }
+    return Response.json({ code: 'active_run' }, { status: 409 });
+  });
+  send('c-six', '/admitted2', {}, 'Admitted');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await send('c-six', '/refused2', {}, 'Refused').catch((error) => error);
+  await stop('c-six');
+  assert.equal(signal.aborted, true);
+  admitted.close();
+});

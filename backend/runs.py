@@ -614,9 +614,8 @@ class Harness:
             raise AdmissionError(409, "not_continuable", "Only the latest interrupted or stopped turn can be continued")
         message = json.loads(message)
         # S1-33: the notes its steps read are its researcher's words too; the stopped turn is not in later history
+        # (together over the message limit, admit_turn refuses it as any message over it, writing nothing)
         text = "\n\n".join([message.get("text", ""), *notes])
-        # shortcut: a message and notes together over the limit go without the notes, still shown on the stopped turn
-        text = text if len(text) <= MAX_MESSAGE_CHARS else message.get("text", "")
         return await self.admit_turn(conversation_id, text, model=model, provider=provider,
                                      effort=effort, retry_of=run_id, material_ids=message.get("material_ids"))
 

@@ -12,6 +12,19 @@ const turns = new Map(); // conversation id -> { text, runId, answer, resultSave
 const aborts = new Map();
 const latest = new WeakMap(); // S1-33: each stream's own latest state (by its abort controller), owned or not
 const replaced = new WeakMap(); // and the stream it replaced
+const notAdmitted = new WeakSet(); // the streams known never to have started a turn: refused, or stopped before it
+
+// What a stream not admitted gives the conversation back to: the latest stream it replaced still under way (one whose
+// first event is unread may be an admitted turn), else the latest that finished; never one known not admitted.
+function givenBack(abort) {
+  let finished = null;
+  for (let owner = replaced.get(abort); owner; owner = replaced.get(owner)) {
+    if (notAdmitted.has(owner)) continue;
+    if (!latest.get(owner).done) return owner;
+    finished ??= owner;
+  }
+  return finished;
+}
 const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut, notices }, for this window
 const listeners = new Set();
 
@@ -54,11 +67,10 @@ export function apply(turn, event) {
 export function send(conversationId, path, body, text) {
   const abort = new AbortController();
   let turn = { text, runId: null, answer: null, done: false };
-  const before = { abort: aborts.get(conversationId), turn: turns.get(conversationId) };
   const mine = () => aborts.get(conversationId) === abort;
+  replaced.set(abort, aborts.get(conversationId));
   aborts.set(conversationId, abort);
   latest.set(abort, turn);
-  replaced.set(abort, before.abort);
   set(conversationId, turn, 'send');
   return new Promise((admitted, refused) => {
     stream(path, body, (event) => {
@@ -76,19 +88,20 @@ export function send(conversationId, path, body, text) {
       if (mine()) set(conversationId, turn, event.type);
       if (turn.runId) admitted();
     }, abort.signal).catch((error) => {
-      if (turn.runId || error.name === 'AbortError') return;
+      if (turn.runId) return;
+      const stopped = error.name === 'AbortError';
+      notAdmitted.add(abort);
       if (mine()) {
-        let owner = before.abort; // past any stream that was itself refused, never admitted
-        while (owner && !latest.get(owner)?.runId) owner = replaced.get(owner);
-        const prior = owner ? latest.get(owner) : null;
-        if (prior) { // the turn it replaced comes back as it is now, finished or under way
+        const owner = givenBack(abort);
+        const prior = owner && latest.get(owner);
+        if (prior && !(stopped && prior.done)) { // the turn it replaced comes back as it is now, finished or under way
           if (prior.done) aborts.delete(conversationId); else aborts.set(conversationId, owner);
           set(conversationId, prior, 'restored');
-        } else {
+        } else if (!stopped) {
           set(conversationId, null, 'refused');
         }
       }
-      refused(error);
+      if (!stopped) refused(error);
     }).finally(() => {
       if (!turn.done) turn = { ...turn, done: true };
       latest.set(abort, turn);

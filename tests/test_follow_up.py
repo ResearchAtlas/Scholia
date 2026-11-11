@@ -425,3 +425,35 @@ async def test_continue_carries_the_notes_its_turn_read(tmp_path):
         assert events(continued)[-1]["status"] == "succeeded"
         said = [m["content"] for m in provider.steps[-1]["messages"] if m["role"] == "user"]
         assert said[-1] == "Which papers do I have?\n\nOnly the ones from 2020"
+
+
+async def test_continue_over_the_message_limit_with_its_notes_is_refused_and_loses_nothing(tmp_path, monkeypatch):
+    # Fix batch 1 (F5): a message and its read notes together over the limit are refused as any message over it is, said
+    # by its code, with nothing written; the turn, its note and Continue stay as they were. Never sent without the note.
+    from backend import runs
+    from test_agent_loop import asked
+    monkeypatch.setattr(runs, "MAX_MESSAGE_CHARS", 40)
+    gate = Gate(0)
+    provider = Scripted(None, [call("list_materials", "c2")], cost=0.04)
+    provider.script[0] = gate.wrap(provider, {"calls": [call("list_materials")]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = 0.1 WHERE id = ?", (conversation,)))
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await gate.reached.wait()
+        run_id = await running_run(client, conversation)
+        await steer(client, run_id, "Only the ones from 2020 please")
+        gate.open.set()
+        ask = await asked(client, conversation)
+        await client.post(f"/api/runs/{run_id}/asks/{ask['ask_id']}", json={"option": ask["options"][-1]})
+        await sending
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = 5 WHERE id = ?", (conversation,)))
+        steps = len(provider.steps)
+        refused = await client.post(f"/api/runs/{run_id}/continue", json={})
+        assert (refused.status_code, refused.json()["code"]) == (400, "message_too_long")
+        read = await conversation_read(client, conversation)
+        assert len(read["turns"]) == 1 and len(provider.steps) == steps
+        assert [(n["text"], n["state"]) for n in read["turns"][0]["steering"]] == [("Only the ones from 2020 please", "read")]
+        assert read["turns"][0]["cancel_reason"] == "limit"  # Continue is still offered
