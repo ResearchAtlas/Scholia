@@ -7,14 +7,14 @@ import { useContext, useEffect, useRef, useState } from 'react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, getBlob } from '../api.js';
 import { errorText, money, toolName } from '../text.js';
-import { readTrace, summarize } from '../trace.js';
+import { readTrace, summarize, turnRanges } from '../trace.js';
 import { libraryEvents, readGuard } from '../library.js';
 import { LoadState } from './fields.jsx';
 
 const SUPPORT = { supported: 'cite.supported', partly: 'cite.partly', unsupported: 'cite.unsupported', unchecked: 'cite.unchecked' };
 const EXISTENCE = { ok: 'trace.exists', not_found: 'cite.notFound', not_read_in_run: 'cite.notRead', source_removed: 'cite.removed' };
 const PHASE = { answer: 'trace.phaseAnswer', judge: 'trace.phaseJudge', route: 'trace.phaseRoute',
-  answer_from_library: 'trace.phaseLibrary' };
+  answer_from_library: 'trace.phaseLibrary', compact: 'trace.phaseCompact' };
 const FUNDED = { share: 'trace.fundedShare', answer_unspent: 'trace.fundedUnspent', budget: 'trace.fundedBudget' };
 
 export function Trace({ turn }) {
@@ -61,6 +61,10 @@ export function Trace({ turn }) {
         {trace.historyLeftOut > 0 && <>
           <dt className="text-muted-foreground">{t('trace.history')}</dt>
           <dd>{t('trace.historyLeftOut', { count: trace.historyLeftOut })}</dd>
+        </>}
+        {trace.summary?.length > 0 && <> {/* S1-21b: the answer used a summary, and of which turns */}
+          <dt className="text-muted-foreground">{t('trace.summary')}</dt>
+          <dd>{t('trace.summaryUsed', { count: trace.summary.length, turns: turnRanges(trace.summary) })}</dd>
         </>}
         <dt className="text-muted-foreground">{t('trace.saved')}</dt>
         <dd>{turn.answer && turn.result_saved ? t('trace.savedYes') : t('trace.savedNo')}</dd>

@@ -4,7 +4,8 @@ Every model call's request comes from `assemble`, and the harness sends only wha
 (backend/runs.py, Harness._call; tests/test_dispatch_path.py checks it). The request holds
 labeled sections in the decided order: the system rules first, then AGENTS.md, the SKILL
 CATALOG, ACTIVE SKILLS, PROJECT STATE, USER MEMORY, RESEARCH EVIDENCE, MODEL-GENERATED
-INFERENCE and the conflicts list, all in the system message; then the history, oldest first;
+INFERENCE and the conflicts list, all in the system message (S1-21b: last there, a model's summary of turns older
+than history's, labeled, backend/compaction.py); then the history, oldest first;
 then the current request; then, in an agent turn, the turn's own chain so far (each assistant step
 whole, with its tool calls and reasoning blocks, and each tool result), never cut or rewritten. A
 section with nothing in it is left out.
@@ -58,6 +59,7 @@ class Request:
     window: int
     tools: list = field(default_factory=list)  # counted with the request; sent once the agent loop offers tools
     cuts: dict = field(default_factory=dict)  # section -> how many records were left out
+    history_room: int = 0  # S1-21b: what history may take here (the lesser of its budget and the capacity left)
 
 
 def count(text: str) -> int:
@@ -133,14 +135,16 @@ def _take(records, room):
 
 
 def assemble(function, *, window, output, budgets, system_rules, request, sections=None, history=(),
-             tools=(), needs_evidence=False, margin_percent=5, chain=()) -> Request:
+             tools=(), needs_evidence=False, margin_percent=5, chain=(), summary=None) -> Request:
     """Build a request for a route of this window (W) under the capacity policy, or raise OverWindow.
 
     output is the step's output setting; budgets the [context] settings; sections maps a section
     (LABELS) to its records, best first; history yields earlier turns as (message, answer), newest
     first, read only as far as they fit; tools are function definitions the step offers. With
     needs_evidence (a pipeline that needs evidence), too little room for evidence that does not fit
-    whole refuses the step."""
+    whole refuses the step. summary (S1-21b, backend/compaction.py), a summary of turns older than every turn in history,
+    is history's oldest part: kept whole, labeled, last in the system message, when every turn of history was kept and it
+    fits what history has left; else left out (cuts["summary"])."""
     sections = {name: [r for r in records if r] for name, records in (sections or {}).items()}
     max_tokens = output_limit(window, output)
     framing = 2 * MESSAGE_FRAMING + REPLY_FRAMING + (count(json.dumps(tools, ensure_ascii=False)) if tools else 0)
@@ -180,8 +184,9 @@ def assemble(function, *, window, output, budgets, system_rules, request, sectio
     for name in (*SMALL, "research_evidence"):
         fill(name)
     turns, history_room, left = [], min(budgets["history"], room), 0
+    room_for_history = history_room
     for message, answer in history:
-        if left:  # older turns are left out whole (compaction comes with S1-21)
+        if left:  # older turns are left out whole (S1-21b: the harness compacts them first, backend/compaction.py)
             left += 1
             continue
         cost = count(message) + count(answer) + 2 * MESSAGE_FRAMING
@@ -193,6 +198,12 @@ def assemble(function, *, window, output, budgets, system_rules, request, sectio
     if left:
         cuts["history"] = left
     blocks = [_block(LABELS[name], kept[name]) for name in LABELS if name in kept]
+    if summary:
+        from backend.compaction import block
+        if not left and count(block(summary)) + 2 <= history_room:
+            blocks.append(block(summary))
+        else:
+            cuts["summary"] = 1
     messages = [{"role": "system", "content": "\n\n".join([system_rules, *blocks])}]
     for message, answer in reversed(turns):
         messages += [{"role": "user", "content": message}, {"role": "assistant", "content": answer}]
@@ -201,7 +212,7 @@ def assemble(function, *, window, output, budgets, system_rules, request, sectio
     tokens = serialized_tokens(messages, tools)
     if tokens + max_tokens > window:  # the policy above makes this impossible; never send one that does not fit
         raise OverWindow("message_over_window")
-    return Request(function, messages, max_tokens, tokens, window, list(tools), cuts)
+    return Request(function, messages, max_tokens, tokens, window, list(tools), cuts, room_for_history)
 
 
 def serialized_tokens(messages, tools=()) -> int:

@@ -102,3 +102,38 @@ async def test_forgetting_the_agents_note_mid_turn_revokes_the_turn_that_wrote_i
         stream = await send(client, await conversation_in(client, project), "Translate this: hello")
         assert len(provider.agent_steps) == 2
         assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "revoked")
+
+
+async def test_a_memory_tool_registers_only_the_papers_of_the_records_it_shows(tmp_path):
+    # MB8 (S1-21a follow-up, adopted by S1-21b with paging): a record past the tool's preview adds its papers to the
+    # request's scope only once a page shows any of it; one never shown never does.
+    import asyncio
+
+    from backend import memory
+    handle = agent.traced_id("call_read_memory") + ".1"
+    provider = Scripted([call("read_memory")], "Done.",
+                        [call("read_memory")], [call("read_output", "c2", handle=handle, offset=8000)],  # the next page
+                        "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, [paper] = await with_papers(client, WAGES)
+        db = client.state["db"]
+        await asyncio.to_thread(db.write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="Oldest decision", status="confirmed",
+            sources=[("material", paper)]))
+        for n in range(9):
+            await asyncio.to_thread(db.write, lambda conn, n=n: memory.write(
+                conn, project_id=project, scope="project", kind="decision", content=f"Decision {n} " + "x" * 900,
+                status="confirmed", sources=[("project", project)]))
+
+        async def scope(run):
+            return json.loads((await rows(client, "SELECT inputs FROM runs WHERE id = ?", run))[0][0])
+        # "Translate this" recalls no memory (memory.wants): what the request holds is the tool's alone
+        unshown = (await send(client, await conversation_in(client, project), "Translate this: hello"))[0]["run_id"]
+        [read] = tool_messages(provider.agent_steps[1])
+        assert "Oldest decision" not in read["content"]
+        assert paper not in (await scope(unshown)).get("context_materials", [])  # MB8: not shown, not registered
+        assert "read_output" in read["content"]  # S1-21b: past the preview, kept and paged
+        paged = (await send(client, await conversation_in(client, project), "Translate this: hello"))[0]["run_id"]
+        [_, page] = tool_messages(provider.agent_steps[-1])
+        assert "Oldest decision" in page["content"]
+        assert paper in (await scope(paged))["context_materials"]  # once a page showed it

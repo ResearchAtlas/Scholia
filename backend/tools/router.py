@@ -10,14 +10,10 @@
 from .registry import ToolRegistry
 from .types import ToolCall, ToolError, ToolResult
 
-PREVIEW_CHARS = 8000  # section 13: a tool's output preview; paging past it comes with S1-21
-
-
 class ToolRouter:
-    def __init__(self, registry: ToolRegistry, *, deny=(), ask=(), allow=(), preview_chars=PREVIEW_CHARS):
+    def __init__(self, registry: ToolRegistry, *, deny=(), ask=(), allow=()):
         self.registry = registry
         self.deny, self.ask, self.allow = set(deny), set(ask), set(allow)
-        self.preview_chars = preview_chars
 
     def rule(self, name) -> str:
         """The project's rule for a tool, in the order deny, then ask, then allow; a tool no list names is
@@ -39,14 +35,10 @@ class ToolRouter:
         return ToolError(type="validation_error", message=problem) if problem else None
 
     async def execute(self, call: ToolCall, *context) -> ToolResult:
-        """Run a call that passed check, with its context; its result's text bounded to the preview."""
+        """Run a call that passed check, with its context. Its result is returned whole: the harness keeps an output past
+        its preview (8,000 characters, or the tool's own smaller budget) and pages it (S1-21b, backend/compaction.py)."""
         func = self.registry.get_implementation(call.name)
-        result = await func(call, *context)
-        if result.ok and len(result.text) > self.preview_chars:
-            cut = result.text[:self.preview_chars]
-            result = result.model_copy(update={"text": cut + f"\n[Cut at {self.preview_chars} characters; ask for less.]",
-                                               "meta": {**result.meta, "cut": True}})
-        return result
+        return await func(call, *context)
 
 
 def failed(call_id, kind, message) -> ToolResult:

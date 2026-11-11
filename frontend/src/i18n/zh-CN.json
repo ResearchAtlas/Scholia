@@ -1174,6 +1174,11 @@
     "other": "{count} 条较早的回答未被带上：它们依据的论文已删除，或其所在项目已不允许这次请求。"
   },
   "trace.history": "历史",
+  "trace.summary": "较早的对话",
+  "trace.summaryUsed": {
+    "other": "第 {turns} 轮以模型写的摘要提供，不作为证据。"
+  },
+  "trace.phaseCompact": "总结较早的对话",
   "trace.pairsJudged": {
     "other": "已核查 {count} 组引用"
   },
@@ -1209,6 +1214,7 @@
   "tool.read_skill_file": "正在阅读技能的说明",
   "tool.ask": "正在询问你",
   "tool.open_place": "正在打开应用中的位置",
+  "tool.read_output": "正在继续读取工具结果",
   "trace.phaseLibrary": "根据资料库作答",
   "trace.skills": "使用的技能",
   "trace.tools": "工具调用",

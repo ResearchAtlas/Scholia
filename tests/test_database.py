@@ -17,6 +17,7 @@ TABLES = {
     "comment_threads", "comments", "memory_records", "memory_sources",
     "audit_log", "tombstones", "list_checks", "extensions", "mcp_servers", "mcp_tool_pins",
     "run_bodies", "run_body_materials",  # S1-19b: the trace's request bodies, deleted with their papers
+    "run_body_memory",  # S1-21b: summaries, kept outputs and pages, deleted with the memory records they hold
 }
 
 
