@@ -1384,6 +1384,7 @@
   "followUp.state.pending": "Scholia 会在下一步读到",
   "followUp.state.read": "Scholia 已读到",
   "followUp.state.queued": "已没有下一步可读到它，因此它已加入你的等待消息",
+  "followUp.state.unread": "Scholia 未读到：本轮在下一步之前已停止",
   "errors.invalid_limit": "请输入大于零的美元金额。",
   "errors.limit_too_low": "这个预算不够这一步，请输入更大的金额。",
   "errors.not_queued": "这条消息已不在等待中。",

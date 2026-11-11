@@ -993,3 +993,109 @@ async def test_a_failed_write_that_leaves_an_unreadable_file_is_never_taken_as_s
         sending.cancel()
         with pytest.raises((asyncio.CancelledError, Exception)):
             await sending
+
+
+# S1-33 fix batch 2 (PR 52 cycle 2 on 4769f6e): lifecycle first (charter section 10)
+
+
+async def _project_conversation(client, budget=None):
+    """A research project (its budget set, if given) and a titled conversation in it: (conversation, project)."""
+    project = (await client.post("/api/projects", json={"name": "Thesis"})).json()["id"]
+    conversation = (await client.post("/api/conversations", json={"project_id": project, "title": "t"})).json()["id"]
+    if budget is not None:
+        await _project_budget(client, project, budget)
+    return conversation, project
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("meanwhile", ["settings_edit", "project_deleted"])
+async def test_a_cancelled_budget_answer_keeps_its_locks_until_its_settings_write_ends(tmp_path, monkeypatch, meanwhile):
+    # D1 (A4, L3, L5): the request answering a project budget ask is cancelled while its config.toml write runs in its
+    # worker. The project-files and settings locks stay held until that write and its record end, so a Settings edit
+    # made meanwhile is never overwritten by it (it is refused as changed since read), and a project deleted
+    # meanwhile is deleted after it, its folder never recreated.
+    import contextlib
+    import threading
+    from backend import asks
+    async with await _app(tmp_path) as client:
+        conversation, project = await _project_conversation(client, budget=1.0)
+        await _spent(client, project, 1.0)
+        read = (await client.get("/api/settings", params={"project_id": project})).json()
+        sending, ask = await _asking(client, conversation)
+        entered, release, saving = threading.Event(), threading.Event(), asks._save_project_budget
+
+        def held(data_dir, decided):
+            entered.set()
+            release.wait(10)
+            return saving(data_dir, decided)
+        monkeypatch.setattr(asks, "_save_project_budget", held)
+        answering = asyncio.create_task(_answer(client, ask, option="continue"))
+        try:
+            assert await asyncio.to_thread(entered.wait, 10)
+            answering.cancel()
+            if meanwhile == "settings_edit":
+                other = asyncio.create_task(client.put("/api/settings", json={
+                    "project_id": project, "hash": read["hash"], "updates": {"project.budget_usd": 5}}))
+            else:
+                other = asyncio.create_task(client.delete(f"/api/projects/{project}", params={"purge_backups": True}))
+            await asyncio.sleep(0.3)
+            waited = not other.done()  # it waits for the answer's write, which still holds the locks
+        finally:
+            release.set()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await answering
+        done = await other
+        if not waited:
+            sending.cancel()
+        assert waited
+        if meanwhile == "settings_edit":
+            assert (done.status_code, done.json()["code"]) == (409, "settings_changed")  # never overwritten unseen
+            assert await _project_budget(client, project) == 2.0
+            assert (await sending)[-1]["status"] == "succeeded"  # the answer woke its run
+        else:
+            assert done.status_code == 200, done.text
+            assert not (tmp_path / "data" / "projects" / project).exists()
+            with contextlib.suppress(Exception):
+                await sending
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["stop", "recovery"])
+async def test_a_settlement_on_stop_or_recovery_records_the_notices_it_reaches(tmp_path, ending):
+    # D5 (N2, reading 8): a call stopped in flight settles at its estimate, and an open reservation a crash left settles
+    # at startup: each settlement records the budget notices it reaches, as a settlement with usage does; the Stop's
+    # are streamed as `budget` too.
+    from scholia_app import MockProvider, send
+    release = asyncio.Event()
+
+    async def held(body):
+        await release.wait()
+        return provider.answer("Late.")
+    provider = MockProvider(held) if ending == "stop" else MockProvider()
+    async with await _app(tmp_path, provider) as client:
+        conversation, project = await _conversation(client, budget=1.0)
+        await _spent(client, project, 0.49, conversation)
+        if ending == "stop":
+            sending = asyncio.create_task(send(client, conversation, "Short?"))
+            while not provider.answers:  # its call is in flight
+                await asyncio.sleep(0.01)
+            run_id = (await _rows(client, "SELECT id FROM runs WHERE conversation_id = ? AND status = 'running'",
+                                  conversation))[0][0]
+            assert (await client.post(f"/api/runs/{run_id}/cancel")).status_code == 200
+            release.set()
+            stream = await sending
+            assert ("conversation", 50) in [(e["budget"], e["percent"]) for e in stream if e["type"] == "budget"]
+        else:
+            run_id = (await send(client, conversation, "Short?"))[0]["run_id"]
+
+            def as_crashed(conn):  # running, as a crash left it, with a call in flight: $0.05 reserved, no usage
+                conn.execute("UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (run_id,))
+                conn.execute("INSERT INTO budget_reservations (id, run_id, step_seq, paying_conversation_id, project_id,"
+                             " estimate_usd) VALUES (?, ?, 9, ?, ?, 0.05)", (new_id(), run_id, conversation, project))
+            harness = client.state["harness"]
+            harness.registry.finished.discard(run_id)
+            await asyncio.to_thread(client.state["db"].write, as_crashed)
+            await harness.recover(kick=False)
+        noticed = await _rows(client, "SELECT json_extract(data, '$.budget'), json_extract(data, '$.percent')"
+                                      " FROM run_events WHERE run_id = ? AND type = 'budget_notice'", run_id)
+        assert ("conversation", 50) in noticed

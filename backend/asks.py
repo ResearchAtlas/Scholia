@@ -232,13 +232,13 @@ async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
     saves and the budget reads of call admission (settings_lock, after the project-files lock as a save takes them),
     so its stale check and the project budget it writes land wholly before or after them; that write follows the
     answer's commit (Harold, 2026-10-21): when it fails nothing is raised, the reply says so, and the step asks again."""
+    from backend.runs import _through  # it imports this module
     state = request.app.state.scholia
     registry = state["harness"].registry
     budget = await asyncio.to_thread(state["db"].read, lambda conn: (asked(conn, run_id)[0] or {}).get("kind") == "budget")
     locks = (state["project_files"], state["harness"].settings_lock) if budget else ()
-    async with contextlib.AsyncExitStack() as held:
-        for lock in locks:
-            await held.enter_async_context(lock)
+
+    async def answering():
         try:
             answered = await asyncio.to_thread(state["db"].write, lambda conn: answer(
                 conn, run_id, ask_id, body.option, body.text, registry, state["data_dir"]))
@@ -255,8 +255,19 @@ async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
                 await asyncio.to_thread(state["db"].write, lambda conn: _budget_saved(conn, run_id, decided, saved))
             except Exception as error:
                 log.warning("a project budget decision's record was not written (%s)", type(error).__name__)
-    if (active := registry.runs.get(run_id)) is not None:  # a run waiting on it wakes now
-        active.answered.set()
+        if (active := registry.runs.get(run_id)) is not None:  # a run waiting on it wakes now
+            active.answered.set()
+        return answered
+
+    async with contextlib.AsyncExitStack() as held:
+        for lock in locks:
+            await held.enter_async_context(lock)
+        # S1-33 (PR 52 cycle 2): once under the locks, the answer, its config.toml write and their record run to their
+        # end whatever cancellation arrives, and the locks are held until then, so no Settings save or deletion runs
+        # beside a write still going on in its worker
+        answered, cancelled = await _through(answering())
+    if cancelled:
+        raise asyncio.CancelledError()
     return answered
 
 

@@ -1432,6 +1432,7 @@
   "followUp.state.pending": "Scholia reads this at its next step",
   "followUp.state.read": "Read by Scholia",
   "followUp.state.queued": "No step was left to read this, so it was added to your waiting messages",
+  "followUp.state.unread": "Not read by Scholia: this turn stopped before its next step",
   "errors.invalid_limit": "Type a budget in US dollars, more than zero.",
   "errors.limit_too_low": "That limit does not cover this step. Type a larger one.",
   "errors.not_queued": "This message is no longer waiting.",

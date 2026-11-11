@@ -1152,9 +1152,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         registry = harness().registry
 
         def notes(run_id, status):
+            """By the record: read by a step that went out; queued by the turn's terminal write, which queues each note
+            no step read (a turn the record still has running whose process has not ended it is not, until recovery);
+            else waiting for the turn's next step, or unread when no step of this process will read it."""
             held = steering.get(run_id)
             return [{"seq": seq, "text": text, "state": "read" if seq in held["carried"] else
-                     "pending" if status == "running" else "queued"} for seq, text in held["notes"]] if held else []
+                     "queued" if status != "running" else
+                     "pending" if derived_status(status, run_id, registry) == "running" else "unread"}
+                    for seq, text in held["notes"]] if held else []
         return {**conversation_dict(row), "running": conversation_id in registry.turns, "queued": queued, "turns": [{
             "run_id": run_id, "seq": seq, "author": author, "message": json.loads(message),
             "answer": json.loads(answer) if answer else None, "result_saved": bool(saved),
@@ -1162,7 +1167,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             "cost_usd": cost, "accounting": json.loads(accounting) if accounting else None,
             "started_at": started, "finished_at": finished, "continues": retry_of,
             "citations": cited.get(run_id, []), "memory_status": memory_status, "memory": remembered.get(run_id, []),
-            "steering": notes(run_id, derived_status(status, run_id, registry)),
+            "steering": notes(run_id, status),
         } for run_id, seq, author, message, answer, saved, reason, status, cancel, cost, started, finished, retry_of,
             accounting, memory_status in turns]}
 

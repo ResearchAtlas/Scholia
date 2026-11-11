@@ -459,6 +459,8 @@ class Harness:
             in_flight = {run_id for (run_id,) in conn.execute(
                 "SELECT DISTINCT run_id FROM budget_reservations WHERE status = 'open' AND run_id IS NOT NULL")}
             spending.settle_left_open(conn)
+            for run_id in in_flight:  # S1-33: the budget notices those settlements reached, as any settlement records
+                _notices(conn, run_id, self.data_dir)
             now = utc_now()
             # S1-19b: a call in flight at the crash left its dispatch event (written before it was sent, with
             # its body's link, and kept whatever becomes of the body); its attempt is recorded now, naming its body,
@@ -1011,11 +1013,15 @@ class Harness:
         except _LimitReached as hit:  # a turn limit (section 13), before any further dispatch: Continue is offered
             call = claim.call  # usually None (a call refused at dispatch is recorded first); any other is closed once
 
+            noticed = []
+
             def limited(conn):
-                _close_call(conn, call)
+                noticed[:] = _close_call(conn, call, self.data_dir)
                 return self._finish_turn(conn, claim.run_id, "cancelled", "limit", hit.code,
                                          limit={hit.code: ctx["limits"].get(hit.code, True)}, claim=claim)
             final = await self._end_turn(claim, limited)
+            for notice in noticed:  # S1-33: streamed once recorded, as _call's are
+                emit({"type": "budget", **notice})
             if final.get("cancel_reason") == "limit":  # not a Stop that came first
                 emit({"type": "limit_reached", "limit": hit.code})
             emit({"type": "run_finished", **final})
@@ -1048,13 +1054,16 @@ class Harness:
         if status is None:
             status = "interrupted" if claim.cancel_reason == "shutdown" else "cancelled"
         cancel_reason = None if status != "cancelled" else ("revoked" if claim.cancel_reason == "revoked" else "researcher")
-        call = claim.call
+        call, noticed = claim.call, []
 
         def stop(conn):
-            _close_call(conn, call)
+            noticed[:] = _close_call(conn, call, self.data_dir)
             return self._finish_turn(conn, claim.run_id, status, cancel_reason, reason or status, claim=claim)
 
-        return await self._ended(claim, stop)
+        final = await self._ended(claim, stop)
+        for notice in noticed:  # S1-33: streamed once recorded, as _call's are, before the run's end
+            claim.events.put_nowait({"type": "budget", **notice})
+        return final
 
     def _finish_turn(self, conn, run_id, status, cancel_reason, reason_code, limit=None, claim=None):
         """Write a terminal status for a turn that has no answer, if it is still running.
@@ -1163,7 +1172,7 @@ class Harness:
         return await asyncio.to_thread(_budgets_now, self.data_dir, project_id)
 
     async def _reserve(self, active, project_id, paying_conversation_id, estimate, *, phase, step, allowance=0.0,
-                       from_allowance=False):
+                       from_allowance=False, again=None):
         """Admit one model call: its reservation and step_started event (with step, what _step
         records of its route and request), against the budgets as they are now (read under
         settings_lock). A cancellation during the write releases the reservation once it is written.
@@ -1181,7 +1190,8 @@ class Harness:
         S1-33: a turn's call that does not fit asks first (backend/budgets.py), with the budget the refusal named and
         the step's whole estimate (with its judge's share), outside settings_lock; once answered it is checked again
         under the budgets as they are then, and asked again while it still does not fit, until Stop or Not now, which
-        raise BudgetExceeded (the turn ends at the limit). A judge's call never asks (option C: its pairs are then
+        raise BudgetExceeded (the turn ends at the limit). again, if given, is awaited once an ask is answered: the
+        call built again as it is now ((estimate, step) for those given, or None if unchanged). A judge's call never asks (option C: its pairs are then
         unchecked for budget), nor does any call of the evaluation project, whose reservations are the conservative
         bound (budgets.bound)."""
         from backend import budgets as budget_rules  # it imports this module
@@ -1262,6 +1272,8 @@ class Harness:
                                            round(request_usd + share_usd, 9), phase)
             if reply is not None and reply.get("option") in budget_rules.STOPS:
                 raise refused
+            if again is not None and (rebuilt := await again()) is not None:
+                request_usd, step = rebuilt
         active.call = call
         if allowance or from_allowance:
             context["allowance"] = (kept.get("allowance") or (None,))[0]
@@ -1798,35 +1810,46 @@ class Harness:
         limits, tools = ctx["limits"], ctx["tools"]
         chain, calls_made, failures = [], 0, 0
         for number in range(limits["agent_steps"]):
-            # S1-33: the researcher's steering notes sent since the last step, read at this one (F11, steer): after the
-            # chain so far, which is never rewritten (model-route rule 5), as their own words
-            notes = await self._read(lambda conn: _unread_notes(conn, claim.run_id, ctx.setdefault("steered", [])))
-            chain += [{"role": "user", "content": text} for _, text in notes]
-            if number or notes:
-                try:
-                    _, request = self._cited_request(ctx, found, decision, chain=chain, read=turn.evidence.numbered)
-                except context.OverWindow:
-                    return "chain_over_window"
-            if number:
-                await self._register_context(claim, turn.evidence.numbered, turn.listed)
-                await self._carry_summary(claim, ctx, turn.evidence.numbered, turn.listed)  # S1-21b: a summary this
-                # step's request is the first to carry
+            notes = []  # S1-33: the researcher's steering notes this step reads (F11, steer)
             judge_estimate = self._judge_estimate(ctx, turn.evidence.numbered)
-            estimate = budget_router.request_cost(ctx["facts"]["rates"], request.input_tokens, request.max_tokens)
-            call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate, allowance=judge_estimate,
-                                       phase="answer", step={**_step(ctx["route"], ctx["facts"], request),
-                                                             "judge_estimate_usd": judge_estimate,
-                                                             # earlier answers left out: one of their papers is deleted
-                                                             **({"history_left_out": ctx["history_left_out"]}
-                                                                if ctx["history_left_out"] and not number else {}),
-                                                             # S1-21b: the earlier turns its request holds as a summary,
-                                                             # or holds through an earlier step that carried it (its
-                                                             # assistant message stays in the chain: rule 5)
-                                                             **({"summary": {"turns": ctx["summary_info"]["turns"]}}
-                                                                if ctx.get("summary_info") and (
-                                                                    not request.cuts.get("summary")
-                                                                    or ctx.get("summary_carried")) else {}),
-                                                             **({"steering": [seq for seq, _ in notes]} if notes else {})})
+
+            async def built(again=False):
+                """S1-33: the notes sent since the last step, after the chain so far, which is never rewritten
+                (model-route rule 5), as the researcher's own words, and the step's request, its estimate and its
+                record. Built again once the step's budget ask is answered (again: None when no note came meanwhile),
+                so a note sent while it waited is read by the step it waited for. Raises context.OverWindow."""
+                nonlocal request
+                more = await self._read(lambda conn: _unread_notes(
+                    conn, claim.run_id, [*ctx.setdefault("steered", []), *(seq for seq, _ in notes)]))
+                if again and not more:
+                    return None
+                notes.extend(more)
+                chain.extend({"role": "user", "content": text} for _, text in more)
+                if number or notes:
+                    _, request = self._cited_request(ctx, found, decision, chain=chain, read=turn.evidence.numbered)
+                if number:
+                    await self._register_context(claim, turn.evidence.numbered, turn.listed)
+                    await self._carry_summary(claim, ctx, turn.evidence.numbered, turn.listed)  # S1-21b: a summary
+                    # this step's request is the first to carry
+                estimate = budget_router.request_cost(ctx["facts"]["rates"], request.input_tokens, request.max_tokens)
+                return estimate, {**_step(ctx["route"], ctx["facts"], request), "judge_estimate_usd": judge_estimate,
+                                  # earlier answers left out: one of their papers is deleted
+                                  **({"history_left_out": ctx["history_left_out"]}
+                                     if ctx["history_left_out"] and not number else {}),
+                                  # S1-21b: the earlier turns its request holds as a summary, or holds through an
+                                  # earlier step that carried it (its assistant message stays in the chain: rule 5)
+                                  **({"summary": {"turns": ctx["summary_info"]["turns"]}}
+                                     if ctx.get("summary_info") and (
+                                         not request.cuts.get("summary") or ctx.get("summary_carried")) else {}),
+                                  **({"steering": [seq for seq, _ in notes]} if notes else {})}
+
+            try:
+                estimate, step = await built()
+                call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate,
+                                           allowance=judge_estimate, phase="answer", step=step,
+                                           again=lambda: built(again=True))
+            except context.OverWindow:
+                return "chain_over_window"
             ctx["steered"] += [seq for seq, _ in notes]
             await handed({"type": "step", "seq": call.step, "phase": "answer"})
             result = await self._call(claim, call, ctx["route"], ctx["key"], request, ctx["facts"],
@@ -2324,6 +2347,10 @@ class Harness:
                 # The catalog row the route's facts were read from, so the request is the one they
                 # describe; a Private call is limited to the endpoints it lists, as the gate checks.
                 model_entry=facts["row"])
+            # S1-33 (PR 52 cycle 2): the call's outcome is known now, and it replaces the gate's earlier notice, which
+            # says only that a request was being let out (one that then never connected did not leave): a failed
+            # receipt below is closed (_close_call) as what the attempts say, never as sent when none was
+            call.dispatched = result.dispatched
             finished = {"step": call.step, "outcome": "turn_deadline" if call.declined else result.error_kind or "ok",
                         **({"cut": "output_limit"} if result.cut else {})}  # stopped at its output limit
             # S1-19c: an agent step's reply is kept whole as it arrives (model-route rule 5: each assistant step stored
@@ -2487,7 +2514,7 @@ class Harness:
                 self._finish_background(conn, active, "cancelled", None, None, cancel_reason=reason)
 
             def stop(conn):  # the reason is read as it commits: a Cancel meanwhile overrides a shutdown
-                _close_call(conn, call)
+                _close_call(conn, call, self.data_dir)  # a background run's notices are recorded, never streamed
                 if active.cancel_reason == "shutdown":  # it stays running and restarts next time
                     return True
                 cancelled(conn)
@@ -3285,23 +3312,27 @@ def _normalized(sentence):
     return " ".join(unicodedata.normalize("NFC", sentence or "").split())
 
 
-def _close_call(conn, call):
+def _close_call(conn, call, data_dir):
     """Close a call cut off before it was recorded: one that may have gone out settles at
     its estimate and leaves a content-free attempt with an unknown charge; one that never
-    left is released. Either happens once; a call already recorded is left as it is."""
+    left is released. Either happens once; a call already recorded is left as it is. Returns the budget notices
+    its settlement reached (S1-33), recorded with it as with any settlement (data_dir's settings)."""
     if call is None:
-        return
+        return []
     if call.dispatched:
-        if spending.settle(conn, call.reservation_id) and _running(conn, call.run_id):
+        if not spending.settle(conn, call.reservation_id):
+            return []
+        if _running(conn, call.run_id):
             _event(conn, call.run_id, "model_attempt", {
                 "step": call.step, "attempt": max(len(call.bodies) - 1, 0), "route": call.route,
                 "retention": call.retention, "outcome": "cancelled",
                 "http_status": None, "dispatched": True, "charge": "unknown",
                 **_kept_body(conn, call, len(call.bodies) - 1, True)})
-    else:
-        spending.release(conn, call.reservation_id)
-        for number in range(len(call.bodies)):  # its text never left the machine: none of it is kept
-            _kept_body(conn, call, number, False)
+        return _notices(conn, call.run_id, data_dir)
+    spending.release(conn, call.reservation_id)
+    for number in range(len(call.bodies)):  # its text never left the machine: none of it is kept
+        _kept_body(conn, call, number, False)
+    return []
 
 
 def _accounting(conn, run_id, complete=True):

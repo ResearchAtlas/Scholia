@@ -457,3 +457,119 @@ async def test_continue_over_the_message_limit_with_its_notes_is_refused_and_los
         assert len(read["turns"]) == 1 and len(provider.steps) == steps
         assert [(n["text"], n["state"]) for n in read["turns"][0]["steering"]] == [("Only the ones from 2020 please", "read")]
         assert read["turns"][0]["cancel_reason"] == "limit"  # Continue is still offered
+
+
+# S1-33 fix batch 2 (PR 52 cycle 2 on 4769f6e): lifecycle first (charter section 10)
+
+
+async def test_a_failed_receipt_for_a_step_that_never_left_keeps_its_note_unread_and_charges_nothing(tmp_path, monkeypatch):
+    # D2 (L1, I2, U2): the step carrying the note never connected, and the write recording that receipt failed. The
+    # call's known outcome decides (never sent), not the gate's earlier notice that it was letting it out: the
+    # reservation is released, no attempt is recorded as sent, and the note waits queued, never said to be read.
+    import httpx
+    from backend import spending
+    armed, releasing = [], spending.release
+
+    def unreachable(body):
+        armed.append(True)  # from here, the receipt's release fails once
+        raise httpx.ConnectError("connection refused")
+
+    def release(conn, reservation_id):
+        if armed and armed[0] is True:
+            armed[0] = False
+            raise RuntimeError("the receipt's write failed")
+        return releasing(conn, reservation_id)
+    monkeypatch.setattr(spending, "release", release)
+    gate = Gate(0)
+    provider = Scripted(None, unreachable)
+    provider.script[0] = gate.wrap(provider, {"calls": [call("list_materials")]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await gate.reached.wait()
+        run_id = await running_run(client, conversation)
+        await steer(client, run_id, "Only recent ones")
+        gate.open.set()
+        stream = await sending
+        assert armed == [False]  # the receipt's write did fail
+        assert stream[-1]["status"] == "failed" and not [e for e in stream if e["type"] == "steering_note"]
+        sent = await rows(client, "SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'model_attempt'"
+                                  " AND json_extract(data, '$.step') = 1 AND json_extract(data, '$.dispatched') = 1", run_id)
+        assert sent == [(0,)]
+        [(status,)] = await rows(client, "SELECT status FROM budget_reservations WHERE run_id = ? AND step_seq = 1", run_id)
+        assert status == "released"
+        read = await conversation_read(client, conversation)
+        assert [n["state"] for n in read["turns"][-1]["steering"]] == ["queued"]
+        assert [q["text"] for q in read["queued"]] == ["Only recent ones"]
+
+
+@pytest.mark.parametrize("answer", ["set_limit", "go_ahead"])
+async def test_a_note_sent_while_a_step_waits_on_its_budget_ask_is_read_by_that_step(tmp_path, answer):
+    # D8 (F2, SPEC:414): the step the ask is about has not gone out, so it is the note's next step: built again once the
+    # ask is answered, it carries the note. Go ahead raised the limit just enough for the step as it was, so the step,
+    # now larger, asks again with its new estimate before it goes.
+    from test_agent_loop import asked
+    provider = Scripted("Done.")
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = 0.03 WHERE id = ?", (conversation,)))
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        assert (ask["kind"], ask["params"]["phase"]) == ("budget", "answer") and provider.steps == []
+        steered = await steer(client, ask["run_id"], "Only the ones from 2020")
+        assert "steering" in steered.json()
+        path = f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}"
+        if answer == "set_limit":
+            assert (await client.post(path, json={"text": "5"})).status_code == 200
+        else:
+            assert (await client.post(path, json={"option": "go_ahead"})).status_code == 200
+            again = await asked(client, conversation)
+            while again["ask_id"] == ask["ask_id"]:
+                await asyncio.sleep(0.02)
+                again = await asked(client, conversation)
+            assert again["params"]["estimate_usd"] > ask["params"]["estimate_usd"]
+            await client.post(f"/api/runs/{again['run_id']}/asks/{again['ask_id']}", json={"option": "go_ahead"})
+        stream = await sending
+        assert stream[-1]["status"] == "succeeded"
+        [step] = provider.steps
+        assert step["messages"][-1] == {"role": "user", "content": "Only the ones from 2020"}
+        read = await conversation_read(client, conversation)
+        assert [n["state"] for n in read["turns"][-1]["steering"]] == ["read"] and read["queued"] == []
+
+
+async def test_a_note_of_a_turn_whose_terminal_write_failed_is_not_said_to_be_queued(tmp_path, monkeypatch):
+    # D9 (L5, L7, U2): a turn waiting on a budget ask gets a note, then Not now, and its terminal write fails: nothing
+    # was queued, so the note is not said to be; recovery at the next start queues it, and only then is it said to be.
+    from backend import runs
+    from test_agent_loop import asked
+    provider = Scripted("Done.")
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = 0.03 WHERE id = ?", (conversation,)))
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        await steer(client, ask["run_id"], "Only the ones from 2020")
+        closing = runs._close_asks
+
+        def failing(conn, run_id):
+            raise RuntimeError("the terminal write failed")
+        monkeypatch.setattr(runs, "_close_asks", failing)
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "not_now"})
+        try:
+            await sending
+        except Exception:
+            pass
+        while ask["run_id"] in client.state["harness"].registry.runs:
+            await asyncio.sleep(0.02)
+        monkeypatch.setattr(runs, "_close_asks", closing)
+        read = await conversation_read(client, conversation)
+        assert read["queued"] == []
+        [note] = read["turns"][-1]["steering"]
+        assert note["state"] == "unread"  # neither read nor queued: its turn ended without a step to read it
+        client.state["harness"].registry.finished.discard(ask["run_id"])
+        await client.state["harness"].recover(kick=False)
+        read = await conversation_read(client, conversation)
+        assert [q["text"] for q in read["queued"]] == ["Only the ones from 2020"]
+        assert [n["state"] for n in read["turns"][-1]["steering"]] == ["queued"]
