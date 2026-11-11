@@ -1,6 +1,7 @@
 """evals/skill_choice (S1-33; SPEC:1182, 1195): the set's shape, and the offline replay's scoring through the agent loop
 with recorded replies. Nothing is measured of a real model here (the paid evaluation, after M2)."""
 
+import asyncio
 import sys
 from collections import Counter
 from pathlib import Path
@@ -78,3 +79,21 @@ async def test_a_replay_whose_recording_is_missing_runs_out_is_left_over_or_whos
     found = skill_choice.report(list(results.values()), "test")
     assert found["met"] is False and {f["id"] for f in found["failures"]} == {"en-036", "en-037", "en-038", "zh-036"}
     assert found["preview"]["en"]["invalid"] == 3 and found["preview"]["zh-CN"]["invalid"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_recording_that_reaches_an_ask_ends_there_not_met_and_the_replay_goes_on(tmp_path):
+    # PR 52 cycle 4 (G9, Q2; cycle 4 C's probe): a recording holds no answer for the researcher's side of an ask. The
+    # replay stops that turn at the ask, never waits on it, scores it not met (unanswered_ask), and goes on to the next.
+    rows = {r["id"]: r for r in skill_choice.load()}
+    chosen = [rows["en-001"], rows["en-036"]]
+    recorded = {
+        "en-001": [{"calls": [{"name": "use_skill", "arguments": {"name": "help"}}]},
+                   {"calls": [{"name": "ask", "arguments": {"question": "Which part?", "options": ["Setup", "Budgets"]}}]},
+                   {"text": "Done."}],
+        "en-036": [{"text": "A cohort study follows a group over time."}],
+    }
+    results = {r["id"]: r for r in await asyncio.wait_for(skill_choice.replay(chosen, recorded), 30)}
+    assert {i: (r["skill"], r["tools"], r["problem"], r["status"]) for i, r in results.items()} == {
+        "en-001": (False, False, "unanswered_ask", "cancelled"), "en-036": (True, True, None, "succeeded")}
+    assert skill_choice.report(list(results.values()), "test")["preview"]["en"]["invalid"] == 1

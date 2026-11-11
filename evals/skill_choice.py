@@ -14,8 +14,9 @@ Without FILE the oracle replies are replayed (the labels' own skill and tools), 
 scoring, never a model. A message passes on skill when the run activated exactly its expected skill (none for none),
 and on tools when it called every required tool and no forbidden one, read from the run's record (skill_activated,
 tool_call_started). Only a turn that succeeded on its recording, step for step, is evidence: a message with no
-recording, one whose recording ran out (no reply is invented for it), one with steps the turn never took, and one whose
-turn did not succeed fail both, each with its problem.
+recording, one whose turn reached an ask (a recording holds no answer: the turn is stopped there), one whose recording
+ran out (no reply is invented for it), one with steps the turn never took, and one whose turn did not succeed fail
+both, each with its problem.
 
 It prints, as integer counts with English and Chinese apart, the preview's score (messages whose expected skill ships,
 `help` and `literature-review`, or none: SPEC:1195 "The preview is evaluated only on the skills it ships") and every
@@ -141,7 +142,8 @@ def score(row, activated, called, problem=None):
 
 async def replay(rows, recorded=None):
     """Each row's turn replayed: [{"id", "language", "preview", "skill", "tools", "problem", "activated", "called",
-    "status"}]; problem is None, no_recording, recording_ran_out, recording_left_over or run_<status>."""
+    "status"}]; problem is None, no_recording, unanswered_ask, recording_ran_out, recording_left_over or
+    run_<status>."""
     from backend.app import create_app
     from backend.self_test import _Keys
     provider = Replay()
@@ -169,8 +171,10 @@ async def replay(rows, recorded=None):
                         "project_id": project, "title": row["id"]})).json()["id"]
                     provider.steps = list(recorded[row["id"]] if recorded is not None else oracle(row))
                     provider.ran_out = False
-                    response = await client.post(f"/api/conversations/{conversation}/message/stream",
-                                                 json={"content": row["message"]})
+                    sending = asyncio.ensure_future(client.post(f"/api/conversations/{conversation}/message/stream",
+                                                                json={"content": row["message"]}))
+                    asked = await _stopped_at_ask(client, read, conversation, sending)
+                    response = await sending
                     events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
                     run_id = events[0]["run_id"] if events and events[0].get("type") == "run_started" else None
                     record = await asyncio.to_thread(read, lambda conn: conn.execute(
@@ -179,12 +183,27 @@ async def replay(rows, recorded=None):
                     activated = [n for kind, n in record if kind == "skill_activated"]
                     called = [n for kind, n in record if kind == "tool_call_started" and n]
                     status = events[-1].get("status") if events else response.status_code
-                    problem = ("recording_ran_out" if provider.ran_out else "recording_left_over" if provider.steps
+                    problem = ("unanswered_ask" if asked else "recording_ran_out" if provider.ran_out
+                               else "recording_left_over" if provider.steps
                                else None if status == "succeeded" else f"run_{status}")
                     results.append({"id": row["id"], "language": row["language"], "preview": preview,
                                     **score(row, activated, called, problem), "activated": activated, "called": called,
                                     "status": status})
     return results
+
+
+async def _stopped_at_ask(client, read, conversation, sending):
+    """Whether the turn being sent reached an ask, which a recording cannot answer: then it is stopped there, never
+    waited on (PR 52 cycle 4, G9)."""
+    while not sending.done():
+        waiting = await asyncio.to_thread(read, lambda conn: conn.execute(
+            "SELECT id FROM runs WHERE conversation_id = ? AND status = 'running' AND waiting = 'ask'",
+            (conversation,)).fetchone())
+        if waiting is not None:
+            await client.post(f"/api/runs/{waiting[0]}/cancel")
+            return True
+        await asyncio.wait([sending], timeout=0.02)
+    return False
 
 
 def report(results, recorded_name):
