@@ -74,8 +74,8 @@ export function Unsaved({ unsaved, onKeep }) {
 
 // An action from a row or a proposal: what it could not save goes to onFailed(failed, id), outside the rows a reread
 // replaces, and so does its success (onFailed(null, id)), which clears a notice kept for the same record. The views read
-// again once it is done, or when it failed because the record changed (readsAgain); a failure that changed nothing
-// leaves the view and its open editor as they are. Returns whether it was done.
+// again after it, but for a failure the server gives only before any write (readsAgain), which leaves the view and its
+// open editor as they are. Returns whether it was done.
 function useMemoryAction(onChanged, onFailed) {
   const t = useT();
   const [busy, setBusy] = useState(false);
