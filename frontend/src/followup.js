@@ -29,11 +29,13 @@ export function nextQueued(read, runId) {
 
 // The bar (F11, The bar): the budget whose settled spend is the larger share of its limit, from the lowest notice
 // percent on; null below it, and with no notice percents. { budget, settled, limit, percent, meter (at most 100), marks }.
+// A $0 limit is over at any spend (G2); a null one (none its file gives) has no share.
 export function budgetBar(spend) {
   if (!spend) return null;
-  const shares = ['conversation', 'project'].map((budget) => spend[budget] && spend[budget].limit_usd > 0
+  const shares = ['conversation', 'project'].map((budget) => typeof spend[budget]?.limit_usd === 'number'
     ? { budget, settled: spend[budget].settled_usd, limit: spend[budget].limit_usd,
-      percent: (100 * spend[budget].settled_usd) / spend[budget].limit_usd } : null).filter(Boolean);
+      percent: spend[budget].limit_usd > 0 ? (100 * spend[budget].settled_usd) / spend[budget].limit_usd : Infinity }
+    : null).filter(Boolean);
   const closest = shares.sort((a, b) => b.percent - a.percent)[0];
   const marks = [...(spend.notice_percents ?? [50, 85, 90])].sort((a, b) => a - b);
   if (!closest || !marks.length || closest.percent < marks[0]) return null;

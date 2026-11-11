@@ -531,6 +531,14 @@ test('the bar\'s edges: no notice percents, no bar; its meter never above its ma
   assert.match(VIEW(), /if \(done\?\.budget\) load\(\)/);
 });
 
+test('a $0 cap shows the bar, over it at any spend; a limit the file does not give shows none (G2; PR 52 cycle 4, G4)', () => {
+  const zero = (settled) => ({ ...spend(1, 0), project: { limit_usd: 0, settled_usd: settled, open_usd: 0 } });
+  const over = budgetBar(zero(1)); // $1 of the conversation's $10, and $1 settled against a $0 project budget
+  assert.deepEqual([over.budget, over.settled, over.limit, over.meter], ['project', 1, 0, 100]);
+  assert.deepEqual([budgetBar(zero(0)).budget, budgetBar(zero(0)).meter], ['project', 100]); // at it, nothing spent
+  assert.equal(budgetBar({ ...spend(1, 0), project: { limit_usd: null, settled_usd: 5, open_usd: 0 } }), null);
+});
+
 test('a steer whose turn had ended starts as a new turn, as Send does, once nothing runs here (D22, reading 12)', () => {
   const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
   assert.match(followUp, /if \(sent\.ended\) \{[^}]*await idle\(id\);[^\n]*\n\s*if \(stopsAt\(id\) === pressed && !halt\(id\)\) await sendQueued\(sent\.queued\)/);
