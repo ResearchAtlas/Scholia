@@ -161,6 +161,7 @@ class AuditExport(BaseModel):
 class ProjectChange(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     target_venue: str | None = Field(default=None, max_length=200)
+    evaluation: bool | None = None  # S1-33: named only to be refused, never ignored: it is set at creation only
     _name = field_validator("name")(classmethod(lambda cls, v: _visible(v)))
 
 
@@ -765,6 +766,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         changes = body.model_dump(exclude_unset=True)
         if "name" in changes and changes["name"] is None:
             raise ApiError(400, "invalid_request", "A project needs a name")
+        if "evaluation" in changes:  # SPEC:1223, reading 15: nothing after its creation sets or clears the mark
+            raise ApiError(400, "evaluation_at_creation", "A project is marked for evaluation only when it is created")
 
         def update(conn):
             if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone() is None:

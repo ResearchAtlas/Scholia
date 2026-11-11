@@ -848,8 +848,11 @@ async def test_the_evaluation_mark_is_set_at_creation_only(tmp_path):
         project = (await client.post("/api/projects", json={"name": "Evaluation", "evaluation": True})).json()["id"]
         normal = (await client.post("/api/projects", json={"name": "Thesis"})).json()
         assert normal["evaluation"] is False
-        changed = await client.patch(f"/api/projects/{project}", json={"evaluation": False})  # not a field it changes
-        assert changed.status_code == 200 and changed.json()["evaluation"] is True
+        for value in (False, True):  # refused, never ignored (D18; checklist P3), for the evaluation project or not
+            for target in (project, normal["id"]):
+                changed = await client.patch(f"/api/projects/{target}", json={"evaluation": value})
+                assert (changed.status_code, changed.json()["code"]) == (400, "evaluation_at_creation")
+        assert (await client.get(f"/api/projects/{normal['id']}")).json()["evaluation"] is False
         assert (await client.get(f"/api/projects/{project}")).json()["evaluation"] is True
         with pytest.raises(sqlite3.IntegrityError, match="evaluation"):
             await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
