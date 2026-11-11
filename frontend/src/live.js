@@ -10,6 +10,7 @@ import { memoryChanged } from './memory.js';
 
 const turns = new Map(); // conversation id -> { text, runId, answer, resultSaved, error, limit, done }
 const aborts = new Map();
+const latest = new WeakMap(); // S1-33: each stream's own latest state (by its abort controller), owned or not
 const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut, notices }, for this window
 const listeners = new Set();
 
@@ -55,6 +56,7 @@ export function send(conversationId, path, body, text) {
   const before = { abort: aborts.get(conversationId), turn: turns.get(conversationId) };
   const mine = () => aborts.get(conversationId) === abort;
   aborts.set(conversationId, abort);
+  latest.set(abort, turn);
   set(conversationId, turn, 'send');
   return new Promise((admitted, refused) => {
     stream(path, body, (event) => {
@@ -68,23 +70,27 @@ export function send(conversationId, path, body, text) {
       if (event.type === 'chat_response' && event.result_saved === false && turn.runId) {
         unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut), ...(event.notices ? { notices: event.notices } : {}) });
       }
+      latest.set(abort, turn);
       if (mine()) set(conversationId, turn, event.type);
       if (turn.runId) admitted();
     }, abort.signal).catch((error) => {
       if (turn.runId || error.name === 'AbortError') return;
       if (mine()) {
-        if (before.turn && !before.turn.done) { // a turn still under way here: its state comes back
-          aborts.set(conversationId, before.abort);
-          set(conversationId, before.turn, 'restored');
+        const prior = before.abort ? latest.get(before.abort) ?? before.turn : before.turn;
+        if (prior) { // the turn it replaced comes back as it is now, finished or under way
+          if (prior.done) aborts.delete(conversationId); else aborts.set(conversationId, before.abort);
+          set(conversationId, prior, 'restored');
         } else {
           set(conversationId, null, 'refused');
         }
       }
       refused(error);
     }).finally(() => {
+      if (!turn.done) turn = { ...turn, done: true };
+      latest.set(abort, turn);
       if (!mine()) return admitted();
       aborts.delete(conversationId);
-      if (turns.get(conversationId) && !turn.done) set(conversationId, { ...turn, done: true }, 'run_finished');
+      if (turns.get(conversationId) && turns.get(conversationId) !== turn) set(conversationId, turn, 'run_finished');
       admitted();
       if (turn.status === 'succeeded') drain(conversationId, turn.runId, body);
     });

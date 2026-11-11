@@ -270,10 +270,12 @@ def _save_project_budget(data_dir, decided):
     except Exception as error:
         log.warning("a project budget answered in an ask may not be saved (%s)", type(error).__name__)
     try:
-        now = load_settings(data_dir, decided["project_id"]).values["project"]["budget_usd"]
+        loaded = load_settings(data_dir, decided["project_id"])
     except Exception:
         return False
-    return abs(now - decided["to_usd"]) <= 1e-9
+    if loaded.problems:  # a file it cannot read gives defaults, never what it holds: unknown, so not saved
+        return False
+    return abs(loaded.values["project"]["budget_usd"] - decided["to_usd"]) <= 1e-9
 
 
 def _budget_saved(conn, run_id, decided, saved):

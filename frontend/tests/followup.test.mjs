@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { budgetBar, follow, nextQueued } from '../src/followup.js';
-import { drain, send, stop } from '../src/live.js';
+import { drain, send, stop, subscribe } from '../src/live.js';
 
 const spend = (conversation, project, percents = [50, 85, 90]) => ({
   conversation: { limit_usd: 10, settled_usd: conversation, open_usd: 0, own: false },
@@ -150,4 +150,28 @@ test('a stream refused after a newer one started leaves the newer one\'s state a
   await stop('c-two');
   assert.deepEqual(posts, ['/api/runs/r-new/cancel']);
   newer.close();
+});
+
+test('an older turn that finishes while a newer send is pending is shown finished when that send is refused', async (t) => {
+  let refuse;
+  const older = openStream('r-old');
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    url = String(url);
+    if (url === '/old') return new Response(older.body);
+    if (url === '/pending') return new Promise((resolve) => { refuse = resolve; });
+    return Response.json({ turns: [], queued: [] });
+  });
+  const seen = [];
+  const unsubscribe = subscribe((id, turn) => { if (id === 'c-three') seen.push(turn); });
+  await send('c-three', '/old', {}, 'Older');
+  const pending = send('c-three', '/pending', {}, 'Newer').catch((error) => error);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  older.close(); // the older stream ends (its run finished) while the newer one is pending
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  refuse(Response.json({ code: 'active_run' }, { status: 409 }));
+  await pending;
+  unsubscribe();
+  const last = seen.at(-1);
+  assert.equal(last?.runId, 'r-old');
+  assert.equal(last?.done, true); // never left showing a turn that runs
 });

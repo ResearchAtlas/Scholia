@@ -970,3 +970,26 @@ async def test_a_settings_write_that_fails_after_replacing_the_file_is_judged_by
         assert [(d["applied"], d["to_usd"]) for d in await _decisions(client, ask["run_id"])] == [(False, 1.0), (True, 2.0)]
         audited = [json.loads(d) for (d,) in await _rows(client, "SELECT data FROM audit_log WHERE event = 'budget_decision'")]
         assert [(a["to_usd"], a["applied"]) for a in audited] == [(2.0, True)]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_write_that_leaves_an_unreadable_file_is_never_taken_as_saved(tmp_path, monkeypatch):
+    # Fix batch 1 review (P3): an unreadable file reads as defaults, which say nothing of what it holds.
+    from backend import settings
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 25.0)
+        await _spent(client, project, 25.0)
+        sending, ask = await _asking(client, conversation)
+        real = settings.write_private
+
+        def broken(path, data):
+            real(path, b"[project\nbudget_usd = ")
+            raise OSError("fsync of the folder failed")
+        monkeypatch.setattr(settings, "write_private", broken)
+        answered = (await _answer(client, ask, text="50")).json()["budget"]  # 50 is also the shipped default
+        monkeypatch.setattr(settings, "write_private", real)
+        assert (answered["applied"], answered.get("error")) == (False, "not_saved")
+        sending.cancel()
+        with pytest.raises((asyncio.CancelledError, Exception)):
+            await sending
