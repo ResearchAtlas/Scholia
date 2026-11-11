@@ -435,6 +435,9 @@ class Harness:
         # Orders settings saves with the budget reads of call admission: a lowered budget either
         # lands before a call reads it or after that call was admitted.
         self.settings_lock = asyncio.Lock()
+        # S1-33 (PR 52 cycle 3): the runs Stop was pressed for, from any window, even after they ended: nothing waiting
+        # starts on its own after one (_take_queued)
+        self.stopped = set()
 
     async def _write(self, fn):
         return await asyncio.to_thread(self.db.write, fn)
@@ -585,6 +588,7 @@ class Harness:
         has not ended within CANCEL_WAIT_SECONDS. Repeating it is safe; a finished run
         is left as it is."""
         await self._record_dropped()
+        self.stopped.add(run_id)
         active = self.registry.runs.get(run_id)
         if active is not None:
             self._request_cancel(active, reason)
@@ -817,7 +821,7 @@ class Harness:
             if not conn.execute("SELECT 1 FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone():
                 raise AdmissionError(404, "not_found", "No such conversation")
             if queued is not None:
-                _take_queued(conn, claim.conversation_id, message, *queued)
+                _take_queued(conn, claim.conversation_id, message, *queued, stopped=self.stopped)
             (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM turns WHERE conversation_id = ?",
                                   (claim.conversation_id,)).fetchone()
             # Only succeeded turns' answers: a failed, cancelled or revoked turn's text never enters a
@@ -3244,13 +3248,15 @@ def _release_allowances(conn, run_id=None):
         spending.release(conn, reservation)
 
 
-def _take_queued(conn, conversation_id, text, queued_id, after):
-    """S1-33: a queued message taken from the queue by the admission of its turn, in its transaction (Harness._admit)."""
+def _take_queued(conn, conversation_id, text, queued_id, after, stopped=()):
+    """S1-33: a queued message taken from the queue by the admission of its turn, in its transaction (Harness._admit).
+    One started on its own (after) follows only the latest turn, succeeded, and not stopped (stopped: the runs Stop was
+    pressed for, Harness.stopped), so a Stop pressed in another window after the answer committed starts nothing."""
     if after is not None:
         latest = conn.execute("SELECT t.run_id, r.status FROM turns t JOIN runs r ON r.id = t.run_id"
                               " WHERE t.conversation_id = ? ORDER BY t.seq DESC LIMIT 1", (conversation_id,)).fetchone()
-        if latest is None or tuple(latest) != (after, "succeeded"):
-            raise AdmissionError(409, "not_after_success", "The turn before it did not succeed; send it yourself")
+        if latest is None or tuple(latest) != (after, "succeeded") or after in stopped:
+            raise AdmissionError(409, "not_after_success", "The turn before it did not succeed or was stopped; send it yourself")
     if conn.execute("DELETE FROM queued_messages WHERE id = ? AND conversation_id = ? AND text = ?",
                     (queued_id, conversation_id, text)).rowcount != 1:
         raise AdmissionError(409, "not_queued", "This message is no longer waiting")

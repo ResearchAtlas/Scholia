@@ -212,6 +212,12 @@ class FollowUp(BaseModel):
     content: str
 
 
+class Queued(FollowUp):
+    """S1-33: a message waiting as the next turn, with the papers it names (the Library's selection or @-mentions,
+    SPEC:281), which its start checks as any message's selection is checked."""
+    material_ids: list[str] | None = Field(default=None, max_length=50)
+
+
 class QueuedSend(Continue):
     """S1-33: start a queued message as the next turn: by Send, or (after) on its own once that turn succeeded."""
     after: str | None = Field(default=None, max_length=100)
@@ -1344,13 +1350,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         return content
 
     @app.post("/api/conversations/{conversation_id}/queue", status_code=201)
-    async def queue_message(conversation_id: str, body: FollowUp):
+    async def queue_message(conversation_id: str, body: Queued):
         text = _follow_up_text(body.content)
 
         def add(conn):
             if conn.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone() is None:
                 raise ApiError(404, "not_found", "No such conversation")
-            return budgets.queue(conn, conversation_id, text)
+            return budgets.queue(conn, conversation_id, text, body.material_ids)
         added, cancelled = await _through(write(add))  # once its row commits, said on the stream even if cancelled then
         if (running := harness().registry.turns.get(conversation_id)) is not None:  # its stream says so (SPEC:641)
             running.events.put_nowait({"type": "queued"})
@@ -1366,8 +1372,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             if conn.execute("UPDATE queued_messages SET text = ?, updated_at = ? WHERE id = ? AND conversation_id = ?",
                             (text, utc_now(), queued_id, conversation_id)).rowcount != 1:
                 raise ApiError(409, "not_queued", "This message is no longer waiting")
-            return budgets.queued_row(conn.execute("SELECT id, text, created_at, updated_at FROM queued_messages"
-                                                   " WHERE id = ?", (queued_id,)).fetchone())
+            return budgets.queued_row(conn.execute(f"SELECT {budgets.QUEUED_COLUMNS} FROM queued_messages WHERE id = ?",
+                                                   (queued_id,)).fetchone())
         return await write(edit)
 
     @app.delete("/api/conversations/{conversation_id}/queue/{queued_id}")
@@ -1382,12 +1388,15 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     @app.post("/api/conversations/{conversation_id}/queue/{queued_id}/send")
     async def send_queued(conversation_id: str, queued_id: str, body: QueuedSend | None = None):
         body = body or QueuedSend()
-        row = await read(lambda conn: conn.execute("SELECT text FROM queued_messages WHERE id = ? AND conversation_id = ?",
-                                                   (queued_id, conversation_id)).fetchone())
+        row = await read(lambda conn: conn.execute(
+            "SELECT text, material_ids FROM queued_messages WHERE id = ? AND conversation_id = ?",
+            (queued_id, conversation_id)).fetchone())
         if row is None:
             raise ApiError(409, "not_queued", "This message is no longer waiting")
+        # the papers it names, checked as any message's are (a paper deleted since: selection_invalid, and it waits)
         claim = await harness().admit_turn(conversation_id, row[0], model=body.model, provider=body.provider,
-                                           effort=body.effort, queued=(queued_id, body.after))
+                                           effort=body.effort, material_ids=json.loads(row[1]) if row[1] else None,
+                                           queued=(queued_id, body.after))
         return stream(claim)
 
     @app.post("/api/runs/{run_id}/cancel")

@@ -233,24 +233,28 @@ def saved(conn, run_id, decided, ok):
                       from_usd=decided["from_usd"], to_usd=record["to_usd"], applied=ok)
 
 
+QUEUED_COLUMNS = "id, text, created_at, updated_at, material_ids"
+
+
 def queued_row(row):
-    return dict(zip(("id", "text", "created_at", "updated_at"), row))
+    """A waiting message as the API gives it: with material_ids, the papers it names, only when it names some."""
+    found = dict(zip(("id", "text", "created_at", "updated_at"), row[:4]))
+    return {**found, "material_ids": json.loads(row[4])} if row[4] else found
 
 
-def queue(conn, conversation_id, text):
-    """A message waiting as the conversation's next turn, after those already waiting. Returns its row."""
+def queue(conn, conversation_id, text, material_ids=None):
+    """A message waiting as the conversation's next turn, after those already waiting, with the papers it names (ids,
+    checked when it starts, Harness.admit_turn). Returns its row."""
     from backend.db import new_id
     queued_id = new_id()
-    conn.execute("INSERT INTO queued_messages (id, conversation_id, text) VALUES (?, ?, ?)",
-                 (queued_id, conversation_id, text))
-    return queued_row(conn.execute("SELECT id, text, created_at, updated_at FROM queued_messages WHERE id = ?",
-                                   (queued_id,)).fetchone())
+    conn.execute("INSERT INTO queued_messages (id, conversation_id, text, material_ids) VALUES (?, ?, ?, ?)",
+                 (queued_id, conversation_id, text, json.dumps(material_ids) if material_ids else None))
+    return queued_row(conn.execute(f"SELECT {QUEUED_COLUMNS} FROM queued_messages WHERE id = ?", (queued_id,)).fetchone())
 
 
 def queued(conn, conversation_id):
     return [queued_row(r) for r in conn.execute(
-        "SELECT id, text, created_at, updated_at FROM queued_messages WHERE conversation_id = ? ORDER BY rowid",
-        (conversation_id,))]
+        f"SELECT {QUEUED_COLUMNS} FROM queued_messages WHERE conversation_id = ? ORDER BY rowid", (conversation_id,))]
 
 
 def carried_notes(conn, run_id):

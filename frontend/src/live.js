@@ -3,31 +3,20 @@
 // closes (backend/runs.py stream_closed), and several conversations may run at once
 // (slice-1 spec section 2).
 import { useSyncExternalStore } from 'react';
-import { get, post, stream } from './api.js';
+import { ApiError, get, post, stream } from './api.js';
 import { nextQueued } from './followup.js';
 import { asksChanged } from './library.js';
 import { memoryChanged } from './memory.js';
 
 const turns = new Map(); // conversation id -> { text, runId, answer, resultSaved, error, limit, done }
+// S1-33 (PR 52 cycle 3, design review B): one stream at a time per conversation here, its abort controller; while one is
+// being admitted or runs, a message is refused here (send), so nothing is ever handed back between streams.
 const aborts = new Map();
-const latest = new WeakMap(); // S1-33: each stream's own latest state (by its abort controller), owned or not
-const replaced = new WeakMap(); // and the stream it replaced
-const notAdmitted = new WeakSet(); // the streams known never to have started a turn: refused, or stopped before it
-const ended = new WeakSet(); // the streams whose own end (their finally) has run
-const owed = new WeakMap(); // a stream that succeeded while a newer one was sent over it: the drain it left to that one
 const routes = new Map(); // run id -> the route its turn was sent on here ({ model, provider, effort })
-
-// What a stream not admitted gives the conversation back to: the latest stream it replaced still under way (one whose
-// first event is unread may be an admitted turn), else the latest that finished; never one known not admitted.
-function givenBack(abort) {
-  let finished = null;
-  for (let owner = replaced.get(abort); owner; owner = replaced.get(owner)) {
-    if (notAdmitted.has(owner)) continue;
-    if (!latest.get(owner).done) return owner;
-    finished ??= owner;
-  }
-  return finished;
-}
+const halted = new Set(); // conversations Stop was pressed in here since a turn the researcher started was admitted
+const stops = new Map(); // conversation id -> how many times Stop was pressed in it here
+const followed = new Set(); // run ids a waiting message was started after, here (one start a turn)
+const idlers = new Map(); // conversation id -> what waits for its stream here to end (idle)
 const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut, notices }, for this window
 const listeners = new Set();
 
@@ -67,20 +56,29 @@ export function apply(turn, event) {
 // Sends a message (or continues a turn) and follows its stream. Resolves once the turn is
 // admitted, or rejects with the refusal when it was not; an admitted turn ends done
 // however its stream ends, and the conversation's saved turns tell what happened.
-// A stream owns its conversation's live state while it is the latest sent there: an older one never overwrites or clears
-// a newer one's, and one refused gives back what it replaced (S1-33, PR 52 review 1), so Stop always reaches the turn shown.
+// S1-33 (PR 52 cycle 3): while a turn is being admitted or runs here in the conversation, it is refused here at once,
+// with no request, as the backend refuses a second turn (409 active_run): the message then follows the setting, steered
+// or queued (ConversationView), and the one stream here keeps the conversation, so Stop always reaches the turn shown.
 export function send(conversationId, path, body, text) {
+  if (aborts.has(conversationId)) return Promise.reject(new ApiError(409, 'active_run'));
   const abort = new AbortController();
   let turn = { text, runId: null, answer: null, done: false };
-  const mine = () => aborts.get(conversationId) === abort;
-  replaced.set(abort, aborts.get(conversationId));
   aborts.set(conversationId, abort);
-  latest.set(abort, turn);
+  const release = () => { // the conversation is free here again, said before anything awaiting this stream goes on
+    if (aborts.get(conversationId) !== abort) return false;
+    aborts.delete(conversationId);
+    for (const resolve of idlers.get(conversationId) ?? []) resolve();
+    idlers.delete(conversationId);
+    return true;
+  };
   set(conversationId, turn, 'send');
   return new Promise((admitted, refused) => {
     stream(path, body, (event) => {
       turn = apply(turn, event);
-      if (event.type === 'run_started') routes.set(event.run_id, { model: body?.model, provider: body?.provider, effort: body?.effort });
+      if (event.type === 'run_started') {
+        routes.set(event.run_id, { model: body?.model, provider: body?.provider, effort: body?.effort });
+        if (!body?.after) halted.delete(conversationId); // the researcher's own turn, admitted: waiting ones may follow it
+      }
       if (event.type === 'ask') asksChanged(conversationId); // S1-19c: the agent asks; the conversation shows it
       if (event.type === 'memory') memoryChanged(null); // S1-21a: a command or the agent's note changed memory
       // S1-19c: the help skill opens a place, only while its turn's conversation and project are shown (CT4)
@@ -90,88 +88,78 @@ export function send(conversationId, path, body, text) {
       if (event.type === 'chat_response' && event.result_saved === false && turn.runId) {
         unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut), ...(event.notices ? { notices: event.notices } : {}) });
       }
-      latest.set(abort, turn);
-      if (mine()) set(conversationId, turn, event.type);
+      set(conversationId, turn, event.type);
       if (turn.runId) admitted();
     }, abort.signal).catch((error) => {
       if (turn.runId) return;
-      const stopped = error.name === 'AbortError';
-      notAdmitted.add(abort);
-      if (mine()) {
-        const owner = givenBack(abort);
-        const prior = owner && latest.get(owner);
-        if (prior && !(stopped && prior.done)) { // the turn it replaced comes back as it is now, finished or under way
-          // One whose own end is still to come owns the conversation again, so that end finishes it here (and drains);
-          // one that ended while this was sent over it is done, and the drain it left starts now (PR 52 cycle 2)
-          const over = prior.done && ended.has(owner);
-          if (over) aborts.delete(conversationId); else aborts.set(conversationId, owner);
-          set(conversationId, prior, 'restored');
-          if (over) {
-            const start = owed.get(owner);
-            owed.delete(owner);
-            start?.();
-          }
-        } else if (!stopped) {
-          set(conversationId, null, 'refused');
-        }
-      }
-      if (!stopped) refused(error);
+      if (error.name === 'AbortError') return; // stopped before it was admitted: it ends done, starting nothing
+      release();
+      set(conversationId, null, 'refused');
+      refused(error);
     }).finally(() => {
       if (!turn.done) turn = { ...turn, done: true };
-      latest.set(abort, turn);
-      ended.add(abort);
-      if (!mine()) { // a newer stream was sent over it: one refused gives it back and starts the drain it left
-        if (turn.status === 'succeeded') owed.set(abort, () => drain(conversationId, turn.runId, body));
-        return admitted();
-      }
-      aborts.delete(conversationId);
-      if (turns.get(conversationId) && turns.get(conversationId) !== turn) set(conversationId, turn, 'run_finished');
+      if (release() && turns.get(conversationId) && turns.get(conversationId) !== turn) set(conversationId, turn, 'run_finished');
       admitted();
-      if (turn.status === 'succeeded') drain(conversationId, turn.runId, body);
+      if (turn.status === 'succeeded') drain(conversationId);
     });
   });
 }
 
-// S1-33 (F11, queue): after a turn that succeeded, the oldest message waiting in its conversation starts as the next
-// turn, on the route the turn was sent on, wherever the window is; the backend starts it only while that turn is still
-// the latest and succeeded, and once. After any other ending it waits with Send.
-export async function drain(conversationId, runId, route = {}) {
-  const current = turns.get(conversationId);
-  if (!runId || (current && !current.done)) return; // a turn is already starting or running here
-
-  try {
-    const next = nextQueued(await get(`/api/conversations/${encodeURIComponent(conversationId)}`), runId);
-    const now = turns.get(conversationId);
-    if (now && !now.done) return; // a turn started here while the conversation was read: it is never disturbed
-    const { model, provider, effort } = route;
-    if (next) {
-      await send(conversationId, `/api/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(next.id)}/send`,
-        { model, provider, effort, after: runId }, next.text);
+// S1-33 (F11, queue; PR 52 cycle 3, design review B): after a turn that succeeded, the oldest message waiting in its
+// conversation starts as the next turn, on the route that turn was sent on, wherever the window is. Each call reads the
+// conversation and acts on what the record says now: only while the latest turn there succeeded and was sent from this
+// window, no Stop was pressed here since, and nothing is being admitted or running here, checked before and after the
+// read; once a turn. A message edited or removed while it was being started (not_queued) gives way to the next, read
+// again. The backend starts it only while that turn is still the latest, succeeded and not stopped, and once. After any
+// other ending it waits with Send.
+export async function drain(conversationId) {
+  const pressed = stopsAt(conversationId);
+  const free = () => !aborts.has(conversationId) && !halted.has(conversationId) && stopsAt(conversationId) === pressed;
+  for (let tries = 0; tries < 3 && free(); tries += 1) {
+    let read;
+    try {
+      read = await get(`/api/conversations/${encodeURIComponent(conversationId)}`);
+    } catch {
+      return; // it waits, as the conversation shows when it is read
     }
-  } catch {
-    // refused (started meanwhile, or no longer after a turn that succeeded): it waits, as the conversation shows
+    const after = read?.turns?.at(-1)?.run_id;
+    const next = routes.has(after) ? nextQueued(read, after) : null; // a turn sent elsewhere: that window starts it
+    if (!next || !free() || (tries === 0 && followed.has(after))) return;
+    followed.add(after);
+    try {
+      await send(conversationId, `/api/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(next.id)}/send`,
+        { ...routes.get(after), after }, next.text);
+      return;
+    } catch (error) {
+      if (!(error instanceof ApiError && error.code === 'not_queued')) return; // refused otherwise: it waits with Send
+    }
   }
-}
-
-// S1-33: the route a turn was sent on from this window, which a message waiting behind it starts on (Harold,
-// 2026-11-11: a waiting message keeps the finished turn's route); null for a turn sent elsewhere.
-export function sentRoute(runId) {
-  return routes.get(runId) ?? null;
 }
 
 // Stop: cancels the run, which then finishes its stream; before the run has started,
-// closing the stream stops it. runId, if given, is a turn the conversation's record shows running. A send still
-// waiting to be admitted may have been sent over a turn under way: Stop reaches every stream of the conversation under
-// way here, not only the latest, so the turn that runs is always stopped (S1-33, PR 52 cycle 2).
+// closing the stream stops it. runId, if given, is a turn the conversation's record shows running (from another window,
+// perhaps). S1-33 (PR 52 cycle 3): from now on nothing waiting starts on its own here until a turn the researcher starts
+// here is admitted, and the backend starts nothing after a turn stopped anywhere (Harness.cancel).
 export async function stop(conversationId, runId) {
+  halted.add(conversationId);
+  stops.set(conversationId, stopsAt(conversationId) + 1);
   const runs = new Set(runId ? [runId] : []);
-  const closing = [];
-  for (let owner = aborts.get(conversationId); owner; owner = replaced.get(owner)) {
-    if (notAdmitted.has(owner) || latest.get(owner).done) continue;
-    if (latest.get(owner).runId) runs.add(latest.get(owner).runId); else closing.push(owner);
+  const live = turns.get(conversationId);
+  if (aborts.has(conversationId) && live && !live.done) {
+    if (live.runId) runs.add(live.runId); else aborts.get(conversationId).abort();
   }
-  for (const owner of closing) owner.abort();
   await Promise.all([...runs].map((id) => post(`/api/runs/${id}/cancel`)));
+}
+
+// S1-33: how many times Stop was pressed in the conversation here, so the view can tell whether one came meanwhile.
+export function stopsAt(conversationId) {
+  return stops.get(conversationId) ?? 0;
+}
+
+// S1-33: resolves once no turn is being admitted or running here in the conversation.
+export function idle(conversationId) {
+  if (!aborts.has(conversationId)) return Promise.resolve();
+  return new Promise((resolve) => idlers.set(conversationId, [...(idlers.get(conversationId) ?? []), resolve]));
 }
 
 // S1-19c: open_place's places (backend/agent.py PLACES): the window opens the one named (Shell.jsx).

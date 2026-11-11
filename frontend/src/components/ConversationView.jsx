@@ -11,7 +11,7 @@ import { LeftOff, Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
-import { NOTICES, clear, drain, limitText, send, sentRoute, showing, stop, unsavedAnswer, useLiveTurn } from '../live.js';
+import { NOTICES, clear, drain, idle, limitText, send, showing, stop, stopsAt, unsavedAnswer, useLiveTurn } from '../live.js';
 import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
@@ -151,6 +151,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
 
   // S1-33: a steering note read, or a message queued, is shown from the record (a budget notice: the bar reads again)
   useEffect(() => { if (live?.steered || live?.queued) load(); }, [live?.steered, live?.queued, load]);
+  // and a waiting message started as the live turn is no longer listed as waiting (PR 52 cycle 3)
+  useEffect(() => { if (live?.runId) load(); }, [live?.runId, load]);
 
   // S1-33: a waiting message's Send (live.js drain starts the oldest on its own after a turn that succeeded)
   async function sendQueued(item) {
@@ -160,7 +162,9 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       await send(id, `/api/conversations/${id}/queue/${encodeURIComponent(item.id)}/send`, messageRoute(currentChoice()),
         item.text);
     } catch (error) {
-      if (!(error instanceof ApiError && ['not_queued', 'not_after_success', 'active_run'].includes(error.code))) {
+      if (error instanceof ApiError && error.code === 'selection_invalid') { // a paper it names was deleted since
+        setProblem(t('followUp.paperGone'));
+      } else if (!(error instanceof ApiError && ['not_queued', 'not_after_success', 'active_run'].includes(error.code))) {
         setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
       }
     }
@@ -193,19 +197,18 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   }
 
   // S1-33 (F11): a message sent while a turn runs, steered or queued as the setting says; said once read back.
-  // shortcut: it carries no Library selection or @-mentions (they stay chosen for the next message sent when no turn
-  // runs); a queued message would need a selection column and its deletion links (PR 52 cycle 2, D21).
   async function followUp(text) {
     const runId = live?.runId ?? shown.find((turn) => turn.status === 'running')?.run_id ?? null;
+    const pressed = stopsAt(id); // a Stop from here on is the researcher's last word on what runs (PR 52 cycle 3)
+    const papers = chosenPapers(projectId); // they go with it, and so it waits as the next turn (followup.js)
     try {
-      const sent = await follow(id, runId, text);
+      const sent = await follow(id, runId, text, papers.map((paper) => paper.id));
+      if (papers.length) choosePapers(projectId, []); // they went with this message
       await load();
-      if (sent.ended) await sendQueued(sent.queued); // a steer whose turn had ended: a new turn if the conversation is free
-      else if (sent.queued) { // its turn may have ended already: started if that turn succeeded, on that turn's route
-        const after = runId ?? (turns ?? []).at(-1)?.run_id;
-        const route = sentRoute(after); // a turn sent from another window: that one starts it, or it waits with Send
-        if (route) drain(id, after, route);
-      }
+      if (sent.ended) { // a steer whose turn had ended: a new turn once nothing runs here, unless Stop was pressed since
+        await idle(id);
+        if (stopsAt(id) === pressed) await sendQueued(sent.queued);
+      } else if (sent.queued) drain(id); // its turn may have ended already: started if it succeeded here (live.js)
       return true;
     } catch (error) {
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
@@ -508,6 +511,9 @@ function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
       <div className="mx-auto w-full max-w-3xl">
         {problem && <p role="alert" className="mb-2 text-sm text-destructive">{problem}</p>}
         <div className="relative rounded-2xl border bg-card p-2 shadow-xs transition-shadow focus-within:border-brand/50 focus-within:shadow-md focus-within:shadow-brand/5">
+          {chosen.length > 0 && running && ( // S1-33: sent now, it waits as the next turn with them (followup.js)
+            <p className="px-1 pb-1 text-[11px] text-muted-foreground">{t('composer.papersWait')}</p>
+          )}
           {chosen.length > 0 && (
             <ul className="flex flex-wrap gap-1 px-1 pb-1" aria-label={t('composer.chosen')}>
               {chosen.map((paper) => (

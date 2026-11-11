@@ -9,10 +9,15 @@ export async function followUpMode() {
   return (await get('/api/settings')).values?.ui?.follow_up === 'queue' ? 'queue' : 'steer';
 }
 
-// Sends text while a turn runs (runId, or null while it is still being admitted): { steering } or { queued }.
-export async function follow(conversationId, runId, text) {
-  if (runId && (await followUpMode()) === 'steer') return post(`/api/runs/${encodeURIComponent(runId)}/steering`, { content: text });
-  return { queued: await post(`/api/conversations/${encodeURIComponent(conversationId)}/queue`, { content: text }) };
+// Sends text while a turn runs (runId, or null while it is still being admitted): { steering } or { queued }. One that
+// names papers (materialIds) waits as the next turn with them, whatever the setting: a note cannot narrow a turn already
+// under way (Harold, 2026-11-11; SPEC:281).
+export async function follow(conversationId, runId, text, materialIds = []) {
+  if (runId && !materialIds.length && (await followUpMode()) === 'steer') {
+    return post(`/api/runs/${encodeURIComponent(runId)}/steering`, { content: text });
+  }
+  return { queued: await post(`/api/conversations/${encodeURIComponent(conversationId)}/queue`,
+    { content: text, ...(materialIds.length ? { material_ids: materialIds } : {}) }) };
 }
 
 // The queued message a finished turn starts, when that turn succeeded: the oldest, or none.

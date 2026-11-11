@@ -715,4 +715,11 @@ _0011 = r"""
 ALTER TABLE projects ADD COLUMN budget_noticed TEXT CHECK (budget_noticed IS NULL OR json_valid(budget_noticed));
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009, _0010, _0011)
+# S1-33 (PR 52 cycle 3): a waiting message keeps the papers it names (the Library's selection or @-mentions, SPEC:281),
+# their ids as a JSON list, as a turn's message keeps them (ids, never text); its start checks them (a paper deleted
+# since: refused, selection_invalid).
+_0012 = r"""
+ALTER TABLE queued_messages ADD COLUMN material_ids TEXT CHECK (material_ids IS NULL OR json_valid(material_ids));
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009, _0010, _0011, _0012)

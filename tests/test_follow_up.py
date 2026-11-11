@@ -670,3 +670,54 @@ async def test_a_note_carried_out_by_a_steps_first_attempt_stays_read_when_stop_
                           run_id) == [(0.2, "reported")]
         read = await conversation_read(client, conversation)
         assert [n["state"] for n in read["turns"][-1]["steering"]] == ["read"] and read["queued"] == []
+
+
+async def test_a_stop_pressed_after_the_answer_committed_starts_nothing_waiting_after_that_turn(tmp_path):
+    # Design review B, the backend's Stop mark (SPEC:412, Stop is immediate): the turn's answer committed, then Stop was
+    # pressed for it (from a second window, whose Stop mark the sending window does not have). That window then asks for
+    # the waiting message to start after the turn: refused, so nothing starts on its own; Send still starts it.
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        run_id = (await send(client, conversation, "First?"))[0]["run_id"]
+        queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})).json()
+        assert (await client.post(f"/api/runs/{run_id}/cancel")).json()["status"] == "succeeded"  # it had ended
+        path = f"/api/conversations/{conversation}/queue/{queued['id']}/send"
+        after = await client.post(path, json={"after": run_id})
+        assert (after.status_code, after.json()["code"]) == (409, "not_after_success")
+        assert [q["id"] for q in (await conversation_read(client, conversation))["queued"]] == [queued["id"]]
+        sent = await client.post(path, json={})
+        assert sent.status_code == 200 and events(sent)[-1]["status"] == "succeeded"
+        await background_idle(client)
+
+
+async def test_a_message_naming_papers_waits_with_them_and_starts_narrowed_to_them_or_refused_once_one_is_deleted(tmp_path):
+    # Item 5 (Harold, 2026-11-11; SPEC:281; E5): a message sent with papers chosen while a turn runs waits as the next
+    # turn with them (the interface queues it whatever the setting). Its start narrows its turn to them, as any message's
+    # selection does. One naming a paper deleted meanwhile is refused at its start (selection_invalid), and waits, Send
+    # saying why.
+    from cited import cited, conversation_in, with_papers
+    from test_search import WAGES, paper
+    async with cited(tmp_path) as client:
+        project, [wages, rents] = await with_papers(client, WAGES, paper("Rents", "Housing rents rose in the city."))
+        conversation = await conversation_in(client, project)
+        first = (await send(client, conversation, "What do minimum wages do to earnings?"))[0]["run_id"]
+        queued = (await client.post(f"/api/conversations/{conversation}/queue",
+                                    json={"content": "And their earnings?", "material_ids": [wages]})).json()
+        assert queued["material_ids"] == [wages]
+        assert [q.get("material_ids") for q in (await conversation_read(client, conversation))["queued"]] == [[wages]]
+        stream = events(await client.post(f"/api/conversations/{conversation}/queue/{queued['id']}/send",
+                                          json={"after": first}))
+        assert stream[-1]["status"] == "succeeded"
+        run_id = stream[0]["run_id"]
+        turn = next(t for t in (await conversation_read(client, conversation))["turns"] if t["run_id"] == run_id)
+        assert turn["message"]["material_ids"] == [wages]
+        assert {c["material_id"] for c in turn["citations"]} == {wages}  # its retrieval narrowed to the paper it named
+        await background_idle(client)
+        later = (await client.post(f"/api/conversations/{conversation}/queue",
+                                   json={"content": "And rents?", "material_ids": [rents]})).json()
+        assert (await client.delete(f"/api/materials/{rents}")).status_code == 200
+        refused = await client.post(f"/api/conversations/{conversation}/queue/{later['id']}/send", json={})
+        assert (refused.status_code, refused.json()["code"]) == (400, "selection_invalid")
+        assert [q["id"] for q in (await conversation_read(client, conversation))["queued"]] == [later["id"]]
+        assert (await client.post(f"/api/conversations/{conversation}/queue", json={
+            "content": "Too many?", "material_ids": ["x"] * 51})).status_code == 400  # as many as a message may name

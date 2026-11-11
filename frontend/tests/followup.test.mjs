@@ -101,8 +101,9 @@ for (const [status, started] of [['succeeded', true], ['failed', false], ['cance
   });
 }
 
-// PR 52 review 1 (finding 4): a drain whose read was asked before a manual send started never starts its message, and a
-// stream refused never clears or orphans a newer stream's state, so Stop still cancels the newer turn.
+// PR 52 review 1 (finding 4): a drain whose read was asked before a manual send started never starts its message, and
+// Stop still cancels the manual turn. (PR 52 cycle 3: the drain reads the record itself, so the turn before is one sent
+// here, whose own end asked for the read.)
 function openStream(runId) { // a stream that has started its run and stays open until close()
   let controller;
   const body = new ReadableStream({ start(c) { controller = c; c.enqueue(new TextEncoder().encode(`data: {"type":"run_started","run_id":"${runId}"}\n\n`)); } });
@@ -117,91 +118,23 @@ test('a drain whose read was asked before a manual send starts nothing, and Stop
     url = String(url);
     if (init?.method === 'POST') posts.push(url);
     if (url === '/api/conversations/c-race') return new Promise((resolve) => { answerRead = resolve; });
+    if (url === '/first') return new Response(streamOf('data: {"type":"run_started","run_id":"r1"}\n\n', 'data: {"type":"run_finished","status":"succeeded"}\n\n'));
     if (url === '/manual') return new Response(manual.body);
     return Response.json({ run_id: 'r-manual', status: 'cancelled' });
   });
-  const draining = drain('c-race', 'r1', {});
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  await send('c-race', '/first', {}, 'First'); // it succeeds, and its end reads the conversation
+  while (!answerRead) await new Promise((resolve) => setTimeout(resolve, 2));
   await send('c-race', '/manual', {}, 'Typed now'); // admitted: its run started
   answerRead(Response.json({ turns: [{ run_id: 'r1', status: 'succeeded' }], queued: [{ id: 'q1', text: 'Next' }] }));
-  await draining;
+  await settle();
   assert.deepEqual(posts.filter((url) => url.includes('/queue/')), []);
   await stop('c-race');
   assert.ok(posts.includes('/api/runs/r-manual/cancel'));
   manual.close();
 });
 
-test('a stream refused after a newer one started leaves the newer one\'s state and Stop alone', async (t) => {
-  const posts = [];
-  let refuse;
-  const newer = openStream('r-new');
-  t.mock.method(globalThis, 'fetch', async (url, init) => {
-    url = String(url);
-    if (init?.method === 'POST' && url.includes('/cancel')) posts.push(url);
-    if (url === '/older') return new Promise((resolve) => { refuse = resolve; });
-    if (url === '/newer') return new Response(newer.body);
-    return Response.json({});
-  });
-  const older = send('c-two', '/older', {}, 'Older').catch((error) => error);
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  await send('c-two', '/newer', {}, 'Newer');
-  refuse(Response.json({ code: 'active_run' }, { status: 409 }));
-  assert.equal((await older).code, 'active_run');
-  await stop('c-two');
-  assert.deepEqual(posts, ['/api/runs/r-new/cancel']);
-  newer.close();
-});
-
-test('an older turn that finishes while a newer send is pending is shown finished when that send is refused', async (t) => {
-  let refuse;
-  const older = openStream('r-old');
-  t.mock.method(globalThis, 'fetch', async (url) => {
-    url = String(url);
-    if (url === '/old') return new Response(older.body);
-    if (url === '/pending') return new Promise((resolve) => { refuse = resolve; });
-    return Response.json({ turns: [], queued: [] });
-  });
-  const seen = [];
-  const unsubscribe = subscribe((id, turn) => { if (id === 'c-three') seen.push(turn); });
-  await send('c-three', '/old', {}, 'Older');
-  const pending = send('c-three', '/pending', {}, 'Newer').catch((error) => error);
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  older.close(); // the older stream ends (its run finished) while the newer one is pending
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  refuse(Response.json({ code: 'active_run' }, { status: 409 }));
-  await pending;
-  unsubscribe();
-  const last = seen.at(-1);
-  assert.equal(last?.runId, 'r-old');
-  assert.equal(last?.done, true); // never left showing a turn that runs
-});
-
-test('three overlapping sends: when the later two are refused, the running turn keeps its state and Stop', async (t) => {
-  const posts = [];
-  const refusals = {};
-  const running = openStream('r-run');
-  t.mock.method(globalThis, 'fetch', async (url, init) => {
-    url = String(url);
-    if (init?.method === 'POST' && url.includes('/cancel')) posts.push(url);
-    if (url === '/run') return new Response(running.body);
-    if (url === '/two' || url === '/three') return new Promise((resolve) => { refusals[url] = resolve; });
-    return Response.json({});
-  });
-  await send('c-four', '/run', {}, 'Running');
-  const two = send('c-four', '/two', {}, 'Two').catch((error) => error);
-  const three = send('c-four', '/three', {}, 'Three').catch((error) => error);
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  refusals['/two'](Response.json({ code: 'active_run' }, { status: 409 }));
-  await two;
-  refusals['/three'](Response.json({ code: 'active_run' }, { status: 409 }));
-  await three;
-  await stop('c-four');
-  assert.deepEqual(posts, ['/api/runs/r-run/cancel']);
-  running.close();
-});
-
-// Fix batch 1 (F1): an older stream whose first event has not been read yet may be an admitted turn: a refused newer
-// stream gives the conversation back to it, so its events show and Stop reaches it.
+// Fix batch 1 (F1): an admitted turn whose first event has not been read yet keeps the conversation: its events show and
+// Stop reaches it. (PR 52 cycle 3: a message sent meanwhile is refused here, with no request.)
 function lateStream() { // an admitted turn whose events have not arrived
   let controller;
   const body = new ReadableStream({ start(c) { controller = c; } });
@@ -209,14 +142,15 @@ function lateStream() { // an admitted turn whose events have not arrived
   return { body, event: (text) => controller.enqueue(encoder.encode(`data: ${text}\n\n`)), close: () => controller.close() };
 }
 
-test('a refused newer stream leaves an admitted turn whose run_started is unread showing, and Stop reaches it', async (t) => {
+test('a message sent while an admitted turn\'s run_started is unread is refused here; the turn shows, and Stop reaches it', async (t) => {
   const posts = [];
+  const requested = [];
   const admitted = lateStream();
   t.mock.method(globalThis, 'fetch', async (url, init) => {
     url = String(url);
+    requested.push(url);
     if (init?.method === 'POST' && url.includes('/cancel')) posts.push(url);
     if (url === '/admitted') return new Response(admitted.body);
-    if (url === '/refused') return Response.json({ code: 'active_run' }, { status: 409 });
     return Response.json({});
   });
   const seen = [];
@@ -224,6 +158,7 @@ test('a refused newer stream leaves an admitted turn whose run_started is unread
   send('c-five', '/admitted', {}, 'Admitted');
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal((await send('c-five', '/refused', {}, 'Refused').catch((error) => error)).code, 'active_run');
+  assert.ok(!requested.includes('/refused'));
   admitted.event('{"type":"run_started","run_id":"r-five"}');
   await new Promise((resolve) => setTimeout(resolve, 5));
   unsubscribe();
@@ -249,156 +184,220 @@ test('Stop reaches an admitted turn by closing its stream when its run_started i
   admitted.close();
 });
 
-// Fix batch 2 (PR 52 cycle 2, D10 and D14): a send pending over a turn under way. A refused one gives the conversation
-// back and starts the drain a turn that succeeded meanwhile left to it, once; a stopped one starts nothing; and Stop,
-// pressed while it is pending, reaches every turn under way there, not only the latest stream.
+// S1-33 fix batch 3 (PR 52 cycle 3, design review B): one stream at a time per conversation here, a drain that reads the
+// record each time, and a Stop mark here. Each case is one the reviews found (C1a, C1b, C2, C3, B-R2, N1) or one of
+// design review B's probes.
 function controlledStream() { // a stream whose events and end the test sends, each when it chooses
   let controller;
   const body = new ReadableStream({ start(c) { controller = c; } });
   const encoder = new TextEncoder();
   return { body, event: (text) => controller.enqueue(encoder.encode(`data: ${text}\n\n`)), close: () => controller.close() };
 }
+const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+const abortError = () => Object.assign(new Error('aborted'), { name: 'AbortError' });
+const succeeded = (runId) => new Response(streamOf(`data: {"type":"run_started","run_id":"${runId}"}\n\n`,
+  'data: {"type":"run_finished","status":"succeeded"}\n\n'));
 
-function overlapping(conversation, turnStatus = 'succeeded') { // fetch for a turn /a and a send /b pending over it
-  const calls = { queueSends: [], cancels: [], signals: {} };
-  const a = controlledStream();
-  let answerB;
+// A fetch for one conversation: `streams` by path (each a function of the request's init), the conversation's reads
+// (`read`, a function of their count), each start of a waiting message answered by the next of `starts` (by default a
+// turn r-next that succeeds), and cancels; `calls` records what was asked.
+function backend({ read, starts = [], streams = {} }) {
+  const calls = { requests: [], reads: 0, queueSends: [], cancels: [] };
   const fetch = async (url, init) => {
     url = String(url);
-    if (url === '/a') { calls.signals.a = init.signal; return new Response(a.body); }
-    if (url === '/b') {
-      calls.signals.b = init.signal;
-      return new Promise((resolve, reject) => {
-        answerB = resolve;
-        init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
-      });
-    }
+    calls.requests.push(url);
+    if (streams[url]) return streams[url](init);
     if (url.includes('/cancel')) { calls.cancels.push(url); return Response.json({ status: 'cancelled' }); }
     if (url.includes('/queue/')) {
       calls.queueSends.push([url, JSON.parse(init.body)]);
-      return new Response(streamOf('data: {"type":"run_started","run_id":"r-next"}\n\n', 'data: {"type":"run_finished","status":"succeeded"}\n\n'));
+      return (starts.shift() ?? (() => succeeded('r-next')))(init);
     }
-    return Response.json({ turns: [{ run_id: 'r-a', status: turnStatus }], queued: [{ id: 'q1', text: 'Next' }] });
+    calls.reads += 1;
+    return read(calls.reads);
   };
-  return { calls, a, fetch, refuseB: () => answerB(Response.json({ code: 'active_run' }, { status: 409 })) };
+  return { calls, fetch };
 }
-const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+const record = (runId, status, queued = [{ id: 'q1', text: 'Next' }]) => Response.json({ turns: [{ run_id: runId, status }], queued });
 
-test('a turn that succeeds while a newer send is pending starts its waiting message once that send is refused', async (t) => {
-  const run = overlapping('c-d10a');
+test('a message sent while a turn is admitted or runs here is refused here with no request, and one start follows its success (C2)', async (t) => {
+  const a = controlledStream();
+  const run = backend({ streams: { '/a': () => new Response(a.body) }, read: () => record('r-c2', 'succeeded') });
   t.mock.method(globalThis, 'fetch', run.fetch);
-  const a = send('c-d10a', '/a', { model: 'm1', provider: 'openrouter' }, 'A');
-  run.a.event('{"type":"run_started","run_id":"r-a"}');
-  await a;
-  const b = send('c-d10a', '/b', { model: 'm2' }, 'B').catch((error) => error);
+  const sending = send('c-c2', '/a', { model: 'm1' }, 'A');
+  assert.equal((await send('c-c2', '/b', {}, 'B').catch((error) => error)).code, 'active_run'); // being admitted
+  a.event('{"type":"run_started","run_id":"r-c2"}');
+  await sending;
+  assert.equal((await send('c-c2', '/b', {}, 'B').catch((error) => error)).code, 'active_run'); // running
+  assert.ok(!run.calls.requests.includes('/b')); // never sent, so nothing is ever handed back
+  a.event('{"type":"run_finished","status":"succeeded"}');
+  a.close();
   await settle();
-  run.a.event('{"type":"run_finished","status":"succeeded"}');
-  run.a.close(); // its own end runs while B is the conversation's
-  await settle();
-  run.refuseB();
-  assert.equal((await b).code, 'active_run');
-  await settle();
-  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-d10a/queue/q1/send',
-    { model: 'm1', provider: 'openrouter', after: 'r-a' }]]); // once, on the route the turn was sent on
+  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-c2/queue/q1/send', { model: 'm1', after: 'r-c2' }]]);
 });
 
-test('a newer send refused after the turn\'s last event but before its own end leaves that end to drain, once', async (t) => {
-  const run = overlapping('c-d10b');
+test('Stop reaches the one turn here, admitted or still unread, and a send still pending; nothing waiting starts after it', async (t) => {
+  for (const phase of ['pending', 'unread', 'running']) {
+    const a = controlledStream();
+    const signals = {};
+    const conversation = `c-stop-${phase}`;
+    const run = backend({ read: () => record(conversation, 'succeeded'), streams: { '/a': (init) => {
+      signals.a = init.signal;
+      if (phase === 'pending') return new Promise((resolve, reject) => init.signal.addEventListener('abort', () => reject(abortError())));
+      return new Response(a.body);
+    } } });
+    t.mock.method(globalThis, 'fetch', run.fetch);
+    const sending = send(conversation, '/a', {}, 'A').catch(() => {});
+    if (phase === 'running') a.event(`{"type":"run_started","run_id":"${conversation}"}`);
+    await settle();
+    assert.equal((await send(conversation, '/b', {}, 'B').catch((error) => error)).code, 'active_run', phase);
+    await stop(conversation);
+    if (phase === 'running') {
+      assert.deepEqual(run.calls.cancels, [`/api/runs/${conversation}/cancel`]);
+      a.event('{"type":"run_finished","status":"succeeded"}'); // its answer had committed before the Stop
+    } else {
+      assert.equal(signals.a.aborted, true, phase); // closing its stream stops a turn admitted or about to be
+    }
+    if (phase !== 'pending') a.close();
+    await sending;
+    await settle();
+    assert.deepEqual(run.calls.queueSends, [], phase);
+    t.mock.restoreAll();
+  }
+});
+
+test('after Stop, a drain whose read was still out starts nothing more (C1a)', async (t) => {
+  // Two reads of the conversation are out; the first starts the waiting message; Stop closes that start before it is
+  // admitted; then the second read comes back: nothing more is sent.
+  const answers = [];
+  const run = backend({ streams: { '/a': () => succeeded('r-c1a') }, read: () => new Promise((resolve) => answers.push(resolve)),
+    starts: [(init) => new Promise((resolve, reject) => init.signal.addEventListener('abort', () => reject(abortError())))] });
   t.mock.method(globalThis, 'fetch', run.fetch);
-  const a = send('c-d10b', '/a', { model: 'm1' }, 'A');
-  run.a.event('{"type":"run_started","run_id":"r-a"}');
-  await a;
-  const b = send('c-d10b', '/b', {}, 'B').catch((error) => error);
+  await send('c-c1a', '/a', { model: 'm1' }, 'A');
+  await settle(); // its end's drain reads the conversation
+  drain('c-c1a', 'r-c1a', { model: 'm1' }); // a second drain, as a follow-up queued meanwhile asks for one
   await settle();
-  run.a.event('{"type":"run_finished","status":"succeeded"}'); // read, its stream not yet closed
+  assert.equal(answers.length, 2);
+  answers[0](record('r-c1a', 'succeeded'));
   await settle();
-  run.refuseB();
-  await b;
+  assert.equal(run.calls.queueSends.length, 1);
+  await stop('c-c1a');
+  answers[1](record('r-c1a', 'succeeded'));
+  await settle();
+  assert.equal(run.calls.queueSends.length, 1);
+});
+
+test('a turn whose success arrives after Stop starts nothing waiting (C1b)', async (t) => {
+  const a = controlledStream();
+  const run = backend({ streams: { '/a': () => new Response(a.body) }, read: () => record('r-c1b', 'succeeded') });
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  const sending = send('c-c1b', '/a', {}, 'A');
+  a.event('{"type":"run_started","run_id":"r-c1b"}');
+  await sending;
+  await stop('c-c1b');
+  a.event('{"type":"run_finished","status":"succeeded"}'); // its answer committed before the Stop reached it
+  a.close();
   await settle();
   assert.deepEqual(run.calls.queueSends, []);
-  run.a.close();
-  await settle();
-  assert.deepEqual(run.calls.queueSends.map(([url]) => url), ['/api/conversations/c-d10b/queue/q1/send']);
 });
 
-for (const status of ['failed', 'cancelled']) {
-  test(`a turn that ends ${status} while a newer send is pending starts nothing when that send is refused`, async (t) => {
-    const run = overlapping(`c-d10-${status}`, status);
+test('Stop after a success: nothing starts, nor after a refused message; after a message the researcher sends is admitted, the waiting one follows it', async (t) => {
+  const a = controlledStream();
+  let latest = 'r-s1';
+  const run = backend({ read: () => record(latest, 'succeeded'), streams: {
+    '/a': () => new Response(a.body),
+    '/refused': () => Response.json({ code: 'no_provider' }, { status: 400 }),
+    '/b': () => { latest = 'r-s2'; return succeeded('r-s2'); } } });
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  const sending = send('c-s', '/a', { model: 'm1' }, 'A');
+  a.event('{"type":"run_started","run_id":"r-s1"}');
+  await sending;
+  a.event('{"type":"run_finished","status":"succeeded"}');
+  await stop('c-s'); // after its last event, before its stream's end
+  a.close();
+  await settle();
+  assert.deepEqual(run.calls.queueSends, []);
+  assert.equal((await send('c-s', '/refused', {}, 'Refused').catch((error) => error)).code, 'no_provider');
+  await settle();
+  assert.deepEqual(run.calls.queueSends, []);
+  await send('c-s', '/b', { model: 'm2' }, 'B');
+  await settle();
+  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-s/queue/q1/send', { model: 'm2', after: 'r-s2' }]]);
+});
+
+test('a follow-up queued while the turn\'s first event is unread starts once that turn succeeds, from the record (C3)', async (t) => {
+  const a = controlledStream();
+  const run = backend({ streams: { '/a': () => new Response(a.body) }, read: () => record('r-c3', 'succeeded') });
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  const sending = send('c-c3', '/a', { model: 'm1' }, 'A');
+  drain('c-c3', null, {}); // the follow-up's queue reply came back: a turn is being admitted here, so it waits
+  await settle();
+  assert.deepEqual(run.calls.queueSends, []);
+  a.event('{"type":"run_started","run_id":"r-c3"}');
+  await sending;
+  a.event('{"type":"run_finished","status":"succeeded"}');
+  a.close();
+  await settle();
+  assert.deepEqual(run.calls.queueSends.map(([url]) => url), ['/api/conversations/c-c3/queue/q1/send']);
+  const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
+  assert.match(followUp, /else if \(sent\.queued\) drain\(id\)/); // no turns or run id the handler captured
+});
+
+for (const change of ['edited', 'removed']) {
+  test(`a waiting message ${change} while it was being started gives way to the next, read again (B-R2)`, async (t) => {
+    const run = backend({ streams: { '/a': () => succeeded(`r-br-${change}`) },
+      read: (count) => record(`r-br-${change}`, 'succeeded', count === 1 ? [{ id: 'q1', text: 'Next' }, { id: 'q2', text: 'Later' }]
+        : change === 'edited' ? [{ id: 'q1', text: 'Edited' }, { id: 'q2', text: 'Later' }] : [{ id: 'q2', text: 'Later' }]),
+      starts: [() => Response.json({ code: 'not_queued' }, { status: 409 })] });
     t.mock.method(globalThis, 'fetch', run.fetch);
-    const a = send(`c-d10-${status}`, '/a', {}, 'A');
-    run.a.event('{"type":"run_started","run_id":"r-a"}');
-    await a;
-    const b = send(`c-d10-${status}`, '/b', {}, 'B').catch((error) => error);
+    await send(`c-br-${change}`, '/a', {}, 'A');
     await settle();
-    run.a.event(`{"type":"run_finished","status":"${status}"}`);
-    run.a.close();
-    await settle();
-    run.refuseB();
-    await b;
-    await settle();
-    assert.deepEqual(run.calls.queueSends, []);
+    assert.deepEqual(run.calls.queueSends.map(([url]) => url.split('/').at(-2)), change === 'edited' ? ['q1', 'q1'] : ['q1', 'q2']);
   });
 }
 
-test('Stop pressed while a newer send is pending stops the turn under way, and nothing waiting starts', async (t) => {
-  const run = overlapping('c-d14a');
-  t.mock.method(globalThis, 'fetch', run.fetch);
-  const a = send('c-d14a', '/a', {}, 'A');
-  run.a.event('{"type":"run_started","run_id":"r-a"}');
-  await a;
-  const b = send('c-d14a', '/b', {}, 'B').catch((error) => error);
-  await settle();
-  await stop('c-d14a');
-  assert.deepEqual(run.calls.cancels, ['/api/runs/r-a/cancel']); // the turn that runs, not only the pending send
-  assert.equal(run.calls.signals.b.aborted, true);
-  await b;
-  run.a.event('{"type":"run_finished","status":"cancelled"}');
-  run.a.close();
-  await settle();
-  assert.deepEqual(run.calls.queueSends, []);
-});
-
-test('Stop pressed while a newer send is pending, after the turn under it succeeded, starts nothing', async (t) => {
-  const run = overlapping('c-d14b');
-  t.mock.method(globalThis, 'fetch', run.fetch);
-  const a = send('c-d14b', '/a', {}, 'A');
-  run.a.event('{"type":"run_started","run_id":"r-a"}');
-  await a;
-  const b = send('c-d14b', '/b', {}, 'B').catch((error) => error);
-  await settle();
-  run.a.event('{"type":"run_finished","status":"succeeded"}');
-  run.a.close();
-  await settle();
-  await stop('c-d14b');
-  assert.deepEqual(run.calls.cancels, []); // it has ended
-  assert.equal(run.calls.signals.b.aborted, true);
-  await b;
-  await settle();
-  assert.deepEqual(run.calls.queueSends, []); // the researcher stopped: the message waits with Send
-});
-
-test('Stop pressed while a newer send is pending closes a turn whose first event is unread, and a send still pending', async (t) => {
-  for (const older of ['unread', 'pending']) {
-    const signals = {};
-    const unread = controlledStream();
-    t.mock.method(globalThis, 'fetch', async (url, init) => {
-      url = String(url);
-      signals[url] = init.signal;
-      if (url === '/older' && older === 'unread') return new Response(unread.body);
-      return new Promise((resolve, reject) => init.signal.addEventListener('abort',
-        () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
-    });
-    const conversation = `c-d14-${older}`;
-    send(conversation, '/older', {}, 'Older').catch(() => {});
+test('a message sent after the turn\'s last event but before its stream\'s end is refused here, and starts once, in either order', async (t) => {
+  for (const order of ['queued first', 'end first']) {
+    const a = controlledStream();
+    const conversation = `c-last-${order.split(' ')[0]}`;
+    let queued = [];
+    const run = backend({ streams: { '/a': () => new Response(a.body) }, read: () => record(conversation, 'succeeded', queued) });
+    t.mock.method(globalThis, 'fetch', run.fetch);
+    const sending = send(conversation, '/a', { model: 'm1' }, 'A');
+    a.event(`{"type":"run_started","run_id":"${conversation}"}`);
+    await sending;
+    a.event('{"type":"run_finished","status":"succeeded"}');
+    assert.equal((await send(conversation, '/b', {}, 'B').catch((error) => error)).code, 'active_run', order);
+    if (order === 'end first') { a.close(); await settle(); } // its end reads no waiting message yet
+    queued = [{ id: 'q1', text: 'B' }]; // the view queues it (the setting), then asks for a drain
+    drain(conversation);
+    if (order === 'queued first') a.close();
     await settle();
-    const b = send(conversation, '/newer', {}, 'Newer').catch((error) => error);
-    await settle();
-    await stop(conversation);
-    assert.equal(signals['/older'].aborted, true, older); // closing its stream stops a turn admitted or about to be
-    assert.equal(signals['/newer'].aborted, true, older);
-    await b;
+    assert.deepEqual(run.calls.queueSends.map(([url]) => url), [`/api/conversations/${conversation}/queue/q1/send`], order);
     t.mock.restoreAll();
   }
+});
+
+test('a steer answered "ended" after Stop waits with Send; one answered so with no Stop since starts once nothing runs here (N1)', async (t) => {
+  const { idle, stopsAt } = await import('../src/live.js');
+  const a = controlledStream();
+  t.mock.method(globalThis, 'fetch', async (url) => (String(url) === '/a' ? new Response(a.body) : Response.json({ status: 'cancelled' })));
+  const sending = send('c-n1', '/a', {}, 'A');
+  a.event('{"type":"run_started","run_id":"r-n1"}');
+  await sending;
+  const pressed = stopsAt('c-n1');
+  let free = false;
+  idle('c-n1').then(() => { free = true; });
+  await stop('c-n1');
+  assert.equal(stopsAt('c-n1'), pressed + 1); // the view compares it with what it read at the submit
+  await settle();
+  assert.equal(free, false); // its stream is still under way here
+  a.event('{"type":"run_finished","status":"cancelled"}');
+  a.close();
+  await settle();
+  assert.equal(free, true);
+  const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
+  assert.match(followUp, /const pressed = stopsAt\(id\)/);
+  assert.match(followUp, /await idle\(id\);\s*if \(stopsAt\(id\) === pressed\) await sendQueued\(sent\.queued\)/);
 });
 
 test('Stop with a send pending here also stops the turn the record shows running from another window', async (t) => {
@@ -419,12 +418,14 @@ test('Stop with a send pending here also stops the turn the record shows running
   await pending;
 });
 
-test('an older send still pending is given the conversation back when a newer one is refused, and Stop reaches it', async (t) => {
+test('a send still pending keeps the conversation when another message is sent meanwhile: that one is refused here, and Stop reaches the first', async (t) => {
   const cancels = [];
+  const requested = [];
   const older = controlledStream();
   let admit;
   t.mock.method(globalThis, 'fetch', async (url) => {
     url = String(url);
+    requested.push(url);
     if (url.includes('/cancel')) { cancels.push(url); return Response.json({}); }
     if (url === '/older') return new Promise((resolve) => { admit = () => resolve(new Response(older.body)); });
     return Response.json({ code: 'active_run' }, { status: 409 });
@@ -434,6 +435,7 @@ test('an older send still pending is given the conversation back when a newer on
   send('c-pend', '/older', {}, 'Older').catch(() => {});
   await settle();
   assert.equal((await send('c-pend', '/newer', {}, 'Newer').catch((error) => error)).code, 'active_run');
+  assert.ok(!requested.includes('/newer'));
   admit();
   await settle();
   older.event('{"type":"run_started","run_id":"r-older"}');
@@ -481,19 +483,19 @@ test('a limit too low for the step says the least amount it needs, rounded up so
   assert.equal(problemText(makeT('en'), Object.assign(new Error('x'), { code: 'x' }), 'en'), makeT('en')('errors.internal'));
 });
 
-test('a follow-up queued behind a turn drains on the route that turn was sent on, never the picker\'s choice now (D15)', async (t) => {
-  const { sentRoute } = await import('../src/live.js');
-  const stream = controlledStream();
-  t.mock.method(globalThis, 'fetch', async () => new Response(stream.body));
-  const sending = send('c-d15', '/x', { content: 'Q', model: 'm-a', provider: 'openrouter', effort: 'high', material_ids: ['p'] }, 'Q');
-  stream.event('{"type":"run_started","run_id":"r-d15"}');
-  await sending;
-  assert.deepEqual(sentRoute('r-d15'), { model: 'm-a', provider: 'openrouter', effort: 'high' });
-  assert.equal(sentRoute('r-unknown'), null); // a turn sent elsewhere: its own window drains it, or it waits with Send
-  stream.close();
+test('a waiting message starts on the route its turn was sent on, never the picker\'s choice now; after a turn sent elsewhere, nothing starts here (D15)', async (t) => {
+  let latest = 'r-d15';
+  const run = backend({ streams: { '/x': () => succeeded('r-d15') }, read: () => record(latest, 'succeeded') });
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  await send('c-d15', '/x', { content: 'Q', model: 'm-a', provider: 'openrouter', effort: 'high', material_ids: ['p'] }, 'Q');
+  await settle();
+  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-d15/queue/q1/send',
+    { model: 'm-a', provider: 'openrouter', effort: 'high', after: 'r-d15' }]]);
+  latest = 'r-elsewhere'; // the latest turn was sent from another window: that one starts it, or it waits with Send
+  await drain('c-d15');
+  assert.equal(run.calls.queueSends.length, 1);
   const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
   assert.ok(!followUp.includes('currentChoice'), followUp);
-  assert.match(followUp, /sentRoute\(after\)/);
 });
 
 test('a positive amount too small for four decimals is never shown as $0 (D17)', async () => {
@@ -517,9 +519,9 @@ test('the bar\'s edges: no notice percents, no bar; its meter never above its ma
   assert.match(VIEW(), /if \(done\?\.budget\) load\(\)/);
 });
 
-test('a steer whose turn had ended starts as a new turn, as Send does, if the conversation is free (D22, reading 12)', () => {
+test('a steer whose turn had ended starts as a new turn, as Send does, once nothing runs here (D22, reading 12)', () => {
   const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
-  assert.match(followUp, /if \(sent\.ended\) await sendQueued\(sent\.queued\)/);
+  assert.match(followUp, /if \(sent\.ended\) \{[^}]*await idle\(id\);\s*if \(stopsAt\(id\) === pressed\) await sendQueued\(sent\.queued\)/);
 });
 
 test('a budget ask whose project budget could not be read says so, never that the budget is $0 (E4), in both catalogs', () => {
@@ -528,5 +530,27 @@ test('a budget ask whose project budget could not be read says so, never that th
   for (const language of ['en', 'zh-CN']) {
     const catalog = JSON.parse(readFileSync(fileURLToPath(new URL(`../src/i18n/${language}.json`, import.meta.url)), 'utf8'));
     assert.ok(catalog['ask.budget.unread'] && !/\{limit\}/.test(catalog['ask.budget.unread']), language);
+  }
+});
+
+test('a message naming papers sent while a turn runs waits as the next turn with them, whatever the setting, and says so (item 5, SPEC:281)', async (t) => {
+  const sent = [];
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    sent.push([init?.method ?? 'GET', String(url), init?.body ? JSON.parse(init.body) : null]);
+    if (String(url).endsWith('/api/settings')) return Response.json({ values: { ui: { follow_up: 'steer' } } });
+    return Response.json({ id: 'q1', text: 'x', material_ids: ['p1'] });
+  });
+  assert.deepEqual(await follow('c1', 'r1', 'Only this one', ['p1']), { queued: { id: 'q1', text: 'x', material_ids: ['p1'] } });
+  assert.deepEqual(sent, [['POST', '/api/conversations/c1/queue', { content: 'Only this one', material_ids: ['p1'] }]]);
+  const followUp = VIEW().slice(VIEW().indexOf('async function followUp('), VIEW().indexOf('// Attached files'));
+  assert.match(followUp, /follow\(id, runId, text, papers\.map\(\(paper\) => paper\.id\)\)/);
+  assert.match(followUp, /if \(papers\.length\) choosePapers\(projectId, \[\]\)/);
+  const composer = VIEW().slice(VIEW().indexOf('function Composer('), VIEW().indexOf('const MENTION'));
+  assert.match(composer, /chosen\.length > 0 && running && [^\n]*\n\s*<p[^>]*>\{t\('composer\.papersWait'\)\}/);
+  // Send of one whose paper was deleted since says so in words for a waiting message, never "Choose again"
+  assert.match(VIEW(), /error\.code === 'selection_invalid'\) \{[^}]*setProblem\(t\('followUp\.paperGone'\)\)/);
+  for (const language of ['en', 'zh-CN']) {
+    const catalog = JSON.parse(readFileSync(fileURLToPath(new URL(`../src/i18n/${language}.json`, import.meta.url)), 'utf8'));
+    assert.ok(catalog['composer.papersWait'] && catalog['followUp.paperGone'], language);
   }
 });
