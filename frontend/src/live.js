@@ -58,10 +58,10 @@ export function apply(turn, event) {
 // S1-33 (PR 52 cycle 3): while a turn is being admitted or runs here in the conversation, it is refused here at once,
 // with no request, as the backend refuses a second turn (409 active_run): the message then follows the setting, steered
 // or queued (ConversationView), and the one stream here keeps the conversation, so Stop always reaches the turn shown.
-// PR 52 cycle 4 (design review B2): every request that starts a turn leaves through here, so Stop is checked here, in the
-// same step as the request: one is refused here (409 stopped, no request) when Stop was pressed in the conversation here
-// since `since` (the count its caller read when the researcher acted), and a start of its own (auto, the drain) also
-// while the conversation is halted here. Only a turn the researcher started clears that.
+// PR 52 cycle 4 (design review B2): every request that starts a turn leaves through here, so Stop is checked here, in
+// the same step as the request: one is refused here (409 stopped, no request) when Stop was pressed in the conversation
+// here since `since` (the count its caller read when the researcher acted), and a start of its own (auto, the drain)
+// also while the conversation is halted here. Only a turn the researcher started clears that.
 export function send(conversationId, path, body, text, since = stopsAt(conversationId), auto = false) {
   if (stopsAt(conversationId) !== since || (auto && halted.has(conversationId))) {
     return Promise.reject(new ApiError(409, 'stopped'));
@@ -104,7 +104,7 @@ export function send(conversationId, path, body, text, since = stopsAt(conversat
       if (!turn.done) turn = { ...turn, done: true };
       if (release() && turns.get(conversationId) && turns.get(conversationId) !== turn) set(conversationId, turn, 'run_finished');
       admitted();
-      drain(conversationId); // the conversation is free here again, however the stream ended: the record says what follows
+      drain(conversationId); // free here again, however the stream ended: the record says what follows
     });
   });
 }

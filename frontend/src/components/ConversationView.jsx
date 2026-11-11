@@ -208,9 +208,9 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       const sent = await follow(id, runId, text, papers.map((paper) => paper.id));
       if (papers.length) choosePapers(projectId, []); // they went with this message
       await load();
-      // Queued, or a steer whose turn had ended (it waits queued too): its turn may have ended already, and then it starts
-      // only as any waiting message does, after a turn that succeeded here (live.js drain); else it waits with Send
-      // (Harold, 2026-11-12, variant 1N)
+      // Queued, or a steer whose turn had ended (it waits queued too): its turn may have ended already, and then it
+      // starts only as any waiting message does, after a turn that succeeded here (live.js drain); else it waits with
+      // Send (Harold, 2026-11-12, variant 1N)
       if (sent.queued) drain(id);
       return true;
     } catch (error) {
@@ -256,7 +256,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     setProblem(null);
     try {
       await readChoice();
-      await send(id, `/api/runs/${turn.run_id}/continue`, messageRoute(currentChoice()), turn.message?.text ?? '', since);
+      await send(id, `/api/runs/${turn.run_id}/continue`, messageRoute(currentChoice()), turn.message?.text ?? '',
+        since);
     } catch (error) {
       if (error instanceof ApiError && error.code === 'stopped') return; // Continue is still offered
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
