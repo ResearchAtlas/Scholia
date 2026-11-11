@@ -3256,7 +3256,8 @@ def _take_queued(conn, conversation_id, text, queued_id, after, stopped=()):
         latest = conn.execute("SELECT t.run_id, r.status FROM turns t JOIN runs r ON r.id = t.run_id"
                               " WHERE t.conversation_id = ? ORDER BY t.seq DESC LIMIT 1", (conversation_id,)).fetchone()
         if latest is None or tuple(latest) != (after, "succeeded") or after in stopped:
-            raise AdmissionError(409, "not_after_success", "The turn before it did not succeed or was stopped; send it yourself")
+            raise AdmissionError(409, "not_after_success",
+                                 "The turn before it did not succeed or was stopped; send it yourself")
     if conn.execute("DELETE FROM queued_messages WHERE id = ? AND conversation_id = ? AND text = ?",
                     (queued_id, conversation_id, text)).rowcount != 1:
         raise AdmissionError(409, "not_queued", "This message is no longer waiting")

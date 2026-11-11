@@ -249,7 +249,8 @@ def queue(conn, conversation_id, text, material_ids=None):
     queued_id = new_id()
     conn.execute("INSERT INTO queued_messages (id, conversation_id, text, material_ids) VALUES (?, ?, ?, ?)",
                  (queued_id, conversation_id, text, json.dumps(material_ids) if material_ids else None))
-    return queued_row(conn.execute(f"SELECT {QUEUED_COLUMNS} FROM queued_messages WHERE id = ?", (queued_id,)).fetchone())
+    return queued_row(conn.execute(f"SELECT {QUEUED_COLUMNS} FROM queued_messages WHERE id = ?",
+                                   (queued_id,)).fetchone())
 
 
 def queued(conn, conversation_id):
