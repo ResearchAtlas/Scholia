@@ -62,6 +62,14 @@ def totals(conn, *, project_id=None, conversation_id=None):
     return round(settled, 9), round(held, 9)
 
 
+def bases(conn, *, project_id=None, conversation_id=None):
+    """The settled spend of a project, or of a paying conversation, by basis: {reported_usd, estimated_usd}."""
+    column, value = ("project_id", project_id) if conversation_id is None else ("paying_conversation_id", conversation_id)
+    found = dict(conn.execute(f"SELECT basis, coalesce(sum(settled_usd), 0) FROM budget_reservations WHERE {column} = ?"
+                              " AND status = 'settled' GROUP BY basis", (value,)).fetchall())
+    return {"reported_usd": round(found.get("reported", 0), 9), "estimated_usd": round(found.get("estimated", 0), 9)}
+
+
 def _limits(conn, data_dir, project_id, conversation_id):
     """{budget: (its limit now, whether it is the conversation's own)} for the project and, if given, the conversation."""
     project_limit, default = _budgets_now(data_dir, project_id)
@@ -74,31 +82,36 @@ def _limits(conn, data_dir, project_id, conversation_id):
 
 
 def spend(conn, data_dir, project_id, conversation_id=None):
-    """GET /api/projects/{id}/spend: settled and open spend against the project's limit and, given one, the
-    conversation's; no content. None for a conversation not in this project."""
+    """GET /api/projects/{id}/spend: settled spend (with its reported and estimated parts) and open spend against the
+    project's limit and, given one, the conversation's; no content. None for a conversation not in this project."""
     if conversation_id is not None and conn.execute(
             "SELECT 1 FROM conversations WHERE id = ? AND project_id = ?", (conversation_id, project_id)).fetchone() is None:
         return None
     limits = _limits(conn, data_dir, project_id, conversation_id)
     settled, held = totals(conn, project_id=project_id)
-    found = {"project": {"limit_usd": limits["project"][0], "settled_usd": settled, "open_usd": held}, "conversation": None,
+    found = {"project": {"limit_usd": limits["project"][0], "settled_usd": settled, "open_usd": held,
+                         **bases(conn, project_id=project_id)}, "conversation": None,
              "notice_percents": sorted(load_settings(data_dir).values["budget"]["notice_percents"])}
     if conversation_id is not None:
         settled, held = totals(conn, conversation_id=conversation_id)
         limit, own = limits["conversation"]
-        found["conversation"] = {"limit_usd": limit, "settled_usd": settled, "open_usd": held, "own": own}
+        found["conversation"] = {"limit_usd": limit, "settled_usd": settled, "open_usd": held, "own": own,
+                                 **bases(conn, conversation_id=conversation_id)}
     return found
 
 
 def notices(conn, run_id, data_dir):
     """After a settlement, in its transaction: a `budget_notice` event on this run for each notice threshold the settled
     spend of its budgets has reached and that is not yet recorded for that budget and limit (so one settlement crossing
-    several records each, and a raised limit rearms them). Returns what it recorded."""
-    row = conn.execute("SELECT project_id, CASE WHEN kind IN ('turn', 'child') THEN conversation_id END FROM runs"
-                       " WHERE id = ?", (run_id,)).fetchone()
+    several records each, and a raised or lowered limit rearms them). A conversation's are known by its runs' events,
+    deleted only with it; a project's by its own record (projects.budget_noticed), since its conversations are deleted
+    and moved with their runs (PR 52 cycle 2), and each names its project. Returns what it recorded."""
+    row = conn.execute("SELECT r.project_id, CASE WHEN r.kind IN ('turn', 'child') THEN r.conversation_id END,"
+                       " p.budget_noticed FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?",
+                       (run_id,)).fetchone()
     if row is None:
         return []
-    project_id, conversation_id = row
+    project_id, conversation_id, noticed = row[0], row[1], json.loads(row[2] or "[]")
     percents = sorted(load_settings(data_dir).values["budget"]["notice_percents"])
     recorded = []
     for budget, (limit, _) in _limits(conn, data_dir, project_id, conversation_id).items():
@@ -106,16 +119,25 @@ def notices(conn, run_id, data_dir):
             continue
         settled = totals(conn, **({"conversation_id": conversation_id} if budget == "conversation"
                                   else {"project_id": project_id}))[0]
-        scope = ("r.conversation_id = ?", conversation_id) if budget == "conversation" else ("r.project_id = ?", project_id)
         for percent in percents:
-            if settled * 100 < percent * limit - _EPSILON or conn.execute(
-                    "SELECT 1 FROM run_events e JOIN runs r ON r.id = e.run_id WHERE e.type = 'budget_notice'"
-                    f" AND {scope[0]} AND json_extract(e.data, '$.budget') = ? AND json_extract(e.data, '$.percent') = ?"
-                    " AND json_extract(e.data, '$.limit_usd') = ? LIMIT 1", (scope[1], budget, percent, limit)).fetchone():
+            if settled * 100 < percent * limit - _EPSILON:
                 continue
-            notice = {"budget": budget, "percent": percent, "limit_usd": limit, "settled_usd": settled}
+            if budget == "project":
+                if [percent, limit] in noticed:
+                    continue
+                noticed.append([percent, limit])
+            elif conn.execute(
+                    "SELECT 1 FROM run_events e JOIN runs r ON r.id = e.run_id WHERE e.type = 'budget_notice'"
+                    " AND r.conversation_id = ? AND json_extract(e.data, '$.budget') = 'conversation'"
+                    " AND json_extract(e.data, '$.percent') = ? AND json_extract(e.data, '$.limit_usd') = ? LIMIT 1",
+                    (conversation_id, percent, limit)).fetchone():
+                continue
+            notice = {"budget": budget, "percent": percent, "limit_usd": limit, "settled_usd": settled,
+                      **({"project_id": project_id} if budget == "project" else {})}
             _event(conn, run_id, "budget_notice", notice)
             recorded.append(notice)
+    if any(notice["budget"] == "project" for notice in recorded):
+        conn.execute("UPDATE projects SET budget_noticed = json(?) WHERE id = ?", (json.dumps(noticed), project_id))
     return recorded
 
 
@@ -129,10 +151,12 @@ def _typed(text):
 
 
 def _amount(conn, budget, scope_id, current, default):
-    """What Continue adds: the amount the budget's last decision recorded while its limit is what that decision left,
-    else the limit itself; for a limit of zero, the budget's default as configured (so Continue never adds nothing).
-    A conversation's decisions are its runs' events, deleted only with it; a project's last applied one is kept on the
-    project (projects.budget_decided), since its conversations, and their runs, may be deleted (review 1 of PR 52)."""
+    """What Continue adds: the amount the budget's last applied decision recorded while its limit is what that decision
+    left, else the limit itself; for a limit of zero, the budget's default as configured (so Continue never adds nothing).
+    A conversation's decisions are its runs' events, deleted only with it, and only an applied one counts (one stale or
+    stopped changed nothing: PR 52 cycle 2); a project's last applied one is kept on the project
+    (projects.budget_decided), since its conversations, and their runs, may be deleted (review 1 of PR 52), and a
+    Settings edit of the project's budget clears it, so the limit set there is the amount from then on."""
     if budget == "project":
         row = conn.execute("SELECT json_extract(budget_decided, '$.to_usd'), json_extract(budget_decided, '$.amount_usd')"
                            " FROM projects WHERE id = ?", (scope_id,)).fetchone()
@@ -142,6 +166,7 @@ def _amount(conn, budget, scope_id, current, default):
             "SELECT json_extract(e.data, '$.to_usd'), json_extract(e.data, '$.amount_usd') FROM run_events e"
             " JOIN runs r ON r.id = e.run_id WHERE e.type = 'budget_decision' AND r.conversation_id = ?"
             " AND json_extract(e.data, '$.budget') = ? AND json_extract(e.data, '$.amount_usd') IS NOT NULL"
+            " AND json_extract(e.data, '$.applied') = 1"
             " ORDER BY e.rowid DESC LIMIT 1", (scope_id, budget)).fetchone()
     found = row[1] if row is not None and abs(row[0] - current) <= _EPSILON else current
     return found if found > 0 else default

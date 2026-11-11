@@ -799,11 +799,13 @@ async def test_spend_reports_settled_and_open_spend_against_both_budgets_without
         await _spent(client, project, 0.25, other)
         spend = (await client.get(f"/api/projects/{project}/spend", params={"conversation_id": conversation})).json()
         assert spend == {
-            "project": {"limit_usd": 20.0, "settled_usd": 0.75, "open_usd": 0},
-            "conversation": {"limit_usd": 2.0, "settled_usd": 0.5, "open_usd": 0, "own": True},
+            "project": {"limit_usd": 20.0, "settled_usd": 0.75, "open_usd": 0, "reported_usd": 0.75, "estimated_usd": 0},
+            "conversation": {"limit_usd": 2.0, "settled_usd": 0.5, "open_usd": 0, "own": True, "reported_usd": 0.5,
+                             "estimated_usd": 0},
             "notice_percents": [50, 85, 90]}
         default = (await client.get(f"/api/projects/{project}/spend", params={"conversation_id": other})).json()
-        assert default["conversation"] == {"limit_usd": 10, "settled_usd": 0.25, "open_usd": 0, "own": False}
+        assert default["conversation"] == {"limit_usd": 10, "settled_usd": 0.25, "open_usd": 0, "own": False,
+                                           "reported_usd": 0.25, "estimated_usd": 0}
         await client.delete(f"/api/conversations/{conversation}")
         assert (await client.get(f"/api/projects/{project}/spend")).json()["project"]["settled_usd"] == 0.75
         assert (await client.get(f"/api/projects/{project}/spend", params={"conversation_id": conversation})).status_code == 404
@@ -1099,3 +1101,110 @@ async def test_a_settlement_on_stop_or_recovery_records_the_notices_it_reaches(t
         noticed = await _rows(client, "SELECT json_extract(data, '$.budget'), json_extract(data, '$.percent')"
                                       " FROM run_events WHERE run_id = ? AND type = 'budget_notice'", run_id)
         assert ("conversation", 50) in noticed
+
+
+# S1-33 fix batch 2: Continue's amount, the notices' record and the spend's bases
+
+
+@pytest.mark.asyncio
+async def test_a_settings_edit_makes_the_project_limit_continues_amount_even_back_at_the_last_decided_value(tmp_path):
+    # D3 (A5, reading 3): $1, Continue to $2, then $5 and $2 set in Settings: $2 is now the researcher's own setting, so
+    # the next Continue adds $2 (to $4), not the $1 the old decision added.
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 1.0)
+        await _spent(client, project, 1.0)
+        sending, ask = await _asking(client, conversation)
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 2.0
+        await sending
+        await _project_budget(client, project, 5.0)
+        await _project_budget(client, project, 2.0)
+        [(spent,)] = await _rows(client, "SELECT sum(settled_usd) FROM budget_reservations WHERE project_id = ?", project)
+        await _spent(client, project, round(2.0 - spent, 9))  # the cap again
+        sending, ask = await _asking(client, conversation, "Again?")
+        assert ask["params"]["form"] == "cap"
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 4.0
+        await sending
+
+
+@pytest.mark.asyncio
+async def test_a_stale_typed_answer_that_applied_nothing_never_sets_the_next_continues_amount(tmp_path):
+    # D7 (A5, L6): an ask raised at the $1 default, the default then set to $2, and the stale ask answered "100":
+    # nothing applied, so at the $2 cap Continue adds $2 (to $4), never the $100 that was not applied.
+    async with await _app(tmp_path) as client:
+        read = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": read["hash"], "updates": {"budget.conversation_usd": 1}})
+        conversation, project = await _conversation(client)
+        await _spent(client, project, 1.0, conversation)
+        sending, ask = await _asking(client, conversation)
+        read = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": read["hash"], "updates": {"budget.conversation_usd": 2}})
+        stale = (await _answer(client, ask, text="100")).json()["budget"]
+        assert stale["applied"] is False
+        assert (await sending)[-1]["status"] == "succeeded"
+        [(spent,)] = await _rows(client, "SELECT sum(settled_usd) FROM budget_reservations WHERE paying_conversation_id = ?",
+                                 conversation)
+        await _spent(client, project, round(2.0 - spent, 9), conversation)
+        sending, ask = await _asking(client, conversation, "Again?")
+        assert ask["params"]["form"] == "cap"
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 4.0
+        await sending
+
+
+@pytest.mark.asyncio
+async def test_a_project_notice_is_recorded_once_whatever_conversation_is_deleted_or_moved(tmp_path):
+    # D4 (N2, reading 8): the project's notices are the project's own record, not its runs' events, which go with a
+    # conversation deleted or moved: deleting one never rearms a notice, and a moved one never carries a notice into
+    # another project (whose spend it does not describe), nor takes one away from its first.
+    from scholia_app import MockProvider, send
+    async with await _app(tmp_path, MockProvider(cost=0.01)) as client:
+        first, project = await _project_conversation(client, budget=1.0)
+        other = (await client.post("/api/projects", json={"name": "Other"})).json()["id"]
+        await _project_budget(client, other, 1.0)
+
+        async def noticed(where):
+            return await _rows(client, "SELECT count(*) FROM run_events e JOIN runs r ON r.id = e.run_id"
+                                       " WHERE e.type = 'budget_notice' AND json_extract(e.data, '$.budget') = 'project'"
+                                       " AND json_extract(e.data, '$.percent') = 50 AND json_extract(e.data, '$.project_id') = ?", where)
+        await _spent(client, project, 0.5)
+        stream = await send(client, first, "Short?")
+        assert ("project", 50) in [(e["budget"], e["percent"]) for e in stream if e["type"] == "budget"]
+        from scholia_app import background_idle
+        await background_idle(client)
+        moved = await client.post(f"/api/conversations/{first}/move", json={"project_id": other})
+        assert moved.status_code == 200, moved.text
+        second = (await client.post("/api/conversations", json={"project_id": project, "title": "t"})).json()["id"]
+        stream = await send(client, second, "Again?")  # the first project at 52%: its 50% was recorded already
+        assert not [e for e in stream if e["type"] == "budget" and e["budget"] == "project"]
+        await _spent(client, other, 0.5)
+        third = (await client.post("/api/conversations", json={"project_id": other, "title": "t"})).json()["id"]
+        stream = await send(client, third, "There?")  # the other project reaches its own 50% now
+        assert ("project", 50) in [(e["budget"], e["percent"]) for e in stream if e["type"] == "budget"]
+        assert (await client.delete(f"/api/conversations/{third}")).status_code == 200
+        await background_idle(client)
+        fourth = (await client.post("/api/conversations", json={"project_id": other, "title": "t"})).json()["id"]
+        stream = await send(client, fourth, "Still?")  # deleting the conversation that recorded it rearms nothing
+        assert not [e for e in stream if e["type"] == "budget" and e["budget"] == "project"]
+        assert await noticed(project) == [(1,)]  # the moved conversation's run still says whose notice it recorded
+        import json
+        kept = dict(await _rows(client, "SELECT id, budget_noticed FROM projects WHERE id IN (?, ?)", project, other))
+        assert json.loads(kept[project]) == [[50, 1.0]] and json.loads(kept[other]) == [[50, 1.0]]
+
+
+@pytest.mark.asyncio
+async def test_spend_gives_each_budgets_settled_spend_by_basis(tmp_path):
+    # D6 (N3): settled spend split into reported and estimated, for the project and the conversation, beside the totals.
+    from backend.db import utc_now
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client, budget=2.0)
+        await _spent(client, project, 0.1, conversation)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "INSERT INTO budget_reservations (id, step_seq, paying_conversation_id, project_id, estimate_usd, status,"
+            " settled_usd, basis, settled_at) VALUES (?, 0, ?, ?, 0.045494, 'settled', 0.045494, 'estimated', ?)",
+            (new_id(), conversation, project, utc_now())))
+        await _spent(client, project, 0.25)  # another conversation's, or a background run's
+        spend = (await client.get(f"/api/projects/{project}/spend", params={"conversation_id": conversation})).json()
+        assert {k: spend["project"][k] for k in ("settled_usd", "reported_usd", "estimated_usd")} == {
+            "settled_usd": 0.395494, "reported_usd": 0.35, "estimated_usd": 0.045494}
+        assert {k: spend["conversation"][k] for k in ("settled_usd", "reported_usd", "estimated_usd")} == {
+            "settled_usd": 0.145494, "reported_usd": 0.1, "estimated_usd": 0.045494}

@@ -709,4 +709,10 @@ BEGIN
 END;
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009, _0010)
+# S1-33 (PR 52 cycle 2): the project budget's notices already recorded ([percent, limit_usd] pairs), kept with the
+# project, so deleting or moving a conversation, whose runs' events go with it, neither rearms one nor carries one away.
+_0011 = r"""
+ALTER TABLE projects ADD COLUMN budget_noticed TEXT CHECK (budget_noticed IS NULL OR json_valid(budget_noticed));
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009, _0010, _0011)
