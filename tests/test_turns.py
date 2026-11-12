@@ -550,12 +550,17 @@ async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tm
     loop = asyncio.get_running_loop()
 
     def slow_inputs(data_root):
-        loop.call_soon_threadsafe(checking.set)
+        turn = client.state["harness"].registry.turns.get(conversation)
+        if turn is not None and turn.call is not None:  # the turn's own call, reserved, is at the gate
+            loop.call_soon_threadsafe(checking.set)
         time.sleep(0.3)  # the gate is still checking when Stop arrives
         return real(data_root)
 
     async with started(tmp_path / "data") as client:
         await send(client, await new_conversation(client, title="t"))  # the catalog and endpoints, read once
+        # PR 52 (CI on 82e95ab): its memory extraction is done before the patch, so only the turn's own call is checked
+        # after it (a late extraction's check had set the signal before the turn reserved: no reservation to release)
+        await background_idle(client)
         conversation = await new_conversation(client, title="t")
         monkeypatch.setattr(providers_module, "gate_inputs", slow_inputs)
         stream = asyncio.create_task(send(client, conversation))
@@ -563,7 +568,7 @@ async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tm
         run_id = active_turn(client, conversation).run_id
         await client.post(f"/api/runs/{run_id}/cancel")
         assert (await stream)[-1]["status"] == "cancelled"
-        assert len(client.provider.chats) == 1  # the first conversation's only
+        assert len(client.provider.answers) == 1  # the first conversation's only (its extraction is not an answer)
         assert await rows(client, "SELECT status, settled_usd FROM budget_reservations WHERE run_id = ?",
                           run_id) == [("released", None)]
 
