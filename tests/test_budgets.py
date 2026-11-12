@@ -2150,3 +2150,66 @@ async def test_a_budget_ask_whose_run_ended_without_its_terminal_write_is_closed
         assert await _decisions(client, claim.run_id) == []
         assert (await client.get("/api/asks", params={"conversation_id": conversation})).json()["asks"] == []
 
+
+# PR 52's follow-up (Harold, 2026-11-12, the batch 3 readings' (3)): E4's rule for the personal config.toml. While it gives
+# no valid conversation budget, its loader's shipped $10 says nothing of what it holds: a conversation without a limit of
+# its own has no room, so each step asks and the ask says the budget could not be read (never that it is $0); Continue
+# and Go ahead apply nothing; a typed limit applies, the conversation's own from then on. One with its own limit is read
+# from the record, as before.
+
+PERSONAL_UNREAD = [b'budget = "broken"\n', b"[[budget]]\nconversation_usd = 2\n", b"[budget.conversation_usd]\ntoken = 1\n",
+                   b'[budget]\nconversation_usd = "ten"\n']  # a file not valid TOML gives no provider either: no turn runs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left", PERSONAL_UNREAD)
+async def test_while_the_personal_file_gives_no_conversation_budget_each_step_asks_and_only_a_typed_limit_applies(
+        tmp_path, left):
+    from scholia_app import send
+    from test_agent_loop import asked
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        own, _ = await _conversation(client, budget=2.0, title="Own")
+        personal = tmp_path / "data" / "config.toml"
+        personal.write_bytes(left + personal.read_bytes())  # before its providers table, which stays as it was
+        sending, ask = await _asking(client, conversation)
+        params = ask["params"]
+        assert (params["budget"], params["form"], params["limit_usd"], params.get("unread")) == (
+            "conversation", "cap", 0, True)
+        assert client.provider.answers == []  # the step never went out at the shipped default
+        spend = (await client.get(f"/api/projects/{project}/spend", params={"conversation_id": conversation})).json()
+        assert (spend["conversation"]["limit_usd"], spend["conversation"]["own"]) == (None, False)
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["applied"] is False
+        [decided] = await _decisions(client, ask["run_id"])
+        assert (decided["from_usd"], decided["to_usd"], decided["amount_usd"], decided["applied"]) == (
+            None, None, None, False)  # unknown, never $0, and nothing to add to
+        again = await asked(client, conversation)
+        while again["ask_id"] == ask["ask_id"]:
+            assert not sending.done(), (await sending)[-1]
+            await asyncio.sleep(0.02)
+            again = await asked(client, conversation)
+        assert again["params"].get("unread") is True and client.provider.answers == []
+        answered = await _answer(client, again, text="3")
+        assert answered.json()["budget"] == {"applied": True, "budget": "conversation", "limit_usd": 3.0}
+        assert (await sending)[-1]["status"] == "succeeded"
+        assert await _own_budget(client, conversation) == 3.0
+        decided = (await _decisions(client, again["run_id"]))[-1]
+        assert (decided["decision"], decided["from_usd"], decided["to_usd"], decided["amount_usd"]) == (
+            "set_limit", None, 3.0, 3.0)
+        assert (await send(client, own, "Own?"))[-1]["status"] == "succeeded"  # its own limit, from the record
+        from backend import runs
+        assert (await asyncio.to_thread(runs._budgets_now, tmp_path / "data", project))[1] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_personal_file_not_valid_toml_gives_no_room_and_one_giving_its_budget_or_none_is_read_as_before(
+        tmp_path):
+    # The rule's edges: a file not valid TOML gives no room; one without the key, or with a problem elsewhere, gives the
+    # default as it always did
+    from backend import runs
+    async with await _app(tmp_path) as client:
+        _, project = await _conversation(client)
+        for raw, default in ((b"[budget\nconversation_usd = ", 0.0), (b"", 10), (b'[budget]\nnotice_percents = "x"\n', 10),
+                             (b"[budget]\nconversation_usd = 4\n", 4), (b'[ui]\nfollow_up = 7\n', 10)):
+            (tmp_path / "data" / "config.toml").write_bytes(raw)
+            assert (await asyncio.to_thread(runs._budgets_now, tmp_path / "data", project))[1] == default, raw

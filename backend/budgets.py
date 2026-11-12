@@ -21,7 +21,7 @@ import re
 import unicodedata
 
 from backend import governance, openrouter, spending
-from backend.runs import _budget_unread, _budgets_now, _event
+from backend.runs import _budgets_now, _event, _limit_unread
 from backend.settings import PERSONAL, PROJECT, load_settings
 
 _EPSILON = 1e-9
@@ -90,14 +90,16 @@ def spend(conn, data_dir, project_id, conversation_id=None):
         return None
     limits = _limits(conn, data_dir, project_id, conversation_id)
     settled, held = totals(conn, project_id=project_id)
-    unread = _budget_unread(load_settings(data_dir, project_id))  # no limit shown that its file does not give (E4)
+    unread = _limit_unread(conn, data_dir, "project", project_id)  # no limit shown that its file does not give (E4)
     found = {"project": {"limit_usd": None if unread else limits["project"][0], "settled_usd": settled, "open_usd": held,
                          **bases(conn, project_id=project_id)}, "conversation": None,
              "notice_percents": sorted(load_settings(data_dir).values["budget"]["notice_percents"])}
     if conversation_id is not None:
         settled, held = totals(conn, conversation_id=conversation_id)
         limit, own = limits["conversation"]
-        found["conversation"] = {"limit_usd": limit, "settled_usd": settled, "open_usd": held, "own": own,
+        unread = _limit_unread(conn, data_dir, "conversation", project_id, conversation_id)
+        found["conversation"] = {"limit_usd": None if unread else limit, "settled_usd": settled, "open_usd": held,
+                                 "own": own,
                                  **bases(conn, conversation_id=conversation_id)}
     return found
 
@@ -209,7 +211,7 @@ def decide(conn, run_id, ask, option, text, data_dir):
     stale = abs(current - params["limit_usd"]) > _EPSILON or (bool(params.get("unread")) and text is None)
     applied = not stale and decision not in STOPS and abs(wanted - current) > _EPSILON
     # what the records say the limit was: nothing when its file does not give it, never $0 (and no amount to add to)
-    known = None if budget == "project" and _budget_unread(load_settings(data_dir, project_id)) else current
+    known = None if _limit_unread(conn, data_dir, budget, project_id, conversation_id) else current
     amount = amount if known is not None or text is not None else None
     to = wanted if applied else known
     pending = applied and budget == "project"

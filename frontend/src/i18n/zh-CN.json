@@ -1359,6 +1359,7 @@
   "ask.budget.cap.conversation": "本对话已用完 {limit} 的预算。",
   "ask.budget.cap.project": "本项目已用完 {limit} 的预算。",
   "ask.budget.unread": "Scholia 无法从设置文件中读取这个项目的预算，因此每一步之前都会先询问。修复该文件后，再回答即可重新检查这一步。",
+  "ask.budget.unreadConversation": "Scholia 无法从设置文件中读取默认的对话预算，因此每一步之前都会先询问。修复该文件后，再回答即可重新检查这一步。",
   "ask.budget.step.conversation": "{step}预计约需 {estimate}，超过本对话 {limit} 预算中剩余的 {left}。",
   "ask.budget.step.project": "{step}预计约需 {estimate}，超过本项目 {limit} 预算中剩余的 {left}。",
   "ask.budget.body": "费用均为估算：预算限定 Scholia 开始每一步时预计的花费。",

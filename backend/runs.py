@@ -1328,9 +1328,9 @@ class Harness:
         spent = await self._read(lambda conn: spending.spent(
             conn, **({"conversation_id": conversation_id} if conversation_id else {"project_id": project_id})))
         form = "cap" if spent + 1e-9 >= refused.limit_usd else "step"
-        # a project budget its file does not give: the ask says so, never that the budget is $0 (PR 52 cycle 3, E4)
-        unread = refused.budget == "project" and await asyncio.to_thread(
-            lambda: _budget_unread(load_settings(self.data_dir, project_id)))
+        # a budget its file does not give: the ask says so, never that the budget is $0 (PR 52 cycle 3, E4)
+        unread = await self._read(lambda conn: _limit_unread(conn, self.data_dir, refused.budget, project_id,
+                                                             paying_conversation_id))
         turn = agent.Turn(self, active, agent.Evidence({}), active.events.put_nowait)
         return await self._ask(turn, "budget", budget_rules.options(form), {
             "form": form, "budget": refused.budget, "limit_usd": refused.limit_usd, "spent_usd": spent,
@@ -3199,20 +3199,31 @@ def _kept_body(conn, call, number, dispatched):
 
 
 def _budgets_now(data_dir, project_id):
-    """The project's budget and the default conversation budget, as the settings files say now. A project budget its
+    """The project's budget and the default conversation budget, as the settings files say now. A budget its
     config.toml does not give (_budget_unread) is 0, never the loader's default, which says nothing of what the file
-    holds (PR 52 cycle 3, E4): nothing is admitted against it, so a step asks again (Harold, 2026-10-21)."""
+    holds (PR 52 cycle 3, E4): nothing is admitted against it, so a step asks again (Harold, 2026-10-21). The same for
+    the personal file's default (Harold, 2026-11-12): a conversation without a limit of its own then has no room."""
     personal, project = load_settings(data_dir), load_settings(data_dir, project_id)
     return (0.0 if _budget_unread(project) else project.values["project"]["budget_usd"],
-            personal.values["budget"]["conversation_usd"])
+            0.0 if _budget_unread(personal, "budget", "conversation_usd") else personal.values["budget"]["conversation_usd"])
 
 
-def _budget_unread(project):
-    """Whether a project's loaded settings do not give its budget: the file unreadable or not valid TOML, or a problem
-    with the [project] table itself (not a table: PR 52 cycle 4, G2), with the value, or with a key under it (a table
-    where the value belongs); any of these gives the loader's default."""
-    return any(problem["key"] in (None, "project") or (problem["key"] + ".").startswith("project.budget_usd.")
-               for problem in project.problems)
+def _budget_unread(loaded, table="project", key="budget_usd"):
+    """Whether loaded settings do not give a budget (a project's [project] budget_usd, or the personal [budget]
+    conversation_usd): the file unreadable or not valid TOML, or a problem with its table itself (not a table: PR 52
+    cycle 4, G2), with the value, or with a key under it (a table where the value belongs); any of these gives the
+    loader's default."""
+    return any(problem["key"] in (None, table) or (problem["key"] + ".").startswith(f"{table}.{key}.")
+               for problem in loaded.problems)
+
+
+def _limit_unread(conn, data_dir, budget, project_id, conversation_id=None):
+    """Whether a budget's limit is one its settings file does not give (_budget_unread), so no ask or record says it is
+    $0: the project's, or a conversation's without a limit of its own (the personal default)."""
+    if budget == "project":
+        return _budget_unread(load_settings(data_dir, project_id))
+    own = conn.execute("SELECT budget_usd FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+    return own is not None and own[0] is None and _budget_unread(load_settings(data_dir), "budget", "conversation_usd")
 
 
 def _notices(conn, run_id, data_dir):

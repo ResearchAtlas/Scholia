@@ -1407,6 +1407,7 @@
   "ask.budget.cap.conversation": "This conversation has used its budget of {limit}.",
   "ask.budget.cap.project": "This project has used its budget of {limit}.",
   "ask.budget.unread": "Scholia could not read this project's budget in its settings file, so it asks before each step. Once the file is fixed, answer to check the step again.",
+  "ask.budget.unreadConversation": "Scholia could not read the default conversation budget in your settings file, so it asks before each step. Once the file is fixed, answer to check the step again.",
   "ask.budget.step.conversation": "{step} is estimated at about {estimate}, more than the {left} left in this conversation's budget of {limit}.",
   "ask.budget.step.project": "{step} is estimated at about {estimate}, more than the {left} left in this project's budget of {limit}.",
   "ask.budget.body": "Costs are estimates: a budget bounds what Scholia expects to spend when it starts each step.",

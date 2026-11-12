@@ -798,12 +798,15 @@ test('a steer whose turn had ended waits queued and starts only as any waiting m
   assert.match(followUp, /\n\s*if \(sent\.queued\) drain\(id\);/);
 });
 
-test('a budget ask whose project budget could not be read says so, never that the budget is $0 (E4), in both catalogs', () => {
+// PR 52's follow-up: E4's rule for the personal file too, whose default conversation budget the ask names instead.
+test('a budget ask whose budget could not be read says so, never that the budget is $0 (E4), in both catalogs', () => {
   const ask = readFileSync(fileURLToPath(new URL('../src/components/Ask.jsx', import.meta.url)), 'utf8');
-  assert.match(ask, /budget\?\.unread \? t\('ask\.budget\.unread'\)/);
+  assert.match(ask, /budget\?\.unread \? t\(budget\.budget === 'conversation' \? 'ask\.budget\.unreadConversation' : 'ask\.budget\.unread'\)/);
   for (const language of ['en', 'zh-CN']) {
     const catalog = JSON.parse(readFileSync(fileURLToPath(new URL(`../src/i18n/${language}.json`, import.meta.url)), 'utf8'));
-    assert.ok(catalog['ask.budget.unread'] && !/\{limit\}/.test(catalog['ask.budget.unread']), language);
+    for (const key of ['ask.budget.unread', 'ask.budget.unreadConversation']) {
+      assert.ok(catalog[key] && !/\{limit\}/.test(catalog[key]), `${language} ${key}`);
+    }
   }
 });
 
