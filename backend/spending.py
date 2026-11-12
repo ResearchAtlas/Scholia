@@ -80,7 +80,7 @@ def reserve(conn, *, run_id: str, step_seq: int, project_id: str, paying_convers
     """Write an open reservation for one model call and return its id.
 
     A budget of None is not checked; background runs pay no conversation. Raises
-    BudgetExceeded, writing nothing, when the estimate does not fit a budget, and
+    BudgetExceeded, writing nothing, when the estimate does not fit a budget (none fits $0), and
     ValueError for an estimate that is not a non-negative number.
     """
     estimate = amount(estimate_usd)
@@ -94,8 +94,11 @@ def reserve(conn, *, run_id: str, step_seq: int, project_id: str, paying_convers
             continue
         already = spent(conn, **scope)
         # as budgets.decide sums what a step needs, within the kept precision or, for large amounts, a few units of the
-        # float's last place, so the order a step's rows are summed in never refuses the limit Go ahead set for them
-        if round(already + estimate, _DECIMALS) > limit + max(10 ** -_DECIMALS, 4 * math.ulp(limit)):
+        # float's last place, so the order a step's rows are summed in never refuses the limit Go ahead set for them.
+        # A budget of $0 admits nothing, a step that costs nothing included: it is used up already (G2), and a budget
+        # its file does not give is read as $0 (runs._budgets_now), against which nothing is admitted (Harold,
+        # 2026-10-21; the first review's A-F3).
+        if limit <= 0 or round(already + estimate, _DECIMALS) > limit + max(10 ** -_DECIMALS, 4 * math.ulp(limit)):
             raise BudgetExceeded(budget, limit, already, estimate)
     reservation_id = new_id()
     conn.execute(

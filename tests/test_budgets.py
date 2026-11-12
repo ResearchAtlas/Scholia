@@ -2321,6 +2321,44 @@ async def test_a_budget_ask_whose_run_ended_without_its_terminal_write_is_closed
         assert (await client.get("/api/asks", params={"conversation_id": conversation})).json()["asks"] == []
 
 
+# Fix batch 1, A-F3 (Harold, 2026-10-21: nothing is admitted against a budget its file does not give, so each step asks;
+# 2026-11-12 (3) for the personal default): such a budget is read as $0, and a step whose route publishes zero prices
+# fitted it, so it went out with no ask. A budget of $0 (one used up already, G2, or one not read) admits nothing.
+
+_FREE = {"tag": "free", "context_length": 128000, "pricing": {"prompt": "0", "completion": "0"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["conversation", "project", "own zero"])
+async def test_a_step_that_costs_nothing_asks_while_its_budget_cannot_be_read_or_is_zero(tmp_path, budget):
+    from scholia_app import MockProvider
+    async with await _app(tmp_path, MockProvider(endpoints={budget_router_model(): [_FREE]})) as client:
+        conversation, project = await _conversation(client, budget=0 if budget == "own zero" else None)
+        if budget == "conversation":
+            personal = tmp_path / "data" / "config.toml"
+            personal.write_bytes(b'[budget]\nconversation_usd = "broken"\n' + personal.read_bytes())
+        elif budget == "project":
+            await _project_budget(client, project, 50.0)
+            _hand_set(tmp_path, project, '"broken"')
+        sending, ask = await _asking(client, conversation)
+        params = ask["params"]
+        assert (params["budget"], params["form"], params["estimate_usd"], params.get("unread")) == (
+            "project" if budget == "project" else "conversation", "cap", 0, None if budget == "own zero" else True)
+        assert client.provider.answers == []  # it never went out
+        assert (await _answer(client, ask, option="stop")).status_code == 200
+        assert [(e["type"], e.get("cancel_reason")) for e in await sending][-1] == ("run_finished", "limit")
+        assert client.provider.answers == []
+
+
+def test_a_background_call_that_costs_nothing_is_not_admitted_against_a_budget_of_zero(db):
+    # A10: a background run never asks; under a project budget its file does not give (read as $0) its call is refused
+    # as any other is, so a title ends failed and an extraction is skipped, whatever its route costs
+    project = add_project(db)
+    with pytest.raises(spending.BudgetExceeded):
+        reserve(db, project, None, add_turn(db, project)[1], 0.0, project_budget=0.0, conversation_budget=None)
+    assert reserve(db, project, None, add_turn(db, project)[1], 0.0, project_budget=1e-9, conversation_budget=None)
+
+
 # PR 52's follow-up (Harold, 2026-11-12, the batch 3 readings' (3)): E4's rule for the personal config.toml. While it gives
 # no valid conversation budget, its loader's shipped $10 says nothing of what it holds: a conversation without a limit of
 # its own has no room, so each step asks and the ask says the budget could not be read (never that it is $0); Continue
