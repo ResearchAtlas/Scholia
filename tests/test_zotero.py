@@ -758,10 +758,12 @@ async def test_a_lookup_for_a_doi_the_record_no_longer_gives_applies_nothing(tmp
 async def test_deleting_a_paper_revokes_every_import_of_its_item_even_one_admitted_before_it_existed(tmp_path,
                                                                                                     monkeypatch):
     mock = library(tmp_path, pdfs=False)
-    real, calls, both, later = zotero._fetch_item, [], asyncio.Event(), asyncio.Event()
+    real, calls, inside, both, later = zotero._fetch_item, [], asyncio.Event(), asyncio.Event(), asyncio.Event()
 
     async def fetch(harness, active, *args):
         calls.append(active.run_id)
+        if len(calls) == 2:
+            inside.set()
         await (both if len(calls) == 1 else later).wait()
         return await real(harness, active, *args)
 
@@ -769,6 +771,7 @@ async def test_deleting_a_paper_revokes_every_import_of_its_item_even_one_admitt
     async with started(tmp_path / "data", provider(mock)) as client:
         project = await project_of(client)
         runs = [await start(client, project, KEYS[:1]), await start(client, project, KEYS[:1])]
+        await asyncio.wait_for(inside.wait(), 10)  # both imports are in the fetch, so the first of them is known
         both.set()  # both admitted while the paper did not exist: the first goes on
         first = await run_finished(client, calls[0])
         assert first["status"] == "succeeded"
