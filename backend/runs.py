@@ -682,8 +682,10 @@ class Harness:
                 _event(conn, run_id, "steering_note", {"text": text})
                 return {"steering": {"run_id": run_id, "seq": seq}}
             return {"queued": budgets.queue(conn, row[0], text), **({} if under_way else {"ended": True})}
-        done, cancelled = await self._write_through(write)  # once it commits, said on the stream even if cancelled then
-        if "queued" in done and active is not None:  # the turn's stream says so too (SPEC:641)
+        done, cancelled = await self._write_through(write)  # once it commits, its reply says it even if cancelled then
+        # A live label on the turn's stream while it is open (SPEC:641); it may come after the end, or not at all once
+        # the stream has ended: the reply says the row, and the read at the turn's end holds it (Harold, 2026-11-13).
+        if "queued" in done and active is not None and self.registry.runs.get(run_id) is active:
             active.events.put_nowait({"type": "queued"})
         if cancelled:
             raise asyncio.CancelledError()

@@ -1346,8 +1346,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             if conn.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone() is None:
                 raise ApiError(404, "not_found", "No such conversation")
             return budgets.queue(conn, conversation_id, text, body.material_ids)
-        added, cancelled = await _through(write(add))  # once its row commits, said on the stream even if cancelled then
-        if (running := harness().registry.turns.get(conversation_id)) is not None:  # its stream says so (SPEC:641)
+        added, cancelled = await _through(write(add))  # once its row commits, its reply says it even if cancelled then
+        # A live label on a running turn's stream (SPEC:641), which may come after that turn's end; the reply says the
+        # row, and the read at the turn's end holds every message queued before it (Harold, 2026-11-13).
+        if (running := harness().registry.turns.get(conversation_id)) is not None:
             running.events.put_nowait({"type": "queued"})
         if cancelled:
             raise asyncio.CancelledError()

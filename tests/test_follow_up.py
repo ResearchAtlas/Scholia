@@ -630,8 +630,8 @@ async def test_a_note_of_a_turn_whose_terminal_write_failed_is_not_said_to_be_qu
 
 async def test_each_way_a_message_joins_the_queue_is_streamed_as_queued(tmp_path):
     # D11 (F4, SPEC:641): queued by the researcher while the turn runs, by a steer the turn has no step left to read,
-    # and by a note left unread at the turn's end: each streamed as `queued` on the running turn's stream, before its
-    # end, once its row has committed. The event carries no text.
+    # and by a note left unread at the turn's end: each streamed as `queued` on the running turn's stream once its row
+    # has committed, here before its end (a live label: design review P2's Option 1, below). The event carries no text.
     gate = Gate(0)
     provider = Scripted(None)
     provider.script.append(gate.wrap(provider, "The answer."))
@@ -666,6 +666,121 @@ async def test_each_way_a_message_joins_the_queue_is_streamed_as_queued(tmp_path
         assert "queued" in (await steer(client, run_id, "Shorter, please")).json()
         release.set()
         assert [e["type"] for e in await sending].count("queued") == 1
+
+
+# PR 52's follow-up, design review P2's Option 1 (Harold's decision, 2026-11-13): `budget` and `steering_note` are sent
+# before `run_finished`; `queued` and the other stream events are live labels. The reply to the request that queued a
+# message says its row, and the record read at the turn's end holds every message queued before that end. Each case is
+# the first review's B-F1 schedule: none asserts where `queued` falls on the stream.
+
+
+def _held_write(client, monkeypatch, name, before=False):
+    """Hold the database write whose function's qualified name ends with name in its worker thread, once it committed
+    (or, with before, before it begins): (reached, go), threading events: reached is set when it gets there, and it goes
+    on once go is set."""
+    import threading
+    db, real, reached, go = client.state["db"], client.state["db"].write, threading.Event(), threading.Event()
+
+    def write(fn, *args, **kwargs):
+        if not getattr(fn, "__qualname__", "").endswith(name):
+            return real(fn, *args, **kwargs)
+        if before:
+            reached.set()
+            go.wait(10)
+        result = real(fn, *args, **kwargs)
+        if not before:
+            reached.set()
+            go.wait(10)
+        return result
+    monkeypatch.setattr(db, "write", write)
+    return reached, go
+
+
+async def _slow_turn(client, provider, conversation):
+    """A turn whose one model call waits: (its sending task, its run's ActiveRun, the event that lets the call answer)."""
+    release = asyncio.Event()
+
+    async def held(body):
+        await release.wait()
+        return provider.answer("Slow.")
+    provider.replies.append(held)
+    sending = asyncio.create_task(send(client, conversation, "Slow one?"))
+    run_id = await running_run(client, conversation)
+    while not provider.answers:
+        await asyncio.sleep(0.01)
+    return sending, client.state["harness"].registry.runs[run_id], release
+
+
+async def test_a_message_queued_while_its_turn_ends_is_in_the_read_at_that_end_and_in_its_reply(tmp_path, monkeypatch):
+    # B-F1, the queue endpoint: its row commits while the turn runs, its request returns only after the turn ended
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending, _, release = await _slow_turn(client, provider, conversation)
+        reached, go = _held_write(client, monkeypatch, "queue_message.<locals>.add")
+        queueing = asyncio.create_task(client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"}))
+        assert await asyncio.to_thread(reached.wait, 10)
+        release.set()
+        assert [(e["type"], e.get("status")) for e in await sending][-1] == ("run_finished", "succeeded")
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["Next?"]
+        go.set()
+        response = await queueing
+        assert (response.status_code, response.json()["text"]) == (201, "Next?")
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["Next?"]
+
+
+async def test_a_steer_queued_on_a_route_without_tools_while_its_turn_ends_is_in_the_read_and_in_its_reply(
+        tmp_path, monkeypatch):
+    # B-F1, a steer the turn has no step to read: its row commits while the turn runs, its reply comes after the end,
+    # and nothing is put on the ended stream
+    provider = MockProvider()
+    provider.parameters = ["max_tokens", "temperature"]  # no endpoint takes tools: the turn has no next step
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending, active, release = await _slow_turn(client, provider, conversation)
+        reached, go = _held_write(client, monkeypatch, "steer.<locals>.write")
+        steering = asyncio.create_task(steer(client, active.run_id, "Shorter, please"))
+        assert await asyncio.to_thread(reached.wait, 10)
+        release.set()
+        assert [(e["type"], e.get("status")) for e in await sending][-1] == ("run_finished", "succeeded")
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["Shorter, please"]
+        go.set()
+        response = await steering
+        assert response.status_code == 200 and response.json()["queued"]["text"] == "Shorter, please"
+        assert "ended" not in response.json() and active.events.empty()
+
+
+async def test_a_steer_written_after_its_turn_ended_says_ended_with_its_row_which_the_read_holds(tmp_path, monkeypatch):
+    # B-F1, a steer answered `ended`: sent while the turn ran, its write begins only once the turn has ended
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending, active, release = await _slow_turn(client, provider, conversation)
+        reached, go = _held_write(client, monkeypatch, "steer.<locals>.write", before=True)
+        steering = asyncio.create_task(steer(client, active.run_id, "And another thing"))
+        assert await asyncio.to_thread(reached.wait, 10)
+        release.set()
+        assert [(e["type"], e.get("status")) for e in await sending][-1] == ("run_finished", "succeeded")
+        go.set()
+        response = await steering
+        assert response.status_code == 200 and response.json()["ended"] is True
+        assert response.json()["queued"]["text"] == "And another thing"
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["And another thing"]
+
+
+async def test_a_steer_written_after_its_turn_ended_puts_nothing_on_the_ended_stream(tmp_path, monkeypatch):
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending, active, release = await _slow_turn(client, provider, conversation)
+        reached, go = _held_write(client, monkeypatch, "steer.<locals>.write", before=True)
+        steering = asyncio.create_task(steer(client, active.run_id, "And another thing"))
+        assert await asyncio.to_thread(reached.wait, 10)
+        release.set()
+        await sending
+        go.set()
+        assert (await steering).json()["ended"] is True
+        assert active.events.empty()
 
 
 # S1-33 fix batch 3 (PR 52 cycle 3): lifecycle first (charter section 10)
