@@ -2262,13 +2262,48 @@ async def test_a_settings_save_that_would_move_the_limit_in_a_hand_written_layou
         assert await _continue_at_cap(client, conversation, project, 50.0) == 75.0
 
 
+@pytest.mark.asyncio
+async def test_a_save_removing_a_child_of_the_limit_beside_a_table_that_would_move_it_is_refused(tmp_path):
+    # Fix batch 1, A-F2: the first review's probe. Removing a child of a number (`project.budget_usd.x`) changes nothing,
+    # but it exempted the number from the check, so the table moved it with the pair: 200, and Continue then added
+    # $50 (to $100), not the $25 it was given (to $75).
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 25.0)
+        assert await _continue_at_cap(client, conversation, project, 25.0, "Short?") == 50.0
+        _config(tmp_path, project).write_text(
+            'project.template = "imrad"\nproject.budget_continue_usd = 25.0\nproject.budget_continue_at_usd = 50.0\n'
+            'project.budget_usd = 50.0\n')
+        before = _config(tmp_path, project).read_bytes()
+        response = await _saved(client, project, {"project.unused": {}, "project.budget_usd.x": None})
+        assert (response.status_code, response.json().get("code")) == (400, "invalid_setting")
+        assert _config(tmp_path, project).read_bytes() == before
+        assert await _continue_at_cap(client, conversation, project, 50.0) == 75.0
+
+
+_MOVING = b'project.template = "imrad"\nproject.budget_usd = 25.0\n'
+
+
 @pytest.mark.parametrize("raw, updates", [
     (b'project.template = "imrad"\nproject.budget_usd = 80.0\n', {"project.unused": {}}),  # the limit would move
     (b'project.budget_usd = 80.0\nproject.template = "imrad"\n', {"project.unused": {}}),  # another key would
     (b'project.citation_style = "apa"\nproject.template = "imrad"\n', {"project.extra": {"x": 1}}),
     # the internal review's F3: an empty table of its own names none of the keys under it
-    (b'project.template = "imrad"\nproject.budget_usd = 25.0\n', {"project.unused": {}, "project": {}}),
-    (b'project.template = "imrad"\nproject.budget_usd = 25.0\n', {"project": {"unused": {}}}),
+    (_MOVING, {"project.unused": {}, "project": {}}),
+    (_MOVING, {"project": {"unused": {}}}),
+    # Fix batch 1, A-F2: a save naming a child of a value it would move (a removal that changes nothing), for each kind
+    # of key the first review moved, and a save naming a value it would move rather than set
+    (_MOVING, {"project.unused": {}, "project.budget_usd.x": None}),
+    (b'project.citation_style = "apa"\nproject.template = "imrad"\n', {"project.unused": {}, "project.template.x": None}),
+    (b'project.template = "imrad"\nmemory.enabled = false\n', {"project.unused": {}, "memory.enabled.x": None}),
+    (b'project.template = "imrad"\ntools.deny = ["write"]\n', {"project.unused": {}, "tools.deny.x": None}),
+    (b'project.template = "imrad"\nlimits.turn_minutes = 5\n', {"project.unused": {}, "limits.turn_minutes.x": None}),
+    (b'project.template = "imrad"\nmodels.default = "m"\n', {"project.unused": {}, "models.default.x": None}),
+    (b'project.template = "imrad"\nui.panel = "library"\n', {"project.unused": {}, "ui.panel.x": None}),
+    (b'project.template = "imrad"\nmcp.servers = [{ name = "a" }]\n', {"project.unused": {}, "mcp.servers.x": None}),
+    (_MOVING, {"project.unused": {}, "project.budget_usd": 30.0}),  # the limit it sets would read as the shipped $50
+    (_MOVING, {"project.budget_usd": 30.0, "project.unused": {}}),
+    (b'project.template = "imrad"\nmemory.enabled = false\n', {"project.unused": {}, "memory.enabled": False}),
 ])
 def test_a_project_files_save_moving_a_key_it_does_not_name_raises_and_writes_nothing(tmp_path, monkeypatch, raw, updates):
     from backend.settings import load_settings
@@ -2283,7 +2318,8 @@ _LAYOUTS = [b'project.template = "imrad"\nproject.budget_usd = 80.0\nmemory.enab
             b'project.budget_usd = 80.0\nproject.budget_continue_usd = 25.0\nproject.budget_continue_at_usd = 80.0\n'
             b'limits.turn_minutes = 12\n',
             b'[project]\ntemplate = "imrad"\nbudget_usd = 80.0\n[memory]\nenabled = true\n',
-            b"[project]\n", b"[project]\n[memory]\n"]  # empty tables, as a reset leaves them, which a save writes into
+            b"[project]\n", b"[project]\n[memory]\n",  # empty tables, as a reset leaves them, which a save writes into
+            b"project.budget_usd = 80.0\n"]  # a reset of its only key leaves no table
 
 
 @pytest.mark.parametrize("raw", _LAYOUTS)

@@ -284,7 +284,6 @@ class Settings:
                     if not isinstance(leaf_value, dict):
                         node[leaf[-1]] = leaf_value
             data = doc.as_string().encode("utf-8")
-            named = [path for dotted, value in updates.items() for path in _named(_split_key(dotted), value)]
             if self.schema is PROJECT and not answer:
                 # S1-33 (Harold, 2026-11-12, design review C3's Option 2): decided from the file as it was and the bytes
                 # about to be written, read back, never from how updates name the keys
@@ -297,10 +296,12 @@ class Settings:
                             del table[key]
                     data = doc.as_string().encode("utf-8")
                     expected = (after[0], None, None)
-                    named += [("project", key) for key in _CONTINUE_KEYS[1:]]
                 if _continue_keys(data) != expected:
                     raise ValueError(f"{self.label}: what Continue adds is written only by a budget answer")
-            if self.schema is PROJECT and not _unnamed_kept(raw, data, named):
+            # PR 52's follow-up (item 8): the bytes must read back as the document the save changed, so no key moves or
+            # changes that the save does not name, and each it names reads as set. A table added among root dotted keys
+            # gets its header after the first of them, moving the keys after it under it.
+            if self.schema is PROJECT and _values(tomlkit.parse(data.decode("utf-8")).unwrap()) != _values(doc.unwrap()):
                 raise ValueError(f"{self.label}: this save would move or change keys it does not name")
             write_private(self.path, data)
             _parse(self, data)
@@ -309,24 +310,9 @@ class Settings:
 _CONTINUE_KEYS = ("budget_usd", "budget_continue_usd", "budget_continue_at_usd")
 
 
-def _named(path, value):
-    """The key paths an update names: each value a table given leaf by leaf names (an empty table, which only adds a
-    table, names none), else its own path (a value, or None removing the whole key)."""
-    if not isinstance(value, dict):
-        return [path]
-    return [leaf for leaf, found in _leaves({path[-1]: value}, path[:-1]) if found != {}]
-
-
-def _unnamed_kept(raw, data, named):
-    """PR 52's follow-up (batch 7's residual): whether every value in the file as it was (raw) that no path in named
-    covers reads back unchanged from the bytes about to be written (an empty table the save writes into is covered).
-    A save adding a table among root dotted keys makes tomlkit write its header after the first of them, moving the
-    keys after it under the new table."""
-    if not raw:
-        return True
-    after = {path: repr(value) for path, value in _leaves(tomlkit.parse(data.decode("utf-8")).unwrap())}
-    return all(any(path[:len(n)] == n or n[:len(path)] == path for n in named) or after.get(path) == repr(value)
-               for path, value in _leaves(tomlkit.parse(raw.decode("utf-8")).unwrap()))
+def _values(data):
+    """Every value by its key path, empty tables left out: removing a dotted table's last key leaves no table."""
+    return {path: repr(value) for path, value in _leaves(data) if value != {}}
 
 
 def _continue_keys(raw):
