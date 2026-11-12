@@ -968,3 +968,32 @@ async def test_a_note_queued_by_the_answers_commit_is_said_queued_when_stop_land
         stream = await sending
         assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["Also say how many"]
         assert [e["type"] for e in stream][-3:] == ["queued", "chat_response", "run_finished"]  # and the answer (item 3)
+
+
+# PR 52's follow-up (the rule 1 recheck's B6-1 and C1; Harold: "Oldest check, follow-up"; S-2): a start of the queue's own
+# (after) takes only the oldest waiting message, checked in the admission's transaction. A later one was admitted, ahead of
+# the earlier, which then waited behind it.
+
+
+async def test_a_start_after_a_turn_takes_only_the_oldest_waiting_message(tmp_path):
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        first = await send(client, conversation, "First?")
+        assert first[-1]["status"] == "succeeded"
+        await background_idle(client)
+        older = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Older 中文一"})).json()
+        newer = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Newer 中文二"})).json()
+        after = {"after": first[0]["run_id"]}
+        refused = await client.post(f"/api/conversations/{conversation}/queue/{newer['id']}/send", json=after)
+        assert refused.status_code == 409 and refused.json()["code"] == "not_oldest", (refused.status_code, refused.text)
+        read = await conversation_read(client, conversation)
+        assert [t["status"] for t in read["turns"]] == ["succeeded"]
+        assert [q["id"] for q in read["queued"]] == [older["id"], newer["id"]]  # both still waiting, in order
+        started_turn = await client.post(f"/api/conversations/{conversation}/queue/{older['id']}/send", json=after)
+        assert started_turn.status_code == 200 and events(started_turn)[-1]["status"] == "succeeded"
+        read = await conversation_read(client, conversation)
+        assert [q["id"] for q in read["queued"]] == [newer["id"]]
+        sent = await client.post(f"/api/conversations/{conversation}/queue/{newer['id']}/send", json={})  # Send: any
+        assert sent.status_code == 200 and events(sent)[-1]["status"] == "succeeded"
+        await background_idle(client)
+

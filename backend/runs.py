@@ -3271,13 +3271,18 @@ def _take_queued(conn, conversation_id, text, queued_id, after, stopped=()):
     """S1-33: a queued message taken from the queue by the admission of its turn, in its transaction (Harness._admit).
     One started on its own (after) follows only the latest turn, succeeded, and not stopped (stopped: the runs Stop was
     pressed for or cancelled, Harness.stopped), so a Stop pressed in another window after the answer committed starts
-    nothing, nor does a turn whose stream closed before its end was recorded (it waits with Send)."""
+    nothing, nor does a turn whose stream closed before its end was recorded (it waits with Send). And it is only the
+    oldest waiting message (Harold's S-2; PR 52's rule 1 recheck B6-1): Send may start any."""
     if after is not None:
         latest = conn.execute("SELECT t.run_id, r.status FROM turns t JOIN runs r ON r.id = t.run_id"
                               " WHERE t.conversation_id = ? ORDER BY t.seq DESC LIMIT 1", (conversation_id,)).fetchone()
         if latest is None or tuple(latest) != (after, "succeeded") or after in stopped:
             raise AdmissionError(409, "not_after_success",
                                  "The turn before it did not succeed or was stopped; send it yourself")
+        oldest = conn.execute("SELECT id FROM queued_messages WHERE conversation_id = ? ORDER BY rowid LIMIT 1",
+                              (conversation_id,)).fetchone()
+        if oldest is not None and oldest[0] != queued_id:
+            raise AdmissionError(409, "not_oldest", "An earlier message waits before this one")
     if conn.execute("DELETE FROM queued_messages WHERE id = ? AND conversation_id = ? AND text = ?",
                     (queued_id, conversation_id, text)).rowcount != 1:
         raise AdmissionError(409, "not_queued", "This message is no longer waiting")
