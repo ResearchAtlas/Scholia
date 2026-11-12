@@ -1040,7 +1040,7 @@ async def list_materials(project_id: str, request: Request):
             f"SELECT {_MATERIAL_COLUMNS} FROM materials m LEFT JOIN material_versions v ON v.material_id = m.id"
             " AND v.is_current = 1 LEFT JOIN content_files c ON c.sha256 = v.file_sha256 WHERE m.project_id = ?"
             " ORDER BY m.created_at DESC, m.id", (project_id,)).fetchall()
-        open_asks = asks.open_asks(conn, project_id=project_id)
+        open_asks = asks.open_asks(conn, project_id=project_id, registry=registry)
         listed = {ask["run_id"] for ask in open_asks}
         return {"materials": [_describe(conn, row, registry) for row in rows], "asks": open_asks,
                 # S1-14: merges still running whose question is not listed (not asked yet, asked under a
@@ -1329,14 +1329,14 @@ def run_details(conn, run_id, workflow, status, inputs, registry, derived=None):
     project's rows (S1-17). derived: the status the
     list shows (derived_status), worked out in the same read, which Retry is decided by."""
     if workflow not in _WORKFLOWS:
-        return _other(conn, run_id, workflow, status)
+        return _other(conn, run_id, workflow, status, registry)
     ids = json.loads(inputs or "{}").get("material_ids") or []
     titles = [title for (title,) in conn.execute(
         "SELECT title FROM materials WHERE id IN (SELECT value FROM json_each(?)) ORDER BY created_at LIMIT 3",
         (json.dumps(ids),))]
     (kept,) = conn.execute("SELECT count(*) FROM materials WHERE id IN (SELECT value FROM json_each(?))",
                            (json.dumps(ids),)).fetchone()
-    ask = asks.open_asks(conn, run_id=run_id) if status == "running" else []
+    ask = asks.open_asks(conn, run_id=run_id, registry=registry) if status == "running" else []
     details = {"materials": {"titles": titles, "count": kept}, "ask": ask[0] if ask else None,
                "retryable": _retry(conn, run_id, registry, derived)[1] is None}
     if workflow == "index":  # S1-17: a project's run (no papers named); its reason worded as its project offers the model
@@ -1360,7 +1360,7 @@ def _earlier(conn, sha256, kind):
         (sha256, extraction.EXTRACTORS[kind][0])).fetchone() is not None
 
 
-def _other(conn, run_id, workflow, status):
+def _other(conn, run_id, workflow, status, registry):
     """Another module's run in the background-run list: S1-14's merge (backend/references.py), S1-15's
     Zotero import (backend/zotero.py)."""
     if workflow == "zotero_import":
@@ -1371,7 +1371,7 @@ def _other(conn, run_id, workflow, status):
         return {}
     from backend import references  # it builds on this module
 
-    return references.run_details(conn, run_id, status)
+    return references.run_details(conn, run_id, status, registry)
 
 
 def _attachment_problem(conn, material):

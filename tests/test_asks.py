@@ -17,8 +17,10 @@ pytestmark = pytest.mark.asyncio
 
 
 async def asking(client, project, kind="choice", options=("yes", "no"), origin=None, workflow="test"):
-    """A running background run of the project, waiting on an ask: (run id, ask id)."""
+    """A running background run of the project, waiting on an ask: (run id, ask id). Held by the harness, as a running
+    run is from before its record commits: one no process holds reads interrupted, its ask closed (PR 52 cycle 5 B2)."""
     run = new_id()
+    client.state["harness"].registry.add_background(run)
 
     def ask(conn):
         conn.execute("INSERT INTO runs (id, project_id, kind, workflow) VALUES (?, ?, 'background', ?)",
@@ -95,6 +97,9 @@ async def test_an_ask_is_invalid_after_its_run_ends_or_its_project_changes(tmp_p
             await client.post(f"/api/projects/{project}/sensitivity", json={"level": "private"})
             await asyncio.to_thread(db.write, lambda conn: conn.execute(  # tightening revokes; keep it running here
                 "UPDATE runs SET cancel_reason = NULL WHERE id = ?", (run,)))
+            registry = client.state["harness"].registry  # and held as it was, not cancelled
+            registry.release(registry.runs[run])
+            registry.add_background(run)
         elif change == "locked":
             await asyncio.to_thread(db.write, lambda conn: conn.execute(
                 "UPDATE projects SET sensitivity = 'local_only', review_lock = 1 WHERE id = ?", (project,)))
@@ -122,6 +127,24 @@ async def test_asks_are_listed_where_their_work_started(tmp_path):
         runs = [r["ask"] for r in (await client.get("/api/activity")).json()["runs"] if r.get("ask")]
         for shown in (listed, materials, runs):
             assert shown and all((a["project_name"], a["project_kind"]) == ("Thesis", "research") for a in shown)
+
+
+@pytest.mark.parametrize("workflow", ["lookup", "merge"])
+async def test_an_ask_of_a_run_no_process_holds_reads_closed_wherever_it_would_be_shown(tmp_path, workflow):
+    # PR 52 cycle 5 B2 (SPEC:672, SPEC:732): a run recorded running that this process does not hold (its terminal
+    # write failed once it was let go) reads interrupted: its ask is listed nowhere and takes no answer.
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        run, ask = await asking(client, project, workflow=workflow)
+        registry = client.state["harness"].registry
+        registry.release(registry.runs[run])
+        assert (await client.get("/api/asks", params={"project_id": project})).json()["asks"] == []
+        assert (await client.get(f"/api/projects/{project}/materials")).json()["asks"] == []
+        [listed] = [r for r in (await client.get("/api/activity")).json()["runs"] if r["run_id"] == run]
+        assert (listed["status"], listed["ask"]) == ("interrupted", None)
+        response = await answer(client, run, ask, option="yes")
+        assert (response.status_code, response.json()["code"]) == (409, "ask_closed")
+        assert await rows(client, "SELECT count(*) FROM run_events WHERE type = 'ask_answered'") == [(0,)]
 
 
 async def test_an_ask_offers_one_to_three_options():

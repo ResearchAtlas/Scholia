@@ -430,12 +430,12 @@ def _shown(conn, run_id):
     return {"paper": {**_summary(paper), "title": paper.get("title") or row[2]}, "record": _summary(record)}
 
 
-def run_details(conn, run_id, status):
+def run_details(conn, run_id, status, registry=None):
     """What the background-run list shows of a merge run: its paper's title, its open question, and
     no Retry (backend/materials.py run_details)."""
     titles = [title for (title,) in conn.execute(
         "SELECT m.title FROM runs r JOIN materials m ON m.id = json_extract(r.inputs, '$.material_ids[0]')"
         " WHERE r.id = ?", (run_id,))]
-    ask = asks.open_asks(conn, run_id=run_id) if status == "running" else []
+    ask = asks.open_asks(conn, run_id=run_id, registry=registry) if status == "running" else []
     return {"materials": {"titles": titles, "count": len(titles)}, "ask": ask[0] if ask else None, "retryable": False}
 

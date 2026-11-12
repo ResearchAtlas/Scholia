@@ -2099,3 +2099,54 @@ async def test_continue_past_what_a_float_holds_raises_the_limit_to_the_most_nev
         assert await _own_budget(client, conversation) == sys.float_info.max
         [decision] = await _decisions(client, ask["run_id"])
         assert (decision["to_usd"], decision["applied"]) == (sys.float_info.max, True)
+
+
+# PR 52's follow-up (cycle 5 B2; SPEC:672, SPEC:732, A9, G9): a run whose terminal write failed is no longer held by this
+# process, though its row still says running and waiting on its ask: it reads interrupted, and so does its ask, which no
+# answer can apply. Continue applied ($0 to $10 for a conversation, $1 to $2 for a project).
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending, budget", [("stop", "conversation"), ("stop", "project"), ("closed", "conversation")])
+async def test_a_budget_ask_whose_run_ended_without_its_terminal_write_is_closed_and_changes_no_limit(
+        tmp_path, monkeypatch, ending, budget):
+    import contextlib
+    from backend import runs
+    from test_agent_loop import asked
+    async with await _app(tmp_path) as client:
+        harness = client.state["harness"]
+        conversation, project = await _conversation(client, budget=0 if budget == "conversation" else None)
+        if budget == "project":
+            await _project_budget(client, project, 1.0)
+            await _spent(client, project, 1.0)
+        claim = await harness.admit_turn(conversation, "Short?")
+
+        async def read():
+            return [event async for event in harness.events(claim)]
+        reader = asyncio.create_task(read())
+        ask = await asked(client, conversation)
+        assert (ask["params"]["form"], ask["params"]["budget"]) == ("cap", budget)
+        real = runs._close_asks
+
+        def failing(conn, run_id):
+            raise RuntimeError("the terminal write failed")
+        monkeypatch.setattr(runs, "_close_asks", failing)
+        if ending == "stop":
+            await client.post(f"/api/runs/{claim.run_id}/cancel")
+        else:
+            reader.cancel()  # its window went: the closed stream stops the turn
+        await asyncio.wait({claim.task, reader})
+        with contextlib.suppress(BaseException):
+            claim.task.result()
+        monkeypatch.setattr(runs, "_close_asks", real)  # restored once its run is let go
+        assert claim.run_id not in harness.registry.runs
+        assert await _rows(client, "SELECT status, waiting FROM runs WHERE id = ?", claim.run_id) == [("running", "ask")]
+        turn = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1]
+        assert turn["status"] == "interrupted"
+        answered = await _answer(client, ask, option="continue")
+        assert await _own_budget(client, conversation) == (0 if budget == "conversation" else None)
+        assert await _project_budget(client, project) == (1.0 if budget == "project" else 50)
+        assert (answered.status_code, answered.json()["code"]) == (409, "ask_closed")
+        assert await _decisions(client, claim.run_id) == []
+        assert (await client.get("/api/asks", params={"conversation_id": conversation})).json()["asks"] == []
+
