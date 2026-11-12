@@ -274,9 +274,13 @@ async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
 def _save_project_budget(data_dir, decided):
     """Write a project budget's decision to its config.toml: whether the file now holds it. A write that fails may
     have replaced the file already (its folder's sync failing after the rename): the outcome is what the file says,
-    read again, so no record says it unchanged when it changed, nor the reverse (PR 52 review 1)."""
+    read again, so no record says it unchanged when it changed, nor the reverse (PR 52 review 1). What the next
+    Continue adds, and the limit it is for, are written with the limit in the same file replace (Harold, 2026-11-12,
+    design review C's Option 2), so the two never disagree whatever fails after it."""
     try:
-        load_settings(data_dir, decided["project_id"]).save({"project.budget_usd": decided["to_usd"]})
+        load_settings(data_dir, decided["project_id"]).save({
+            "project.budget_usd": decided["to_usd"], "project.budget_continue_usd": decided["amount_usd"],
+            "project.budget_continue_at_usd": decided["to_usd"]})
         return True
     except Exception as error:
         log.warning("a project budget answered in an ask may not be saved (%s)", type(error).__name__)

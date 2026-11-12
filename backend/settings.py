@@ -163,6 +163,10 @@ PERSONAL = {
 PROJECT = {
     **{("project", k): (None, _text) for k in ("target_venue", "citation_style", "citation_style_zh", "template")},
     ("project", "budget_usd"): (50, _number(0)),
+    # S1-33 (Harold, 2026-11-12, design review C's Option 2): written by the program beside the limit, never by the
+    # Settings page: what Continue adds, and the limit it was written for (budgets._amount). No default, so a file
+    # without them gives none, and a backup keeps them (known_only).
+    **{("project", k): (None, _number(0)) for k in ("budget_continue_usd", "budget_continue_at_usd")},
     ("ui", "panel"): (None, _choice("none", "library", "manuscript")),
     ("models", "default"): (None, _text),
     **{("limits", k): (None, check) for k, (_, check) in _LIMITS.items()},  # overrides

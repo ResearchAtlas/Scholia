@@ -151,17 +151,18 @@ def _typed(text):
     return round(value, 9)
 
 
-def _amount(conn, budget, scope_id, current, default):
+def _amount(conn, data_dir, budget, scope_id, current, default):
     """What Continue adds: the amount the budget's last applied decision recorded while its limit is what that decision
     left, else the limit itself; for a limit of zero, the budget's default as configured (so Continue never adds nothing).
     A conversation's decisions are its runs' events, deleted only with it, and only an applied one counts (one stale or
-    stopped changed nothing: PR 52 cycle 2); a project's last applied one is kept on the project
-    (projects.budget_decided), since its conversations, and their runs, may be deleted (review 1 of PR 52), and a
-    Settings edit of the project's budget clears it, so the limit set there is the amount from then on."""
+    stopped changed nothing: PR 52 cycle 2). A project's are in its config.toml beside the limit (Harold, 2026-11-12,
+    design review C's Option 2): `budget_continue_usd` while `budget_continue_at_usd` is the limit, written with it in
+    one file replace (asks._save_project_budget), and taken out by any Settings save of the budget, so the limit set
+    there is the amount from then on. A pair a hand edit made invalid is none."""
     if budget == "project":
-        row = conn.execute("SELECT json_extract(budget_decided, '$.to_usd'), json_extract(budget_decided, '$.amount_usd')"
-                           " FROM projects WHERE id = ?", (scope_id,)).fetchone()
-        row = row if row is not None and row[1] is not None else None
+        own = load_settings(data_dir, scope_id).values["project"]
+        row = (own.get("budget_continue_at_usd"), own.get("budget_continue_usd"))
+        row = row if None not in row else None
     else:
         row = conn.execute(
             "SELECT json_extract(e.data, '$.to_usd'), json_extract(e.data, '$.amount_usd') FROM run_events e"
@@ -190,7 +191,7 @@ def decide(conn, run_id, ask, option, text, data_dir):
     needed = round(spent + params["estimate_usd"], 9)
     # a zero limit's Continue adds the personal default (a conversation's) or the shipped project budget, never nothing
     default = _budgets_now(data_dir, project_id)[1] if budget == "conversation" else PROJECT[("project", "budget_usd")][0]
-    amount = _amount(conn, budget, conversation_id if budget == "conversation" else project_id, current,
+    amount = _amount(conn, data_dir, budget, conversation_id if budget == "conversation" else project_id, current,
                      default or PERSONAL[("budget", "conversation_usd")][0])
     if text is not None:
         typed = _typed(text)
@@ -229,9 +230,6 @@ def saved(conn, run_id, decided, ok):
     record.pop("project_id")
     if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is not None:
         _event(conn, run_id, "budget_decision", record)
-    if ok:  # what the next Continue adds again, kept with the project
-        conn.execute("UPDATE projects SET budget_decided = json(?) WHERE id = ?", (json.dumps(
-            {"to_usd": decided["to_usd"], "amount_usd": decided["amount_usd"]}), decided["project_id"]))
     governance.record(conn, "budget_decision", decided["project_id"], budget="project", decision=decided["decision"],
                       from_usd=decided["from_usd"], to_usd=record["to_usd"], applied=ok)
 

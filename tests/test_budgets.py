@@ -1283,12 +1283,13 @@ async def test_the_notices_a_recorded_settlement_reached_are_streamed_when_stop_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("edits, after", [((5.0, 2.0), 4.0), ((2.0,), 3.0)])
+@pytest.mark.parametrize("edits, after", [((5.0, 2.0), 4.0), ((2.0,), 4.0)])
 async def test_a_settings_edit_makes_the_project_limit_continues_amount_even_back_at_the_last_decided_value(
         tmp_path, edits, after):
     # D3 (A5, reading 3): $1, Continue to $2, then $5 and $2 set in Settings: $2 is now the researcher's own setting, so
-    # the next Continue adds $2 (to $4), not the $1 the old decision added. Saving the $2 unchanged sets nothing: the
-    # decision's $1 stays the amount (to $3), as a save of an unchanged value changes nothing (review of batch 2).
+    # the next Continue adds $2 (to $4), not the $1 the old decision added. Saving the $2 unchanged does the same (to
+    # $4): any Settings save of the budget makes it the amount (Harold, 2026-11-12, design review C's Option 2 with
+    # always-remove; until then, from the review of batch 2, an unchanged save kept the decision's $1, to $3).
     async with await _app(tmp_path) as client:
         conversation, project = await _conversation(client)
         await _project_budget(client, project, 1.0)
@@ -1310,8 +1311,8 @@ async def test_a_settings_edit_makes_the_project_limit_continues_amount_even_bac
 async def test_a_settings_edit_cancelled_once_its_file_is_written_still_makes_the_limit_continues_amount(
         tmp_path, monkeypatch):
     # S1-33 fix batch 3 (E3, reading 3): as D3's test, but each Settings save is cancelled once its config.toml write
-    # has completed. The clear of the last decision runs inside the save's own protection, so it is never skipped: the
-    # next Continue adds $2 (to $4), not the $1 the old decision added.
+    # has completed. What the old decision left for Continue goes in that same write (design review C's Option 2), so
+    # it is never skipped: the next Continue adds $2 (to $4), not the $1 the old decision added.
     import contextlib
     import threading
     from backend import settings as settings_module
@@ -1374,6 +1375,191 @@ async def test_a_settings_save_over_a_budget_its_file_did_not_give_makes_the_lim
         await _spent(client, project, round(50.0 - spent, 9))  # the cap again
         sending, ask = await _asking(client, conversation, "Again?")
         assert ask["params"]["form"] == "cap"
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 100.0
+        await sending
+
+
+# PR 52 cycle 5 (A-F1; Harold, 2026-11-12, design review C's Option 2): what Continue adds to the project budget is in its
+# config.toml beside the limit (budget_continue_usd, written for the limit budget_continue_at_usd), in the same file
+# replace as the limit, and any Settings save of the budget takes it out. Each case starts at $25, Continued to $50
+# (adding $25).
+
+
+def _config(tmp_path, project):
+    return tmp_path / "data" / "projects" / project / "config.toml"
+
+
+def _hand_set(tmp_path, project, text):
+    """A hand edit of the project budget's line in its config.toml."""
+    import re
+    config = _config(tmp_path, project)
+    config.write_text(re.sub(r"(?m)^budget_usd = .*$", f"budget_usd = {text}", config.read_text()))
+
+
+async def _continue_at_cap(client, conversation, project, limit, text="Again?"):
+    """Spend up to the project's limit, answer its cap ask Continue, and return the limit it gives."""
+    [(spent,)] = await _rows(client, "SELECT coalesce(sum(settled_usd), 0) FROM budget_reservations WHERE project_id = ?",
+                             project)
+    await _spent(client, project, round(limit - spent, 9))
+    sending, ask = await _asking(client, conversation, text)
+    assert ask["params"]["form"] == "cap"
+    answered = (await _answer(client, ask, option="continue")).json()["budget"]
+    await sending
+    return answered["limit_usd"]
+
+
+async def _at_fifty(client):
+    """A conversation in the General project, whose budget $25 was Continued to $50: (conversation, project)."""
+    conversation, project = await _conversation(client)
+    await _project_budget(client, project, 25.0)
+    assert await _continue_at_cap(client, conversation, project, 25.0, "Short?") == 50.0
+    return conversation, project
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("by_hand", ["30", '"abc"'])
+async def test_a_settings_save_that_fails_after_replacing_the_file_and_is_saved_again_makes_the_limit_continues_amount(
+        tmp_path, monkeypatch, by_hand):
+    # A-F1, both forms: the budget set by hand to $30 (or made invalid), then $50 saved in Settings, whose folder's sync
+    # fails once the file was replaced, and saved again: $50 is the researcher's setting, so Continue adds $50.
+    from backend import settings
+    async with await _app(tmp_path) as client:
+        conversation, project = await _at_fifty(client)
+        _hand_set(tmp_path, project, by_hand)
+        real = settings.write_private
+
+        def replaced_then_failed(path, data):
+            real(path, data)
+            raise OSError("fsync of the folder failed")
+        monkeypatch.setattr(settings, "write_private", replaced_then_failed)
+        read = (await client.get("/api/settings", params={"project_id": project})).json()
+        with pytest.raises(OSError):  # the save fails (the in-process client raises what the app did not answer)
+            await client.put("/api/settings", json={"project_id": project, "hash": read["hash"],
+                                                    "updates": {"project.budget_usd": 50.0}})
+        monkeypatch.setattr(settings, "write_private", real)
+        assert await _project_budget(client, project) == 50.0  # its file was replaced
+        await _project_budget(client, project, 50.0)  # saved again
+        assert await _continue_at_cap(client, conversation, project, 50.0) == 100.0
+
+
+@pytest.mark.asyncio
+async def test_a_budget_answer_whose_record_fails_after_its_file_write_still_never_compounds(tmp_path, monkeypatch):
+    # Design review C (the ask's side): the answer's file write succeeds and its record after it fails; the amount was
+    # written with the limit, so the next Continue adds $25 (to $75), never the $50 limit (to $100).
+    from backend import asks
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 25.0)
+
+        def failing(conn, run_id, decided, saved):
+            raise RuntimeError("the record could not be written")
+        monkeypatch.setattr(asks, "_budget_saved", failing)
+        assert await _continue_at_cap(client, conversation, project, 25.0, "Short?") == 50.0
+        monkeypatch.undo()
+        assert await _continue_at_cap(client, conversation, project, 50.0) == 75.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edits, after", [(("80",), 160.0), (("80", "50"), 75.0)])
+async def test_a_hand_edit_of_the_limit_makes_it_the_amount_but_one_back_to_the_same_value_brings_the_old_amount_back(
+        tmp_path, edits, after):
+    # Design review C: a hand edit to $80 is the researcher's own limit, so Continue adds $80 (to $160). One away and back
+    # to $50 (read in between) brings the $25 back (to $75): the accepted residual (Harold, 2026-11-12), since no design
+    # keeping the limit in a hand-editable file can tell it from no edit at all.
+    async with await _app(tmp_path) as client:
+        conversation, project = await _at_fifty(client)
+        for usd in edits:
+            _hand_set(tmp_path, project, usd)
+            assert (await client.get(f"/api/projects/{project}/spend")).json()["project"]["limit_usd"] == float(usd)
+        assert await _continue_at_cap(client, conversation, project, float(edits[-1])) == after
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_project_config_takes_what_continue_adds_with_it(tmp_path):
+    # Design review C: config.toml deleted, the limit is the shipped $50 and nothing beside it: Continue adds $50.
+    async with await _app(tmp_path) as client:
+        conversation, project = await _at_fifty(client)
+        _config(tmp_path, project).unlink()
+        assert await _project_budget(client, project) == 50
+        assert await _continue_at_cap(client, conversation, project, 50.0) == 100.0
+
+
+def test_a_backup_keeps_what_continue_adds_beside_the_limit():
+    from backend.settings import known_only
+    import tomllib
+    kept = known_only(b"[project]\nbudget_usd = 50.0\nbudget_continue_usd = 25.0\nbudget_continue_at_usd = 50.0\n")
+    assert tomllib.loads(kept.decode())["project"] == {"budget_usd": 50.0, "budget_continue_usd": 25.0,
+                                                       "budget_continue_at_usd": 50.0}
+
+
+def test_a_settings_save_names_the_project_budget_however_its_key_is_spelled():
+    # A Settings save of the budget takes out what Continue adds, whatever spelling its key has (app._names_budget).
+    from backend.app import _names_budget
+    assert all(_names_budget(u) for u in ({"project.budget_usd": 1}, {'"project".budget_usd': 1},
+                                          {"project . budget_usd": None}, {"project": {"budget_usd": 1}}))
+    assert not any(_names_budget(u) for u in ({"project.template": "x"}, {"project": {"template": "x"}},
+                                              {"budget.conversation_usd": 1}, {"[project": 1}))
+
+
+@pytest.mark.asyncio
+async def test_a_budget_answer_whose_file_write_fails_before_the_replace_keeps_the_old_amount(tmp_path, monkeypatch):
+    # Design review C: at the $50 cap, Continue's write fails before the file is replaced: nothing is raised, and the
+    # file still holds $50 with its $25, so the next Continue adds $25 (to $75).
+    import contextlib
+    from backend import settings
+    async with await _app(tmp_path) as client:
+        conversation, project = await _at_fifty(client)
+        before = _config(tmp_path, project).read_bytes()
+
+        def failed(path, data):
+            raise OSError("disk full")
+        monkeypatch.setattr(settings, "write_private", failed)
+        [(spent,)] = await _rows(client, "SELECT sum(settled_usd) FROM budget_reservations WHERE project_id = ?", project)
+        await _spent(client, project, round(50.0 - spent, 9))
+        sending, ask = await _asking(client, conversation, "Again?")
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["applied"] is False
+        monkeypatch.undo()
+        assert _config(tmp_path, project).read_bytes() == before
+        sending.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sending
+        assert await _continue_at_cap(client, conversation, project, 50.0, "Once more?") == 75.0
+
+
+@pytest.mark.asyncio
+async def test_a_budget_answer_writes_the_limit_and_what_continue_adds_in_one_file_write(tmp_path, monkeypatch):
+    import tomllib
+    from backend import settings
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 25.0)
+        real, written = settings.write_private, []
+
+        def recording(path, data):
+            if path == _config(tmp_path, project):
+                written.append(data)
+            real(path, data)
+        monkeypatch.setattr(settings, "write_private", recording)
+        assert await _continue_at_cap(client, conversation, project, 25.0, "Short?") == 50.0
+        assert len(written) == 1
+        table = tomllib.loads(written[0].decode())["project"]
+        assert (table["budget_usd"], table["budget_continue_usd"], table["budget_continue_at_usd"]) == (50, 25, 50)
+
+
+@pytest.mark.asyncio
+async def test_a_pair_made_invalid_by_hand_adds_the_limit_and_leaves_the_budget_read(tmp_path):
+    # Design review C: what Continue adds made invalid by hand is none, never an unread budget: the bar shows the $50
+    # limit, the ask is an ordinary cap ask, and Continue adds the limit (to $100).
+    import re
+    async with await _app(tmp_path) as client:
+        conversation, project = await _at_fifty(client)
+        config = _config(tmp_path, project)
+        config.write_text(re.sub(r"(?m)^budget_continue_usd = .*$", 'budget_continue_usd = "x"', config.read_text()))
+        assert (await client.get(f"/api/projects/{project}/spend")).json()["project"]["limit_usd"] == 50.0
+        [(spent,)] = await _rows(client, "SELECT sum(settled_usd) FROM budget_reservations WHERE project_id = ?", project)
+        await _spent(client, project, round(50.0 - spent, 9))
+        sending, ask = await _asking(client, conversation, "Again?")
+        assert not ask["params"].get("unread")
         assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 100.0
         await sending
 

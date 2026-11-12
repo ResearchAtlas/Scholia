@@ -41,7 +41,7 @@ from backend.db import (ContentStore, Database, DatabaseCloseError, DatabaseClos
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
 from backend import governance
-from backend.runs import MAX_MESSAGE_CHARS, AdmissionError, Harness, _budget_unread, _through, derived_status
+from backend.runs import MAX_MESSAGE_CHARS, AdmissionError, Harness, _through, derived_status
 from backend import budgets  # S1-33: the budget bar's spend, queued messages and steering notes
 from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, instruction_file_size, instructions_size,
                               load_instructions, load_settings, visible, write_private)
@@ -634,22 +634,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         changed = _providers_changed(body.updates, providers.configured(data_dir, include_off=True))
         refuse_if_busy(changed)  # before any field is written
 
-        def limit():  # S1-33: the project budget its file gives, None for one it does not (never the loader's default)
-            return None if _budget_unread(loaded) else (loaded.values.get("project") or {}).get("budget_usd")
-        limit_before = limit()  # whether the save changes it (PR 52 cycle 4, G3: a repair of an unread budget does)
+        updates = body.updates
+        if body.project_id is not None and _names_budget(updates):
+            # S1-33 (Harold, 2026-11-12, design review C's Option 2): a limit saved here, even unchanged, is what Continue
+            # adds from now on: what an earlier answer wrote beside it goes, in the same file replace
+            updates = {**updates, "project.budget_continue_usd": None, "project.budget_continue_at_usd": None}
 
         async def saving():  # under the project-files lock, the save and what it changes run to their end together
-            await asyncio.to_thread(loaded.save, body.updates)
-            if body.project_id is not None and limit() != limit_before:
-                # S1-33: a limit changed here is Continue's amount from now on, whatever an earlier answer decided (if
-                # this fails, the saved limit stands, and the old amount still applies only while the limit equals its
-                # result); saving the limit unchanged changes nothing. Inside the save's own protection, so a request
-                # cancelled once the file was written still clears it (PR 52 cycle 3, E3)
-                try:
-                    await write(lambda conn: conn.execute(
-                        "UPDATE projects SET budget_decided = NULL WHERE id = ?", (body.project_id,)))
-                except Exception as error:
-                    log.warning("the project budget's last decision was not cleared (%s)", type(error).__name__)
+            await asyncio.to_thread(loaded.save, updates)
         try:
             saved = _to_end(saving())
             # A provider turned off, moved or removed takes routes away: ordered with dispatch.
@@ -1552,6 +1544,18 @@ def _ensure_openrouter(data_dir):
         updates["providers.openrouter.base_url"] = providers.OPENROUTER_BASE_URL
     if updates:
         personal.save(updates)
+
+
+def _names_budget(updates):
+    """S1-33: whether a settings save writes or removes the project budget, however its key is spelled."""
+    for key, value in updates.items():
+        try:
+            path = _split_key(key)
+        except ValueError:  # the save refuses it
+            continue
+        if path == ("project", "budget_usd") or path == ("project",) and isinstance(value, dict) and "budget_usd" in value:
+            return True
+    return False
 
 
 def _write_project_folder(data_dir, project_id):
