@@ -543,17 +543,17 @@ async def test_a_response_that_fails_before_it_starts_leaves_no_claim(tmp_path):
 
 
 async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tmp_path, monkeypatch):
-    import time
     from backend import providers as providers_module
     real = providers_module.gate_inputs
     checking = asyncio.Event()
+    stopped = threading.Event()  # PR 52 rule 1 recheck A-F2: held until Stop was asked for, never a fixed wait
     loop = asyncio.get_running_loop()
 
     def slow_inputs(data_root):
         turn = client.state["harness"].registry.turns.get(conversation)
         if turn is not None and turn.call is not None:  # the turn's own call, reserved, is at the gate
             loop.call_soon_threadsafe(checking.set)
-        time.sleep(0.3)  # the gate is still checking when Stop arrives
+            assert stopped.wait(10)  # the gate is still checking when Stop arrives
         return real(data_root)
 
     async with started(tmp_path / "data") as client:
@@ -567,6 +567,7 @@ async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tm
         await asyncio.wait_for(checking.wait(), 5)
         run_id = active_turn(client, conversation).run_id
         await client.post(f"/api/runs/{run_id}/cancel")
+        stopped.set()
         assert (await stream)[-1]["status"] == "cancelled"
         assert len(client.provider.chats) == 2  # the first conversation's turn and its extraction only
         assert await rows(client, "SELECT status, settled_usd FROM budget_reservations WHERE run_id = ?",
@@ -576,11 +577,11 @@ async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tm
 async def test_a_receipt_is_recorded_even_if_stop_comes_while_the_client_closes(tmp_path, monkeypatch):
     import httpx
     real_exit = httpx.AsyncClient.__aexit__
-    closing = asyncio.Event()
+    closing, stopped = asyncio.Event(), asyncio.Event()  # held until Stop was asked for, never a fixed wait (A-F2)
 
     async def slow_exit(self, *exc):
         closing.set()
-        await asyncio.sleep(0.3)
+        await asyncio.wait_for(stopped.wait(), 10)
         await real_exit(self, *exc)
 
     async with started(tmp_path / "data") as client:
@@ -592,6 +593,7 @@ async def test_a_receipt_is_recorded_even_if_stop_comes_while_the_client_closes(
         await asyncio.wait_for(closing.wait(), 5)
         run_id = active_turn(client, conversation).run_id
         await client.post(f"/api/runs/{run_id}/cancel")
+        stopped.set()
         assert (await stream)[-1]["status"] == "cancelled"
         assert await rows(client, "SELECT status, settled_usd, basis FROM budget_reservations WHERE run_id = ?",
                           run_id) == [("settled", 0.002, "reported")]
