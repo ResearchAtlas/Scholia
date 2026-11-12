@@ -34,7 +34,7 @@ from backend import reasoning_capability
 from backend.outbound_gate import DISPATCHED, NO_RESPONSE_CACHE, OutboundDenied
 from backend.reasoning_control import resolve_reasoning_payload
 from backend.settings import visible
-from backend.spending import amount
+from backend.spending import amount, combined
 
 log = logging.getLogger(__name__)
 
@@ -148,7 +148,7 @@ class ModelResult:
                 total, known = total + cost, True
             elif attempt.dispatched and (attempt.outcome == "ok" or attempt.http_status is None):
                 return None  # it may have been billed, and nothing says what it cost
-        return total if known else None
+        return combined(total) if known else None
 
 
 # Routes known to reject the optional reasoning field, keyed by provider origin,

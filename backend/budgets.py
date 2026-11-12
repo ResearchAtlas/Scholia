@@ -44,7 +44,7 @@ def options(form):
 def bound(conn, project_id, estimate):
     """A call's reservation: its estimate, or in the evaluation project the conservative bound, the estimate (the counted
     request and its whole output limit at the highest reachable rate) times the attempts one call may make."""
-    return round(estimate * EVALUATION_ATTEMPTS, 9) if evaluation(conn, project_id) else estimate
+    return spending.combined(estimate * EVALUATION_ATTEMPTS) if evaluation(conn, project_id) else estimate
 
 
 def evaluation(conn, project_id):
@@ -59,7 +59,7 @@ def totals(conn, *, project_id=None, conversation_id=None):
         "SELECT coalesce(sum(CASE status WHEN 'settled' THEN settled_usd ELSE 0 END), 0),"
         " coalesce(sum(CASE status WHEN 'open' THEN estimate_usd ELSE 0 END), 0)"
         f" FROM budget_reservations WHERE {column} = ?", (value,)).fetchone()
-    return round(settled, 9), round(held, 9)
+    return spending.combined(settled), spending.combined(held)
 
 
 def bases(conn, *, project_id=None, conversation_id=None):
@@ -67,7 +67,8 @@ def bases(conn, *, project_id=None, conversation_id=None):
     column, value = ("project_id", project_id) if conversation_id is None else ("paying_conversation_id", conversation_id)
     found = dict(conn.execute(f"SELECT basis, coalesce(sum(settled_usd), 0) FROM budget_reservations WHERE {column} = ?"
                               " AND status = 'settled' GROUP BY basis", (value,)).fetchall())
-    return {"reported_usd": round(found.get("reported", 0), 9), "estimated_usd": round(found.get("estimated", 0), 9)}
+    return {"reported_usd": spending.combined(found.get("reported", 0)),
+            "estimated_usd": spending.combined(found.get("estimated", 0))}
 
 
 def _limits(conn, data_dir, project_id, conversation_id):
@@ -121,7 +122,7 @@ def notices(conn, run_id, data_dir):
         settled = totals(conn, **({"conversation_id": conversation_id} if budget == "conversation"
                                   else {"project_id": project_id}))[0]
         for percent in percents:
-            if settled * 100 < percent * limit - _EPSILON:
+            if 100 * (settled / limit) < percent - _EPSILON:  # a share, which no product of large amounts overflows
                 continue
             if budget == "project":
                 if [percent, limit] in noticed:
@@ -189,7 +190,7 @@ def decide(conn, run_id, ask, option, text, data_dir):
     current = limits[budget][0]
     spent = spending.spent(conn, **({"conversation_id": conversation_id} if budget == "conversation"
                                     else {"project_id": project_id}))
-    needed = round(spent + params["estimate_usd"], 9)
+    needed = spending.combined(spent + params["estimate_usd"])
     # a zero limit's Continue adds the personal default (a conversation's) or the shipped project budget, never nothing
     default = _budgets_now(data_dir, project_id)[1] if budget == "conversation" else PROJECT[("project", "budget_usd")][0]
     amount = _amount(conn, data_dir, budget, conversation_id if budget == "conversation" else project_id, current,
@@ -201,7 +202,8 @@ def decide(conn, run_id, ask, option, text, data_dir):
         decision, wanted, amount = "set_limit", typed, typed
     else:
         decision = option
-        wanted = {"continue": round(current + amount, 9), "go_ahead": max(current, needed)}.get(option, current)
+        wanted = {"continue": spending.combined(current + amount),
+                  "go_ahead": max(current, needed)}.get(option, current)
     # An ask raised while the project's file did not give its budget (unread, PR 52 cycle 3, E4): only a typed limit
     # means anything; Continue and Go ahead have no amount to add to, so they apply nothing and the step is checked again
     stale = abs(current - params["limit_usd"]) > _EPSILON or (bool(params.get("unread")) and text is None)

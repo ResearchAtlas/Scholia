@@ -1001,3 +1001,14 @@ test('a seeded random matrix of sends, steers, Sends, edits, removals, refusals,
   }
   assert.deepEqual(found.slice(0, 10), []);
 });
+
+// PR 52's follow-up (cycle 5 A-F2): a share of a budget is settled / limit, which a limit too large to multiply cannot
+// overflow: 1e307 of 1.7e308 is about 5.9%, never Infinity with a full bar.
+test('the bar reads the share of a limit too large to multiply, never Infinity (A-F2)', () => {
+  const huge = (settled) => ({ conversation: { limit_usd: 1.7e308, settled_usd: settled, open_usd: 0, own: true },
+    project: { limit_usd: 1.7e308, settled_usd: settled, open_usd: 0 }, notice_percents: [50, 85, 90] });
+  assert.equal(budgetBar(huge(1e307)), null); // about 5.9%: below the lowest notice percent
+  const near = budgetBar(huge(1.6e308));
+  assert.ok(Math.abs(near.percent - 94.1176) < 0.001 && near.meter === 94, JSON.stringify(near));
+  assert.equal(budgetBar(huge(Number.MAX_VALUE)).meter, 100); // a total held at the most a float holds: over it
+});

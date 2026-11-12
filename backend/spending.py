@@ -16,13 +16,22 @@ service): money spent stays in the project's total until the project is deleted.
 A settlement for a row that no longer exists changes nothing and creates nothing.
 
 Every function takes an open connection inside a write (or read) transaction.
+
+Amounts combine where they are summed (here, in the database's sums, and over a call's attempts) or priced (counts
+times rates): each is valid, but a total of them can pass what a float holds. Such a total is held at MAX_USD, the
+largest a float holds (combined), and keeps its basis: money counted is never less than its parts, and never infinite,
+which no record, reply or limit could carry (PR 52 cycle 5 A-F2). A spend held there fits no step, so the step asks;
+every notice of its budget is reached; and the bar is full. Comparisons never add amounts: admission compares the
+estimate with what is left, and a budget's share is its spend divided by its limit.
 """
 
 import math
+import sys
 
 from backend.db import new_id, utc_now
 
 _DECIMALS = 9  # amounts are kept to a billionth of a dollar
+MAX_USD = sys.float_info.max
 
 
 class BudgetExceeded(Exception):
@@ -50,6 +59,12 @@ def amount(value) -> float | None:
         return None
 
 
+def combined(total) -> float:
+    """An amount combined from valid amounts (a sum, or counts times rates), as it is kept: rounded to the kept
+    precision, and held at MAX_USD when the combination passed what a float holds."""
+    return min(round(total, _DECIMALS), MAX_USD)
+
+
 def spent(conn, *, project_id: str | None = None, conversation_id: str | None = None) -> float:
     """Settled spend plus open reservations, for a project or a paying conversation."""
     column, value = ("project_id", project_id) if conversation_id is None else ("paying_conversation_id", conversation_id)
@@ -58,7 +73,7 @@ def spent(conn, *, project_id: str | None = None, conversation_id: str | None = 
         f" FROM budget_reservations WHERE {column} = ?",
         (value,),
     ).fetchone()
-    return round(total, _DECIMALS)
+    return combined(total)
 
 
 def reserve(conn, *, run_id: str, step_seq: int, project_id: str, paying_conversation_id: str | None,
@@ -79,7 +94,7 @@ def reserve(conn, *, run_id: str, step_seq: int, project_id: str, paying_convers
         if limit is None:
             continue
         already = spent(conn, **scope)
-        if already + estimate > limit + 10 ** -_DECIMALS:
+        if estimate > limit - already + 10 ** -_DECIMALS:  # against what is left, which a large spend cannot round away
             raise BudgetExceeded(budget, limit, already, estimate)
     reservation_id = new_id()
     conn.execute(
@@ -121,7 +136,7 @@ def run_cost(conn, run_id: str) -> float:
         " FROM budget_reservations WHERE run_id = ?",
         (run_id,),
     ).fetchone()
-    return round(total, _DECIMALS)
+    return combined(total)
 
 
 def settle_left_open(conn) -> int:

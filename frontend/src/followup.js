@@ -34,7 +34,7 @@ export function budgetBar(spend) {
   if (!spend) return null;
   const shares = ['conversation', 'project'].map((budget) => typeof spend[budget]?.limit_usd === 'number'
     ? { budget, settled: spend[budget].settled_usd, limit: spend[budget].limit_usd,
-      percent: spend[budget].limit_usd > 0 ? (100 * spend[budget].settled_usd) / spend[budget].limit_usd : Infinity }
+      percent: spend[budget].limit_usd > 0 ? 100 * (spend[budget].settled_usd / spend[budget].limit_usd) : Infinity }
     : null).filter(Boolean);
   const closest = shares.sort((a, b) => b.percent - a.percent)[0];
   const marks = [...(spend.notice_percents ?? [50, 85, 90])].sort((a, b) => a - b);

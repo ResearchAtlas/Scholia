@@ -1304,7 +1304,7 @@ class Harness:
                         raise
                     refused = exceeded
             reply = await self._budget_ask(active, project_id, paying_conversation_id, refused,
-                                           round(request_usd + share_usd, 9), phase)
+                                           spending.combined(request_usd + share_usd), phase)
             if reply is not None and reply.get("option") in budget_rules.STOPS:
                 raise refused
             if again is not None and (rebuilt := await again()) is not None:
@@ -2756,7 +2756,7 @@ class Harness:
         except context.OverWindow as over:
             raise RunOutcome("failed", over.code) from None
         estimate = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
-        bound = estimate * openrouter.MAX_ATTEMPTS
+        bound = spending.combined(estimate * openrouter.MAX_ATTEMPTS)
         remembered = [r[0] for r in related]
         versions = {r[0]: r[4] for r in related}  # as its request holds them: one edited since is refused at dispatch
 
@@ -3119,6 +3119,7 @@ def _settle_attempts(conn, reservation_id, rates, attempts):
                 continue
             basis = "estimated" if basis == "reported" else basis
         total += cost
+    total = spending.combined(total)  # each a valid amount, their sum held at the most a float holds
     if basis == "reported":
         spending.settle(conn, reservation_id, total)
     elif basis == "estimated":
@@ -3403,7 +3404,8 @@ def _accounting(conn, run_id, complete=True):
     unknown = sum(1 for (data,) in conn.execute(
         "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'", (run_id,))
         if json.loads(data).get("charge") == "unknown" and json.loads(data).get("dispatched"))
-    return {"reported_usd": totals.get("reported", 0), "estimated_usd": totals.get("estimated", 0),
+    return {"reported_usd": spending.combined(totals.get("reported", 0)),
+            "estimated_usd": spending.combined(totals.get("estimated", 0)),
             "unknown_attempts": unknown, "complete": complete}
 
 

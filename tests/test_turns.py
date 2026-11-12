@@ -1577,6 +1577,30 @@ async def test_a_stop_while_the_gate_decides_on_a_retry_records_it_unsent_and_ke
         assert await rows(client, "SELECT attempt FROM run_bodies WHERE run_id = ?", run_id) == [(0,)]
 
 
+async def test_a_retried_call_whose_two_reported_costs_sum_past_what_a_float_holds_keeps_them_as_reported(
+        tmp_path, monkeypatch):
+    # PR 52 cycle 5 A-F2 (SPEC:425): the rejected attempt and its retry each reported 1.7e308, a valid amount; their sum
+    # overflowed to infinity, which settlement took for no amount, so the call settled at its estimate, marked
+    # estimated. The total is held at the most a float holds (spending.combined), settled as reported, and the turn's
+    # record and stream carry it.
+    import sys
+    big = 1.7e308
+    rejected = (400, {"error": {}, "usage": {"prompt_tokens": 10, "completion_tokens": 0, "cost": big}})
+    answered = (200, {"choices": [{"message": {"role": "assistant", "content": "Hi."}}],
+                      "usage": {"prompt_tokens": 12, "completion_tokens": 5, "cost": big}})
+    async with started(tmp_path / "data", MockProvider(rejected, answered)) as client:
+        conversation = await lab(client, monkeypatch)
+        stream = await send(client, conversation, provider="lab", model="m")
+        assert stream[-1]["status"] == "succeeded"
+        run_id = stream[0]["run_id"]
+        assert (await reservation(client, run_id))[1:] == ("settled", sys.float_info.max, "reported")
+        assert await attempts_of(client, run_id) == [(0, "request", True, "reported", big, True),
+                                                     (1, "ok", True, "reported", big, True)]
+        assert (stream[-1]["cost_usd"], stream[-1]["accounting"]["reported_usd"]) == (sys.float_info.max,) * 2
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert turn["cost_usd"] == sys.float_info.max
+
+
 async def test_a_stop_while_a_retry_is_in_flight_keeps_both_attempts_and_charges_at_least_the_reported_one(
         tmp_path, monkeypatch):
     # N1: the retry had left when Stop came, with no usage: the call keeps its first attempt's $0.20 and its estimate
