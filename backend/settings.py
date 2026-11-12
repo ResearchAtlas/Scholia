@@ -284,6 +284,7 @@ class Settings:
                     if not isinstance(leaf_value, dict):
                         node[leaf[-1]] = leaf_value
             data = doc.as_string().encode("utf-8")
+            named = [path for dotted, value in updates.items() for path in _named(_split_key(dotted), value)]
             if self.schema is PROJECT and not answer:
                 # S1-33 (Harold, 2026-11-12, design review C3's Option 2): decided from the file as it was and the bytes
                 # about to be written, read back, never from how updates name the keys
@@ -296,13 +297,34 @@ class Settings:
                             del table[key]
                     data = doc.as_string().encode("utf-8")
                     expected = (after[0], None, None)
+                    named += [("project", key) for key in _CONTINUE_KEYS[1:]]
                 if _continue_keys(data) != expected:
                     raise ValueError(f"{self.label}: what Continue adds is written only by a budget answer")
+            if self.schema is PROJECT and not _unnamed_kept(raw, data, named):
+                raise ValueError(f"{self.label}: this save would move or change keys it does not name")
             write_private(self.path, data)
             _parse(self, data)
 
 
 _CONTINUE_KEYS = ("budget_usd", "budget_continue_usd", "budget_continue_at_usd")
+
+
+def _named(path, value):
+    """The key paths an update names: each value a table given leaf by leaf names, else its own path (a value, or None
+    removing the whole key)."""
+    return [leaf for leaf, _ in _leaves({path[-1]: value}, path[:-1])] if isinstance(value, dict) and value else [path]
+
+
+def _unnamed_kept(raw, data, named):
+    """PR 52's follow-up (batch 7's residual): whether every value in the file as it was (raw) that no path in named
+    covers reads back unchanged from the bytes about to be written (an empty table the save writes into is covered).
+    A save adding a table among root dotted keys makes tomlkit write its header after the first of them, moving the
+    keys after it under the new table."""
+    if not raw:
+        return True
+    after = {path: repr(value) for path, value in _leaves(tomlkit.parse(data.decode("utf-8")).unwrap())}
+    return all(any(path[:len(n)] == n or n[:len(path)] == path for n in named) or after.get(path) == repr(value)
+               for path, value in _leaves(tomlkit.parse(raw.decode("utf-8")).unwrap()))
 
 
 def _continue_keys(raw):

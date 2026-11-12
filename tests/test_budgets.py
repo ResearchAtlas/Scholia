@@ -2213,3 +2213,59 @@ async def test_a_personal_file_not_valid_toml_gives_no_room_and_one_giving_its_b
                              (b"[budget]\nconversation_usd = 4\n", 4), (b'[ui]\nfollow_up = 7\n', 10)):
             (tmp_path / "data" / "config.toml").write_bytes(raw)
             assert (await asyncio.to_thread(runs._budgets_now, tmp_path / "data", project))[1] == default, raw
+
+
+# PR 52's follow-up (batch 7's residual; design review C3's "Outside this class"): in a project file whose keys are root
+# dotted keys, a save adding a table under `project` makes tomlkit write its header after the first of them, so every key
+# after it moves under the new table. With the limit not first, the limit moved too and read as reset to the shipped $50
+# (200). A project file's save writes nothing unless every key it does not name reads back as it was (Settings.save).
+
+
+@pytest.mark.asyncio
+async def test_a_settings_save_that_would_move_the_limit_in_a_hand_written_layout_is_refused_and_writes_nothing(tmp_path):
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 25.0)
+        _config(tmp_path, project).write_text('project.template = "imrad"\nproject.budget_usd = 25.0\n')
+        assert await _continue_at_cap(client, conversation, project, 25.0, "Short?") == 50.0
+        before = _config(tmp_path, project).read_bytes()
+        response = await _saved(client, project, {"project.unused": {}})
+        assert (response.status_code, response.json().get("code")) == (400, "invalid_setting")
+        assert _config(tmp_path, project).read_bytes() == before
+        assert await _project_budget(client, project) == 50.0
+        assert await _continue_at_cap(client, conversation, project, 50.0) == 75.0
+
+
+@pytest.mark.parametrize("raw, updates", [
+    (b'project.template = "imrad"\nproject.budget_usd = 80.0\n', {"project.unused": {}}),  # the limit would move
+    (b'project.budget_usd = 80.0\nproject.template = "imrad"\n', {"project.unused": {}}),  # another key would
+    (b'project.citation_style = "apa"\nproject.template = "imrad"\n', {"project.extra": {"x": 1}}),
+])
+def test_a_project_files_save_moving_a_key_it_does_not_name_raises_and_writes_nothing(tmp_path, monkeypatch, raw, updates):
+    from backend.settings import load_settings
+    written = _project_file(tmp_path, monkeypatch, raw)
+    with pytest.raises(ValueError):
+        load_settings(tmp_path, "p").save(updates)
+    assert written == [] and (tmp_path / "projects" / "p" / "config.toml").read_bytes() == raw
+
+
+_LAYOUTS = [b'project.template = "imrad"\nproject.budget_usd = 80.0\nmemory.enabled = true\n',
+            b'memory.enabled = true\nproject.budget_usd = 80.0\nproject.citation_style = "apa"\n',
+            b'project.budget_usd = 80.0\nproject.budget_continue_usd = 25.0\nproject.budget_continue_at_usd = 80.0\n'
+            b'limits.turn_minutes = 12\n',
+            b'[project]\ntemplate = "imrad"\nbudget_usd = 80.0\n[memory]\nenabled = true\n',
+            b"[project]\n", b"[project]\n[memory]\n"]  # empty tables, as a reset leaves them, which a save writes into
+
+
+@pytest.mark.parametrize("raw", _LAYOUTS)
+@pytest.mark.parametrize("updates, answer", [
+    ({"project.citation_style": "vancouver"}, False), ({"memory.enabled": False}, False),
+    ({"project.budget_usd": 60}, False), ({"project.budget_usd": None}, False), ({"limits.turn_minutes": 9}, False),
+    ({"project.budget_usd": 90.0, "project.budget_continue_usd": 10.0, "project.budget_continue_at_usd": 90.0}, True)])
+def test_the_apps_own_project_saves_move_no_key_in_any_layout_and_are_written(tmp_path, monkeypatch, raw, updates, answer):
+    # The rule refuses only a save that would move what it does not name: the Settings page's saves and a budget
+    # answer's, on hand-written layouts too, are written as before (a probe over 207 layouts found none refused)
+    from backend.settings import load_settings
+    written = _project_file(tmp_path, monkeypatch, raw)
+    load_settings(tmp_path, "p").save(updates, answer=answer)
+    assert len(written) == 1
