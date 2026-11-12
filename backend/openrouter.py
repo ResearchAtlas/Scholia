@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -255,21 +256,38 @@ def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens
 
 async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, timeout: float = 120.0,
                       effort: str | None = None, zdr_enabled: bool = False, max_tokens: int | None = None,
-                      model_entry=None, capability_records=None, on_dispatch=None, on_body=None, tools=None) -> ModelResult:
+                      model_entry=None, capability_records=None, attempts=None, on_body=None, tools=None) -> ModelResult:
     """One chat completion. Never raises for a provider failure: the result carries
     the failure kind and every attempt. Cancellation propagates (the caller settles
     what the attempt in flight cost). The client must be the outbound gate's: its
     notice that a request went out is the only evidence that an attempt may be
-    billed. on_dispatch, if given, is called with that notice, so a caller cancelled
-    before it knows nothing left. on_body, if given, is awaited with each attempt's exact request bytes
+    billed. on_body, if given, is awaited with each attempt's exact request bytes
     before they are sent (S1-19: the trace keeps them even for a call stopped in flight).
-    """
-    sent = []  # the gate's notices that the current attempt's request went out, with the terms it applied
 
-    def dispatched(terms=None):
-        sent.append(terms)
-        if on_dispatch is not None:
-            on_dispatch(terms)
+    attempts, if given, is the caller's list (S1-33, PR 52 cycle 4, design review A2): the gate's notice itself adds
+    the attempt to it, as sent with nothing reported, in the step the request enters the transport; the attempt's
+    ending (end) then completes that entry, or adds one not sent when no notice came. So from the notice on, however
+    the attempt ends or fails to end, the list says it went out, and an ending never reached leaves it sent with an
+    unknown charge (outcome "other"), which costs the estimate (SPEC:425), never $0. Only end may say a let-out
+    attempt was not sent: a connection that never opened.
+    """
+    current = {}  # the attempt under way: when it started, and its entry once the gate let it out
+
+    def dispatched(terms=None):  # the gate's notice, once an attempt
+        if "entry" not in current:
+            current["entry"] = Attempt("other", None, _ms(current["started"]), dispatched=True, retention=terms)
+            attempts.append(current["entry"])
+
+    def end(outcome, status=None, usage=None, unsent=False):
+        """The attempt under way ended so: its entry completed, or one not sent added when the gate gave no notice."""
+        entry = current.get("entry")
+        if entry is None:
+            attempts.append(Attempt(outcome, status, _ms(current["started"]), usage or {}, dispatched=False))
+            return
+        entry.outcome, entry.http_status, entry.elapsed_ms, entry.usage = outcome, status, _ms(current["started"]), \
+            usage or {}
+        if unsent:  # let out by the gate, but its connection never opened
+            entry.dispatched, entry.retention = False, None
 
     extensions = {DISPATCHED: dispatched}
     payload = build_payload(route, messages, effort=effort, zdr_enabled=zdr_enabled, max_tokens=max_tokens,
@@ -280,7 +298,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
     if zdr_enabled:
         headers[NO_RESPONSE_CACHE[0]] = NO_RESPONSE_CACHE[1]  # OpenRouter's response caching off (section 6.4)
     deadline = time.monotonic() + timeout
-    attempts = []
+    attempts = [] if attempts is None else attempts
     while True:
         # Encoded here, as httpx would encode json=, so the trace keeps the exact bytes that went out (S1-19).
         sending = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
@@ -291,20 +309,21 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return _failed("timeout", attempts, route)
-        started = time.monotonic()
-        sent.clear()
+        current.clear()
+        current["started"] = time.monotonic()
         try:
             response = await asyncio.wait_for(
                 client.post(route.provider.chat_url, headers=headers, content=sending, extensions=extensions,
                             timeout=httpx.Timeout(remaining, connect=connect_timeout_for(remaining))),
                 timeout=remaining,
             )
+        except asyncio.CancelledError:  # cut off: it may have left only if the gate let it out
+            end("cancelled")
+            raise
         except Exception as error:  # cancellation is not an Exception, and propagates
-            # The gate's notice decides whether the request left: refused, cut off by the time
-            # bound during the gate's check, or never connected, it did not.
-            left = bool(sent) and not isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout))
-            attempts.append(Attempt(classify_error(error), None, _ms(started), dispatched=left,
-                                    retention=sent[-1] if left else None))
+            # Refused, or cut off by the time bound during the gate's check: no notice, so not sent. Let out but
+            # never connected: not sent either.
+            end(classify_error(error), unsent=isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)))
             return _failed(attempts[-1].outcome, attempts, route)
         body = _json(response)
         usage = body.get("usage") if isinstance(body, dict) and isinstance(body.get("usage"), dict) else {}
@@ -312,8 +331,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
             # OpenRouter answers 403 for its moderation and its providers' guardrails: a policy block.
             kind = "policy_block" if response.status_code == 403 and route.provider.is_openrouter \
                 else classify_status(response.status_code)
-            attempts.append(Attempt(kind, response.status_code, _ms(started), usage,
-                                    retention=sent[-1] if sent else None))
+            end(kind, response.status_code, usage)
             retry = (response.status_code == 400 and "reasoning" in payload and not route.provider.is_openrouter
                      and len(attempts) < MAX_ATTEMPTS)
             if retry:
@@ -330,18 +348,17 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
             # say on reasoning); or the model or a policy declined. Its reported cost is kept, and the
             # same prompt is never sent again (model-route rule 4).
             kind = refusal or ("output_limit" if _choice(body).get("finish_reason") == "length" else "malformed")
-            attempts.append(Attempt(kind, response.status_code, _ms(started), usage,
-                                    retention=sent[-1] if sent else None))
+            end(kind, response.status_code, usage)
             return _failed(kind, attempts, route)
-        attempts.append(Attempt("ok", response.status_code, _ms(started), usage, retention=sent[-1] if sent else None))
+        end("ok", response.status_code, usage)
         if len(attempts) > 1 and "reasoning" not in payload:
             _remember_no_reasoning(route, key)
         return ModelResult(content, reasoning, None, attempts, tool_calls,
                            cut=_choice(body).get("finish_reason") == "length", message=_choice(body).get("message"))
 
 
-def _count(value):
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+def _count(value):  # a token count; one no float can hold is none (PR 52 cycle 4: it prices nothing)
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= sys.float_info.max
 
 
 def _failed(kind, attempts, route):
@@ -356,7 +373,7 @@ def _ms(started):
 def _json(response):
     try:
         return response.json()
-    except ValueError:
+    except Exception:  # not JSON, or nested deeper than the decoder follows (RecursionError): malformed (PR 52 cycle 4)
         return None
 
 

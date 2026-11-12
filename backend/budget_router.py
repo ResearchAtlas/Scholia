@@ -16,6 +16,7 @@ reported usage. Estimates are approximate and never authoritative.
 """
 
 import re
+import sys
 from dataclasses import asdict, dataclass
 
 AUTO = "auto"
@@ -110,8 +111,10 @@ def request_cost(rates, input_tokens: int, output_tokens: int) -> float:
 
 def cost_from_usage(rates, usage: dict) -> float | None:
     """An estimate from reported token counts, at the step's rates, when the provider reported tokens
-    but no cost; None when it reported neither."""
+    but no cost; None when it reported neither, or a count no float can hold (as openrouter._count, so an attempt
+    whose record has no count is charged its estimate: PR 52 cycle 4)."""
     prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
-    if not all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in (prompt, completion)):
+    if not all(isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= sys.float_info.max
+               for n in (prompt, completion)):
         return None
     return request_cost(rates, prompt, completion)

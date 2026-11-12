@@ -323,3 +323,48 @@ async def test_no_memory_canary_reaches_the_log(tmp_path, caplog):
                    "CANARY-EDITED", "CANARY-PROMPT"):
         assert canary not in text, canary
         assert not any(canary in record.getMessage() for record in caplog.records), canary
+
+
+async def test_no_steering_queued_or_budget_answer_canary_reaches_the_log(tmp_path, caplog, monkeypatch):
+    # S1-33 (checklist I4): steering notes, queued messages and a typed budget answer, including one refused and a
+    # project budget whose settings write fails, log none of their text.
+    from backend import settings
+    data = tmp_path / "data"
+    data.mkdir()
+    handler = logs.configure(data)
+    caplog.set_level(logging.DEBUG, logger="backend")
+    try:
+        async with started(data) as client:
+            conversation = (await client.post("/api/conversations", json={"title": "t"})).json()["id"]
+            stream = await send(client, conversation, "CANARY-PROMPT")
+            await client.post(f"/api/runs/{stream[0]['run_id']}/steering", json={"content": "CANARY-STEERING"})
+            queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "CANARY-QUEUED"})).json()
+            await client.put(f"/api/conversations/{conversation}/queue/{queued['id']}", json={"content": "CANARY-EDITED"})
+            project = (await client.get(f"/api/conversations/{conversation}")).json()["project_id"]
+            read = (await client.get("/api/settings", params={"project_id": project})).json()
+            await client.put("/api/settings", json={"project_id": project, "hash": read["hash"],
+                                                    "updates": {"project.budget_usd": 0.01}})
+            monkeypatch.setattr(settings.Settings, "save", lambda self, updates, answer=False: (_ for _ in ()).throw(OSError("CANARY-DISK")))
+            sending = asyncio.create_task(send(client, conversation, "CANARY-PROMPT budget"))
+            from test_agent_loop import asked
+            ask = await asked(client, conversation)
+            path = f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}"
+            await client.post(path, json={"text": "CANARY-LIMIT"})
+            await client.post(path, json={"text": "25"})  # its settings write fails: it asks again
+            again = await asked(client, conversation)
+            for _ in range(200):  # asked again, by a new ask
+                if again["ask_id"] != ask["ask_id"]:
+                    break
+                await asyncio.sleep(0.05)
+                again = await asked(client, conversation)
+            assert again["ask_id"] != ask["ask_id"]
+            await client.post(f"/api/runs/{again['run_id']}/asks/{again['ask_id']}", json={"option": "not_now"})
+            await sending
+            await background_idle(client)
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    text = (data / "logs" / "scholia.log").read_text()
+    for canary in ("CANARY-PROMPT", "CANARY-STEERING", "CANARY-QUEUED", "CANARY-EDITED", "CANARY-LIMIT", "CANARY-DISK"):
+        assert canary not in text, canary
+        assert not any(canary in record.getMessage() for record in caplog.records), canary

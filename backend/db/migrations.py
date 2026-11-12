@@ -683,4 +683,45 @@ CREATE TABLE run_body_memory (
 CREATE INDEX run_body_memory_by_memory ON run_body_memory (memory_id);
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009)
+# S1-33: messages sent while a turn runs that wait as the next turn (slice-1 spec F11, queue): the researcher's text,
+# in the order queued, until one starts as a turn (its admission deletes the row in the same transaction) or is
+# removed; deleted with their conversation (backend/db/deletion.py). And the preview's evaluation project (SPEC:1223),
+# marked in the database when it is created and never after, so no settings file or later change loosens its
+# conservative admission. A project's last applied budget decision ({"to_usd", "amount_usd"}): what Continue adds again
+# while its budget is still what that decision left, kept with the project so deleting a conversation never changes it.
+# (PR 52 cycle 5: no longer read or written; what Continue adds is in the project's config.toml beside its budget,
+# budgets._amount.)
+_0010 = r"""
+CREATE TABLE queued_messages (
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
+    conversation_id TEXT NOT NULL REFERENCES conversations (id),
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) CHECK (created_at IS strftime('%Y-%m-%dT%H:%M:%fZ', created_at)),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) CHECK (updated_at IS strftime('%Y-%m-%dT%H:%M:%fZ', updated_at))
+) STRICT;
+CREATE INDEX queued_messages_by_conversation ON queued_messages (conversation_id);
+
+ALTER TABLE projects ADD COLUMN evaluation INTEGER NOT NULL DEFAULT 0 CHECK (evaluation IN (0, 1));
+ALTER TABLE projects ADD COLUMN budget_decided TEXT CHECK (budget_decided IS NULL OR json_valid(budget_decided));
+
+CREATE TRIGGER projects_evaluation_at_creation BEFORE UPDATE OF evaluation ON projects
+WHEN NEW.evaluation IS NOT OLD.evaluation
+BEGIN
+    SELECT RAISE(ABORT, 'a project is marked for evaluation only when it is created');
+END;
+"""
+
+# S1-33 (PR 52 cycle 2): the project budget's notices already recorded ([percent, limit_usd] pairs), kept with the
+# project, so deleting or moving a conversation, whose runs' events go with it, neither rearms one nor carries one away.
+_0011 = r"""
+ALTER TABLE projects ADD COLUMN budget_noticed TEXT CHECK (budget_noticed IS NULL OR json_valid(budget_noticed));
+"""
+
+# S1-33 (PR 52 cycle 3): a waiting message keeps the papers it names (the Library's selection or @-mentions, SPEC:281),
+# their ids as a JSON list, as a turn's message keeps them (ids, never text); its start checks them (a paper deleted
+# since: refused, selection_invalid).
+_0012 = r"""
+ALTER TABLE queued_messages ADD COLUMN material_ids TEXT CHECK (material_ids IS NULL OR json_valid(material_ids));
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009, _0010, _0011, _0012)

@@ -68,6 +68,7 @@ ON_DELETE = {
     # A conversation's runs and turns. Artifacts are kept unless deleted themselves.
     ("runs", "conversation_id"): DELETE,
     ("turns", "conversation_id"): DELETE,
+    ("queued_messages", "conversation_id"): DELETE,  # S1-33: messages waiting as its next turn
     ("budget_reservations", "paying_conversation_id"): "paying_conversation_id = NULL",
     ("artifacts", "source_conversation_id"): "source_conversation_id = NULL",
     # A run's record, its child runs, the post-answer runs keyed to its turn, and its

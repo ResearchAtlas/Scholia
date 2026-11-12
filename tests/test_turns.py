@@ -233,11 +233,13 @@ async def test_cancel_during_the_model_call_ends_the_turn_and_settles_its_estima
         [(step,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_started'", run_id)
         assert json.loads(step)["estimate_usd"] == estimate  # the request-sized estimate, settled once (S1-19)
         # The attempt cut off in flight is recorded, content-free, with an unknown charge; it names the exact
-        # text it sent (S1-19b: stored before it was sent, in the content store, never in the event).
+        # text it sent (S1-19b: stored before it was sent, in the content store, never in the event). S1-33 (PR 52
+        # cycle 3): recorded from the adapter's own attempt, so with the time it had run.
         [(attempt,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'",
                                   run_id)
         assert json.loads(attempt) == {"step": 0, "attempt": 0, "route": json.loads(attempt)["route"], "outcome": "cancelled",
-                                       "http_status": None, "dispatched": True, "charge": "unknown",
+                                       "http_status": None, "elapsed_ms": json.loads(attempt)["elapsed_ms"],
+                                       "dispatched": True, "charge": "unknown",
                                        "retention": {"level": "normal"},  # the terms it was sent under
                                        "body": json.loads(attempt)["body"]}
         assert len(json.loads(attempt)["body"]) == 64
@@ -349,9 +351,13 @@ async def test_a_step_that_does_not_fit_the_budget_is_refused_before_any_call(tm
                                                            "updates": {"project.budget_usd": 0.0001}})
         assert response.status_code == 200, response.text
         conversation = await new_conversation(client, project_id=project)
-        stream = await send(client, conversation)
-        assert [e["type"] for e in stream] == ["run_started", "route", "limit_reached", "run_finished"]
-        assert stream[2]["budget"] == "project" and stream[-1]["status"] == "cancelled"
+        sending = asyncio.create_task(send(client, conversation))
+        from test_agent_loop import asked
+        ask = await asked(client, conversation)  # S1-33: it asks before the step; Not now ends it at the limit
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "not_now"})
+        stream = await sending
+        assert [e["type"] for e in stream] == ["run_started", "route", "ask", "limit_reached", "run_finished"]
+        assert stream[3]["budget"] == "project" and stream[-1]["status"] == "cancelled"
         assert provider.chats == []
         assert (await counts(client))["budget_reservations"] == 0
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
@@ -544,12 +550,17 @@ async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tm
     loop = asyncio.get_running_loop()
 
     def slow_inputs(data_root):
-        loop.call_soon_threadsafe(checking.set)
+        turn = client.state["harness"].registry.turns.get(conversation)
+        if turn is not None and turn.call is not None:  # the turn's own call, reserved, is at the gate
+            loop.call_soon_threadsafe(checking.set)
         time.sleep(0.3)  # the gate is still checking when Stop arrives
         return real(data_root)
 
     async with started(tmp_path / "data") as client:
         await send(client, await new_conversation(client, title="t"))  # the catalog and endpoints, read once
+        # PR 52 (CI on 82e95ab): its memory extraction is done before the patch, so only the turn's own call is checked
+        # after it (a late extraction's check had set the signal before the turn reserved: no reservation to release)
+        await background_idle(client)
         conversation = await new_conversation(client, title="t")
         monkeypatch.setattr(providers_module, "gate_inputs", slow_inputs)
         stream = asyncio.create_task(send(client, conversation))
@@ -557,7 +568,7 @@ async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tm
         run_id = active_turn(client, conversation).run_id
         await client.post(f"/api/runs/{run_id}/cancel")
         assert (await stream)[-1]["status"] == "cancelled"
-        assert len(client.provider.chats) == 1  # the first conversation's only
+        assert len(client.provider.chats) == 2  # the first conversation's turn and its extraction only
         assert await rows(client, "SELECT status, settled_usd FROM budget_reservations WHERE run_id = ?",
                           run_id) == [("released", None)]
 
@@ -816,8 +827,12 @@ async def test_a_turn_whose_terminal_write_fails_reads_interrupted_once_released
         if handler == "cancelled":
             claim.task = asyncio.create_task(harness._turn(claim))
             harness._request_cancel(claim, "researcher")  # its cancellation handler writes the terminal record
-        else:  # a reader pulls it to its first step, which does not fit
-            assert [event["type"] async for event in harness.events(claim)] == ["run_started", "route"]
+        else:  # a reader pulls it to its first step, which does not fit: it asks (S1-33), and Not now ends it at the limit
+            stream = harness.events(claim)
+            assert [(await anext(stream))["type"] for _ in range(3)] == ["run_started", "route", "ask"]
+            [ask] = (await client.get("/api/asks", params={"conversation_id": conversation})).json()["asks"]
+            await client.post(f"/api/runs/{claim.run_id}/asks/{ask['ask_id']}", json={"option": "not_now"})
+            assert [event["type"] async for event in stream] == []
         with pytest.raises(RuntimeError):
             await claim.task
         assert not harness.registry.is_active(claim.run_id) and claim.run_id not in harness.registry.finished
@@ -956,7 +971,9 @@ async def test_a_terminal_write_that_commits_while_its_turn_is_stopped_marks_it_
         tmp_path, monkeypatch, write):
     """PR 46 recheck 3: a Stop during a turn's terminal write (its answer, or a provider failure) cancelled the await
     while the writer went on and committed; when the Stop's own write then failed, the turn was released never known
-    finished, and a read taken before that commit read it interrupted. The writer marks it finished as it commits."""
+    finished, and a read taken before that commit read it interrupted. The writer marks it finished as it commits.
+    (PR 52 cycle 4: a Stop that lands once the write began now waits for it, so the turn ends as that write recorded
+    it and the Stop has no write of its own; the stub that fails it stays to show none is made.)"""
     from backend.runs import Registry, derived_status
     real_release, real_commit, real_finish = Registry.release, runs_module.Harness._commit_answer, \
         runs_module.Harness._finish_turn
@@ -998,8 +1015,8 @@ async def test_a_terminal_write_that_commits_while_its_turn_is_stopped_marks_it_
         harness._request_cancel(claim, "researcher")  # the Stop, while the terminal write is still to commit
         await asyncio.sleep(0.05)  # the turn's await is cancelled and the Stop's own write is queued
         gate.set()
-        with pytest.raises(RuntimeError):
-            await claim.task
+        await claim.task
+        assert len(calls) == (0 if write == "answer" else 1)  # only the turn's own terminal write
         await reader
         assert seen == ["running"] and claim.run_id in harness.registry.finished
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
@@ -1197,6 +1214,8 @@ async def test_a_stop_that_comes_before_a_failed_or_limited_turn_commits_wins(tm
         assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == outcome
         assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", claim.run_id) == [outcome]
         if reason == "shutdown":  # interrupted by closing the app: Continue is offered
+            if ending == "limit":  # the continued turn's step fits again (S1-33: one that does not would ask)
+                monkeypatch.setattr(runs_module.spending, "reserve", real)
             assert (await client.post(f"/api/runs/{claim.run_id}/continue")).status_code == 200
 
 
@@ -1448,3 +1467,300 @@ async def test_two_conversations_of_one_project_keep_their_own_citations_and_res
             paying = await rows(client, "SELECT DISTINCT paying_conversation_id FROM budget_reservations WHERE run_id = ?",
                                 run_id)
             assert owners == [(run_id,)] and paying == [(conversation,)]
+
+
+# S1-33 fix batch 3 (PR 52 cycle 3, design review A): what each attempt did, from the adapter's own list, settles a
+# call and writes its record, even when the call never comes back to its receipt (a Stop, a failed write). Lifecycle
+# first (charter section 10): the turn's cleanup closes such a call as its attempts say, once.
+
+REJECTED = (400, {"error": {}, "usage": {"prompt_tokens": 10, "completion_tokens": 0, "cost": 0.2}})  # went out: $0.20
+
+
+async def lab(client, monkeypatch):
+    """A conversation on an OpenAI-compatible provider sent the reasoning field, which a first attempt that answers
+    REJECTED makes the adapter retry without (openrouter.query_model)."""
+    from backend import openrouter
+    monkeypatch.setattr(openrouter, "resolve_model_reasoning", lambda route, effort, **kw: ({"effort": "high"}, None))
+    settings = (await client.get("/api/settings")).json()
+    await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+        "providers.lab.kind": "openai-compatible", "providers.lab.base_url": "http://127.0.0.1:9/v1"}})
+    await client.put("/api/keys/lab", json={"key": "k"})
+    return await new_conversation(client, title="t")
+
+
+def fails_once(monkeypatch, name):
+    """runs.<name> raises the first time it is called (the receipt's write); the calls made."""
+    real, calls = getattr(runs_module, name), []
+
+    def failing(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("the receipt's write failed")
+        return real(*args, **kwargs)
+    monkeypatch.setattr(runs_module, name, failing)
+    return calls
+
+
+async def attempts_of(client, run_id):
+    return [(d["attempt"], d["outcome"], d["dispatched"], d["charge"], d.get("cost_usd"), "body" in d)
+            for d in (json.loads(data) for (data,) in await rows(
+                client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt' ORDER BY seq", run_id))]
+
+
+async def reservation(client, run_id):
+    [found] = await rows(client, "SELECT estimate_usd, status, settled_usd, basis FROM budget_reservations"
+                                 " WHERE run_id = ?", run_id)
+    return found
+
+
+async def test_a_reported_request_whose_receipt_write_fails_keeps_its_reported_charge(tmp_path, monkeypatch):
+    # E1 case 3 (SPEC:154, 425): the one request reported $0.20, then the write recording it failed. The turn's cleanup
+    # closes the call as its attempt says: settled at $0.20 reported, never at its estimate with an unknown attempt.
+    async with started(tmp_path / "data", MockProvider(cost=0.2)) as client:
+        conversation = await new_conversation(client, title="t")
+        failed = fails_once(monkeypatch, "_settle_attempts")
+        stream = await send(client, conversation)
+        assert failed and stream[-1]["status"] == "failed"
+        run_id = stream[0]["run_id"]
+        assert (await reservation(client, run_id))[1:] == ("settled", 0.2, "reported")
+        assert await attempts_of(client, run_id) == [(0, "ok", True, "reported", 0.2, True)]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert turn["accounting"]["unknown_attempts"] == 0
+
+
+async def test_a_reported_attempt_keeps_its_charge_beside_a_retry_that_never_connected_when_the_receipt_fails(
+        tmp_path, monkeypatch):
+    # E1 case 1: the first attempt went out and reported $0.20; its retry never connected; the receipt's write failed.
+    # Both attempts are recorded as they were, and the call is charged the first one's $0.20, reported.
+    import httpx
+
+    def unreachable(body):
+        raise httpx.ConnectError("connection refused")
+    provider = MockProvider(REJECTED, unreachable)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await lab(client, monkeypatch)
+        fails_once(monkeypatch, "_settle_attempts")
+        stream = await send(client, conversation, provider="lab", model="m")
+        assert stream[-1]["status"] == "failed" and len(provider.answers) == 2
+        run_id = stream[0]["run_id"]
+        assert (await reservation(client, run_id))[1:] == ("settled", 0.2, "reported")
+        assert await attempts_of(client, run_id) == [(0, "request", True, "reported", 0.2, True),
+                                                     (1, "network", False, "unknown", None, False)]
+
+
+async def test_a_stop_while_the_gate_decides_on_a_retry_records_it_unsent_and_keeps_the_first_attempts_charge(
+        tmp_path, monkeypatch):
+    # E1 case 2: the retry's body was kept, and Stop came while the gate was still deciding on it, so it never left.
+    # The record says so (no body kept for it, not dispatched), and the call is charged what its first attempt reported.
+    import time
+    from backend import outbound_gate
+    provider = MockProvider(REJECTED)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await lab(client, monkeypatch)
+        harness, loop, real, chats = client.state["harness"], asyncio.get_running_loop(), outbound_gate.OutboundGate._check, []
+
+        def checking(self, request, scope, hop=None):
+            if request.url.path.endswith("/chat/completions"):
+                chats.append(request)
+                if len(chats) == 2:  # the retry: Stop arrives while the gate decides
+                    loop.call_soon_threadsafe(lambda: harness._request_cancel(active_turn(client, conversation),
+                                                                              "researcher"))
+                    time.sleep(0.3)
+            return real(self, request, scope, hop)
+        monkeypatch.setattr(outbound_gate.OutboundGate, "_check", checking)
+        stream = await send(client, conversation, provider="lab", model="m")
+        assert stream[-1]["status"] == "cancelled" and len(chats) == 2 and len(provider.answers) == 1
+        run_id = stream[0]["run_id"]
+        assert (await reservation(client, run_id))[1:] == ("settled", 0.2, "reported")
+        assert await attempts_of(client, run_id) == [(0, "request", True, "reported", 0.2, True),
+                                                     (1, "cancelled", False, "unknown", None, False)]
+        assert await rows(client, "SELECT attempt FROM run_bodies WHERE run_id = ?", run_id) == [(0,)]
+
+
+async def test_a_stop_while_a_retry_is_in_flight_keeps_both_attempts_and_charges_at_least_the_reported_one(
+        tmp_path, monkeypatch):
+    # N1: the retry had left when Stop came, with no usage: the call keeps its first attempt's $0.20 and its estimate
+    # for the one cut off, settled at the larger, marked estimated (_settle_attempts); neither attempt is lost.
+    reached = asyncio.Event()
+
+    async def in_flight(body):
+        reached.set()
+        await asyncio.sleep(30)
+    provider = MockProvider(REJECTED, in_flight)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await lab(client, monkeypatch)
+        sending = asyncio.create_task(send(client, conversation, provider="lab", model="m"))
+        await asyncio.wait_for(reached.wait(), 5)
+        run_id = active_turn(client, conversation).run_id
+        await client.post(f"/api/runs/{run_id}/cancel")
+        assert (await sending)[-1]["status"] == "cancelled"
+        estimate, status, settled, basis = await reservation(client, run_id)
+        assert (status, settled, basis) == ("settled", max(0.2, estimate), "estimated")
+        assert await attempts_of(client, run_id) == [(0, "request", True, "reported", 0.2, True),
+                                                     (1, "cancelled", True, "unknown", None, True)]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert turn["accounting"]["unknown_attempts"] == 1
+
+
+async def test_a_retry_whose_body_could_not_be_kept_never_left_and_the_first_attempt_keeps_its_charge(
+        tmp_path, monkeypatch):
+    # N2: the write keeping the retry's body failed before it was sent, so the call never came back to its receipt. Its
+    # first attempt, which went out and reported $0.20, is recorded and charged; nothing says the retry was sent.
+    provider = MockProvider(REJECTED)
+    real = runs_module._keep_body
+
+    def keeping(conn, call, number, ref):
+        if number == 1:
+            raise RuntimeError("the body's write failed")
+        return real(conn, call, number, ref)
+    monkeypatch.setattr(runs_module, "_keep_body", keeping)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await lab(client, monkeypatch)
+        stream = await send(client, conversation, provider="lab", model="m")
+        assert stream[-1]["status"] == "failed" and len(provider.answers) == 1
+        run_id = stream[0]["run_id"]
+        assert (await reservation(client, run_id))[1:] == ("settled", 0.2, "reported")
+        assert await attempts_of(client, run_id) == [(0, "request", True, "reported", 0.2, True)]
+
+
+async def test_a_call_whose_outcome_could_not_be_written_before_the_app_stopped_settles_at_its_estimate_by_the_crash_rule(
+        tmp_path, monkeypatch):
+    # The residual Harold accepted (2026-11-11, item 2; N3): the request never connected, and neither the receipt nor the
+    # turn's cleanup could write that before the app stopped. Section 6.1's crash rule then settles the reservation at
+    # its estimate, marked estimated, and the turn reads interrupted with Continue: the app could not know better.
+    import httpx
+    from backend import spending
+    failing, releasing = [True], spending.release
+
+    def release(conn, reservation_id):
+        if failing[0]:
+            raise RuntimeError("the write failed")
+        return releasing(conn, reservation_id)
+
+    def unreachable(body):
+        raise httpx.ConnectError("connection refused")
+    monkeypatch.setattr(spending, "release", release)
+    async with started(tmp_path / "data", MockProvider(unreachable)) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        assert not [e for e in stream if e["type"] == "run_finished"]  # its end could not be written either
+        run_id = stream[0]["run_id"]
+        failing[0] = False
+        await client.state["harness"].recover(kick=False)  # as at the next start
+        estimate, *settled = await reservation(client, run_id)
+        assert settled == ["settled", estimate, "estimated"]
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", run_id) == [("interrupted",)]
+
+
+# PR 52 cycle 4 (design review A2): a reply the adapter can read nothing from, or whose numbers no float can hold, is a
+# reply like any other: its call is recorded as the attempt went, and charged at an estimate when nothing says its cost.
+
+
+async def test_a_reply_too_deeply_nested_to_decode_is_charged_at_its_estimate_as_a_request_that_went_out(tmp_path):
+    # G1 (cycle 4 A's F1): a 200 reply of 10,000 nested arrays. The decoder's RecursionError escaped the adapter before
+    # the attempt joined the call's list, so the request that went out was released at $0 and its kept body deleted. It
+    # is now the malformed reply it is: the turn fails malformed, its one attempt went out, its body is kept, and the
+    # call is charged its estimate, marked estimated, the charge unknown (SPEC:425).
+    async with started(tmp_path / "data", MockProvider((200, b"[" * 10000 + b"]" * 10000))) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        assert stream[-1]["status"] == "failed" and {"type": "error", "code": "malformed"} in stream
+        run_id = stream[0]["run_id"]
+        estimate, *settled = await reservation(client, run_id)
+        assert settled == ["settled", estimate, "estimated"]
+        assert await attempts_of(client, run_id) == [(0, "malformed", True, "unknown", None, True)]
+        assert stream[-1]["accounting"]["unknown_attempts"] == 1
+
+
+@pytest.mark.parametrize("usage", [{"prompt_tokens": 12, "completion_tokens": 5, "cost": 10 ** 400},
+                                   {"prompt_tokens": 10 ** 400, "completion_tokens": 5}])
+async def test_a_reply_whose_cost_or_token_count_no_float_holds_is_delivered_and_charged_at_an_estimate(tmp_path, usage):
+    # Design review A2 (G1, new): a reported cost or token count of 401 digits raised OverflowError in the receipt and
+    # again in the turn's cleanup, leaving the turn with no end and its reservation open until the next start. Neither
+    # is a number the record can use: the answer is delivered, and the call is charged from its readable token counts
+    # at the step's rates, or else at its estimate (its attempt's charge then unknown), settled as estimated either way.
+    reply = (200, {"choices": [{"message": {"role": "assistant", "content": "Hi."}}], "usage": usage})
+    async with started(tmp_path / "data", MockProvider(reply)) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        assert stream[-1]["status"] == "succeeded"
+        assert [e["content"] for e in stream if e["type"] == "chat_response"] == ["Hi."]
+        estimate, status, settled, basis = await reservation(client, stream[0]["run_id"])
+        assert (status, basis) == ("settled", "estimated") and 0 < settled <= estimate
+        [attempt] = await attempts_of(client, stream[0]["run_id"])
+        if "cost" not in usage:  # no count the step's rates can price: its estimate, its charge unknown (review F5)
+            assert settled == estimate and attempt[3] == "unknown" and stream[-1]["accounting"]["unknown_attempts"] == 1
+        else:
+            assert attempt[3] == "estimated" and stream[-1]["accounting"]["unknown_attempts"] == 0
+
+
+async def test_a_turn_whose_reply_a_defect_left_unread_settles_at_its_estimate_with_its_attempt_sent(tmp_path, monkeypatch):
+    # Design review A2's Option 2 (its test 7): the decoder made to raise, a failure between the reply and the attempt's
+    # ending. The gate's notice had already put the attempt in the call's list as sent, so the turn's cleanup settles
+    # the call at its estimate with that attempt sent, its body kept and its charge unknown, never released at $0.
+    from backend import openrouter
+
+    def broken(response):
+        raise RuntimeError("the decoder failed")
+    monkeypatch.setattr(openrouter, "_json", broken)
+    async with started(tmp_path / "data", MockProvider()) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        assert stream[-1]["status"] == "failed"
+        run_id = stream[0]["run_id"]
+        estimate, *settled = await reservation(client, run_id)
+        assert settled == ["settled", estimate, "estimated"]
+        assert await attempts_of(client, run_id) == [(0, "other", True, "unknown", None, True)]
+
+
+async def test_while_a_turns_request_is_at_the_provider_its_call_already_says_it_went_out(tmp_path):
+    # Design review A2 (its test 7): in flight, the call's own list holds the attempt as sent (no stand-in says "never
+    # left" while the provider has the request).
+    arrived, release = asyncio.Event(), asyncio.Event()
+
+    async def held(body):
+        arrived.set()
+        await release.wait()
+        return provider.answer("An answer.")
+    provider = MockProvider(held)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        sending = asyncio.create_task(send(client, conversation))
+        await asyncio.wait_for(arrived.wait(), 10)
+        call = active_turn(client, conversation).call
+        assert call.dispatched and [(a.outcome, a.dispatched) for a in call.attempts] == [("other", True)]
+        release.set()
+        assert (await sending)[-1]["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("ending", ["answer", "failed"])
+async def test_a_stop_landing_while_a_turns_end_is_written_still_gets_that_end_on_the_stream(tmp_path, monkeypatch, ending):
+    # PR 52 cycle 4 (G5's class, batch 4 part 2 item 3): Stop lands while the turn's terminal write runs, once it began.
+    # The answer (or the failure) commits, and the stream says so as the record does, before it ends: chat_response,
+    # saved (or the error), then run_finished with the recorded status. Before, the answer was saved but never sent.
+    import time
+    method = "_commit_answer" if ending == "answer" else "_finish_turn"
+    real = getattr(runs_module.Harness, method)
+    provider = MockProvider() if ending == "answer" else MockProvider((200, {"choices": [{"message": {"content": " "}}]}))
+    async with started(tmp_path / "data", provider) as client:
+        harness, loop = client.state["harness"], asyncio.get_running_loop()
+
+        def writing(self, conn, *args, **kwargs):
+            done = real(self, conn, *args, **kwargs)
+            if not getattr(writing, "stopped", False):
+                writing.stopped = True
+                claim = harness.registry.turns[conversation]
+                loop.call_soon_threadsafe(lambda: harness._request_cancel(claim, "researcher"))
+                time.sleep(0.3)  # the Stop lands while this write is still to commit
+            return done
+        monkeypatch.setattr(runs_module.Harness, method, writing)
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        if ending == "answer":
+            assert turn["status"] == "succeeded" and turn["answer"] == {"text": "An answer."}
+            assert [e["type"] for e in stream][-2:] == ["chat_response", "run_finished"]
+            assert (stream[-2]["content"], stream[-2]["result_saved"], stream[-1]["status"]) == ("An answer.", True, "succeeded")
+        else:
+            assert turn["status"] == "failed"
+            assert stream[-2:] == [{"type": "error", "code": "malformed"}, {**stream[-1], "status": "failed"}]

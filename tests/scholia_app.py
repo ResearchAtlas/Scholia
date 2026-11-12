@@ -105,6 +105,8 @@ class MockProvider:
                 if asyncio.iscoroutine(reply):
                     reply = await reply
             status, payload = reply
+            if isinstance(payload, bytes):  # a body JSON encoders refuse to write, as below
+                return httpx.Response(status, content=payload, headers={"content-type": "application/json"})
             return httpx.Response(status, json=payload)
         queue = self.title_replies if title else self.replies
         reply = queue.pop(0) if queue else None

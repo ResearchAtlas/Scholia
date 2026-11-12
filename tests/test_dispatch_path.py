@@ -13,6 +13,8 @@ check moved out of the gate's callback) are planted here to show the check finds
 import ast
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = sorted((ROOT / "backend").rglob("*.py"))
 
@@ -212,3 +214,142 @@ def test_the_checks_catch_another_caller():
                     "from backend.context import Request as R\n",
                     "import dataclasses\nr = dataclasses.replace(request, messages=[])\n"):
         assert requests_built(planted), planted
+
+
+# S1-33 (PR 52 cycle 3, design review A): one recorder of what each call's attempts did. The settlement authority is
+# reached only through it, so no other reader of a stand-in (a sticky flag, a body count) can settle a call.
+
+
+def calls_to(source, name):
+    """(the chain of functions it is in, line) for each call of `name`, as a plain name or an attribute, and each import
+    of it by name."""
+    found = []
+
+    def visit(node, chain):
+        for child in ast.iter_child_nodes(node):
+            inner = [*chain, child.name] if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else chain
+            if isinstance(child, ast.Call) and name in (getattr(child.func, "attr", None), getattr(child.func, "id", None)):
+                found.append((tuple(chain), child.lineno))
+            elif isinstance(child, ast.ImportFrom) and any(a.name == name for a in child.names):
+                found.append((tuple(chain), child.lineno))
+            visit(child, inner)
+
+    visit(ast.parse(source), [])
+    return found
+
+
+def recorder_problems(sources):
+    """What breaks the one-recorder rule, for {module file name: source}."""
+    problems = []
+    for name, source in sources.items():
+        for callee, allowed in (("settle", "_settle_attempts"), ("_settle_attempts", "_record_attempts"),
+                                ("settle_left_open", "recover")):
+            for chain, line in calls_to(source, callee):
+                if name != "runs.py" or allowed not in chain:
+                    problems.append(f"{name}:{line} calls {callee} outside {allowed}")
+    runs = ast.parse(sources["runs.py"])
+    record = next(n for n in ast.walk(runs) if isinstance(n, ast.FunctionDef) and n.name == "_record_attempts")
+    close = next(n for n in ast.walk(runs) if isinstance(n, ast.FunctionDef) and n.name == "_close_call")
+    call = next(n for n in ast.walk(runs) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_call")
+    for function in (close, call):  # the receipt and the close of a call cut off: each through the one recorder
+        if "_record_attempts(" not in ast.unparse(function):
+            problems.append(f"runs.py: {function.name} does not record through _record_attempts")
+    if "call.attempts" not in ast.unparse(record):
+        problems.append("runs.py: _record_attempts does not read the call's own attempts")
+    adapter = next(n for n in ast.walk(call) if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "query_model")
+    if not any(k.arg == "attempts" and ast.unparse(k.value) == "call.attempts" for k in adapter.keywords):
+        problems.append("runs.py: _call does not give the adapter the call's own list of attempts")
+    for node in ast.walk(runs):  # a call's dispatch is read from its attempts, never set
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(
+            node, (ast.AugAssign, ast.AnnAssign)) else []
+        for target in (t for whole in targets for t in ast.walk(whole)):
+            if isinstance(target, ast.Attribute) and target.attr == "dispatched":
+                problems.append(f"runs.py:{node.lineno} sets a dispatched flag")
+    return problems
+
+
+def test_one_recorder_settles_every_model_call():
+    assert recorder_problems(_sources()) == []
+    from backend import runs
+    with pytest.raises(AttributeError):  # read from its attempts only
+        runs._Call("r", 0, "b").dispatched = True
+
+
+def test_the_recorder_check_finds_a_second_settlement_and_a_sticky_flag():
+    sources = _sources()
+    planted = {**sources, "runs.py": sources["runs.py"] + (
+        "\n\ndef _close_quickly(conn, call):\n    spending.settle(conn, call.reservation_id)\n"
+        "\n\ndef _gate_said(call):\n    call.dispatched = True\n")}
+    problems = recorder_problems(planted)
+    assert any("calls settle outside _settle_attempts" in p for p in problems)
+    assert any("sets a dispatched flag" in p for p in problems)
+    planted = {**sources, "app.py": sources["app.py"] + "\nfrom backend.spending import settle_left_open\n"}
+    assert any(p.startswith("app.py") for p in recorder_problems(planted))
+    old = "_record_attempts(conn, call, _running(conn, call.run_id))"
+    assert old in sources["runs.py"]
+    unrecorded = {**sources, "runs.py": sources["runs.py"].replace(old, "spending.release(conn, call.reservation_id)")}
+    assert any("_close_call does not record" in p for p in recorder_problems(unrecorded))
+
+
+# S1-33 (PR 52 cycle 4, design review A2's Option 2): what an attempt did has one store, written when the request
+# leaves. The gate's notice (the post's DISPATCHED extension) adds the attempt to the caller's list itself, as sent;
+# only that notice and the attempt's ending (end) add to the list or decide whether an attempt was sent, so no exit
+# between the notice and the ending can leave a request that went out unrecorded.
+
+
+def adapter_problems(source):
+    """What breaks that rule in openrouter.py's source."""
+    tree = ast.parse(source)
+    adapter = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "query_model")
+    notice = next((value.id for node in ast.walk(adapter) if isinstance(node, ast.Dict)
+                   for key, value in zip(node.keys, node.values)
+                   if isinstance(key, ast.Name) and key.id == "DISPATCHED" and isinstance(value, ast.Name)), None)
+    nested = {n.name: n for n in adapter.body if isinstance(n, ast.FunctionDef)}
+
+    def appends(node):
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("append", "extend", "insert") and ast.unparse(node.func.value) == "attempts") \
+            or (isinstance(node, ast.AugAssign) and ast.unparse(node.target) == "attempts")
+
+    def decides(node):
+        return (isinstance(node, ast.Call) and any(k.arg == "dispatched" for k in node.keywords)) or (
+            isinstance(node, (ast.Assign, ast.AugAssign)) and any(
+                isinstance(t, ast.Attribute) and t.attr == "dispatched"
+                for whole in (node.targets if isinstance(node, ast.Assign) else [node.target]) for t in ast.walk(whole)))
+
+    problems = []
+    if notice not in nested:
+        problems.append("the post's DISPATCHED extension is not a function of query_model")
+    elif not any(appends(n) for n in ast.walk(nested[notice])):
+        problems.append(f"the gate's notice ({notice}) does not add the attempt to the caller's list")
+    allowed = {("query_model", notice), ("query_model", "end")}
+
+    def visit(node, chain):
+        for child in ast.iter_child_nodes(node):
+            inner = (*chain, child.name) if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else chain
+            if chain not in allowed and appends(child):
+                problems.append(f"openrouter.py:{child.lineno} adds to attempts outside the notice and end")
+            if chain not in allowed and decides(child):
+                problems.append(f"openrouter.py:{child.lineno} decides whether an attempt was sent outside the notice"
+                                " and end")
+            visit(child, inner)
+
+    visit(tree, ())
+    return problems
+
+
+def test_the_gates_notice_records_each_attempt_as_sent_and_only_its_ending_completes_it():
+    assert adapter_problems(_sources()["openrouter.py"]) == []
+
+
+def test_the_notice_check_finds_a_second_append_a_notice_kept_aside_and_a_flag_set_elsewhere():
+    source = _sources()["openrouter.py"]
+    ending, notice = 'end("ok", response.status_code, usage)', "extensions = {DISPATCHED: dispatched}"
+    assert ending in source and notice in source
+    second = source.replace(ending, 'attempts.append(Attempt("ok", response.status_code, 0, usage))')
+    assert any("adds to attempts outside" in p for p in adapter_problems(second))
+    aside = source.replace(notice, "kept = []\n\n    def aside(terms=None):\n        kept.append(terms)\n\n"
+                                   "    extensions = {DISPATCHED: aside}")
+    assert any("does not add the attempt" in p for p in adapter_problems(aside))
+    flagged = source.replace(ending, ending + "\n        attempts[-1].dispatched = bool(kept)")
+    assert any("decides whether an attempt was sent outside" in p for p in adapter_problems(flagged))

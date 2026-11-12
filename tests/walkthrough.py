@@ -47,6 +47,11 @@ records each call's role.
 S1-21b: answers to a message marked as a long conversation are long, and a compaction call (its role "compact") answers
 with a short synthetic summary (walkthrough step 94).
 
+S1-33: a message marked "(budget walk $x, synthetic)" is answered at a reported cost of $x, moving its project toward
+its budget (walkthrough steps 96 to 98); one marked "(slow, synthetic)" is answered after a few seconds, and one marked
+"(steer walk, synthetic)" first lists the papers, slowly, then answers saying the researcher's note it read (steps 99
+and 99b).
+
 S1-21a: the provider's memory extractions propose a decision for a message that considers a survey (and nothing for any
 other); the agent writes a next step with update_progress when asked to note one. Where we left off reads the clock as
 this launch's own, moved forward by the number of seconds in the file named by "memory clock".
@@ -399,6 +404,31 @@ def agent_step(body):
     return None
 
 
+# S1-33: budgets and messages sent during a run (walkthrough steps 96 to 99b)
+BUDGET_WALK = re.compile(r"[(（](?:budget walk|预算演示) \$([0-9.]+)")
+SLOW = ("(slow, synthetic)", "（慢，合成数据）")
+STEER_WALK = ("(steer walk, synthetic)", "（引导演示，合成数据）")
+SLOW_SECONDS = 10  # long enough to queue and edit a message while it runs
+
+
+async def later(reply):
+    await asyncio.sleep(SLOW_SECONDS)
+    return reply
+
+
+def steer_walk(body):
+    """The steering flow's steps: the papers listed, slowly, then an answer that says the note the step read."""
+    messages = body["messages"]
+    users = [m.get("content") or "" for m in messages if m.get("role") == "user"]
+    zh = any(STEER_WALK[1] in text for text in users)
+    if not any(m.get("role") == "tool" for m in messages):
+        return later(tool_call("w-steer", "list_materials", {}))
+    note = users[-1] if not any(mark in users[-1] for mark in STEER_WALK) else None
+    text = (f"已读到你的提示：{note}" if zh else f"I read your note: {note}") if note else ("没有提示。" if zh else "No note.")
+    return 200, {"choices": [{"message": {"role": "assistant", "content": text}}],
+                 "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150, "cost": 0.0012}}
+
+
 def tool_call(call_id, name, arguments):
     return 200, {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
         {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}]},
@@ -409,6 +439,9 @@ def tool_call(call_id, name, arguments):
 def synthetic(body):
     kind = role(body)
     first = ((body or {}).get("messages") or [{}])[0].get("content", "")
+    said = " ".join(m.get("content") or "" for m in body.get("messages", []) if m.get("role") == "user") if kind == "answer" else ""
+    if body.get("tools") and any(mark in said for mark in STEER_WALK):  # S1-33
+        return steer_walk(body)
     stepped = agent_step(body) if kind == "answer" and body.get("tools") else None
     if isinstance(stepped, tuple):
         return stepped
@@ -434,8 +467,11 @@ def synthetic(body):
         text = " ".join(sentence.format(markers[i % len(markers)]) for i, sentence in enumerate(CITED))
     else:
         text = ANSWER
-    return 200, {"choices": [{"message": {"role": "assistant", "content": text}}],
-                 "usage": {"prompt_tokens": 120, "completion_tokens": 180, "total_tokens": 300, "cost": 0.0042}}
+    walked = BUDGET_WALK.search(asked)  # S1-33: this request's recorded cost, moving its project toward its budget
+    reply = 200, {"choices": [{"message": {"role": "assistant", "content": text}}],
+                  "usage": {"prompt_tokens": 120, "completion_tokens": 180, "total_tokens": 300,
+                            "cost": float(walked.group(1)) if walked else 0.0042}}
+    return later(reply) if any(mark in asked for mark in SLOW) else reply
 
 
 def main(argv=None):

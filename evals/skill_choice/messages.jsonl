@@ -1,0 +1,150 @@
+{"id": "en-001", "language": "en", "message": "How do I add papers to my library?", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-002", "language": "en", "message": "Where do I change which model Scholia uses?", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-003", "language": "en", "message": "What does the budget bar above the message box mean?", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-004", "language": "en", "message": "How do I make a project Local only?", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-005", "language": "en", "message": "Can you open the Library for me?", "expected_skill": "help", "required_tools": ["open_place"], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-006", "language": "en", "message": "What happens to my papers if I delete a project?", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-007", "language": "en", "message": "How do I export a project?", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-008", "language": "en", "message": "Open the provider settings, please.", "expected_skill": "help", "required_tools": ["open_place"], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-009", "language": "en", "message": "What is the review lock?", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-010", "language": "en", "message": "How do I import my papers from Zotero?", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-011", "language": "en", "message": "Why did Scholia ask me before going past my budget?", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-012", "language": "en", "message": "Show me the settings for this project.", "expected_skill": "help", "required_tools": ["open_place"], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-013", "language": "en", "message": "What happens to a message I send while Scholia is still working?", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-014", "language": "en", "message": "Where are backups kept, and how do I restore one?", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-015", "language": "en", "message": "Take me to the advanced settings.", "expected_skill": "help", "required_tools": ["open_place"], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "en-016", "language": "en", "message": "Synthesize what my papers say about minimum wages and employment.", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "en-017", "language": "en", "message": "Screen the papers in my library for ones that study adolescents.", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "en-018", "language": "en", "message": "What do the studies in my library find about remote work and productivity?", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "en-019", "language": "en", "message": "Compare the methods used across my papers on sleep and memory.", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "en-020", "language": "en", "message": "Write a short literature review of my papers on urban heat islands.", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "en-021", "language": "en", "message": "Which of my papers report a negative effect of class size?", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "en-022", "language": "en", "message": "Summarize the evidence in my library on microplastics in drinking water.", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "en-023", "language": "en", "message": "Group my papers by the method they use.", "expected_skill": "literature-review", "required_tools": ["list_materials"], "forbidden_tools": ["open_place"]}
+{"id": "en-024", "language": "en", "message": "Where do the papers in my library disagree about carbon pricing?", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "en-025", "language": "en", "message": "Give me a synthesis of the findings on language immersion schooling in my papers.", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "en-026", "language": "en", "message": "Review the evidence my papers give on mindfulness and anxiety.", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "en-027", "language": "en", "message": "Which outcomes do my papers on minimum wages measure?", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "en-028", "language": "en", "message": "Make an evidence table of my papers on telehealth.", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "en-029", "language": "en", "message": "What gaps remain in the research I have collected on coral bleaching?", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "en-030", "language": "en", "message": "Screen my library: which papers are randomized trials?", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "en-031", "language": "en", "message": "Synthesize my papers on the effects of social media on teenagers.", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "en-032", "language": "en", "message": "How consistent are the effect sizes across my papers on exercise and depression?", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "en-033", "language": "en", "message": "Pull together what my sources say about rent control.", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "en-034", "language": "en", "message": "Which theoretical frameworks do my papers on migration use?", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "en-035", "language": "en", "message": "Review what my papers find about the long-term effects of preschool.", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "en-036", "language": "en", "message": "What is a cohort study?", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-037", "language": "en", "message": "Hello!", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-038", "language": "en", "message": "Translate \"systematic review\" into French.", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-039", "language": "en", "message": "What is the difference between a median and a mean?", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-040", "language": "en", "message": "Which papers do I have?", "expected_skill": null, "required_tools": ["list_materials"], "forbidden_tools": ["use_skill"]}
+{"id": "en-041", "language": "en", "message": "Thanks, that helps.", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-042", "language": "en", "message": "Explain what a p-value is in one sentence.", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-043", "language": "en", "message": "In what year was the Human Genome Project completed?", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-044", "language": "en", "message": "Rewrite this sentence more simply: \"The intervention exhibited heterogeneous effects.\"", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-045", "language": "en", "message": "How many papers are in this project?", "expected_skill": null, "required_tools": ["list_materials"], "forbidden_tools": ["use_skill"]}
+{"id": "en-046", "language": "en", "message": "What does \"confounding\" mean?", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-047", "language": "en", "message": "What did I say I would do next?", "expected_skill": null, "required_tools": ["read_project_state"], "forbidden_tools": ["use_skill"]}
+{"id": "en-048", "language": "en", "message": "What does the abbreviation RCT stand for?", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-049", "language": "en", "message": "Is 0.05 a strict rule for significance?", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-050", "language": "en", "message": "What do you remember about my preferences?", "expected_skill": null, "required_tools": ["read_memory"], "forbidden_tools": ["use_skill"]}
+{"id": "en-051", "language": "en", "message": "How many minutes are there in three hours?", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-052", "language": "en", "message": "Good morning, Scholia.", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-053", "language": "en", "message": "What does the abstract of my paper on wage floors say?", "expected_skill": null, "required_tools": ["answer_from_library"], "forbidden_tools": ["use_skill"]}
+{"id": "en-054", "language": "en", "message": "List the papers in my library that are retracted.", "expected_skill": null, "required_tools": ["list_materials"], "forbidden_tools": ["use_skill"]}
+{"id": "en-055", "language": "en", "message": "Suggest a name for a variable that counts clinic visits.", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "en-056", "language": "en", "message": "Brainstorm research questions about urban gardens.", "expected_skill": "brainstorm", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-057", "language": "en", "message": "Help me come up with angles for a study on gig workers.", "expected_skill": "brainstorm", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-058", "language": "en", "message": "Give me ten ideas for a thesis on climate adaptation.", "expected_skill": "brainstorm", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-059", "language": "en", "message": "What could I study about online learning and motivation?", "expected_skill": "brainstorm", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-060", "language": "en", "message": "Let's brainstorm hypotheses about commuting and wellbeing.", "expected_skill": "brainstorm", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-061", "language": "en", "message": "Find recent papers on CRISPR off-target effects.", "expected_skill": "literature-search", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-062", "language": "en", "message": "Search for studies on four-day work weeks that I don't have yet.", "expected_skill": "literature-search", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-063", "language": "en", "message": "Look for new papers about wildfire smoke and health.", "expected_skill": "literature-search", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-064", "language": "en", "message": "Find me more papers like my ones on minimum wages.", "expected_skill": "literature-search", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-065", "language": "en", "message": "Search the literature for meta-analyses on tutoring.", "expected_skill": "literature-search", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-066", "language": "en", "message": "Draft the introduction of my paper on urban heat.", "expected_skill": "writing", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-067", "language": "en", "message": "Help me write an abstract for my study on sleep.", "expected_skill": "writing", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-068", "language": "en", "message": "Rewrite my methods section so it reads more clearly.", "expected_skill": "writing", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-069", "language": "en", "message": "Write a discussion paragraph about my main finding.", "expected_skill": "writing", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-070", "language": "en", "message": "Turn my notes into a related-work section.", "expected_skill": "writing", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-071", "language": "en", "message": "Critique the research design of my tutoring study.", "expected_skill": "critique", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-072", "language": "en", "message": "What are the weaknesses of the argument in my introduction?", "expected_skill": "critique", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-073", "language": "en", "message": "Review my draft as a skeptical referee would.", "expected_skill": "critique", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-074", "language": "en", "message": "Point out the flaws in my sampling plan.", "expected_skill": "critique", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "en-075", "language": "en", "message": "How would a reviewer attack my conclusions?", "expected_skill": "critique", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-001", "language": "zh-CN", "message": "怎样把论文添加到文献库？", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-002", "language": "zh-CN", "message": "我在哪里更换 Scholia 使用的模型？", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-003", "language": "zh-CN", "message": "输入框上方的预算条是什么意思？", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-004", "language": "zh-CN", "message": "如何把项目设为仅限本地？", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-005", "language": "zh-CN", "message": "帮我打开文献库。", "expected_skill": "help", "required_tools": ["open_place"], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-006", "language": "zh-CN", "message": "删除项目后我的论文会怎样？", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-007", "language": "zh-CN", "message": "怎么导出一个项目？", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-008", "language": "zh-CN", "message": "请打开模型服务商的设置。", "expected_skill": "help", "required_tools": ["open_place"], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-009", "language": "zh-CN", "message": "审稿锁定是什么？", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-010", "language": "zh-CN", "message": "怎么从 Zotero 导入论文？", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-011", "language": "zh-CN", "message": "为什么超出预算之前 Scholia 要先问我？", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-012", "language": "zh-CN", "message": "打开这个项目的设置。", "expected_skill": "help", "required_tools": ["open_place"], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-013", "language": "zh-CN", "message": "Scholia 还在工作时我发的消息会怎么处理？", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-014", "language": "zh-CN", "message": "备份保存在哪里，怎么恢复？", "expected_skill": "help", "required_tools": [], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-015", "language": "zh-CN", "message": "带我去高级设置。", "expected_skill": "help", "required_tools": ["open_place"], "forbidden_tools": ["answer_from_library", "search_passages", "read_passage"]}
+{"id": "zh-016", "language": "zh-CN", "message": "综合一下我的论文关于最低工资和就业的结论。", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "zh-017", "language": "zh-CN", "message": "筛选文献库里研究青少年的论文。", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "zh-018", "language": "zh-CN", "message": "我收集的研究对远程办公和生产率有什么发现？", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "zh-019", "language": "zh-CN", "message": "比较我关于睡眠和记忆的论文所用的研究方法。", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "zh-020", "language": "zh-CN", "message": "根据我的论文写一段关于城市热岛的文献综述。", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "zh-021", "language": "zh-CN", "message": "我的哪些论文报告班级规模有负面影响？", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "zh-022", "language": "zh-CN", "message": "总结我文献库中关于饮用水微塑料的证据。", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "zh-023", "language": "zh-CN", "message": "按研究方法给我的论文分组。", "expected_skill": "literature-review", "required_tools": ["list_materials"], "forbidden_tools": ["open_place"]}
+{"id": "zh-024", "language": "zh-CN", "message": "我的论文在碳定价问题上有哪些分歧？", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "zh-025", "language": "zh-CN", "message": "综合我的论文中关于沉浸式语言教学的发现。", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "zh-026", "language": "zh-CN", "message": "梳理我的论文中关于正念与焦虑的证据。", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "zh-027", "language": "zh-CN", "message": "我关于最低工资的论文测量了哪些结果？", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "zh-028", "language": "zh-CN", "message": "为我关于远程医疗的论文做一个证据表。", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "zh-029", "language": "zh-CN", "message": "我收集的珊瑚白化研究还有哪些空白？", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "zh-030", "language": "zh-CN", "message": "筛一下文献库：哪些论文是随机对照试验？", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "zh-031", "language": "zh-CN", "message": "综合我的论文关于社交媒体对青少年影响的结论。", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "zh-032", "language": "zh-CN", "message": "我的论文里运动与抑郁的效应量一致吗？", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "zh-033", "language": "zh-CN", "message": "汇总我的资料对租金管制的看法。", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "zh-034", "language": "zh-CN", "message": "我关于移民的论文用了哪些理论框架？", "expected_skill": "literature-review", "required_tools": ["search_passages"], "forbidden_tools": ["open_place"]}
+{"id": "zh-035", "language": "zh-CN", "message": "回顾我的论文中关于学前教育长期效果的证据。", "expected_skill": "literature-review", "required_tools": ["answer_from_library"], "forbidden_tools": ["open_place"]}
+{"id": "zh-036", "language": "zh-CN", "message": "什么是队列研究？", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-037", "language": "zh-CN", "message": "你好！", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-038", "language": "zh-CN", "message": "把“系统综述”翻译成英文。", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-039", "language": "zh-CN", "message": "中位数和平均数有什么区别？", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-040", "language": "zh-CN", "message": "我有哪些论文？", "expected_skill": null, "required_tools": ["list_materials"], "forbidden_tools": ["use_skill"]}
+{"id": "zh-041", "language": "zh-CN", "message": "谢谢，很有帮助。", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-042", "language": "zh-CN", "message": "用一句话解释 p 值。", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-043", "language": "zh-CN", "message": "人类基因组计划是哪一年完成的？", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-044", "language": "zh-CN", "message": "把这句话改得简单些：“该干预表现出异质性效应。”", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-045", "language": "zh-CN", "message": "这个项目里有多少篇论文？", "expected_skill": null, "required_tools": ["list_materials"], "forbidden_tools": ["use_skill"]}
+{"id": "zh-046", "language": "zh-CN", "message": "“混杂”是什么意思？", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-047", "language": "zh-CN", "message": "我上次说下一步要做什么？", "expected_skill": null, "required_tools": ["read_project_state"], "forbidden_tools": ["use_skill"]}
+{"id": "zh-048", "language": "zh-CN", "message": "RCT 是什么的缩写？", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-049", "language": "zh-CN", "message": "0.05 是显著性的硬性标准吗？", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-050", "language": "zh-CN", "message": "你记得我有哪些偏好？", "expected_skill": null, "required_tools": ["read_memory"], "forbidden_tools": ["use_skill"]}
+{"id": "zh-051", "language": "zh-CN", "message": "三小时等于多少分钟？", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-052", "language": "zh-CN", "message": "早上好，Scholia。", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-053", "language": "zh-CN", "message": "我那篇关于工资下限的论文摘要说了什么？", "expected_skill": null, "required_tools": ["answer_from_library"], "forbidden_tools": ["use_skill"]}
+{"id": "zh-054", "language": "zh-CN", "message": "列出我文献库里被撤稿的论文。", "expected_skill": null, "required_tools": ["list_materials"], "forbidden_tools": ["use_skill"]}
+{"id": "zh-055", "language": "zh-CN", "message": "给一个统计门诊次数的变量起个名字。", "expected_skill": null, "required_tools": [], "forbidden_tools": ["use_skill"]}
+{"id": "zh-056", "language": "zh-CN", "message": "围绕城市菜园头脑风暴一些研究问题。", "expected_skill": "brainstorm", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-057", "language": "zh-CN", "message": "帮我想想研究零工劳动者可以从哪些角度切入。", "expected_skill": "brainstorm", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-058", "language": "zh-CN", "message": "给我十个关于气候适应的论文选题。", "expected_skill": "brainstorm", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-059", "language": "zh-CN", "message": "关于在线学习和学习动机，我可以研究什么？", "expected_skill": "brainstorm", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-060", "language": "zh-CN", "message": "一起想一想通勤与幸福感之间的假设。", "expected_skill": "brainstorm", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-061", "language": "zh-CN", "message": "查找关于 CRISPR 脱靶效应的最新论文。", "expected_skill": "literature-search", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-062", "language": "zh-CN", "message": "搜索我还没有的关于四天工作制的研究。", "expected_skill": "literature-search", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-063", "language": "zh-CN", "message": "找一些关于野火烟雾与健康的新论文。", "expected_skill": "literature-search", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-064", "language": "zh-CN", "message": "再帮我找些和我那几篇最低工资论文类似的文章。", "expected_skill": "literature-search", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-065", "language": "zh-CN", "message": "检索关于课外辅导的元分析。", "expected_skill": "literature-search", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-066", "language": "zh-CN", "message": "帮我起草关于城市高温那篇论文的引言。", "expected_skill": "writing", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-067", "language": "zh-CN", "message": "帮我为睡眠研究写一段摘要。", "expected_skill": "writing", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-068", "language": "zh-CN", "message": "把我的方法部分改写得更清楚。", "expected_skill": "writing", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-069", "language": "zh-CN", "message": "就我的主要发现写一段讨论。", "expected_skill": "writing", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-070", "language": "zh-CN", "message": "把我的笔记整理成相关研究一节。", "expected_skill": "writing", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-071", "language": "zh-CN", "message": "评一评我辅导研究的研究设计。", "expected_skill": "critique", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-072", "language": "zh-CN", "message": "我引言里的论证有哪些弱点？", "expected_skill": "critique", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-073", "language": "zh-CN", "message": "像一位挑剔的审稿人那样审阅我的草稿。", "expected_skill": "critique", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-074", "language": "zh-CN", "message": "指出我抽样方案中的问题。", "expected_skill": "critique", "required_tools": [], "forbidden_tools": ["open_place"]}
+{"id": "zh-075", "language": "zh-CN", "message": "审稿人会怎样质疑我的结论？", "expected_skill": "critique", "required_tools": [], "forbidden_tools": ["open_place"]}

@@ -163,6 +163,10 @@ PERSONAL = {
 PROJECT = {
     **{("project", k): (None, _text) for k in ("target_venue", "citation_style", "citation_style_zh", "template")},
     ("project", "budget_usd"): (50, _number(0)),
+    # S1-33 (Harold, 2026-11-12, design review C's Option 2): written by the program beside the limit, never by the
+    # Settings page: what Continue adds, and the limit it was written for (budgets._amount). No default, so a file
+    # without them gives none, and a backup keeps them (known_only).
+    **{("project", k): (None, _number(0)) for k in ("budget_continue_usd", "budget_continue_at_usd")},
     ("ui", "panel"): (None, _choice("none", "library", "manuscript")),
     ("models", "default"): (None, _text),
     **{("limits", k): (None, check) for k, (_, check) in _LIMITS.items()},  # overrides
@@ -233,7 +237,7 @@ class Settings:
     _digest: str | None = None
     _broken: bool = False
 
-    def save(self, updates):
+    def save(self, updates, answer=False):
         """Write updates ({"section.key": value}) to the file, keeping comments and unknown keys.
 
         A value of None removes the key, so the setting returns to its default.
@@ -241,6 +245,10 @@ class Settings:
         Re-reads the file first and raises SettingsChanged if it changed since it
         was loaded. Raises ValueError, writing nothing, for an invalid value, a
         secret, a personal setting in a project file, or a file that is not valid TOML.
+
+        In a project file, what Continue adds to the budget is written only by a budget
+        answer (answer=True). Any other save that changes the limit takes it out in the
+        same write; one that changes what Continue adds but not the limit raises ValueError.
         """
         with _save_lock:
             raw = _read(self.path)
@@ -276,8 +284,35 @@ class Settings:
                     if not isinstance(leaf_value, dict):
                         node[leaf[-1]] = leaf_value
             data = doc.as_string().encode("utf-8")
+            if self.schema is PROJECT and not answer:
+                # S1-33 (Harold, 2026-11-12, design review C3's Option 2): decided from the file as it was and the bytes
+                # about to be written, read back, never from how updates name the keys
+                before, after = _continue_keys(raw), _continue_keys(data)
+                expected = before
+                if after[0] != before[0]:  # the limit changed: what Continue adds goes in the same replace
+                    for key in _CONTINUE_KEYS[1:]:
+                        table = doc.get("project")  # looked up for each key: a held table goes stale on dotted keys
+                        if isinstance(table, dict) and key in table:
+                            del table[key]
+                    data = doc.as_string().encode("utf-8")
+                    expected = (after[0], None, None)
+                if _continue_keys(data) != expected:
+                    raise ValueError(f"{self.label}: what Continue adds is written only by a budget answer")
             write_private(self.path, data)
             _parse(self, data)
+
+
+_CONTINUE_KEYS = ("budget_usd", "budget_continue_usd", "budget_continue_at_usd")
+
+
+def _continue_keys(raw):
+    """S1-33: a project file's limit and what Continue adds for it, read from its bytes: each a valid number as the
+    loader keeps it (compared by value, so 50 is 50.0), None when absent, or "invalid" when present but not valid (true
+    included), so a limit made invalid by hand and then set or reset counts as changed."""
+    own = tomlkit.parse(raw.decode("utf-8")).unwrap().get("project") if raw else None
+    own = own if isinstance(own, dict) else {}
+    return tuple((own[key] if _check(PROJECT, ("project", key), own[key])[1] is None else "invalid") if key in own
+                 else None for key in _CONTINUE_KEYS)
 
 
 def _defaults(schema):

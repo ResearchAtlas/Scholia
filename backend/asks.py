@@ -13,7 +13,9 @@ endpoint; a turn's asks (the agent's, S1-19c) only in their conversation, where 
 """
 
 import asyncio
+import contextlib
 import json
+import logging
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -21,8 +23,10 @@ from pydantic import BaseModel, Field
 
 from backend import governance
 from backend.db import new_id
-from backend.runs import _event
-from backend.settings import visible
+from backend.runs import _budget_unread, _event
+from backend.settings import load_settings, visible
+
+log = logging.getLogger(__name__)
 
 # The kinds that rule the text box out, and how many options an ask may offer.
 NO_TEXT = {"identifier_lookup", "model_download"}
@@ -86,10 +90,13 @@ def _current_policy(conn, project_id):
     return None if row is None else {"level": row[0], "locked": bool(row[1])}
 
 
-def answer(conn, run_id, ask_id, option=None, text=None, registry=None):
+def answer(conn, run_id, ask_id, option=None, text=None, registry=None, data_dir=None):
     """The researcher's answer, in the caller's transaction, or AskRefused having changed nothing. A
     run with a cancel requested (registry's, read in this transaction) is ending: its ask is closed,
-    though its terminal record is not written yet."""
+    though its terminal record is not written yet. S1-33: a budget ask's answer applies its effect here too
+    (backend/budgets.py, read with data_dir's settings), its typed text a new limit; the reply's `budget` says what
+    it applied, and a project budget's decision is returned under `project_budget` for the caller to apply once this
+    has committed (budgets.saved)."""
     if (option is None) == (text is None):
         raise AskRefused(400, "invalid_answer", "Answer with one option or with text")
     run = conn.execute("SELECT status, cancel_reason, waiting FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -115,7 +122,16 @@ def answer(conn, run_id, ask_id, option=None, text=None, registry=None):
     conn.execute("UPDATE runs SET waiting = NULL WHERE id = ?", (run_id,))
     governance.record(conn, "ask_answered", ask["project_id"], question=ask["kind"],
                       answer=option if option is not None else "text")
-    return {"ask_id": ask_id, "option": option, "answered": True}
+    reply = {"ask_id": ask_id, "option": option, "answered": True}
+    if ask["kind"] == "budget":  # its effect, in this transaction (section 6.2, Effects)
+        from backend import budgets
+        try:
+            reply["budget"], reply["project_budget"] = budgets.decide(conn, run_id, ask, option, text, data_dir)
+        except budgets.Refused as refused:
+            error = AskRefused(400, refused.code, refused.message)
+            error.needed_usd = refused.needed_usd  # the least limit this step needs
+            raise error from None
+    return reply
 
 
 def withdraw(conn, run_id, ask_id, reason):
@@ -212,14 +228,71 @@ async def list_asks(request: Request, project_id: str | None = None, conversatio
 
 @router.post("/api/runs/{run_id}/asks/{ask_id}")
 async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
-    """The one way an ask is answered: by the researcher, here."""
+    """The one way an ask is answered: by the researcher, here. S1-33: a budget ask's answer is ordered with settings
+    saves and the budget reads of call admission (settings_lock, after the project-files lock as a save takes them),
+    so its stale check and the project budget it writes land wholly before or after them; that write follows the
+    answer's commit (Harold, 2026-10-21): when it fails nothing is raised, the reply says so, and the step asks again."""
+    from backend.runs import _through  # it imports this module
     state = request.app.state.scholia
     registry = state["harness"].registry
-    try:
-        answered = await asyncio.to_thread(state["db"].write,
-                                           lambda conn: answer(conn, run_id, ask_id, body.option, body.text, registry))
-    except AskRefused as refused:
-        return JSONResponse({"code": refused.code, "message": refused.message}, status_code=refused.status)
-    if (active := registry.runs.get(run_id)) is not None:  # a run waiting on it wakes now
-        active.answered.set()
+    budget = await asyncio.to_thread(state["db"].read, lambda conn: (asked(conn, run_id)[0] or {}).get("kind") == "budget")
+    locks = (state["project_files"], state["harness"].settings_lock) if budget else ()
+
+    async def answering(written):  # written: the answer's own write, which only this endpoint makes
+        try:
+            answered = await asyncio.to_thread(state["db"].write, written)
+        except AskRefused as refused:
+            return JSONResponse({"code": refused.code, "message": refused.message, **(
+                {"needed_usd": refused.needed_usd} if getattr(refused, "needed_usd", None) else {})},
+                status_code=refused.status)
+        if (decided := answered.pop("project_budget", None)) is not None:
+            saved = await asyncio.to_thread(_save_project_budget, state["data_dir"], decided)
+            if not saved:
+                answered["budget"] = {**answered["budget"], "applied": False, "error": "not_saved",
+                                      "limit_usd": decided["from_usd"]}
+            try:  # its record and audit row; a project deleted meanwhile keeps none
+                await asyncio.to_thread(state["db"].write, lambda conn: _budget_saved(conn, run_id, decided, saved))
+            except Exception as error:
+                log.warning("a project budget decision's record was not written (%s)", type(error).__name__)
+        if (active := registry.runs.get(run_id)) is not None:  # a run waiting on it wakes now
+            active.answered.set()
+        return answered
+
+    async with contextlib.AsyncExitStack() as held:
+        for lock in locks:
+            await held.enter_async_context(lock)
+        # S1-33 (PR 52 cycle 2): once under the locks, the answer, its config.toml write and their record run to their
+        # end whatever cancellation arrives, and the locks are held until then, so no Settings save or deletion runs
+        # beside a write still going on in its worker
+        answered, cancelled = await _through(answering(lambda conn: answer(
+            conn, run_id, ask_id, body.option, body.text, registry, state["data_dir"])))
+    if cancelled:
+        raise asyncio.CancelledError()
     return answered
+
+
+def _save_project_budget(data_dir, decided):
+    """Write a project budget's decision to its config.toml: whether the file now holds it. A write that fails may
+    have replaced the file already (its folder's sync failing after the rename): the outcome is what the file says,
+    read again, so no record says it unchanged when it changed, nor the reverse (PR 52 review 1). What the next
+    Continue adds, and the limit it is for, are written with the limit in the same file replace (Harold, 2026-11-12,
+    design review C's Option 2), so the two never disagree whatever fails after it."""
+    try:
+        load_settings(data_dir, decided["project_id"]).save({
+            "project.budget_usd": decided["to_usd"], "project.budget_continue_usd": decided["amount_usd"],
+            "project.budget_continue_at_usd": decided["to_usd"]}, answer=True)
+        return True
+    except Exception as error:
+        log.warning("a project budget answered in an ask may not be saved (%s)", type(error).__name__)
+    try:
+        loaded = load_settings(data_dir, decided["project_id"])
+    except Exception:
+        return False
+    if _budget_unread(loaded):  # an unreadable file, or this value, gives the default, never what it holds: unknown,
+        return False  # so not saved
+    return abs(loaded.values["project"]["budget_usd"] - decided["to_usd"]) <= 1e-9
+
+
+def _budget_saved(conn, run_id, decided, saved):
+    from backend import budgets
+    budgets.saved(conn, run_id, decided, saved)

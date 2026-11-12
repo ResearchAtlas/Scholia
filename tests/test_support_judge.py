@@ -81,7 +81,15 @@ async def test_the_judge_is_reserved_with_its_answer_and_a_budget_that_cannot_ho
         await client.put("/api/settings", json={"project_id": tight, "hash": current["hash"], "updates": {
             "project.budget_usd": round(step["estimate_usd"] + step["judge_estimate_usd"] / 2, 6)}})  # the answer alone fits
         before = len(client.provider.chats)
-        refused = await send(client, await conversation_in(client, tight), QUESTION)
+        # S1-33 (B6): the step asks first, its estimate covering the judge's share; Not now ends it at the limit
+        from test_agent_loop import asked
+        tight_conversation = await conversation_in(client, tight)
+        sending = asyncio.create_task(send(client, tight_conversation, QUESTION))
+        ask = await asked(client, tight_conversation)
+        assert (ask["kind"], ask["params"]["form"], ask["params"]["budget"]) == ("budget", "step", "project")
+        assert ask["params"]["estimate_usd"] == pytest.approx(step["estimate_usd"] + step["judge_estimate_usd"])
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "not_now"})
+        refused = await sending
         assert [e["type"] for e in refused][-2:] == ["limit_reached", "run_finished"]
         assert len(client.provider.chats) == before  # neither the answer nor the judge was sent
 

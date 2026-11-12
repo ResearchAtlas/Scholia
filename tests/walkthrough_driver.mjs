@@ -2513,6 +2513,179 @@ async function compactionFlow(ctx) {
   }
 }
 
+// S1-33 (checklist W1 to W3; CH:76, 104): a synthetic project whose budget is $0.20, moved toward it by recorded costs;
+// the bar at 50% and 90%, then one step over what is left (Not now ends at the limit, with Continue), then Go ahead and
+// the cap (Continue adds the budget's amount again). Each step reads its record back through the API.
+async function enterProject(ctx, name, updates) {
+  const { page, L, get } = ctx;
+  const { dialog, openSidebar } = navigation(ctx);
+  if (await dialog().count()) { await page.keyboard.press('Escape'); await page.waitForTimeout(500); }
+  const id = (await get('/api/projects', { method: 'POST', body: JSON.stringify({ name, sensitivity: 'normal' }) })).body.id;
+  const read = (await get(`/api/settings?project_id=${id}`)).body;
+  const saved = await get('/api/settings', { method: 'PUT', body: JSON.stringify({ project_id: id, hash: read.hash, updates }) });
+  if (saved.status !== 200) throw new Error(`the project's settings were not saved (${saved.status})`);
+  await page.reload(); await page.locator('#composer').waitFor();
+  await openSidebar();
+  await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+  await page.getByRole('menuitem', { name, exact: true }).click(); await page.waitForTimeout(1200);
+  const conversation = async () => (await get('/api/conversations')).body.conversations.find((c) => c.project_id === id);
+  const read_ = async () => (await get(`/api/conversations/${(await conversation()).id}`)).body;
+  const until = async (what, test, tries = 150) => {
+    for (let i = 0; i < tries; i += 1) { const value = await test(); if (value) return value; await page.waitForTimeout(200); }
+    throw new Error(`${what} did not happen in time`);
+  };
+  return { id, conversation, read: read_, until };
+}
+
+async function budgetFlow(ctx) {
+  const { page, L, C, step, check, get } = ctx;
+  const box = () => page.locator('#composer');
+  const zh = C.lang !== 'en';
+  const { id, conversation, read, until } = await enterProject(ctx, zh ? '预算（合成数据）' : 'Budgets (synthetic)',
+    { 'project.budget_usd': 0.2, 'memory.enabled': false });
+  const costly = (usd, n) => (zh ? `第 ${n} 个问题（预算演示 $${usd}，合成数据）` : `Question ${n} (budget walk $${usd}, synthetic)`);
+  const latest = async () => (await conversation()) && (await read()).turns.at(-1);
+  const send = async (text) => {
+    await box().fill(text);
+    await page.getByRole('button', { name: L('composer.send'), exact: true }).click();
+  };
+  const succeeded = async (text) => {
+    const turn = await until('the answer saved', async () => { const t = await latest(); return t?.message?.text === text && t.status === 'succeeded' && t; });
+    await page.waitForTimeout(1500); // the live turn hands over to its record
+    return turn;
+  };
+  const spend = async () => (await get(`/api/projects/${id}/spend?conversation_id=${(await conversation()).id}`)).body;
+  const budget = async () => (await get(`/api/settings?project_id=${id}`)).body.values.project.budget_usd;
+  const money = (value) => new Intl.NumberFormat(zh ? 'zh-CN' : 'en', { style: 'currency', currency: 'USD',
+    minimumFractionDigits: value > 0 && value < 0.01 ? 4 : 2, maximumFractionDigits: value > 0 && value < 0.01 ? 4 : 2 }).format(value);
+  const bar = (found) => page.getByRole('meter', { name: L('budget.bar.project').replace('{spent}', money(found.project.settled_usd))
+    .replace('{limit}', money(found.project.limit_usd)) });
+  const card = () => page.getByRole('group', { name: L('ask.label') });
+  const decisions = async (runId) => (await get(`/api/runs/${runId}/trace?after=-1`)).body.events.filter((e) => e.type === 'budget_decision');
+
+  await step('96-budget-bar', async () => {
+    await send(costly('0.10', 1));
+    const first = await succeeded(costly('0.10', 1));
+    let found = await spend();
+    await bar(found).waitFor();
+    check('the bar shows the project budget\'s settled spend from 50% (read back)',
+      found.project.settled_usd >= 0.1 && found.project.settled_usd < 0.17 && await bar(found).count() === 1);
+    await send(costly('0.08', 2));
+    const second = await succeeded(costly('0.08', 2));
+    found = await spend();
+    await bar(found).waitFor();
+    check('at 90% the bar says about $x of $y, as the spend reads back', found.project.settled_usd >= 0.18 && await bar(found).count() === 1);
+    const notices = [];
+    for (const turn of [first, second]) {
+      notices.push(...(await get(`/api/runs/${turn.run_id}/trace?after=-1`)).body.events.filter((e) => e.type === 'budget_notice'));
+    }
+    check('each threshold is recorded once, as the settlements crossed it',
+      notices.map((e) => e.data.percent).join() === '50,85,90' && notices.every((e) => e.data.budget === 'project'));
+  });
+
+  await step('97-step-over-left', async () => {
+    await send(costly('0.06', 3));
+    await card().waitFor();
+    check('one step over what is left asks first: Go ahead, Set a new limit or Not now',
+      await card().getByRole('button', { name: L('ask.budget.option.go_ahead'), exact: true }).count() === 1
+      && await card().getByRole('button', { name: L('ask.budget.setLimit'), exact: true }).count() === 1
+      && await card().getByRole('button', { name: L('ask.budget.option.not_now'), exact: true }).count() === 1);
+    await card().getByRole('button', { name: L('ask.budget.option.not_now'), exact: true }).click();
+    const ended = await until('the turn ended at the limit', async () => { const t = await latest(); return t?.status === 'cancelled' && t; });
+    check('Not now ends the run at the limit, nothing raised (read back)', ended.cancel_reason === 'limit' && await budget() === 0.2
+      && (await decisions(ended.run_id)).some((e) => e.data.decision === 'not_now' && e.data.applied === false));
+    await page.getByRole('button', { name: L('turn.continue'), exact: true }).waitFor();
+    check('Continue is offered', await page.getByRole('button', { name: L('turn.continue'), exact: true }).count() === 1);
+  });
+
+  await step('98-budget-cap', async () => {
+    await page.getByRole('button', { name: L('turn.continue'), exact: true }).click();
+    await card().waitFor();
+    await card().getByRole('button', { name: L('ask.budget.option.go_ahead'), exact: true }).click();
+    await succeeded(costly('0.06', 3));
+    const raised = await budget();
+    check('Go ahead raised the budget just enough for the step (read back)', raised > 0.2 && raised < 0.3);
+    await send(costly('0.01', 4));
+    await card().waitFor();
+    check('at the cap: Continue, Set a new limit or Stop',
+      await card().getByRole('button', { name: L('ask.budget.option.continue'), exact: true }).count() === 1
+      && await card().getByRole('button', { name: L('ask.budget.setLimit'), exact: true }).count() === 1
+      && await card().getByRole('button', { name: L('ask.budget.option.stop'), exact: true }).count() === 1);
+    await card().getByRole('button', { name: L('ask.budget.option.continue'), exact: true }).click();
+    const turn = await succeeded(costly('0.01', 4));
+    check('Continue added the budget\'s amount again (read back)', Math.abs(await budget() - (raised + 0.2)) < 1e-6
+      && (await decisions(turn.run_id)).some((e) => e.data.decision === 'continue' && e.data.applied === true));
+  });
+}
+
+// S1-33 (checklist W4, W5): a message sent while a turn runs. Steer: the note appears, then the next step reads it,
+// as its record and trace say. Queue (the setting changed in Settings): the message waits, is edited, and starts as the
+// next turn once the first succeeds.
+async function followUpFlow(ctx) {
+  const { page, L, C, step, check, get } = ctx;
+  const { dialog, openSettings } = navigation(ctx);
+  const box = () => page.locator('#composer');
+  const zh = C.lang !== 'en';
+  const { conversation, read, until } = await enterProject(ctx, zh ? '运行中的消息（合成数据）' : 'Messages during a run (synthetic)',
+    { 'memory.enabled': false });
+  const send = async (text) => {
+    await box().fill(text);
+    await page.getByRole('button', { name: L('composer.send'), exact: true }).click();
+  };
+  const running = () => until('the turn running', async () => (await conversation()) && (await read()).turns.at(-1)?.status === 'running');
+
+  await step('99-steer', async () => {
+    const asked = zh ? '列出我的论文（引导演示，合成数据）' : 'List my papers (steer walk, synthetic)';
+    const note = zh ? '只看 2020 年以后的' : 'Only the ones after 2020';
+    await send(asked);
+    await running();
+    await send(note);
+    await page.getByText(L('followUp.state.pending'), { exact: true }).waitFor();
+    check('the note is shown waiting for the next step once recorded (read back)',
+      (await read()).turns.at(-1).steering.some((n) => n.text === note && n.state === 'pending'));
+    const turn = await until('the answer saved', async () => { const t = (await read()).turns.at(-1); return t.status === 'succeeded' && t; });
+    await page.waitForTimeout(1500);
+    check('the next step read it, and the turn says so from its record', turn.steering[0]?.state === 'read'
+      && await page.getByText(L('followUp.state.read'), { exact: true }).count() === 1 && turn.answer.text.includes(note));
+    const events = (await get(`/api/runs/${turn.run_id}/trace?after=-1`)).body.events;
+    check('the trace holds the note and the step that carried it', events.some((e) => e.type === 'steering_note')
+      && events.some((e) => e.type === 'step_started' && (e.data.steering ?? []).length === 1));
+  });
+
+  await step('99b-queue', async () => {
+    await openSettings('settings.page.general');
+    const choice = dialog().getByRole('radiogroup', { name: L('settings.followUp') });
+    await choice.scrollIntoViewIfNeeded();
+    await choice.getByRole('radio', { name: L('settings.followUpQueue'), exact: true }).click(); await page.waitForTimeout(800);
+    check('the setting is saved as queue (read back)', (await get('/api/settings')).body.values.ui.follow_up === 'queue');
+    await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+    try {
+      const first = zh ? '先回答这个（慢，合成数据）' : 'Answer this first (slow, synthetic)';
+      const next = zh ? '然后是这个' : 'Then this one';
+      const edited = zh ? '然后是这个，请简短' : 'Then this one, briefly';
+      await send(first);
+      await running();
+      await send(next);
+      await page.getByRole('list', { name: L('followUp.waiting') }).waitFor();
+      check('it waits as the next turn, as the queue holds it (read back)', (await read()).queued.map((q) => q.text).join() === next);
+      await page.getByRole('button', { name: L('followUp.edit'), exact: true }).click();
+      await page.getByLabel(L('followUp.editLabel')).fill(edited);
+      await page.getByRole('button', { name: L('followUp.save'), exact: true }).click();
+      await until('the edit saved', async () => (await read()).queued[0]?.text === edited || (await read()).turns.at(-1)?.message?.text === edited);
+      const turns = await until('the queued message ran as the next turn', async () => {
+        const found = await read(); const t = found.turns.at(-1);
+        return t?.message?.text === edited && t.status === 'succeeded' && found;
+      });
+      check('the edited message started once, as the next turn, after the first succeeded',
+        turns.turns.map((t) => t.message.text).slice(-2).join('|') === `${first}|${edited}` && turns.queued.length === 0);
+      await page.waitForTimeout(1500);
+    } finally {
+      const back = (await get('/api/settings')).body;
+      await get('/api/settings', { method: 'PUT', body: JSON.stringify({ hash: back.hash, updates: { 'ui.follow_up': 'steer' } }) });
+    }
+  });
+}
+
 // Samples an element's open or close animation frame by frame: its box and opacity at each tenth
 // of its animations, read with them paused (Web Animations API). The box shows the composed
 // motion, whichever properties (transform, translate) carry it.
@@ -2872,6 +3045,8 @@ async function run(combo, build, outRoot) {
     if (C.materials) await s119(ctx);  // S1-19b: cited answers; its stand-in helper and provider are the test server's
     if (C.memoryClock) await memoryFlow(ctx);  // S1-21a: memory and Where we left off, on the test server's clock
     if (server) await compactionFlow(ctx);  // S1-21b: compaction, on the test server's synthetic provider
+    if (server) await budgetFlow(ctx);  // S1-33: the budget bar and the budget asks, on its recorded costs
+    if (server) await followUpFlow(ctx);  // S1-33: steer and queue, on its slow synthetic steps
     if (server) {  // S1-36: the gold sets' review pages, in a tab of their own
       const appPage = page;
       page = await appPage.context().newPage();

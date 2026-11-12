@@ -960,3 +960,54 @@ async def test_each_reply_line_is_exactly_a_pair_and_a_verdict_or_its_pair_is_un
         assert parse(f"{lead}\n1: supported", 1) == {}, lead
     assert parse("9" * 5000 + ": supported\n1: partly", 1) == {1: "partly"}  # no number is read past six digits
     assert parse("\uff11: unsupported\n1: supported", 1) == {}  # a fullwidth 1 is no verdict, but it names pair 1
+
+
+async def test_a_citation_check_that_never_connected_is_released_when_its_receipt_write_fails(tmp_path, monkeypatch):
+    # S1-33 fix batch 3 (PR 52 cycle 3, E2): the check's judge request never connected and the write recording that
+    # failed once; the run's handler closes the call as its attempt says, released, and recovery has nothing to charge.
+    import httpx
+    from backend import spending
+    from test_detached_tail import fails_once_armed
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        await background_idle(client)
+        armed = fails_once_armed(monkeypatch, spending, "release")
+
+        def unreachable(body):
+            armed.append(True)
+            raise httpx.ConnectError("connection refused")
+        client.provider.verdicts = unreachable
+        [check] = (await client.post("/api/citations/check", json={"run_id": run_id})).json()["run_ids"]
+        await background_idle(client)
+        assert armed == [False]
+        before = await rows(client, "SELECT status, settled_usd FROM budget_reservations WHERE run_id = ?", check)
+        assert before == [("released", None)]
+        await client.state["harness"].recover(kick=False)
+        assert await rows(client, "SELECT status, settled_usd FROM budget_reservations WHERE run_id = ?", check) == before
+        assert await rows(client, "SELECT json_extract(data, '$.outcome') FROM run_events WHERE run_id = ?"
+                                  " AND type = 'model_attempt'", check) == [("network",)]
+
+
+async def test_a_citation_check_whose_reply_cannot_be_decoded_is_sent_once_and_charged_its_estimate(tmp_path):
+    # PR 52 cycle 4 (G1; design review A2, its test 3): the check's judge reply is nested too deeply to decode. Its
+    # attempt is recorded as sent, so the call is charged its estimate (never released at $0), and recovery sends
+    # nothing again.
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        await background_idle(client)
+        judged = len(client.provider.judged)
+        client.provider.verdicts = lambda body: (200, b"[" * 10000 + b"]" * 10000)
+        [check] = (await client.post("/api/citations/check", json={"run_id": run_id})).json()["run_ids"]
+        await background_idle(client)
+        [(estimate, status, settled, basis)] = await rows(
+            client, "SELECT estimate_usd, status, settled_usd, basis FROM budget_reservations WHERE run_id = ?", check)
+        assert (status, settled, basis) == ("settled", estimate, "estimated")
+        await client.state["harness"].recover(kick=False)
+        await background_idle(client)
+        assert await rows(client, "SELECT json_extract(data, '$.outcome'), json_extract(data, '$.dispatched')"
+                                  " FROM run_events WHERE run_id = ? AND type = 'model_attempt'", check) == [("malformed", 1)]
+        assert len(client.provider.judged) == judged + 1

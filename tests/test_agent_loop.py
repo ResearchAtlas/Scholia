@@ -745,7 +745,12 @@ async def test_c3_a_nested_calls_settlement_failure_reaches_the_turns_cleanup_no
         assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE run_id = ? AND status = 'open'",
                           run_id) == [(0,)]
         turn = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1]
-        assert turn["accounting"]["unknown_attempts"] == 1  # the sent call's charge is unknown, not lost
+        # S1-33 (PR 52 cycle 3, E1 case 3): the turn's cleanup closes the call as its attempt said, so the sent call's
+        # reported charge is kept, never lost to an estimate with an unknown attempt
+        assert turn["accounting"]["unknown_attempts"] == 0
+        [(amount, basis)] = await rows(client, "SELECT settled_usd, basis FROM budget_reservations WHERE id = ?",
+                                       settled[1])  # the tool's answer step, whose receipt failed
+        assert basis == "reported" and amount > 0
 
 
 # The turn's deadline in the dispatch check (Harold, decided 2026-10-22: the limit governs admission at the gate's
