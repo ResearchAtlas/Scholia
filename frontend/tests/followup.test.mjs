@@ -574,6 +574,93 @@ test('after Stop here, nothing waiting starts on its own until a turn the resear
   assert.ok(!run.calls.requests.includes('/auto'));
 });
 
+// PR 52 cycle 5 (design review B3, Option 1, Harold 2026-11-12): the window remembers a start only once the backend
+// answered it (admitted, or refused on its merits). Each case is one cycle 5 or design review B3 found.
+for (const change of ['edited', 'removed']) {
+  for (const order of ['read first', 'refusal first']) {
+    test(`a start given up while the researcher's own message is pending is asked again once that one is refused: ${change}, ${order} (cycle 5 C1)`, async (t) => {
+      // A succeeds; its drain starts q1, which is edited or removed meanwhile (not_queued); the retry's read is out when
+      // the researcher's message B is sent; B is refused on its merits. In either order, the waiting message starts once.
+      const conversation = `c-c5-${change}-${order.split(' ')[0]}`;
+      const after = `${conversation}-a`;
+      const retry = held();
+      const left = change === 'edited' ? [{ id: 'q1', text: 'Edited' }, { id: 'q2', text: 'Later' }] : [{ id: 'q2', text: 'Later' }];
+      let refuse;
+      const run = backend({ read: (count) => (count === 1 ? record(after, 'succeeded', [{ id: 'q1', text: 'Next' }, { id: 'q2', text: 'Later' }])
+        : count === 2 ? retry.promise : record(after, 'succeeded', left)),
+      streams: { '/a': () => succeeded(after),
+        '/b': () => new Promise((resolve) => { refuse = () => resolve(Response.json({ code: 'no_provider' }, { status: 400 })); }) },
+      starts: [() => Response.json({ code: 'not_queued' }, { status: 409 })] });
+      t.mock.method(globalThis, 'fetch', run.fetch);
+      await send(conversation, '/a', {}, 'A');
+      await settle(); // its drain's start was refused not_queued; the retry's read is out
+      const b = send(conversation, '/b', {}, 'B').catch((error) => error);
+      await settle();
+      if (order === 'read first') { retry.release(record(after, 'succeeded', left)); await settle(); refuse(); }
+      else { refuse(); await settle(); retry.release(record(after, 'succeeded', left)); }
+      assert.equal((await b).code, 'no_provider');
+      await settle();
+      assert.deepEqual(run.calls.queueSends.map(([url, body]) => [url.split('/').at(-2), body]),
+        [['q1', { after }], [change === 'edited' ? 'q1' : 'q2', { after }]]);
+    });
+  }
+}
+
+test('a start whose message was removed meanwhile, with none left to start, still starts a message queued later (design review B3, seed 91)', async (t) => {
+  const run = backend({ read: (count) => record('r-s91', 'succeeded', count === 1 ? [{ id: 'q1', text: 'Next' }] : count === 2 ? []
+    : [{ id: 'q3', text: 'Queued later' }]), streams: { '/a': () => succeeded('r-s91') },
+  starts: [() => Response.json({ code: 'not_queued' }, { status: 409 })] });
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  await send('c-s91', '/a', {}, 'A');
+  await settle(); // q1 removed as it was started; the retry reads none waiting
+  assert.deepEqual(run.calls.queueSends.map(([url]) => url.split('/').at(-2)), ['q1']);
+  drain('c-s91'); // a message joined the queue (the view's followUp asks for a drain)
+  await settle();
+  assert.deepEqual(run.calls.queueSends.map(([url, body]) => [url.split('/').at(-2), body]), [['q1', { after: 'r-s91' }],
+    ['q3', { after: 'r-s91' }]]);
+});
+
+for (const [kind, answer, again] of [
+  ['that is refused on its merits', () => Response.json({ code: 'not_after_success' }, { status: 409 }), 0],
+  ['answered with a server failure', () => Response.json({ code: 'internal' }, { status: 500 }), 0],
+  ['held off by another window', () => Response.json({ code: 'active_run' }, { status: 409 }), 1],
+  ['that got no answer', () => { throw new TypeError('fetch failed'); }, 1]]) {
+  test(`a start of its own ${kind} sends one request; a later release here asks ${again ? 'once more' : 'nothing'} (design review B3)`, async (t) => {
+    const conversation = `c-b3-${kind.split(' ').at(-1)}`;
+    const run = backend({ read: () => record(`${conversation}-a`, 'succeeded'), starts: [answer],
+      streams: { '/a': () => succeeded(`${conversation}-a`), '/b': () => Response.json({ code: 'no_provider' }, { status: 400 }) } });
+    t.mock.method(globalThis, 'fetch', run.fetch);
+    await send(conversation, '/a', {}, 'A');
+    await settle();
+    assert.equal(run.calls.queueSends.length, 1); // no loop: a refused start of its own asks nothing more itself
+    const reads = run.calls.reads;
+    assert.equal((await send(conversation, '/b', {}, 'B').catch((error) => error)).code, 'no_provider'); // free here again
+    await settle();
+    assert.ok(run.calls.reads > reads); // that release asked
+    assert.equal(run.calls.queueSends.length, 1 + again);
+  });
+}
+
+test('a stream cut while its answer is written starts nothing while the record says running; then the backend refuses the start (the cut stream stopped it) and it waits with Send (cycle 5 C2)', async (t) => {
+  let status = 'running';
+  const run = backend({ read: () => record('r-c5c2', status), streams: { '/a': () => new Response(streamOf(
+    'data: {"type":"run_started","run_id":"r-c5c2"}\n\n')), '/b': () => Response.json({ code: 'no_provider' }, { status: 400 }) },
+  starts: [() => Response.json({ code: 'not_after_success' }, { status: 409 }), () => succeeded('r-c5c2-sent')] });
+  t.mock.method(globalThis, 'fetch', run.fetch);
+  await send('c-c5c2', '/a', {}, 'A');
+  await settle();
+  assert.deepEqual(run.calls.queueSends, []); // its end read the turn running: the answer's commit was still written
+  status = 'succeeded'; // committed: the backend marked the turn stopped as its stream closed first
+  await send('c-c5c2', '/b', {}, 'B').catch(() => {}); // a later release here asks once, and is refused
+  await settle();
+  await send('c-c5c2', '/b', {}, 'B').catch(() => {}); // and then asks nothing more
+  await settle();
+  assert.deepEqual(run.calls.queueSends, [['/api/conversations/c-c5c2/queue/q1/send', { after: 'r-c5c2' }]]);
+  await viewHandlers('c-c5c2').sendQueued({ id: 'q1', text: 'Next' }); // Send starts it
+  await settle();
+  assert.deepEqual(run.calls.queueSends.at(-1), ['/api/conversations/c-c5c2/queue/q1/send', {}]);
+});
+
 test('Stop with a send pending here also stops the turn the record shows running from another window', async (t) => {
   const cancels = [];
   let signal;
@@ -750,6 +837,9 @@ test('a message naming papers sent while a turn runs waits as the next turn with
 // leaves for an action the researcher took before a Stop here; nothing starts on its own after a Stop here until a turn
 // the researcher started is admitted; nothing starts on its own but through the drain; at most one start a turn, the
 // oldest waiting; and once all has arrived, a waiting message never waits behind a turn that succeeded here with no Stop.
+// PR 52 cycle 5 (design review B3): waiting messages are also edited or removed (one being started then is refused
+// not_queued) and the researcher's own sends are refused on their merits at random; the one start not owed after a turn
+// is after three edits or removals in a row (a listed rule case).
 function seeded(seed) {
   return () => { seed = (seed + 0x6d2b79f5) | 0; let x = Math.imul(seed ^ (seed >>> 15), 1 | seed); x ^= x + Math.imul(x ^ (x >>> 7), 61 | x); return ((x ^ (x >>> 14)) >>> 0) / 4294967296; };
 }
@@ -761,7 +851,7 @@ async function trial(seed, install) {
   const conversation = `c-matrix-${seed}`;
   const broken = [];
   const state = { turns: [], queued: [], stopped: new Set(), runs: 0, items: 0, halted: false, started: new Map(), pressed: new Map(),
-    pending: [], streams: new Map() };
+    pending: [], streams: new Map(), answers: new Map(), starting: new Set() };
   const latest = () => state.turns.at(-1);
   const running = () => state.turns.find((turn) => turn.status === 'running');
   const quietly = (fn) => { try { fn(); } catch { /* the stream was closed already: its reader stopped */ } };
@@ -788,6 +878,8 @@ async function trial(seed, install) {
     url = String(url);
     const body = init.body ? JSON.parse(init.body) : {};
     const sending = /message\/stream|\/continue|\/queue\/[^/]+\/send/.test(url);
+    const version = url.includes('/queue/') ? state.queued.find((q) => q.id === url.split('/').at(-2))?.version : undefined;
+    if (url.includes('/queue/')) state.starting.add(url.split('/').at(-2));
     if (sending && body.after) { // a start of its own, checked as it leaves
       if (state.halted) broken.push(`${url}: started on its own after a Stop here`);
     } else if (sending) {
@@ -809,25 +901,31 @@ async function trial(seed, install) {
       if (url.endsWith('/steering')) {
         const turn = state.turns.find((t) => url.includes(t.run_id));
         if (turn?.status === 'running') return Response.json({ steering: { run_id: turn.run_id, seq: 1 } });
-        const item = { id: `q${state.items += 1}`, text: body.content };
+        const item = { id: `q${state.items += 1}`, text: body.content, version: 0 };
         state.queued.push(item);
         return Response.json({ queued: item, ended: true });
       }
       if (url.endsWith('/queue')) {
-        const item = { id: `q${state.items += 1}`, text: body.content };
+        const item = { id: `q${state.items += 1}`, text: body.content, version: 0 };
         state.queued.push(item);
         return Response.json(item, { status: 201 });
       }
       if (url.includes('/queue/')) {
+        state.starting.delete(url.split('/').at(-2));
         const item = state.queued.find((q) => q.id === url.split('/').at(-2));
+        const answered = (code) => { // the answers to the starts after a turn, in order
+          if (body.after) state.answers.set(body.after, [...(state.answers.get(body.after) ?? []), code]);
+          return Response.json({ code }, { status: code === 'refused' ? 400 : 409 });
+        };
         if (body.after) {
           const before = latest();
           if (!before || before.run_id !== body.after || before.status !== 'succeeded' || state.stopped.has(body.after)) {
-            return Response.json({ code: 'not_after_success' }, { status: 409 });
+            return answered('not_after_success');
           }
         }
-        if (!item) return Response.json({ code: 'not_queued' }, { status: 409 });
-        if (running()) return Response.json({ code: 'active_run' }, { status: 409 });
+        if (!item || item.version !== version) return answered('not_queued'); // removed, or edited as it was started
+        if (running()) return answered('active_run');
+        if (!body.after && random() < 0.2) return answered('refused'); // the researcher's own Send, refused on its merits
         if (body.after) {
           state.started.set(body.after, (state.started.get(body.after) ?? 0) + 1);
           if (state.started.get(body.after) > 1) broken.push(`two starts after ${body.after}`);
@@ -838,6 +936,7 @@ async function trial(seed, install) {
         return response;
       }
       if (sending) {
+        if (random() < 0.2) return Response.json({ code: 'refused' }, { status: 400 }); // refused on its merits
         const response = admit(init);
         if (response.ok) state.halted = false; // a turn the researcher started, admitted
         return response;
@@ -855,9 +954,15 @@ async function trial(seed, install) {
     return viewHandlers(conversation, { live: live_, running: isRunning, shown: state.turns.map((t) => ({ ...t })),
       readChoice: () => (random() < 0.5 ? Promise.resolve() : later(() => {})) });
   };
+  const changed = () => { // a waiting message to edit or remove: one being started, when there is one
+    const starting = state.queued.filter((q) => state.starting.has(q.id));
+    return starting.length ? pick(starting) : state.queued.length ? pick(state.queued) : null;
+  };
   const actions = {
     message: () => { const text = `m${state.items += 1}`; press(text); view().submit(text); },
     send: () => { if (!state.queued.length) return; const item = pick(state.queued); press(item.id); view().sendQueued(item); },
+    edit: () => { const item = changed(); if (item) { item.text += '*'; item.version += 1; } },
+    remove: () => { const item = changed(); if (item) state.queued = state.queued.filter((q) => q !== item); },
     stop: () => { state.halted = true; stop(conversation, running()?.run_id).catch(() => {}); },
     stopElsewhere: () => { const turn = latest(); if (turn) { state.stopped.add(turn.run_id); end(turn, 'cancelled'); } },
     finish: () => { const turn = running(); if (turn) end(turn, pick(['succeeded', 'succeeded', 'failed'])); },
@@ -865,8 +970,8 @@ async function trial(seed, install) {
     deliver: () => { if (state.pending.length) state.pending.splice(Math.floor(random() * state.pending.length), 1)[0](); },
   };
   state.mode = pick(['steer', 'queue']);
-  const weights = ['message', 'message', 'send', 'stop', 'stopElsewhere', 'finish', 'finish', 'mode', 'deliver', 'deliver',
-    'deliver', 'deliver', 'deliver', 'deliver'];
+  const weights = ['message', 'message', 'send', 'stop', 'stopElsewhere', 'finish', 'finish', 'mode', 'edit', 'remove', 'deliver',
+    'deliver', 'deliver', 'deliver', 'deliver', 'deliver', 'deliver'];
   for (let step = 0; step < 40; step += 1) {
     actions[pick(weights)]();
     await tick();
@@ -877,19 +982,21 @@ async function trial(seed, install) {
   }
   for (let i = 0; i < 5; i += 1) await tick();
   const last = latest();
+  const givenUp = (state.answers.get(last?.run_id) ?? []).slice(-3);
   if (!state.pending.length && !running() && last?.status === 'succeeded' && !state.halted && !state.stopped.has(last.run_id)
-    && state.queued.length && !state.started.get(last.run_id)) {
+    && state.queued.length && !state.started.get(last.run_id) && !(givenUp.length === 3 && givenUp.every((c) => c === 'not_queued'))) {
     broken.push(`${state.queued.map((q) => q.id)} left waiting behind ${last.run_id}, which succeeded here`);
   }
   unsubscribe();
   return broken;
 }
 
-test('a seeded random matrix of sends, steers, Sends, Stops here and elsewhere and late deliveries keeps every rule (B2)', async (t) => {
+test('a seeded random matrix of sends, steers, Sends, edits, removals, refusals, Stops here and elsewhere and late deliveries keeps every rule (B2, B3)', async (t) => {
   let current = null;
   t.mock.method(globalThis, 'fetch', (...args) => current(...args));
   const found = [];
-  for (let seed = 1; seed <= 400; seed += 1) {
+  // seeds 1 to 400, and 1059: cycle 5's C1 on 82e95ab (a start given up while a Send was pending, then that Send refused)
+  for (const seed of [...Array.from({ length: 400 }, (_, i) => i + 1), 1059]) {
     found.push(...(await trial(seed, (fetch) => { current = fetch; })).map((problem) => `seed ${seed}: ${problem}`));
   }
   assert.deepEqual(found.slice(0, 10), []);

@@ -104,7 +104,9 @@ export function send(conversationId, path, body, text, since = stopsAt(conversat
       if (!turn.done) turn = { ...turn, done: true };
       if (release() && turns.get(conversationId) && turns.get(conversationId) !== turn) set(conversationId, turn, 'run_finished');
       admitted();
-      drain(conversationId); // free here again, however the stream ended: the record says what follows
+      // free here again, however the stream ended: the record says what follows; a start of its own that was refused
+      // asks nothing more (its drain goes on, or it waits with Send)
+      if (!auto || turn.runId) drain(conversationId);
     });
   });
 }
@@ -114,9 +116,12 @@ export function send(conversationId, path, body, text, since = stopsAt(conversat
 // turn's record), wherever the window is. Asked at every stream's end here, and after a message joins the queue. Each
 // call reads the conversation and acts on what the record says now: only while the latest turn there succeeded and was
 // sent from this window, no Stop was pressed here since, and nothing is being admitted or running here, checked before
-// and after the read, and again by send as the request leaves; once a turn. A message edited or removed while it was
-// being started (not_queued) gives way to the next, read again. The backend starts it only while that turn is still the
-// latest, succeeded and not stopped from any window, and once. After any other ending it waits with Send.
+// and after the read, and again by send as the request leaves; once a turn, remembered only once the backend answered
+// (PR 52 cycle 5, design review B3: admitted, or refused on its merits), so a start another window held off (active_run)
+// or that got no answer is asked again at the next release here. A message edited or removed while it was being started
+// (not_queued) gives way to the next, read again. The backend starts it only while that turn is still the latest,
+// succeeded and not stopped from any window (nor its stream closed before its end was recorded), and once. After any
+// other ending it waits with Send.
 export async function drain(conversationId) {
   const pressed = stopsAt(conversationId);
   const free = () => !aborts.has(conversationId) && !halted.has(conversationId) && stopsAt(conversationId) === pressed;
@@ -129,14 +134,17 @@ export async function drain(conversationId) {
     }
     const after = read?.turns?.at(-1)?.run_id;
     const next = routes.has(after) ? nextQueued(read, after) : null; // a turn sent elsewhere: that window starts it
-    if (!next || !free() || (tries === 0 && followed.has(after))) return;
-    followed.add(after);
+    if (!next || !free() || followed.has(after)) return;
     try {
       await send(conversationId, `/api/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(next.id)}/send`,
         { after }, next.text, pressed, true);
+      followed.add(after);
       return;
     } catch (error) {
-      if (!(error instanceof ApiError && error.code === 'not_queued')) return; // refused otherwise: it waits with Send
+      if (error instanceof ApiError && error.code === 'not_queued') continue;
+      // refused on its merits: it waits with Send; held off here or elsewhere, or no answer: asked again when free here
+      if (error instanceof ApiError && error.status > 0 && !['active_run', 'stopped'].includes(error.code)) followed.add(after);
+      return;
     }
   }
 }
