@@ -1012,3 +1012,34 @@ test('the bar reads the share of a limit too large to multiply, never Infinity (
   assert.ok(Math.abs(near.percent - 94.1176) < 0.001 && near.meter === 94, JSON.stringify(near));
   assert.equal(budgetBar(huge(Number.MAX_VALUE)).meter, 100); // a total held at the most a float holds: over it
 });
+
+// PR 52's follow-up (cycle 5 C3; SPEC:415, F4): the view's conversation read, taken from its source and run with what it
+// closes over stood in for. An older read answering after a queue edit's or removal's newer one was shown over it,
+// putting the removed or old text back on screen; only the newest read asked is shown, as the asks' are.
+test('an older conversation read answering late never restores a waiting message edited or removed since (C3)', async () => {
+  const { newest, readGuard } = await import('../src/library.js');
+  const source = VIEW();
+  const start = source.indexOf('const load = useCallback(async () => {');
+  let end = source.indexOf('{', start);
+  for (let depth = 0; ; end += 1) {
+    depth += source[end] === '{' ? 1 : source[end] === '}' ? -1 : 0;
+    if (depth === 0) break;
+  }
+  const body = source.slice(source.indexOf('async () =>', start), end + 1);
+  for (const [label, after] of [['removed', []], ['edited', [{ id: 'q1', text: 'Edited 中文' }]]]) {
+    const reads = [];
+    const shown = { queued: null };
+    const env = { id: 'c-c3', guard: { current: readGuard() }, newestRead: newest(), markdownReady: async () => {},
+      get: () => new Promise((resolve) => reads.push(resolve)), setTurns: () => {},
+      setQueued: (queued) => { shown.queued = queued; }, setFailed: () => {}, setStale: () => {}, setReads: () => {} };
+    const load = new Function(...Object.keys(env), `return (${body});`)(...Object.values(env));
+    const older = load(); // asked before the edit or removal, held
+    const newer = load(); // the change's own read
+    await new Promise((resolve) => setImmediate(resolve));
+    reads[1]({ turns: [], queued: after });
+    await newer;
+    reads[0]({ turns: [], queued: [{ id: 'q1', text: 'Original 中文' }] });
+    await older;
+    assert.deepEqual(shown.queued, after, label);
+  }
+});

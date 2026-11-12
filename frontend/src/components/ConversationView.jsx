@@ -92,25 +92,29 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   const guard = useRef(null); // which reads may be shown (library.js readGuard)
   if (guard.current === null) guard.current = readGuard();
   const [stale, setStale] = useState(false);
+  // Only the newest read asked is shown, as the asks' are: an older one answering late would put back a waiting
+  // message edited or removed since (PR 52 cycle 5 C3).
+  const [newestRead] = useState(newest);
   const load = useCallback(async () => { // whether the conversation was read
     if (!id) return false;
     const settle = guard.current.ask();
+    const current = newestRead();
     try {
       // The Markdown renderer loads beside the first read, so answers show formatted with their turns.
       const [read] = await Promise.all([get(`/api/conversations/${id}`), markdownReady()]);
-      if (!settle(true)) return false; // asked before the library changed: never shown
+      if (!current() || !settle(true)) return false; // overtaken, or asked before the library changed: never shown
       setTurns(read.turns);
       setQueued(read.queued ?? []);
       setFailed(false);
       setStale(false);
       return true;
     } catch {
-      if (settle(false)) setFailed(true);
+      if (current() && settle(false)) setFailed(true);
       return false;
     } finally {
       setReads((n) => n + 1);
     }
-  }, [id]);
+  }, [id, newestRead]);
 
   useEffect(() => {
     load();
