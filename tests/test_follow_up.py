@@ -742,6 +742,120 @@ async def test_a_stop_pressed_after_the_answer_committed_starts_nothing_waiting_
         assert run_id in client.state["harness"].stopped and unknown not in client.state["harness"].stopped
 
 
+@pytest.mark.parametrize("late_steer", [False, True])
+async def test_a_stop_still_reading_its_finished_turn_starts_nothing_waiting_after_that_turn(tmp_path, monkeypatch,
+                                                                                            late_steer):
+    # PR 52 cycle 5, B1 (SPEC:412, F7; design review B3's Option 1): Stop for a turn that had just finished (from another
+    # window) is still reading its record when a start of the waiting message after that turn arrives: a message queued
+    # before, or a steer answered "ended" meanwhile. Refused, as the mark comes before any await; Send still starts it.
+    from backend import runs
+    real, armed, reached, release = runs.Harness._read, [], asyncio.Event(), asyncio.Event()
+
+    async def read(self, fn):
+        if armed and armed.pop():  # the next read: the Stop's, of its run's record
+            reached.set()
+            await release.wait()
+        return await real(self, fn)
+    monkeypatch.setattr(runs.Harness, "_read", read)
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        run_id = (await send(client, conversation, "First?"))[0]["run_id"]
+        await background_idle(client)
+        if not late_steer:
+            queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})).json()
+        armed.append(True)
+        stopping = asyncio.create_task(client.post(f"/api/runs/{run_id}/cancel"))
+        await asyncio.wait_for(reached.wait(), 5)
+        if late_steer:
+            ended = (await steer(client, run_id, "Next?")).json()
+            assert ended["ended"] is True
+            queued = ended["queued"]
+        path = f"/api/conversations/{conversation}/queue/{queued['id']}/send"
+        after = await client.post(path, json={"after": run_id})
+        release.set()
+        assert (await stopping).json()["status"] == "succeeded"
+        assert after.status_code == 409 and after.json()["code"] == "not_after_success"
+        assert [q["id"] for q in (await conversation_read(client, conversation))["queued"]] == [queued["id"]]
+        sent = await client.post(path, json={})
+        assert sent.status_code == 200 and events(sent)[-1]["status"] == "succeeded"
+        await background_idle(client)
+
+
+async def test_a_stop_held_behind_a_stale_claims_record_starts_nothing_waiting_after_its_turn(tmp_path, monkeypatch):
+    # PR 52 cycle 5 (design review B3, a second way into B1): Stop pressed for a running turn waits behind the record of a
+    # released stale claim (Harness._record_dropped); the turn succeeds meanwhile. A start of the waiting message after
+    # it is refused all the same; Send still starts it.
+    from backend import runs
+    real, reached, release = runs.Harness._record_dropped, asyncio.Event(), asyncio.Event()
+
+    async def record_dropped(self):
+        if not reached.is_set():  # the Stop's (an admission records them too)
+            reached.set()
+            await release.wait()
+        await real(self)
+    gate = Gate(0)
+    provider = Scripted(None)
+    provider.script[0] = gate.wrap(provider, "The answer.")
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "First?"))
+        await gate.reached.wait()
+        run_id = await running_run(client, conversation)
+        queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})).json()
+        monkeypatch.setattr(runs.Harness, "_record_dropped", record_dropped)
+        stopping = asyncio.create_task(client.post(f"/api/runs/{run_id}/cancel"))
+        await asyncio.wait_for(reached.wait(), 5)
+        gate.open.set()
+        assert (await sending)[-1]["status"] == "succeeded"  # its answer committed before the Stop reached it
+        path = f"/api/conversations/{conversation}/queue/{queued['id']}/send"
+        after = await client.post(path, json={"after": run_id})
+        release.set()
+        assert (await stopping).json()["status"] == "succeeded"
+        assert after.status_code == 409 and after.json()["code"] == "not_after_success"
+        sent = await client.post(path, json={})
+        assert sent.status_code == 200 and events(sent)[-1]["status"] == "succeeded"
+        await background_idle(client)
+
+
+@pytest.mark.parametrize("cut", [True, False])
+async def test_a_turn_whose_stream_closed_before_its_end_was_recorded_starts_nothing_waiting_on_its_own(tmp_path,
+                                                                                                       monkeypatch, cut):
+    # PR 52 cycle 5, C2 (Harold, 2026-11-12, design review B3's Option 1 (i)): the turn's stream closes while its answer's
+    # commit is still written. The answer is saved and the turn succeeded, but its window could not know it: the closed
+    # stream stops it as Stop does, so the waiting message waits with Send. A stream read to its end marks nothing.
+    import time
+    from backend import runs
+    real = runs.Harness._commit_answer
+    async with started(tmp_path / "data") as client:
+        harness, loop, reader = client.state["harness"], asyncio.get_running_loop(), None
+
+        def committing(self, conn, claim, answer, ctx):
+            committed = real(self, conn, claim, answer, ctx)
+            if cut:
+                loop.call_soon_threadsafe(reader.cancel)  # its window goes while the answer is still to commit
+                time.sleep(0.3)
+            return committed
+        monkeypatch.setattr(runs.Harness, "_commit_answer", committing)
+        conversation = await named(client)
+        queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})).json()
+        claim = await harness.admit_turn(conversation, "First?")
+
+        async def read_stream():
+            return [event async for event in harness.events(claim)]
+        reader = asyncio.create_task(read_stream())
+        await asyncio.wait({reader})
+        await asyncio.wait({claim.task})
+        assert (await conversation_read(client, conversation))["turns"][-1]["status"] == "succeeded"
+        assert (claim.run_id in harness.stopped) is cut
+        path = f"/api/conversations/{conversation}/queue/{queued['id']}/send"
+        after = await client.post(path, json={"after": claim.run_id})
+        if cut:
+            assert after.status_code == 409 and after.json()["code"] == "not_after_success"
+            after = await client.post(path, json={})
+        assert after.status_code == 200 and events(after)[-1]["status"] == "succeeded"
+        await background_idle(client)
+
+
 async def test_a_message_naming_papers_waits_with_them_and_starts_narrowed_to_them_or_refused_once_one_is_deleted(tmp_path):
     # Item 5 (Harold, 2026-11-11; SPEC:281; E5): a message sent with papers chosen while a turn runs waits as the next
     # turn with them (the interface queues it whatever the setting). Its start narrows its turn to them, as any message's

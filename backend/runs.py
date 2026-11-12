@@ -436,8 +436,9 @@ class Harness:
         # Orders settings saves with the budget reads of call admission: a lowered budget either
         # lands before a call reads it or after that call was admitted.
         self.settings_lock = asyncio.Lock()
-        # S1-33 (PR 52 cycle 3): the runs Stop was pressed for, from any window, even after they ended: nothing waiting
-        # starts on its own after one (_take_queued)
+        # S1-33 (PR 52 cycle 3): the runs Stop was pressed for, from any window, even after they ended, and (cycle 5) every
+        # run cancelled here, a turn whose stream closed before its end was recorded among them: nothing waiting starts on
+        # its own after one (_take_queued)
         self.stopped = set()
 
     async def _write(self, fn):
@@ -543,7 +544,10 @@ class Harness:
         started has run nothing: its conversation is freed and it is recorded at once, and it
         is released once that write has ended. A background run whose
         task is still to come (its record being written, see record_background) stays held:
-        its task sees the request as it starts, and ends it."""
+        its task sees the request as it starts, and ends it. S1-33 (PR 52 cycle 5, B1, C2): the run is marked stopped
+        first, with no await before (Harness.stopped), so nothing waiting starts on its own after it: a Stop, and a
+        stream closed before its turn's end was recorded (stream_closed)."""
+        self.stopped.add(active.run_id)
         if active.cancel_requested.is_set():
             if active.kind == "background" and active.cancel_reason == "shutdown" and reason != "shutdown":
                 active.cancel_reason = reason
@@ -587,11 +591,13 @@ class Harness:
         commits before it sees the request keeps that result, and the reply says so
         rather than promising a cancellation. The reply is "cancelling" only if the run
         has not ended within CANCEL_WAIT_SECONDS. Repeating it is safe; a finished run
-        is left as it is."""
+        is left as it is. S1-33 (PR 52 cycle 5, B1): the run is marked stopped before any await, one that had ended too
+        (a Stop from another window after its answer committed), so no waiting message starts on its own after it
+        meanwhile; the mark goes again for no such run."""
+        self.stopped.add(run_id)
         await self._record_dropped()
         active = self.registry.runs.get(run_id)
         if active is not None:
-            self.stopped.add(run_id)
             self._request_cancel(active, reason)
             if active.closing is not None:  # its response never started: recorded now
                 # Shielded: a request cancelled while it waits never cancels the write, its finished mark or its release.
@@ -602,8 +608,8 @@ class Harness:
                     return {"run_id": run_id, "status": "cancelling"}
         row = await self._read(lambda conn: conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone())
         if row is None:
+            self.stopped.discard(run_id)
             return None
-        self.stopped.add(run_id)  # one that had ended too: a Stop from another window after its answer committed
         return {"run_id": run_id, "status": derived_status(row[0], run_id, self.registry)}
 
     async def _record_dropped(self):
@@ -3262,7 +3268,8 @@ def _release_allowances(conn, run_id=None):
 def _take_queued(conn, conversation_id, text, queued_id, after, stopped=()):
     """S1-33: a queued message taken from the queue by the admission of its turn, in its transaction (Harness._admit).
     One started on its own (after) follows only the latest turn, succeeded, and not stopped (stopped: the runs Stop was
-    pressed for, Harness.stopped), so a Stop pressed in another window after the answer committed starts nothing."""
+    pressed for or cancelled, Harness.stopped), so a Stop pressed in another window after the answer committed starts
+    nothing, nor does a turn whose stream closed before its end was recorded (it waits with Send)."""
     if after is not None:
         latest = conn.execute("SELECT t.run_id, r.status FROM turns t JOIN runs r ON r.id = t.run_id"
                               " WHERE t.conversation_id = ? ORDER BY t.seq DESC LIMIT 1", (conversation_id,)).fetchone()
