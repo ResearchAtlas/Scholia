@@ -280,7 +280,7 @@ def _save_project_budget(data_dir, decided):
     try:
         load_settings(data_dir, decided["project_id"]).save({
             "project.budget_usd": decided["to_usd"], "project.budget_continue_usd": decided["amount_usd"],
-            "project.budget_continue_at_usd": decided["to_usd"]})
+            "project.budget_continue_at_usd": decided["to_usd"]}, answer=True)
         return True
     except Exception as error:
         log.warning("a project budget answered in an ask may not be saved (%s)", type(error).__name__)

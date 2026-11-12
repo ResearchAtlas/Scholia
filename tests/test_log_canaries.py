@@ -344,7 +344,7 @@ async def test_no_steering_queued_or_budget_answer_canary_reaches_the_log(tmp_pa
             read = (await client.get("/api/settings", params={"project_id": project})).json()
             await client.put("/api/settings", json={"project_id": project, "hash": read["hash"],
                                                     "updates": {"project.budget_usd": 0.01}})
-            monkeypatch.setattr(settings.Settings, "save", lambda self, updates: (_ for _ in ()).throw(OSError("CANARY-DISK")))
+            monkeypatch.setattr(settings.Settings, "save", lambda self, updates, answer=False: (_ for _ in ()).throw(OSError("CANARY-DISK")))
             sending = asyncio.create_task(send(client, conversation, "CANARY-PROMPT budget"))
             from test_agent_loop import asked
             ask = await asked(client, conversation)

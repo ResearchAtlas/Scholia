@@ -4,6 +4,7 @@ notices, spend and the evaluation project's conservative admission (backend/budg
 import asyncio
 import sqlite3
 import threading
+import tomllib
 
 import pytest
 
@@ -641,10 +642,10 @@ async def test_a_project_budget_answer_whose_settings_write_fails_raises_nothing
         sending, ask = await _asking(client, conversation)
         saving = settings.Settings.save
 
-        def failing(self, updates):
+        def failing(self, updates, answer=False):
             if "project.budget_usd" in updates:
                 raise OSError("disk full")
-            return saving(self, updates)
+            return saving(self, updates, answer)
         monkeypatch.setattr(settings.Settings, "save", failing)
         answered = (await _answer(client, ask, option="continue")).json()
         assert answered["budget"] == {"applied": False, "budget": "project", "limit_usd": 1.0, "error": "not_saved"}
@@ -1283,13 +1284,13 @@ async def test_the_notices_a_recorded_settlement_reached_are_streamed_when_stop_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("edits, after", [((5.0, 2.0), 4.0), ((2.0,), 4.0)])
+@pytest.mark.parametrize("edits, after", [((5.0, 2.0), 4.0), ((2.0,), 3.0)])
 async def test_a_settings_edit_makes_the_project_limit_continues_amount_even_back_at_the_last_decided_value(
         tmp_path, edits, after):
     # D3 (A5, reading 3): $1, Continue to $2, then $5 and $2 set in Settings: $2 is now the researcher's own setting, so
-    # the next Continue adds $2 (to $4), not the $1 the old decision added. Saving the $2 unchanged does the same (to
-    # $4): any Settings save of the budget makes it the amount (Harold, 2026-11-12, design review C's Option 2 with
-    # always-remove; until then, from the review of batch 2, an unchanged save kept the decision's $1, to $3).
+    # the next Continue adds $2 (to $4), not the $1 the old decision added. Saving the $2 unchanged changes nothing, so
+    # the decision's $1 stays (to $3): Harold, 2026-11-12, design review C3's Option 2, which decides from what the save
+    # changes (batches 5 and 6 took it out on any save of the budget, to $4).
     async with await _app(tmp_path) as client:
         conversation, project = await _conversation(client)
         await _project_budget(client, project, 1.0)
@@ -1318,8 +1319,8 @@ async def test_a_settings_edit_cancelled_once_its_file_is_written_still_makes_th
     from backend import settings as settings_module
     real_save, written, release = settings_module.Settings.save, threading.Event(), threading.Event()
 
-    def saving(self, updates):
-        result = real_save(self, updates)
+    def saving(self, updates, answer=False):
+        result = real_save(self, updates, answer)
         if "project.budget_usd" in updates and armed:
             written.set()
             release.wait(10)  # the request is cancelled here, its file already written
@@ -1381,8 +1382,8 @@ async def test_a_settings_save_over_a_budget_its_file_did_not_give_makes_the_lim
 
 # PR 52 cycle 5 (A-F1; Harold, 2026-11-12, design review C's Option 2): what Continue adds to the project budget is in its
 # config.toml beside the limit (budget_continue_usd, written for the limit budget_continue_at_usd), in the same file
-# replace as the limit, and any Settings save of the budget takes it out. Each case starts at $25, Continued to $50
-# (adding $25).
+# replace as the limit, and a Settings save that changes the limit takes it out (batch 7). Each case starts at $25,
+# Continued to $50 (adding $25).
 
 
 def _config(tmp_path, project):
@@ -1492,31 +1493,20 @@ def test_a_backup_keeps_what_continue_adds_beside_the_limit():
                                                        "budget_continue_at_usd": 50.0}
 
 
-def test_a_settings_save_names_its_project_keys_however_each_is_spelled():
-    # The [project] keys a Settings save names, whatever spelling each has (app._project_keys): a save of the budget
-    # takes out what Continue adds, and one naming what Continue adds is refused.
-    from backend.app import _project_keys
-    assert all(_project_keys(u) == {"budget_usd"} for u in (
-        {"project.budget_usd": 1}, {'"project".budget_usd': 1}, {"project . budget_usd": None},
-        {"project": {"budget_usd": 1}}, {'project."budget\\u005Fusd"': 1}))
-    assert _project_keys({'project."budget_continue_usd"': 1, "project": {"budget_continue_at_usd": 1, "template": "x"},
-                          "ui.panel": "none"}) == {"budget_continue_usd", "budget_continue_at_usd", "template"}
-    assert not any(_project_keys(u) for u in ({"budget.conversation_usd": 1}, {"[project": 1}, {"project": None}))
-
-
 async def _saved(client, project, updates):
     """A Settings save of the project's config.toml as just read: the response."""
     read = (await client.get("/api/settings", params={"project_id": project})).json()
     return await client.put("/api/settings", json={"project_id": project, "hash": read["hash"], "updates": updates})
 
 
+# PR 52 batch 7 (rule 1 recheck B7-1; Harold, 2026-11-12, design review C3's Option 2): Settings.save decides from the
+# file before and the bytes it is about to write, read back, never from how a save names its keys. A changed limit
+# takes what Continue adds out in the same replace; what Continue adds changed any other way is refused, nothing
+# written; anything else is written.
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("updates", [
-    # The rule 1 recheck's probe: the pair taken out, then put back by a later table, or by quoted dotted aliases.
-    {"project.budget_continue_usd": None, "project.budget_continue_at_usd": None,
-     "project": {"budget_usd": 50.0, "budget_continue_usd": 25.0, "budget_continue_at_usd": 50.0}},
-    {"project.budget_continue_usd": None, "project.budget_continue_at_usd": None, "project.budget_usd": 50.0,
-     '"project".budget_continue_usd': 25.0, '"project".budget_continue_at_usd': 50.0},
     # The pair alone, without the budget (design review C2: to $1,050, $550, $57).
     {"project.budget_continue_usd": 1000.0, "project.budget_continue_at_usd": 50.0},
     {"project": {"budget_continue_usd": 1000.0, "budget_continue_at_usd": 50.0}},
@@ -1526,23 +1516,49 @@ async def _saved(client, project, updates):
     # Each key removed alone (to $100).
     {"project.budget_continue_usd": None},
     {"project.budget_continue_at_usd": None},
-    # The budget with an aliased pair.
-    {"project.budget_usd": 50.0, '"project".budget_continue_usd': 25.0, '"project".budget_continue_at_usd': 50.0},
-    None,  # the whole of values.project, as read after the Continue, saved back
 ])
-async def test_a_settings_save_naming_what_continue_adds_is_refused_and_writes_nothing(tmp_path, updates):
-    # PR 52 batch 6 (rule 1 recheck A-F1; Harold, 2026-11-12, design review C2's Option 1): a project Settings save
-    # naming budget_continue_usd or budget_continue_at_usd, however spelled, is refused before anything is written, so
-    # the next Continue still adds the $25 (to $75).
+async def test_a_settings_save_changing_what_continue_adds_alone_is_refused_and_writes_nothing(tmp_path, updates):
+    # A project Settings save that changes budget_continue_usd or budget_continue_at_usd and not the limit is refused
+    # before anything is written, so the next Continue still adds the $25 (to $75). As in batch 6.
     async with await _app(tmp_path) as client:
         conversation, project = await _at_fifty(client)
         before = _config(tmp_path, project).read_bytes()
-        if updates is None:
-            updates = {"project": (await client.get("/api/settings", params={"project_id": project})).json()["values"]
-                       ["project"]}
         response = await _saved(client, project, updates)
         assert (response.status_code, response.json()["code"]) == (400, "invalid_setting")
         assert _config(tmp_path, project).read_bytes() == before
+        assert await _continue_at_cap(client, conversation, project, 50.0) == 75.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("updates", [
+    # The rule 1 recheck's B7-1: a child of the budget that does not exist, removed, in each of its spellings.
+    {"project.budget_usd.unused": None},
+    {'"project" . "budget_usd" . "unused"': None},
+    {'project."budget\\u005Fusd".unused': None},
+    {"project.budget_usd.unused.more": None},
+    {"project.budget_continue_usd.unused": None},  # a child of what Continue adds (batch 6: 400)
+    {"project.budget_usd": 50.0},  # the budget saved unchanged, as Enter on the Settings page does (batch 6: to $100)
+    {"project.template": "x"},  # another key
+    # Cycle 6's A-F1 probe with the same values: the pair taken out, then put back by a later table, or by quoted dotted
+    # aliases (batch 6: 400).
+    {"project.budget_continue_usd": None, "project.budget_continue_at_usd": None,
+     "project": {"budget_usd": 50.0, "budget_continue_usd": 25.0, "budget_continue_at_usd": 50.0}},
+    {"project.budget_continue_usd": None, "project.budget_continue_at_usd": None, "project.budget_usd": 50.0,
+     '"project".budget_continue_usd': 25.0, '"project".budget_continue_at_usd': 50.0},
+    # The budget with an aliased pair, all as they were (batch 6: 400).
+    {"project.budget_usd": 50.0, '"project".budget_continue_usd': 25.0, '"project".budget_continue_at_usd': 50.0},
+    None,  # the whole of values.project, as read after the Continue, saved back (batch 6: 400)
+])
+async def test_a_settings_save_leaving_the_limit_and_what_continue_adds_as_they_were_keeps_what_continue_adds(
+        tmp_path, updates):
+    # A save that changes neither the limit nor what Continue adds, however it names them, is written, and the next
+    # Continue still adds the $25 (to $75).
+    async with await _app(tmp_path) as client:
+        conversation, project = await _at_fifty(client)
+        if updates is None:
+            updates = {"project": (await client.get("/api/settings", params={"project_id": project})).json()["values"]
+                       ["project"]}
+        assert (response := await _saved(client, project, updates)).status_code == 200, response.text
         assert await _continue_at_cap(client, conversation, project, 50.0) == 75.0
 
 
@@ -1560,21 +1576,129 @@ async def test_a_settings_save_of_what_continue_adds_is_refused_in_a_new_project
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("updates, after", [
-    *(({key: 50.0}, 100.0) for key in ("project.budget_usd", '"project".budget_usd', "project . budget_usd",
-                                        'project."budget\\u005Fusd"')),
-    ({"project": {"budget_usd": 50.0}}, 100.0),
-    ({"project.budget_usd": None}, 100.0),  # reset to the shipped $50
-    ({"project": None}, 100.0),  # the whole table removed, what Continue adds with it
-    ({"project.template": "x"}, 75.0),
+@pytest.mark.parametrize("updates, limit", [
+    *(({key: 60.0}, 60.0) for key in ("project.budget_usd", '"project".budget_usd', "project . budget_usd",
+                                       'project."budget\\u005Fusd"')),
+    ({"project": {"budget_usd": 60.0}}, 60.0),
+    # The budget changed with an aliased pair: the pair goes with the limit, never adding $1,000 (batch 6: 400).
+    ({"project.budget_usd": 60.0, '"project".budget_continue_usd': 1000.0, '"project".budget_continue_at_usd': 60.0},
+     60.0),
+    ({"project.budget_usd": None}, 50.0),  # reset to the shipped $50
+    ({"project": None}, 50.0),  # the whole table removed, what Continue adds with it
 ])
-async def test_a_settings_save_not_naming_what_continue_adds_is_written(tmp_path, updates, after):
-    # Design review C2: a save of the budget in any spelling, or its reset, still takes out what Continue adds (Continue
-    # then adds the $50 limit, to $100); a save of another key leaves it (to $75).
+async def test_a_settings_save_changing_the_limit_takes_what_continue_adds_out_with_it(tmp_path, updates, limit):
+    # A5, reading 3: a limit changed in Settings, in any spelling, or reset, is the researcher's own, so the next
+    # Continue adds that limit (to twice it), not the $25.
     async with await _app(tmp_path) as client:
         conversation, project = await _at_fifty(client)
         assert (response := await _saved(client, project, updates)).status_code == 200, response.text
-        assert await _continue_at_cap(client, conversation, project, 50.0) == after
+        assert await _continue_at_cap(client, conversation, project, limit) == 2 * limit
+
+
+@pytest.mark.asyncio
+async def test_a_settings_save_changing_nothing_while_the_cap_ask_waits_keeps_what_its_continue_adds(tmp_path):
+    # B7-1 during an open ask, with a note and a queued message waiting: the save removing a child of the budget that
+    # does not exist is written and leaves the ask open, and its Continue adds the $25 (to $75; batch 6: to $100).
+    from scholia_app import MockProvider
+    from test_agent_loop import asked
+    async with await _app(tmp_path, MockProvider(cost=0)) as client:
+        conversation, project = await _at_fifty(client)
+        [(spent,)] = await _rows(client, "SELECT sum(settled_usd) FROM budget_reservations WHERE project_id = ?", project)
+        await _spent(client, project, round(50.0 - spent, 9))
+        sending, ask = await _asking(client, conversation, "Again?")
+        assert ask["params"]["form"] == "cap"
+        assert (await client.post(f"/api/runs/{ask['run_id']}/steering",
+                                  json={"content": "Only recent papers"})).status_code == 200
+        queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next question"})).json()
+        assert (response := await _saved(client, project, {"project.budget_usd.unused": None})).status_code == 200, \
+            response.text
+        assert (await asked(client, conversation))["ask_id"] == ask["ask_id"]
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["limit_usd"] == 75.0
+        assert (await asyncio.wait_for(sending, 10))[-1]["status"] == "succeeded"
+        read = (await client.get(f"/api/conversations/{conversation}")).json()
+        assert read["queued"] == [queued] and read["turns"][-1]["steering"][0]["state"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_a_settings_save_that_would_move_what_continue_adds_in_a_hand_written_layout_is_refused(tmp_path):
+    # Design review C3: the project's keys written by hand as dotted keys at the root, $25 Continued to $50. A save adding
+    # a table there makes tomlkit write its header among those keys, so the keys after it would move under it, what
+    # Continue adds among them: 400, nothing written, and Continue still adds $25 (to $75; batch 6: 200, to $100).
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 25.0)
+        _config(tmp_path, project).write_text('project.budget_usd = 25.0\nproject.template = "imrad"\n')
+        assert await _continue_at_cap(client, conversation, project, 25.0, "Short?") == 50.0
+        before = _config(tmp_path, project).read_bytes()
+        response = await _saved(client, project, {"project.unused": {}})
+        assert (response.status_code, response.json().get("code")) == (400, "invalid_setting")
+        assert _config(tmp_path, project).read_bytes() == before
+        assert await _continue_at_cap(client, conversation, project, 50.0) == 75.0
+
+
+_PAIRED = b"[project]\nbudget_usd = 50.0\nbudget_continue_usd = 25.0\nbudget_continue_at_usd = 50.0\n"
+
+
+def _project_file(tmp_path, monkeypatch, raw):
+    """A project's config.toml holding raw, and the list each later write_private call appends its bytes to."""
+    from backend import settings
+    real, written = settings.write_private, []
+    real(tmp_path / "projects" / "p" / "config.toml", raw)
+    monkeypatch.setattr(settings, "write_private", lambda path, data: (written.append(data), real(path, data)))
+    return written
+
+
+@pytest.mark.parametrize("raw, updates, kept", [
+    (_PAIRED, {"project.template": "x"}, {"budget_usd": 50.0, "budget_continue_usd": 25.0,
+                                          "budget_continue_at_usd": 50.0, "template": "x"}),
+    (_PAIRED, {"project.budget_usd": 50}, {"budget_usd": 50, "budget_continue_usd": 25.0,
+                                           "budget_continue_at_usd": 50.0}),  # 50 is the same limit as 50.0
+    (_PAIRED, {"project.budget_usd.unused": None}, tomllib.loads(_PAIRED.decode())["project"]),
+    (_PAIRED, {"project.budget_usd": 60.0}, {"budget_usd": 60.0}),
+    (_PAIRED, {"project.budget_usd": 60.0, "project.budget_continue_usd": 1000.0}, {"budget_usd": 60.0}),
+    (_PAIRED, {"project.budget_usd": None}, {}),
+    # The same keys written by hand as dotted keys at the root: each is taken out of the table as it is then.
+    (b'project.budget_usd = 50.0\nproject.budget_continue_usd = 25.0\nproject.budget_continue_at_usd = 50.0\n'
+     b'project.template = "imrad"\n', {"project.budget_usd": 60.0}, {"budget_usd": 60.0, "template": "imrad"}),
+    # A limit made invalid by hand, then reset: a change, as setting it is (G3).
+    (b'[project]\nbudget_usd = "abc"\nbudget_continue_usd = 25.0\nbudget_continue_at_usd = 50.0\n',
+     {"project.budget_usd": None}, {}),
+    # A limit of true, given by hand, is no budget: a limit of 1 is a change, never the same as true.
+    (b"[project]\nbudget_usd = true\nbudget_continue_usd = 0.5\nbudget_continue_at_usd = 1\n",
+     {"project.budget_usd": 1}, {"budget_usd": 1}),
+])
+def test_a_project_files_save_is_written_with_what_continue_adds_kept_unless_the_limit_changed(
+        tmp_path, monkeypatch, raw, updates, kept):
+    from backend.settings import load_settings
+    written = _project_file(tmp_path, monkeypatch, raw)
+    load_settings(tmp_path, "p").save(updates)
+    assert len(written) == 1 and tomllib.loads(written[0].decode()).get("project", {}) == kept
+
+
+@pytest.mark.parametrize("raw, updates", [
+    (_PAIRED, {"project.budget_continue_usd": 1000.0}),
+    (_PAIRED, {"project.budget_continue_at_usd": None}),
+    (_PAIRED, {"project": {"budget_usd": 50.0, "budget_continue_usd": 25.5}}),
+    # What Continue adds given as true by hand is none: 1 is a change, never the same as true.
+    (b"[project]\nbudget_usd = 1.0\nbudget_continue_usd = true\nbudget_continue_at_usd = 1.0\n",
+     {"project.budget_continue_usd": 1}),
+])
+def test_a_project_files_save_changing_what_continue_adds_alone_raises_and_writes_nothing(
+        tmp_path, monkeypatch, raw, updates):
+    from backend.settings import load_settings
+    written = _project_file(tmp_path, monkeypatch, raw)
+    with pytest.raises(ValueError):
+        load_settings(tmp_path, "p").save(updates)
+    assert written == [] and (tmp_path / "projects" / "p" / "config.toml").read_bytes() == raw
+
+
+def test_a_budget_answers_save_writes_the_limit_and_what_continue_adds_in_one_file_write(tmp_path, monkeypatch):
+    from backend.settings import load_settings
+    written = _project_file(tmp_path, monkeypatch, _PAIRED)
+    load_settings(tmp_path, "p").save({"project.budget_usd": 75.0, "project.budget_continue_usd": 25.0,
+                                       "project.budget_continue_at_usd": 75.0}, answer=True)
+    assert len(written) == 1 and tomllib.loads(written[0].decode())["project"] == {
+        "budget_usd": 75.0, "budget_continue_usd": 25.0, "budget_continue_at_usd": 75.0}
 
 
 @pytest.mark.asyncio

@@ -634,19 +634,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         changed = _providers_changed(body.updates, providers.configured(data_dir, include_off=True))
         refuse_if_busy(changed)  # before any field is written
 
-        updates = body.updates
-        named = _project_keys(updates) if body.project_id is not None else set()
-        if named & {"budget_continue_usd", "budget_continue_at_usd"}:
-            # S1-33 (Harold, 2026-11-12, design review C2's Option 1): only an ask's answer writes what Continue adds
-            raise ApiError(400, "invalid_setting", "A setting is not valid")
-        if "budget_usd" in named:
-            # S1-33 (Harold, 2026-11-12, design review C's Option 2): a limit saved here, even unchanged, is what Continue
-            # adds from now on: what an earlier answer wrote beside it goes, in the same file replace, after every
-            # update (the save names neither key)
-            updates = {**updates, "project.budget_continue_usd": None, "project.budget_continue_at_usd": None}
-
         async def saving():  # under the project-files lock, the save and what it changes run to their end together
-            await asyncio.to_thread(loaded.save, updates)
+            await asyncio.to_thread(loaded.save, body.updates)
         try:
             saved = _to_end(saving())
             # A provider turned off, moved or removed takes routes away: ordered with dispatch.
@@ -1549,23 +1538,6 @@ def _ensure_openrouter(data_dir):
         updates["providers.openrouter.base_url"] = providers.OPENROUTER_BASE_URL
     if updates:
         personal.save(updates)
-
-
-def _project_keys(updates):
-    """S1-33: the [project] keys a settings save writes or removes, each key read as the save reads it (quoted parts
-    and escapes included); a project table names its own keys."""
-    names = set()
-    for key, value in updates.items():
-        try:
-            path = _split_key(key)
-        except ValueError:  # the save refuses it
-            continue
-        if path[:1] == ("project",):
-            if len(path) > 1:
-                names.add(path[1])
-            elif isinstance(value, dict):
-                names.update(value)
-    return names
 
 
 def _write_project_folder(data_dir, project_id):

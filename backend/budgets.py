@@ -157,8 +157,9 @@ def _amount(conn, data_dir, budget, scope_id, current, default):
     A conversation's decisions are its runs' events, deleted only with it, and only an applied one counts (one stale or
     stopped changed nothing: PR 52 cycle 2). A project's are in its config.toml beside the limit (Harold, 2026-11-12,
     design review C's Option 2): `budget_continue_usd` while `budget_continue_at_usd` is the limit, written with it in
-    one file replace (asks._save_project_budget), and taken out by any Settings save of the budget, so the limit set
-    there is the amount from then on. A pair a hand edit made invalid is none."""
+    one file replace (asks._save_project_budget), and taken out by any other save that changes the limit (Settings.save,
+    design review C3's Option 2), so the limit set there is the amount from then on. A pair a hand edit made invalid is
+    none."""
     if budget == "project":
         own = load_settings(data_dir, scope_id).values["project"]
         row = (own.get("budget_continue_at_usd"), own.get("budget_continue_usd"))
