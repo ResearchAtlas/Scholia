@@ -310,9 +310,11 @@ _CONTINUE_KEYS = ("budget_usd", "budget_continue_usd", "budget_continue_at_usd")
 
 
 def _named(path, value):
-    """The key paths an update names: each value a table given leaf by leaf names, else its own path (a value, or None
-    removing the whole key)."""
-    return [leaf for leaf, _ in _leaves({path[-1]: value}, path[:-1])] if isinstance(value, dict) and value else [path]
+    """The key paths an update names: each value a table given leaf by leaf names (an empty table, which only adds a
+    table, names none), else its own path (a value, or None removing the whole key)."""
+    if not isinstance(value, dict):
+        return [path]
+    return [leaf for leaf, found in _leaves({path[-1]: value}, path[:-1]) if found != {}]
 
 
 def _unnamed_kept(raw, data, named):

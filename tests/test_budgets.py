@@ -2010,21 +2010,23 @@ def test_a_sum_of_amounts_past_what_a_float_holds_is_held_at_the_most_never_infi
     from backend import budgets
     assert db.read(lambda conn: budgets.totals(conn, project_id=project)) == (sys.float_info.max, sys.float_info.max)
     assert db.read(lambda conn: budgets.bases(conn, project_id=project))["reported_usd"] == sys.float_info.max
-    with pytest.raises(spending.BudgetExceeded):  # a spend held at the most fits no step, even under a limit at the most
-        reserve(db, project, conversation, run, 0.01, step=2, project_budget=sys.float_info.max, conversation_budget=None)
+    with pytest.raises(spending.BudgetExceeded):  # a spend held at the most fits no step under a limit below it
+        reserve(db, project, conversation, run, 0.01, step=2, project_budget=1.7e308, conversation_budget=None)
     assert spending.combined(BIG + BIG) == sys.float_info.max
     assert spending.combined(0.1 + 0.2) == 0.3  # the kept precision, as before
 
 
-@pytest.mark.parametrize("limit", [1e16, 1e308])
-def test_a_step_at_a_large_limit_already_reached_is_refused_though_adding_it_would_round_it_away(db, limit):
-    # Admission compares the estimate with what is left (limit - spent), never spent + estimate with the limit: at these
-    # magnitudes $0.50 added to the spend rounded to nothing, so a step past a budget already used up was admitted.
+@pytest.mark.parametrize("already, estimate", [(19423135.578402165, 6.435008896), (1e9, 0.045496), (123456789012.5, 0.75),
+                                               (1.7e308, 0.04), (1e308, 1e308)])
+def test_the_limit_go_ahead_sets_admits_its_step_at_any_spend(db, already, estimate):
+    # A6 (the internal review's F1): Go ahead sets the limit to what the step needs, summed as budgets.decide sums it;
+    # admission sums spend and estimate the same way, so that limit admits the step, never asks again
     project = add_project(db)
     conversation, run = add_turn(db, project)
-    reserve(db, project, conversation, run, limit, project_budget=None, conversation_budget=limit)
-    with pytest.raises(spending.BudgetExceeded):
-        reserve(db, project, conversation, run, 0.5, step=1, project_budget=None, conversation_budget=limit)
+    reserve(db, project, conversation, run, already, project_budget=None, conversation_budget=None)
+    spent = db.read(lambda conn: spending.spent(conn, conversation_id=conversation))
+    needed = spending.combined(spent + spending.amount(estimate))
+    assert reserve(db, project, conversation, run, estimate, step=1, project_budget=None, conversation_budget=needed)
 
 
 def test_a_calls_attempts_whose_costs_sum_past_what_a_float_holds_settle_as_reported_at_the_most(db):
@@ -2240,6 +2242,9 @@ async def test_a_settings_save_that_would_move_the_limit_in_a_hand_written_layou
     (b'project.template = "imrad"\nproject.budget_usd = 80.0\n', {"project.unused": {}}),  # the limit would move
     (b'project.budget_usd = 80.0\nproject.template = "imrad"\n', {"project.unused": {}}),  # another key would
     (b'project.citation_style = "apa"\nproject.template = "imrad"\n', {"project.extra": {"x": 1}}),
+    # the internal review's F3: an empty table of its own names none of the keys under it
+    (b'project.template = "imrad"\nproject.budget_usd = 25.0\n', {"project.unused": {}, "project": {}}),
+    (b'project.template = "imrad"\nproject.budget_usd = 25.0\n', {"project": {"unused": {}}}),
 ])
 def test_a_project_files_save_moving_a_key_it_does_not_name_raises_and_writes_nothing(tmp_path, monkeypatch, raw, updates):
     from backend.settings import load_settings

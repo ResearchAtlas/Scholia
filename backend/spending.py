@@ -20,9 +20,10 @@ Every function takes an open connection inside a write (or read) transaction.
 Amounts combine where they are summed (here, in the database's sums, and over a call's attempts) or priced (counts
 times rates): each is valid, but a total of them can pass what a float holds. Such a total is held at MAX_USD, the
 largest a float holds (combined), and keeps its basis: money counted is never less than its parts, and never infinite,
-which no record, reply or limit could carry (PR 52 cycle 5 A-F2). A spend held there fits no step, so the step asks;
-every notice of its budget is reached; and the bar is full. Comparisons never add amounts: admission compares the
-estimate with what is left, and a budget's share is its spend divided by its limit.
+which no record, reply or limit could carry (PR 52 cycle 5 A-F2). A spend held there fits no step under any limit
+below it, so the step asks; every notice of its budget is reached; and the bar is full. Admission sums spend and
+estimate the same way (combined), so the limit Go ahead sets always admits its step, and a budget's share is its spend
+divided by its limit, which never overflows.
 """
 
 import math
@@ -94,7 +95,7 @@ def reserve(conn, *, run_id: str, step_seq: int, project_id: str, paying_convers
         if limit is None:
             continue
         already = spent(conn, **scope)
-        if estimate > limit - already + 10 ** -_DECIMALS:  # against what is left, which a large spend cannot round away
+        if combined(already + estimate) > limit + 10 ** -_DECIMALS:  # as budgets.decide sums what a step needs
             raise BudgetExceeded(budget, limit, already, estimate)
     reservation_id = new_id()
     conn.execute(

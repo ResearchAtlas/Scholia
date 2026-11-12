@@ -1046,3 +1046,14 @@ test('an older conversation read answering late never restores a waiting message
     assert.deepEqual(shown.queued, after, label);
   }
 });
+
+// The internal review's F2: a needed limit too large to count in cents is said as it is, never as "null".
+test('a limit too low for the step says the least it needs even past what cents can count (A-F2)', async () => {
+  const { ApiError } = await import('../src/api.js');
+  const { problemText } = await import('../src/action.js');
+  const { makeT } = await import('../src/i18n/index.js');
+  for (const needed of [1.7e307, Number.MAX_VALUE]) {
+    const text = problemText(makeT('en'), new ApiError(400, 'limit_too_low', needed), 'en');
+    assert.ok(!/null|Infinity|NaN/.test(text) && /\$\d{1,3}(,\d{3})+/.test(text), text);
+  }
+});
