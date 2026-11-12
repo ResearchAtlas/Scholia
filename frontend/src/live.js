@@ -15,7 +15,7 @@ const aborts = new Map();
 const routes = new Set(); // run ids of the turns sent from here (the backend starts a waiting message on its route)
 const halted = new Set(); // conversations Stop was pressed in here since a turn the researcher started was admitted
 const stops = new Map(); // conversation id -> how many times Stop was pressed in it here
-const followed = new Set(); // run ids a waiting message was started after, here (one start a turn)
+const followed = new Set(); // run ids a waiting message was started after here, or refused on its merits (one a turn)
 const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut, notices }, for this window
 const listeners = new Set();
 
