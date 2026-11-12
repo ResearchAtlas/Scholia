@@ -1537,7 +1537,10 @@ async def test_a_settings_save_changing_what_continue_adds_alone_is_refused_and_
     {'project."budget\\u005Fusd".unused': None},
     {"project.budget_usd.unused.more": None},
     {"project.budget_continue_usd.unused": None},  # a child of what Continue adds (batch 6: 400)
-    {"project.budget_usd": 50.0},  # the budget saved unchanged, as Enter on the Settings page does (batch 6: to $100)
+    # The budget saved unchanged, as Enter on the Settings page does, in each spelling (batch 6: to $100).
+    *({key: 50.0} for key in ("project.budget_usd", '"project".budget_usd', "project . budget_usd",
+                              'project."budget\\u005Fusd"')),
+    {"project": {"budget_usd": 50.0}},
     {"project.template": "x"},  # another key
     # Cycle 6's A-F1 probe with the same values: the pair taken out, then put back by a later table, or by quoted dotted
     # aliases (batch 6: 400).

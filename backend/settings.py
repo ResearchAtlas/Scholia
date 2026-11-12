@@ -248,7 +248,7 @@ class Settings:
 
         In a project file, what Continue adds to the budget is written only by a budget
         answer (answer=True). Any other save that changes the limit takes it out in the
-        same write, and one that changes it while leaving the limit raises ValueError.
+        same write; one that changes what Continue adds but not the limit raises ValueError.
         """
         with _save_lock:
             raw = _read(self.path)
