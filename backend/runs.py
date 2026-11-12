@@ -1608,6 +1608,8 @@ class Harness:
             async def forgetting():  # each deletion and its record to their end, whatever cancellation comes meanwhile
                 count = changed = 0
                 for record in ids:
+                    if claim.cancel_requested.is_set():  # Stop is immediate: no deletion starts after it (SPEC:412)
+                        break
                     def as_seen(conn, record=record):  # in the deletion's own transaction (MB9): edited, kept or
                         found = memory.row(conn, record)  # replaced since, it is not what the researcher chose to forget
                         if found is None:
@@ -1627,8 +1629,9 @@ class Harness:
                                                           f"record{'s' if count != 1 else ''}. Do not use it."
                            + (f" {changed} record{'s' if changed != 1 else ''} changed since the researcher chose and "
                               f"{'were' if changed != 1 else 'was'} not forgotten." if changed else ""))
-            # PR 52's follow-up (design review P): a Stop once a deletion committed is honored after its record, as a
-            # tool's result is (_tool's keeping): never a record deleted with nothing said of it
+            # PR 52's follow-up (design review P): a Stop once a deletion committed is honored after that deletion and the
+            # record of what was forgotten, as a tool's result is (_tool's keeping): never a record deleted with nothing
+            # said of it
             _, cancelled = await _through(forgetting())
             if cancelled:
                 raise asyncio.CancelledError()

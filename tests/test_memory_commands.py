@@ -380,3 +380,46 @@ async def test_a_forget_stopped_once_its_deletion_committed_still_records_and_sa
         assert {"type": "memory", "action": "forgotten", "count": 1} in stream
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1:]
         assert [(m["action"], m["count"]) for m in turn["memory"]] == [("forgotten", 1)]
+
+
+
+async def test_a_stop_during_a_forget_of_several_records_deletes_none_after_it_and_says_what_it_forgot(tmp_path,
+                                                                                                     monkeypatch):
+    # The internal review's F4: Stop is immediate (SPEC:412). The deletion it landed on commits, and the forget records
+    # and says that one; the records still to be deleted are kept, as they were before the follow-up.
+    import time
+    from backend import memory
+    from backend.db import deletion
+    real = deletion.delete
+    async with started(tmp_path / "data") as client:
+        harness, loop = client.state["harness"], asyncio.get_running_loop()
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        first = await send(client, conversation, "What do I study?")
+        await background_idle(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: [memory.save_command(
+            conn, project_id=project, run_id=first[0]["run_id"], action="save", text=text)
+            for text in ("the pilot used a survey", "the cohort is 40 nurses", "interviews ran in May")])
+        made = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+        assert len(made) == 3
+        deleted = []
+
+        def deleting(*args, **kwargs):
+            found = real(*args, **kwargs)
+            deleted.append(args[3])
+            if len(deleted) == 1:  # committed: the Stop lands while its worker is still to return
+                loop.call_soon_threadsafe(harness._request_cancel, harness.registry.turns[conversation], "researcher")
+                time.sleep(0.2)
+            return found
+        monkeypatch.setattr(deletion, "delete", deleting)
+        sending = asyncio.create_task(send(client, conversation, "forget this"))
+        ask = await open_ask(client, conversation)
+        assert len(ask["params"]["records"]) == 3
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "forget"})
+        stream = await sending
+        assert stream[-1]["status"] == "cancelled" and len(deleted) == 1
+        assert len(await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")) == 2
+        [(data,)] = await rows(client, "SELECT data FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                               stream[0]["run_id"])
+        assert (json.loads(data)["action"], json.loads(data)["count"]) == ("forgotten", 1)
+        assert {"type": "memory", "action": "forgotten", "count": 1} in stream
