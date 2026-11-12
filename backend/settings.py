@@ -244,7 +244,8 @@ class Settings:
 
         Re-reads the file first and raises SettingsChanged if it changed since it
         was loaded. Raises ValueError, writing nothing, for an invalid value, a
-        secret, a personal setting in a project file, or a file that is not valid TOML.
+        secret, a personal setting in a project file, a file that is not valid TOML, or
+        a save that would move or change a key it does not name.
 
         In a project file, what Continue adds to the budget is written only by a budget
         answer (answer=True). Any other save that changes the limit takes it out in the
@@ -298,10 +299,11 @@ class Settings:
                     expected = (after[0], None, None)
                 if _continue_keys(data) != expected:
                     raise ValueError(f"{self.label}: what Continue adds is written only by a budget answer")
-            # PR 52's follow-up (item 8): the bytes must read back as the document the save changed, so no key moves or
-            # changes that the save does not name, and each it names reads as set. A table added among root dotted keys
-            # gets its header after the first of them, moving the keys after it under it.
-            if self.schema is PROJECT and _values(tomlkit.parse(data.decode("utf-8")).unwrap()) != _values(doc.unwrap()):
+            # PR 52's follow-up (item 8; Harold, 2026-11-13, Option 1 for the personal file): the bytes must read back
+            # as the document the save changed, so no key moves or changes that the save does not name, and each it
+            # names reads as set. A table added among root dotted keys gets its header after the first of them, moving
+            # the keys after it under it.
+            if _values(tomlkit.parse(data.decode("utf-8")).unwrap()) != _values(doc.unwrap()):
                 raise ValueError(f"{self.label}: this save would move or change keys it does not name")
             write_private(self.path, data)
             _parse(self, data)

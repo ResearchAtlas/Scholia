@@ -492,7 +492,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             refuse_if_busy({providers.OPENROUTER})
 
             async def set_up():
-                await asyncio.to_thread(_ensure_openrouter, data_dir)
+                try:
+                    await asyncio.to_thread(_ensure_openrouter, data_dir)
+                except ValueError:  # a settings file this save cannot change as it is (Settings.save): nothing written
+                    raise ApiError(400, "invalid_setting", "A setting is not valid") from None
                 return await _save_key(providers.OPENROUTER, body.openrouter_key)
 
             return {"ok": True, "warning": await _to_end(set_up())}

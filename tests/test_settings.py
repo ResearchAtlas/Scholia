@@ -806,3 +806,68 @@ def test_settings_that_leave_the_data_folder_keep_only_what_the_app_knows():
     assert tomlkit.parse(known_only(project).decode()).unwrap() == {
         "project": {"citation_style": "apa7"}, "ui": {"panel": "library"}}  # a personal setting is not a project's
     assert known_only(b"not = = toml") is None and known_only(b"\xff") is None
+
+
+# PR 52's follow-up, item 8's personal file (Harold, 2026-11-13, Option 1): the project file's rule applies here too. A
+# save is written only when its bytes read back as the document it changed. In a hand-written file whose keys are root
+# dotted keys, a save adding a table among them (the Providers page adding a provider or a model's window, the layout,
+# the picker's choice, the first run's OpenRouter table) made tomlkit write its header after the first of them, so every
+# key after it moved under the new table: `lab` lost its URL and the follow-up mode fell back to steer, unsaid.
+_ROOT_DOTTED = ('providers.lab.kind = "openai-compatible"\nproviders.lab.base_url = "http://127.0.0.1:9/v1"\n'
+                'ui.follow_up = "queue"\n')
+_UI_DOTTED = 'ui.follow_up = "queue"\nbudget.conversation_usd = 20\n'
+
+
+@pytest.mark.parametrize("raw, updates", [
+    (_ROOT_DOTTED, {"providers.other.kind": "openai-compatible", "providers.other.base_url": "http://127.0.0.1:8/v1"}),
+    (_ROOT_DOTTED, {"providers.lab.windows.m": 4096}),
+    (_ROOT_DOTTED, {"providers.openrouter.kind": "openrouter",
+                    "providers.openrouter.base_url": "https://openrouter.ai/api/v1"}),
+    (_UI_DOTTED, {"ui.layout.sidebar_width": 250}),
+    (_UI_DOTTED, {"ui.model.id": "m", "ui.model.provider": "lab"}),
+    (_UI_DOTTED, {"ui.layout.sidebar_width": 250, "ui.follow_up": "steer"}),  # one it names moves too
+])
+def test_a_personal_save_that_would_move_a_key_it_does_not_name_raises_and_writes_nothing(tmp_path, raw, updates):
+    (tmp_path / "config.toml").write_text(raw)
+    with pytest.raises(ValueError):
+        load_settings(tmp_path).save(updates)
+    assert (tmp_path / "config.toml").read_text() == raw
+    assert load_settings(tmp_path).values["ui"]["follow_up"] == "queue"
+
+
+# Every save the app makes on the personal file: the Providers page, General, the layout, the model picker, and the
+# keys the program writes itself (the first run's OpenRouter table, the local helper's mirror)
+_APP_SAVES = [
+    {"providers.openrouter.kind": "openrouter", "providers.openrouter.base_url": "https://openrouter.ai/api/v1"},
+    {"providers.lab.kind": "openai-compatible", "providers.lab.base_url": "http://127.0.0.1:9/v1"},
+    {"providers.lab.windows.m": 4096}, {"providers.lab.default_window": 8192}, {"providers.lab.default_window": None},
+    {"providers.lab.enabled": False}, {"providers.lab.enabled": None}, {"providers.lab.models": ["m"]},
+    {"providers.openrouter.windows.m": 4096}, {"ui.language": "en"}, {"ui.follow_up": "queue"},
+    {"budget.conversation_usd": 30}, {"zotero.enabled": True}, {"subagents.models": ["a"]}, {"subagents.at_once": 2},
+    {"subagents.tool_calls": 9}, {"subagents.effort_cap": "low"}, {"models.router": "r"}, {"models.router": None},
+    {"models.efforts.m": "high"}, {"ui.model.id": "m", "ui.model.provider": "lab"},
+    {"ui.model.id": "auto", "ui.model.provider": None},
+    {"ui.layout.sidebar_width": 250, "ui.layout.sidebar_open": False, "ui.layout.panel_share": 0.4},
+    {"helper.model_source": "modelscope"},
+]
+
+
+@pytest.mark.parametrize("order", [1, -1])
+def test_the_apps_own_personal_saves_on_a_file_it_wrote_are_written(tmp_path, order):
+    # From no file, each save after the last, in both orders: none is refused (a probe of 3,000 saves in random runs
+    # found none refused and none moving a key)
+    for updates in _APP_SAVES[::order]:
+        load_settings(tmp_path).save(updates)
+    values = load_settings(tmp_path).values
+    assert values["providers"]["lab"]["base_url"] == "http://127.0.0.1:9/v1" and values["ui"]["follow_up"] == "queue"
+
+
+@pytest.mark.parametrize("updates", _APP_SAVES)
+@pytest.mark.parametrize("raw", [
+    '[providers.lab]\nkind = "openai-compatible"\nbase_url = "http://127.0.0.1:9/v1"\n[ui]\nfollow_up = "queue"\n',
+    'ui.follow_up = "queue"\n[providers.lab]\nkind = "openai-compatible"\nbase_url = "http://127.0.0.1:9/v1"\n',
+    '# mine\n[ui] # here\nfollow_up = "queue" # q\n\n[budget]\nconversation_usd = 20\n'])
+def test_the_apps_own_personal_saves_on_hand_written_tables_are_written(tmp_path, raw, updates):
+    (tmp_path / "config.toml").write_text(raw)
+    load_settings(tmp_path).save(updates)
+    assert load_settings(tmp_path).values["ui"]["follow_up"] == "queue" or updates == {"ui.follow_up": "queue"}
