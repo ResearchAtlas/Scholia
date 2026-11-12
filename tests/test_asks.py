@@ -140,6 +140,12 @@ async def test_an_ask_of_a_run_no_process_holds_reads_closed_wherever_it_would_b
         registry.release(registry.runs[run])
         assert (await client.get("/api/asks", params={"project_id": project})).json()["asks"] == []
         assert (await client.get(f"/api/projects/{project}/materials")).json()["asks"] == []
+        conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # started from a conversation
+            "UPDATE runs SET inputs = json_object('origin', json_object('conversation_id', ?)) WHERE id = ?",
+            (conversation, run)))
+        assert (await client.get("/api/asks", params={"conversation_id": conversation})).json() == {
+            "asks": [], "working": 0}  # nothing for the view to keep reading (the internal review's F5)
         [listed] = [r for r in (await client.get("/api/activity")).json()["runs"] if r["run_id"] == run]
         assert (listed["status"], listed["ask"]) == ("interrupted", None)
         response = await answer(client, run, ask, option="yes")

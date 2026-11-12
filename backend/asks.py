@@ -225,10 +225,10 @@ async def list_asks(request: Request, project_id: str | None = None, conversatio
     so the conversation knows to look again."""
     registry = request.app.state.scholia["harness"].registry
 
-    def listing(conn):
-        working = conn.execute(
-            "SELECT count(*) FROM runs WHERE status = 'running' AND json_extract(inputs, '$.origin.conversation_id') = ?",
-            (conversation_id,)).fetchone()[0] if conversation_id else 0
+    def listing(conn):  # a run no process here holds reads interrupted (SPEC:672), so it is not working either
+        working = sum(derived_status("running", run, registry) == "running" for (run,) in conn.execute(
+            "SELECT id FROM runs WHERE status = 'running' AND json_extract(inputs, '$.origin.conversation_id') = ?",
+            (conversation_id,))) if conversation_id else 0
         return {"asks": open_asks(conn, project_id, conversation_id, registry=registry), "working": working}
 
     return await asyncio.to_thread(request.app.state.scholia["db"].read, listing)
