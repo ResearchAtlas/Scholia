@@ -438,7 +438,8 @@ class Harness:
         self.settings_lock = asyncio.Lock()
         # S1-33 (PR 52 cycle 3): the runs Stop was pressed for, from any window, even after they ended, and (cycle 5) every
         # run cancelled here, a turn whose stream closed before its end was recorded among them: nothing waiting starts on
-        # its own after one (_take_queued)
+        # its own after one (_take_queued). shortcut: one id per run cancelled in this launch, never taken out; a bounded
+        # log if that grows large
         self.stopped = set()
 
     async def _write(self, fn):

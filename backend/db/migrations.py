@@ -689,6 +689,8 @@ CREATE INDEX run_body_memory_by_memory ON run_body_memory (memory_id);
 # marked in the database when it is created and never after, so no settings file or later change loosens its
 # conservative admission. A project's last applied budget decision ({"to_usd", "amount_usd"}): what Continue adds again
 # while its budget is still what that decision left, kept with the project so deleting a conversation never changes it.
+# (PR 52 cycle 5: no longer read or written; what Continue adds is in the project's config.toml beside its budget,
+# budgets._amount.)
 _0010 = r"""
 CREATE TABLE queued_messages (
     id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),

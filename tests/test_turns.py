@@ -568,7 +568,7 @@ async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tm
         run_id = active_turn(client, conversation).run_id
         await client.post(f"/api/runs/{run_id}/cancel")
         assert (await stream)[-1]["status"] == "cancelled"
-        assert len(client.provider.answers) == 1  # the first conversation's only (its extraction is not an answer)
+        assert len(client.provider.chats) == 2  # the first conversation's turn and its extraction only
         assert await rows(client, "SELECT status, settled_usd FROM budget_reservations WHERE run_id = ?",
                           run_id) == [("released", None)]
 
