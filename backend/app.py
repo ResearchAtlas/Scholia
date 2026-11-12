@@ -635,9 +635,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         refuse_if_busy(changed)  # before any field is written
 
         updates = body.updates
-        if body.project_id is not None and _names_budget(updates):
+        named = _project_keys(updates) if body.project_id is not None else set()
+        if named & {"budget_continue_usd", "budget_continue_at_usd"}:
+            # S1-33 (Harold, 2026-11-12, design review C2's Option 1): only an ask's answer writes what Continue adds
+            raise ApiError(400, "invalid_setting", "A setting is not valid")
+        if "budget_usd" in named:
             # S1-33 (Harold, 2026-11-12, design review C's Option 2): a limit saved here, even unchanged, is what Continue
-            # adds from now on: what an earlier answer wrote beside it goes, in the same file replace
+            # adds from now on: what an earlier answer wrote beside it goes, in the same file replace, after every
+            # update (the save names neither key)
             updates = {**updates, "project.budget_continue_usd": None, "project.budget_continue_at_usd": None}
 
         async def saving():  # under the project-files lock, the save and what it changes run to their end together
@@ -1546,16 +1551,21 @@ def _ensure_openrouter(data_dir):
         personal.save(updates)
 
 
-def _names_budget(updates):
-    """S1-33: whether a settings save writes or removes the project budget, however its key is spelled."""
+def _project_keys(updates):
+    """S1-33: the [project] keys a settings save writes or removes, each key read as the save reads it (quoted parts
+    and escapes included); a project table names its own keys."""
+    names = set()
     for key, value in updates.items():
         try:
             path = _split_key(key)
         except ValueError:  # the save refuses it
             continue
-        if path == ("project", "budget_usd") or path == ("project",) and isinstance(value, dict) and "budget_usd" in value:
-            return True
-    return False
+        if path[:1] == ("project",):
+            if len(path) > 1:
+                names.add(path[1])
+            elif isinstance(value, dict):
+                names.update(value)
+    return names
 
 
 def _write_project_folder(data_dir, project_id):

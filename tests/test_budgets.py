@@ -1492,13 +1492,89 @@ def test_a_backup_keeps_what_continue_adds_beside_the_limit():
                                                        "budget_continue_at_usd": 50.0}
 
 
-def test_a_settings_save_names_the_project_budget_however_its_key_is_spelled():
-    # A Settings save of the budget takes out what Continue adds, whatever spelling its key has (app._names_budget).
-    from backend.app import _names_budget
-    assert all(_names_budget(u) for u in ({"project.budget_usd": 1}, {'"project".budget_usd': 1},
-                                          {"project . budget_usd": None}, {"project": {"budget_usd": 1}}))
-    assert not any(_names_budget(u) for u in ({"project.template": "x"}, {"project": {"template": "x"}},
-                                              {"budget.conversation_usd": 1}, {"[project": 1}))
+def test_a_settings_save_names_its_project_keys_however_each_is_spelled():
+    # The [project] keys a Settings save names, whatever spelling each has (app._project_keys): a save of the budget
+    # takes out what Continue adds, and one naming what Continue adds is refused.
+    from backend.app import _project_keys
+    assert all(_project_keys(u) == {"budget_usd"} for u in (
+        {"project.budget_usd": 1}, {'"project".budget_usd': 1}, {"project . budget_usd": None},
+        {"project": {"budget_usd": 1}}, {'project."budget\\u005Fusd"': 1}))
+    assert _project_keys({'project."budget_continue_usd"': 1, "project": {"budget_continue_at_usd": 1, "template": "x"},
+                          "ui.panel": "none"}) == {"budget_continue_usd", "budget_continue_at_usd", "template"}
+    assert not any(_project_keys(u) for u in ({"budget.conversation_usd": 1}, {"[project": 1}, {"project": None}))
+
+
+async def _saved(client, project, updates):
+    """A Settings save of the project's config.toml as just read: the response."""
+    read = (await client.get("/api/settings", params={"project_id": project})).json()
+    return await client.put("/api/settings", json={"project_id": project, "hash": read["hash"], "updates": updates})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("updates", [
+    # The rule 1 recheck's probe: the pair taken out, then put back by a later table, or by quoted dotted aliases.
+    {"project.budget_continue_usd": None, "project.budget_continue_at_usd": None,
+     "project": {"budget_usd": 50.0, "budget_continue_usd": 25.0, "budget_continue_at_usd": 50.0}},
+    {"project.budget_continue_usd": None, "project.budget_continue_at_usd": None, "project.budget_usd": 50.0,
+     '"project".budget_continue_usd': 25.0, '"project".budget_continue_at_usd': 50.0},
+    # The pair alone, without the budget (design review C2: to $1,050, $550, $57).
+    {"project.budget_continue_usd": 1000.0, "project.budget_continue_at_usd": 50.0},
+    {"project": {"budget_continue_usd": 1000.0, "budget_continue_at_usd": 50.0}},
+    {"project.budget_continue_usd": 500.0},
+    {'project."budget_continue_usd"': 7.0},
+    {'project."budget\\u005Fcontinue_usd"': 7.0},
+    # Each key removed alone (to $100).
+    {"project.budget_continue_usd": None},
+    {"project.budget_continue_at_usd": None},
+    # The budget with an aliased pair.
+    {"project.budget_usd": 50.0, '"project".budget_continue_usd': 25.0, '"project".budget_continue_at_usd': 50.0},
+    None,  # the whole of values.project, as read after the Continue, saved back
+])
+async def test_a_settings_save_naming_what_continue_adds_is_refused_and_writes_nothing(tmp_path, updates):
+    # PR 52 batch 6 (rule 1 recheck A-F1; Harold, 2026-11-12, design review C2's Option 1): a project Settings save
+    # naming budget_continue_usd or budget_continue_at_usd, however spelled, is refused before anything is written, so
+    # the next Continue still adds the $25 (to $75).
+    async with await _app(tmp_path) as client:
+        conversation, project = await _at_fifty(client)
+        before = _config(tmp_path, project).read_bytes()
+        if updates is None:
+            updates = {"project": (await client.get("/api/settings", params={"project_id": project})).json()["values"]
+                       ["project"]}
+        response = await _saved(client, project, updates)
+        assert (response.status_code, response.json()["code"]) == (400, "invalid_setting")
+        assert _config(tmp_path, project).read_bytes() == before
+        assert await _continue_at_cap(client, conversation, project, 50.0) == 75.0
+
+
+@pytest.mark.asyncio
+async def test_a_settings_save_of_what_continue_adds_is_refused_in_a_new_project(tmp_path):
+    # Design review C2: a new project at $25, never Continued, given $0.01 for that limit would add $0.01 (to $25.01).
+    async with await _app(tmp_path) as client:
+        project = (await client.post("/api/projects", json={"name": "P"})).json()["id"]
+        conversation = (await client.post("/api/conversations", json={"title": "Named", "project_id": project})).json()["id"]
+        await _project_budget(client, project, 25.0)
+        response = await _saved(client, project, {"project.budget_continue_usd": 0.01,
+                                                  "project.budget_continue_at_usd": 25.0})
+        assert (response.status_code, response.json()["code"]) == (400, "invalid_setting")
+        assert await _continue_at_cap(client, conversation, project, 25.0, "Short?") == 50.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("updates, after", [
+    *(({key: 50.0}, 100.0) for key in ("project.budget_usd", '"project".budget_usd', "project . budget_usd",
+                                        'project."budget\\u005Fusd"')),
+    ({"project": {"budget_usd": 50.0}}, 100.0),
+    ({"project.budget_usd": None}, 100.0),  # reset to the shipped $50
+    ({"project": None}, 100.0),  # the whole table removed, what Continue adds with it
+    ({"project.template": "x"}, 75.0),
+])
+async def test_a_settings_save_not_naming_what_continue_adds_is_written(tmp_path, updates, after):
+    # Design review C2: a save of the budget in any spelling, or its reset, still takes out what Continue adds (Continue
+    # then adds the $50 limit, to $100); a save of another key leaves it (to $75).
+    async with await _app(tmp_path) as client:
+        conversation, project = await _at_fifty(client)
+        assert (response := await _saved(client, project, updates)).status_code == 200, response.text
+        assert await _continue_at_cap(client, conversation, project, 50.0) == after
 
 
 @pytest.mark.asyncio
