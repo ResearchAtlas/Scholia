@@ -95,7 +95,9 @@ def reserve(conn, *, run_id: str, step_seq: int, project_id: str, paying_convers
         if limit is None:
             continue
         already = spent(conn, **scope)
-        if combined(already + estimate) > limit + 10 ** -_DECIMALS:  # as budgets.decide sums what a step needs
+        # as budgets.decide sums what a step needs, within the kept precision or, for large amounts, a few units of the
+        # float's last place, so the order a step's rows are summed in never refuses the limit Go ahead set for them
+        if combined(already + estimate) > limit + max(10 ** -_DECIMALS, 4 * math.ulp(limit)):
             raise BudgetExceeded(budget, limit, already, estimate)
     reservation_id = new_id()
     conn.execute(

@@ -2029,6 +2029,30 @@ def test_the_limit_go_ahead_sets_admits_its_step_at_any_spend(db, already, estim
     assert reserve(db, project, conversation, run, estimate, step=1, project_budget=None, conversation_budget=needed)
 
 
+def test_the_limit_go_ahead_sets_admits_a_step_and_its_judges_share_reserved_together_at_any_spend(db):
+    # The recheck's F1-residual (pre-existing at 87371d7): an answer step reserves its request and its judge's share in
+    # one transaction; Go ahead's limit is spent + (request + share), the rows sum as (spent + request) + share, and at
+    # large spends the two differ in the float's last place. Within a few of those units, the step is admitted.
+    import random
+    rng = random.Random(7)
+    cases = [((33619774.470715225,), 4.363519406, 7.995511916)] + [
+        (tuple(round(rng.uniform(1, 10) * 10 ** rng.choice([5, 7, 8, 9, 11, 13]), 9) for _ in range(3)),
+         round(rng.uniform(0.01, 9), 9), round(rng.uniform(0.01, 9), 9)) for _ in range(200)]
+    for rows, request, share in cases:
+        project = add_project(db)
+        conversation, run = add_turn(db, project)
+        for step, usd in enumerate(rows):
+            reserve(db, project, conversation, run, usd, project_budget=None, conversation_budget=None, step=step)
+        spent = db.read(lambda conn: spending.spent(conn, conversation_id=conversation))
+        needed = spending.combined(spent + spending.combined(request + share))  # as budgets.decide sets it
+
+        def both(conn):
+            for usd in (request, share):
+                spending.reserve(conn, run_id=run, step_seq=9, project_id=project, paying_conversation_id=conversation,
+                                 estimate_usd=usd, project_budget_usd=None, conversation_budget_usd=needed)
+        db.write(both)  # never BudgetExceeded
+
+
 def test_a_calls_attempts_whose_costs_sum_past_what_a_float_holds_settle_as_reported_at_the_most(db):
     # SPEC:425: the call reported both attempts; their sum overflowed, and settle took infinity for no amount, so the
     # call settled at its estimate, marked estimated, its reported charges lost.
