@@ -347,3 +347,36 @@ async def test_a_forget_answered_after_its_record_moved_to_another_project_leave
         assert {"type": "memory", "action": "forgotten", "count": 1} in await sending
         assert await rows(client, "SELECT content, project_id FROM memory_records WHERE type != 'progress'") == [
             ("we exclude studies before 2000", private)]
+
+
+async def test_a_forget_stopped_once_its_deletion_committed_still_records_and_says_what_it_forgot(tmp_path, monkeypatch):
+    # PR 52's follow-up, item 9 (design review P's separate finding): Stop landed while the forget's deletion ran in its
+    # worker. The deletion committed, but the loop was cut there: no memory_proposed event and no stream event, the turn
+    # read cancelled with nothing said of the record it deleted. The deletions and their record run to their end, as a
+    # tool's result does (Harness._tool's keeping), and then the Stop is honored.
+    import time
+    from backend.db import deletion
+    real = deletion.delete
+    async with started(tmp_path / "data") as client:
+        harness, loop = client.state["harness"], asyncio.get_running_loop()
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Remember: the pilot used a survey")
+        await background_idle(client)
+        [(record,)] = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+
+        def deleting(*args, **kwargs):
+            found = real(*args, **kwargs)  # committed: the Stop lands while its worker is still to return
+            loop.call_soon_threadsafe(harness._request_cancel, harness.registry.turns[conversation], "researcher")
+            time.sleep(0.2)
+            return found
+        monkeypatch.setattr(deletion, "delete", deleting)
+        stream = await send(client, conversation, "Forget: the pilot used a survey")
+        assert stream[-1]["status"] == "cancelled"
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE id = ?", record) == [(0,)]
+        [(data,)] = await rows(client, "SELECT data FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                               stream[0]["run_id"])
+        assert (json.loads(data)["action"], json.loads(data)["count"]) == ("forgotten", 1)
+        assert {"type": "memory", "action": "forgotten", "count": 1} in stream
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1:]
+        assert [(m["action"], m["count"]) for m in turn["memory"]] == [("forgotten", 1)]
