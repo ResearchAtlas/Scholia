@@ -76,7 +76,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   const [queued, setQueued] = useState([]); // S1-33: messages waiting as the next turn, as last read
   const [failed, setFailed] = useState(false);
   const [problem, setProblem] = useState(null);
-  const [reads, setReads] = useState(0); // each read, failed or not, so polling goes on
+  const [reads, setReads] = useState(0); // each newest read done, failed or not, so polling goes on
   const end = useRef(null);
   const [attached, setAttached] = useState(null); // what the last attach said, and the lookup it started
   // Read for the conversation attach() tags its files with: a draft's too, before the window knows it.
@@ -112,7 +112,9 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       if (current() && settle(false)) setFailed(true);
       return false;
     } finally {
-      setReads((n) => n + 1);
+      // only the newest read counts as done: one overtaken would start the handoff again, overtaking the read in
+      // flight, and none would ever be shown (fix batch 1, C-F1); the newer read counts when it ends
+      if (current()) setReads((n) => n + 1);
     }
   }, [id, newestRead]);
 

@@ -1052,6 +1052,58 @@ test('an older conversation read answering late never restores a waiting message
   }
 });
 
+// Fix batch 1, C-F1 (F7): the view's conversation read and its handoff effect, each taken from its source and run on a
+// clock of its own. A read was outstanding when the stream ended; the handoff's read began 50 ms into it, each read
+// answering 100 ms after it was asked. The older read, dropped as overtaken, still counted as a read done, which
+// started the handoff again, overtaking the read in flight: forty reads, none shown, the live turn never let go and
+// Send never shown. Only the newest read asked counts as done, so the handoff's read is shown and lets the turn go.
+test('a read dropped as older never starts the handoff again, so its newest read is shown and Send follows (C-F1)', async () => {
+  const { newest, readGuard } = await import('../src/library.js');
+  const source = VIEW();
+  const block = (from, opener) => { // the function source starting at `opener` after `from`, braces balanced
+    const start = source.indexOf(opener, source.indexOf(from));
+    let end = source.indexOf('{', start);
+    for (let depth = 0; ; end += 1) {
+      depth += source[end] === '{' ? 1 : source[end] === '}' ? -1 : 0;
+      if (depth === 0) break;
+    }
+    return source.slice(start, end + 1);
+  };
+  const loadBody = block('const load = useCallback(async () => {', 'async () =>');
+  const handoffBody = block('useEffect(() => {\n    if (!waiting) return undefined;', '() =>');
+  let now = 0;
+  const timers = new Map();
+  let next = 0;
+  const later = (fn, ms) => { next += 1; timers.set(next, { at: now + ms, fn }); return next; };
+  const shown = [];
+  let reads = 0;
+  let cleared = 0;
+  let asked = 0;
+  let cleanup = null;
+  const env = { id: 'c-cf1', guard: { current: readGuard() }, newestRead: newest(), markdownReady: async () => {},
+    get: () => { asked += 1; return new Promise((resolve) => later(() => resolve({ turns: [{ status: 'cancelled' }], queued: [{ id: 'q1', text: 'Next' }] }), 100)); },
+    setTurns: (turns) => shown.push(turns), setQueued: () => {}, setFailed: () => {}, setStale: () => {},
+    setReads: (f) => { const before = reads; reads = f(reads); if (reads !== before) rerun(); } };
+  const load = new Function(...Object.keys(env), `return (${loadBody});`)(...Object.values(env));
+  const handoff = new Function('waiting', 'handoff', 'failed', 'POLL_MS', 'load', 'clear', 'id', 'setTimeout', 'clearTimeout',
+    `return (${handoffBody});`);
+  function rerun() { // the effect's deps changed (reads): its cleanup, then the effect again, as React runs them
+    cleanup?.();
+    if (!cleared) cleanup = handoff(true, true, false, 2000, load, () => { cleared += 1; }, 'c-cf1', later, (t) => timers.delete(t))();
+  }
+  load(); // a read outstanding when the stream ends
+  later(rerun, 50); // the handoff begins 50 ms into it
+  while (!cleared && now < 5000 && timers.size) {
+    const [key, { at, fn }] = [...timers.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+    timers.delete(key);
+    now = at;
+    fn();
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.ok(cleared === 1 && shown.length >= 1, JSON.stringify({ asked, shown: shown.length, cleared, now }));
+  assert.ok(asked <= 3, `reads asked: ${asked}`);
+});
+
 // The internal review's F2 and the first review's C-F2 (design review V's Option 1, Harold's decision of 2026-11-13): a
 // needed limit is at most $1,000,000, so it is said rounded up to the cent, grouped, in both languages, and the backend
 // takes it typed back as said (tests/test_budgets.py).
