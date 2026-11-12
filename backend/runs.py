@@ -1429,11 +1429,12 @@ class Harness:
                                                     "tool_call_id": call_id}
         await self._record(claim, "retrieval_trace", {**trace, "mode": found["mode"], "reason": found["reason"]})
 
-    async def _record(self, claim, kind, data, also=None):
+    async def _record(self, claim, kind, data, also=None, kept=False):
         """One event of a running turn (none when kind is None), and also(conn), if given, in its transaction; a
-        run deleted, ended or revoked meanwhile is cancelled instead."""
+        run deleted, ended or revoked meanwhile is cancelled instead. kept: the record of an effect that has committed
+        already (a forget's deletions), written on a run revoked meanwhile too, before its end (SPEC:650)."""
         def record(conn):
-            if not _running(conn, claim.run_id) or _revoked(conn, claim.run_id):
+            if not _running(conn, claim.run_id) or (_revoked(conn, claim.run_id) and not kept):
                 raise _Cancelled()
             if kind is not None:
                 _event(conn, claim.run_id, kind, data)
@@ -1573,7 +1574,7 @@ class Harness:
                     "command": action, "applied": int(bool(outcome["ids"] or count)), "action": outcome["what"],
                     **({"records": outcome["ids"]} if outcome["ids"] else {}), **({"count": count} if count else {}),
                     **(data or {})})
-            await self._record(claim, None, None, also=apply)
+            await self._record(claim, None, None, also=apply, kept=bool(count))
             if outcome["ids"]:
                 await self._index_memory(project_id)
             turn.emit({"type": "memory", "action": outcome["what"], "count": count or len(outcome["ids"])})
@@ -1609,8 +1610,9 @@ class Harness:
 
             async def forgetting():  # each deletion and its record to their end, whatever cancellation comes meanwhile
                 count = changed = 0
+                failed = None
                 for record in ids:
-                    if claim.cancel_requested.is_set():  # Stop is immediate: no deletion starts after it (SPEC:412)
+                    if claim.cancel_requested.is_set():  # Stop or a revocation: no deletion starts after it (SPEC:412)
                         break
                     def as_seen(conn, record=record):  # in the deletion's own transaction (MB9): edited, kept or
                         found = memory.row(conn, record)  # replaced since, it is not what the researcher chose to forget
@@ -1627,10 +1629,18 @@ class Harness:
                         pass
                     except ValueError:
                         changed += 1
+                    except Exception as error:  # what the others forgot is recorded, then the turn fails (B-F2)
+                        failed = error  # one that failed after its commit forgot its record too
+                        count += await self._read(lambda conn, record=record: memory.row(conn, record) is None)
+                        break
+                if failed is not None and not count:
+                    raise failed
                 await done("forgotten", count=count, line=f"Forgotten at the researcher's request: {count} memory "
                                                           f"record{'s' if count != 1 else ''}. Do not use it."
                            + (f" {changed} record{'s' if changed != 1 else ''} changed since the researcher chose and "
                               f"{'were' if changed != 1 else 'was'} not forgotten." if changed else ""))
+                if failed is not None:
+                    raise failed
             # PR 52's follow-up (design review P): a Stop once a deletion committed is honored after that deletion and the
             # record of what was forgotten, as a tool's result is (_tool's keeping): never a record deleted with nothing
             # said of it
