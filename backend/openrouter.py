@@ -93,7 +93,7 @@ class Attempt:
 
     @property
     def reported_cost(self):
-        """The cost the provider reported, if it is a valid amount (finite, not negative)."""
+        """The cost the provider reported, if it is a valid amount (finite, not negative, at most spending.MAX_USD)."""
         return amount(self.usage.get("cost"))
 
     def record(self) -> dict:

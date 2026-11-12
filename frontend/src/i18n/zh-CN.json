@@ -1391,6 +1391,7 @@
   "followUp.state.unread": "Scholia 未读到：本轮在下一步之前已停止",
   "errors.invalid_limit": "请输入大于零的美元金额。",
   "errors.limit_too_low": "这个预算不够这一步，请输入更大的金额。",
+  "errors.limit_too_high": "预算最多为 US$1,000,000。",
   "errors.limitNeeded": "这个预算不够这一步，它至少需要 {needed}。请输入这个金额或更多。",
   "errors.not_queued": "这条消息已不在等待中。",
   "errors.not_after_success": "前一轮没有完成，请自己发送它。",

@@ -20,6 +20,8 @@ from pathlib import Path
 
 import tomlkit
 
+from backend.spending import MAX_USD
+
 
 _INT64 = range(-2**63, 2**63)  # TOML integers are 64-bit; tomlkit reads larger ones too
 
@@ -31,6 +33,11 @@ def _int(low, high=None):
 def _number(above, below=None):
     return lambda v: (((type(v) is int and v in _INT64) or (type(v) is float and math.isfinite(v)))
                       and v > above and (below is None or v < below))
+
+
+def _budget(v):
+    """A budget in dollars, from a billionth of a dollar to the most an amount can be (design review V)."""
+    return _number(0)(v) and 1e-9 <= v <= MAX_USD
 
 
 def _choice(*options):
@@ -139,7 +146,7 @@ PERSONAL = {
     ("subagents", "at_once"): (3, _int(1)),
     ("subagents", "tool_calls"): (30, _int(1)),
     ("subagents", "effort_cap"): (None, _text),
-    ("budget", "conversation_usd"): (10, _number(0)),
+    ("budget", "conversation_usd"): (10, _budget),
     ("budget", "notice_percents"): ([50, 85, 90], lambda v: type(v) is list and all(_int(1, 100)(x) for x in v)),
     ("privacy", "trim_bodies_after_days"): (0, _int(0)),
     # The local model helper (backend/local_helper.py; section 13's lifecycle values).
@@ -162,11 +169,11 @@ PERSONAL = {
 
 PROJECT = {
     **{("project", k): (None, _text) for k in ("target_venue", "citation_style", "citation_style_zh", "template")},
-    ("project", "budget_usd"): (50, _number(0)),
+    ("project", "budget_usd"): (50, _budget),
     # S1-33 (Harold, 2026-11-12, design review C's Option 2): written by the program beside the limit, never by the
     # Settings page: what Continue adds, and the limit it was written for (budgets._amount). No default, so a file
     # without them gives none, and a backup keeps them (known_only).
-    **{("project", k): (None, _number(0)) for k in ("budget_continue_usd", "budget_continue_at_usd")},
+    **{("project", k): (None, _budget) for k in ("budget_continue_usd", "budget_continue_at_usd")},
     ("ui", "panel"): (None, _choice("none", "library", "manuscript")),
     ("models", "default"): (None, _text),
     **{("limits", k): (None, check) for k, (_, check) in _LIMITS.items()},  # overrides

@@ -1304,7 +1304,7 @@ class Harness:
                         raise
                     refused = exceeded
             reply = await self._budget_ask(active, project_id, paying_conversation_id, refused,
-                                           spending.combined(request_usd + share_usd), phase)
+                                           round(request_usd + share_usd, 9), phase)
             if reply is not None and reply.get("option") in budget_rules.STOPS:
                 raise refused
             if again is not None and (rebuilt := await again()) is not None:
@@ -3132,7 +3132,7 @@ def _settle_attempts(conn, reservation_id, rates, attempts):
                 continue
             basis = "estimated" if basis == "reported" else basis
         total += cost
-    total = spending.combined(total)  # each a valid amount, their sum held at the most a float holds
+    total = spending.combined(total)  # one call's record: each attempt a valid amount, their sum held at MAX_USD
     if basis == "reported":
         spending.settle(conn, reservation_id, total)
     elif basis == "estimated":
@@ -3460,8 +3460,7 @@ def _accounting(conn, run_id, complete=True):
     unknown = sum(1 for (data,) in conn.execute(
         "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'", (run_id,))
         if json.loads(data).get("charge") == "unknown" and json.loads(data).get("dispatched"))
-    return {"reported_usd": spending.combined(totals.get("reported", 0)),
-            "estimated_usd": spending.combined(totals.get("estimated", 0)),
+    return {"reported_usd": round(totals.get("reported", 0), 9), "estimated_usd": round(totals.get("estimated", 0), 9),
             "unknown_attempts": unknown, "complete": complete}
 
 

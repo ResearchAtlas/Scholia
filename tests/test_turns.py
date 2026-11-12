@@ -1579,28 +1579,33 @@ async def test_a_stop_while_the_gate_decides_on_a_retry_records_it_unsent_and_ke
         assert await rows(client, "SELECT attempt FROM run_bodies WHERE run_id = ?", run_id) == [(0,)]
 
 
-async def test_a_retried_call_whose_two_reported_costs_sum_past_what_a_float_holds_keeps_them_as_reported(
-        tmp_path, monkeypatch):
-    # PR 52 cycle 5 A-F2 (SPEC:425): the rejected attempt and its retry each reported 1.7e308, a valid amount; their sum
-    # overflowed to infinity, which settlement took for no amount, so the call settled at its estimate, marked
-    # estimated. The total is held at the most a float holds (spending.combined), settled as reported, and the turn's
-    # record and stream carry it.
-    import sys
-    big = 1.7e308
-    rejected = (400, {"error": {}, "usage": {"prompt_tokens": 10, "completion_tokens": 0, "cost": big}})
+@pytest.mark.parametrize("cost", [1_000_000.0, 1.7e308])
+async def test_a_retried_call_reporting_up_to_the_most_an_amount_can_be_keeps_it_as_reported_and_more_is_estimated(
+        tmp_path, monkeypatch, cost):
+    # PR 52 cycle 5 A-F2 (SPEC:425), design review V's Option 1: the rejected attempt and its retry each reported
+    # $1,000,000, the most an amount can be: their sum is held there (one call's record, spending.combined), settled as
+    # reported, and the turn's record and stream carry it. Each reporting 1.7e308, no amount: an invalid report, so each
+    # attempt is charged from its reported tokens at the step's rates, marked estimated, as any invalid report is.
+    rejected = (400, {"error": {}, "usage": {"prompt_tokens": 10, "completion_tokens": 0, "cost": cost}})
     answered = (200, {"choices": [{"message": {"role": "assistant", "content": "Hi."}}],
-                      "usage": {"prompt_tokens": 12, "completion_tokens": 5, "cost": big}})
+                      "usage": {"prompt_tokens": 12, "completion_tokens": 5, "cost": cost}})
     async with started(tmp_path / "data", MockProvider(rejected, answered)) as client:
         conversation = await lab(client, monkeypatch)
         stream = await send(client, conversation, provider="lab", model="m")
         assert stream[-1]["status"] == "succeeded"
         run_id = stream[0]["run_id"]
-        assert (await reservation(client, run_id))[1:] == ("settled", sys.float_info.max, "reported")
-        assert await attempts_of(client, run_id) == [(0, "request", True, "reported", big, True),
-                                                     (1, "ok", True, "reported", big, True)]
-        assert (stream[-1]["cost_usd"], stream[-1]["accounting"]["reported_usd"]) == (sys.float_info.max,) * 2
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
-        assert turn["cost_usd"] == sys.float_info.max
+        _, status, settled, basis = await reservation(client, run_id)
+        if cost == 1_000_000.0:
+            assert (status, settled, basis) == ("settled", 1_000_000.0, "reported")
+            assert await attempts_of(client, run_id) == [(0, "request", True, "reported", cost, True),
+                                                         (1, "ok", True, "reported", cost, True)]
+            assert (stream[-1]["cost_usd"], stream[-1]["accounting"]["reported_usd"], turn["cost_usd"]) == (cost,) * 3
+        else:
+            assert (status, basis) == ("settled", "estimated") and 0 < settled < 1
+            assert [a[3] for a in await attempts_of(client, run_id)] == ["estimated", "estimated"]
+            assert stream[-1]["accounting"] == {**stream[-1]["accounting"], "reported_usd": 0, "estimated_usd": settled}
+            assert turn["cost_usd"] == settled
 
 
 async def test_a_stop_while_a_retry_is_in_flight_keeps_both_attempts_and_charges_at_least_the_reported_one(

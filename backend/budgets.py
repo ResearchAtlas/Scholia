@@ -59,7 +59,7 @@ def totals(conn, *, project_id=None, conversation_id=None):
         "SELECT coalesce(sum(CASE status WHEN 'settled' THEN settled_usd ELSE 0 END), 0),"
         " coalesce(sum(CASE status WHEN 'open' THEN estimate_usd ELSE 0 END), 0)"
         f" FROM budget_reservations WHERE {column} = ?", (value,)).fetchone()
-    return spending.combined(settled), spending.combined(held)
+    return round(settled, 9), round(held, 9)
 
 
 def bases(conn, *, project_id=None, conversation_id=None):
@@ -67,8 +67,7 @@ def bases(conn, *, project_id=None, conversation_id=None):
     column, value = ("project_id", project_id) if conversation_id is None else ("paying_conversation_id", conversation_id)
     found = dict(conn.execute(f"SELECT basis, coalesce(sum(settled_usd), 0) FROM budget_reservations WHERE {column} = ?"
                               " AND status = 'settled' GROUP BY basis", (value,)).fetchall())
-    return {"reported_usd": spending.combined(found.get("reported", 0)),
-            "estimated_usd": spending.combined(found.get("estimated", 0))}
+    return {"reported_usd": round(found.get("reported", 0), 9), "estimated_usd": round(found.get("estimated", 0), 9)}
 
 
 def _limits(conn, data_dir, project_id, conversation_id):
@@ -153,7 +152,13 @@ def _typed(text):
     value = float(found.group(1).replace(",", "")) if found else math.nan
     if not math.isfinite(value) or value <= 0:
         raise Refused("invalid_limit", "Type a budget in US dollars, more than zero")
+    if round(value, 9) > spending.MAX_USD:
+        raise _too_high()
     return round(value, 9)
+
+
+def _too_high():
+    return Refused("limit_too_high", f"A budget can be at most ${spending.MAX_USD:,.0f}")
 
 
 def _amount(conn, data_dir, budget, scope_id, current, default):
@@ -194,24 +199,27 @@ def decide(conn, run_id, ask, option, text, data_dir):
     current = limits[budget][0]
     spent = spending.spent(conn, **({"conversation_id": conversation_id} if budget == "conversation"
                                     else {"project_id": project_id}))
-    needed = spending.combined(spent + params["estimate_usd"])
+    needed = round(spent + params["estimate_usd"], 9)
     # a zero limit's Continue adds the personal default (a conversation's) or the shipped project budget, never nothing
     default = _budgets_now(data_dir, project_id)[1] if budget == "conversation" else PROJECT[("project", "budget_usd")][0]
     amount = _amount(conn, data_dir, budget, conversation_id if budget == "conversation" else project_id, current,
                      default or PERSONAL[("budget", "conversation_usd")][0])
     if text is not None:
         typed = _typed(text)
+        if needed > spending.MAX_USD:  # no limit can cover this step (design review V): never a needed amount past it
+            raise _too_high()
         if typed + _EPSILON < needed:
             raise Refused("limit_too_low", f"This step needs a budget of at least ${needed:.2f}", needed)
         decision, wanted, amount = "set_limit", typed, typed
     else:
         decision = option
-        wanted = {"continue": spending.combined(current + amount),
-                  "go_ahead": max(current, needed)}.get(option, current)
+        wanted = {"continue": round(current + amount, 9), "go_ahead": max(current, needed)}.get(option, current)
     # An ask raised while the project's file did not give its budget (unread, PR 52 cycle 3, E4): only a typed limit
     # means anything; Continue and Go ahead have no amount to add to, so they apply nothing and the step is checked again
     stale = abs(current - params["limit_usd"]) > _EPSILON or (bool(params.get("unread")) and text is None)
     applied = not stale and decision not in STOPS and abs(wanted - current) > _EPSILON
+    if applied and wanted > spending.MAX_USD:  # Continue or Go ahead past the most a limit can be: only Stop or Not now
+        raise _too_high()
     # what the records say the limit was: nothing when its file does not give it, never $0 (and no amount to add to)
     known = None if _limit_unread(conn, data_dir, budget, project_id, conversation_id) else current
     amount = amount if known is not None or text is not None else None

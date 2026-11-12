@@ -17,22 +17,20 @@ A settlement for a row that no longer exists changes nothing and creates nothing
 
 Every function takes an open connection inside a write (or read) transaction.
 
-Amounts combine where they are summed (here, in the database's sums, and over a call's attempts) or priced (counts
-times rates): each is valid, but a total of them can pass what a float holds. Such a total is held at MAX_USD, the
-largest a float holds (combined), and keeps its basis: money counted is never less than its parts, and never infinite,
-which no record, reply or limit could carry (PR 52 cycle 5 A-F2). A spend held there fits no step under any limit
-below it, so the step asks; every notice of its budget is reached; and the bar is full. Admission sums spend and
-estimate the same way (combined), so the limit Go ahead sets always admits its step, and a budget's share is its spend
-divided by its limit, which never overflows.
+An amount is $0 to MAX_USD, $1,000,000 (PR 52's follow-up, design review V's Option 1, Harold's decision of
+2026-11-13): a value from outside above it is not an amount (amount), so a single reported cost above it is an invalid report,
+counted at the estimate and marked estimated, and a limit above it is refused where it enters (the settings files,
+a typed limit, an answer that would raise one past it). One computed record (a step's estimate or bound, a call's
+attempts) is held at MAX_USD (combined). Every sum of amounts then stays far below what a float holds, and its cents
+are exact, so sums are plain rounds to the kept precision.
 """
 
 import math
-import sys
 
 from backend.db import new_id, utc_now
 
 _DECIMALS = 9  # amounts are kept to a billionth of a dollar
-MAX_USD = sys.float_info.max
+MAX_USD = 1_000_000.0  # the most an amount or a limit can be (design review V)
 
 
 class BudgetExceeded(Exception):
@@ -48,12 +46,12 @@ class BudgetExceeded(Exception):
 
 
 def amount(value) -> float | None:
-    """A cost as a non-negative finite float rounded to the kept precision, or None
-    for anything else (missing, negative, NaN, infinite, not a number, an integer no float can hold)."""
+    """A cost as a float from 0 to MAX_USD rounded to the kept precision, or None for anything else (missing,
+    negative, above MAX_USD, NaN, infinite, not a number, an integer no float can hold)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
-        if not math.isfinite(value) or value < 0:
+        if not math.isfinite(value) or value < 0 or value > MAX_USD:
             return None
         return round(float(value), _DECIMALS)
     except OverflowError:  # a reply's 401-digit cost (PR 52 cycle 4, design review A2)
@@ -61,8 +59,8 @@ def amount(value) -> float | None:
 
 
 def combined(total) -> float:
-    """An amount combined from valid amounts (a sum, or counts times rates), as it is kept: rounded to the kept
-    precision, and held at MAX_USD when the combination passed what a float holds."""
+    """One computed record from valid amounts (a step's estimate, counts times rates, or a call's attempts), as it is
+    kept: rounded to the kept precision, and held at MAX_USD when it is more."""
     return min(round(total, _DECIMALS), MAX_USD)
 
 
@@ -74,7 +72,7 @@ def spent(conn, *, project_id: str | None = None, conversation_id: str | None = 
         f" FROM budget_reservations WHERE {column} = ?",
         (value,),
     ).fetchone()
-    return combined(total)
+    return round(total, _DECIMALS)
 
 
 def reserve(conn, *, run_id: str, step_seq: int, project_id: str, paying_conversation_id: str | None,
@@ -97,7 +95,7 @@ def reserve(conn, *, run_id: str, step_seq: int, project_id: str, paying_convers
         already = spent(conn, **scope)
         # as budgets.decide sums what a step needs, within the kept precision or, for large amounts, a few units of the
         # float's last place, so the order a step's rows are summed in never refuses the limit Go ahead set for them
-        if combined(already + estimate) > limit + max(10 ** -_DECIMALS, 4 * math.ulp(limit)):
+        if round(already + estimate, _DECIMALS) > limit + max(10 ** -_DECIMALS, 4 * math.ulp(limit)):
             raise BudgetExceeded(budget, limit, already, estimate)
     reservation_id = new_id()
     conn.execute(
@@ -139,7 +137,7 @@ def run_cost(conn, run_id: str) -> float:
         " FROM budget_reservations WHERE run_id = ?",
         (run_id,),
     ).fetchone()
-    return combined(total)
+    return round(total, _DECIMALS)
 
 
 def settle_left_open(conn) -> int:

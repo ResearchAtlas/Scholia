@@ -2025,64 +2025,87 @@ async def test_a_queued_message_admitted_after_a_tightening_is_built_under_the_n
             assert events(sent)[-1]["status"] != "succeeded"
 
 
-# PR 52's follow-up (cycle 5 A-F2, batch 4's F6): amounts each valid, combined past what a float holds. A total of valid
-# amounts (a sum, or a count times a rate) is held at the largest a float holds (spending.combined), never infinite and
-# never less than its parts; a share of a budget is settled / limit, which cannot overflow.
+# PR 52's follow-up, design review V's Option 1 (rule 2, very large values: the first review's A-F1, C-F2, C-F3 and the
+# cycles before): an amount is $0 to spending.MAX_USD, $1,000,000. A value from outside above it is not an amount, so a
+# single reported cost above it is an invalid report, counted at the estimate and marked estimated, and a limit above it
+# is refused where it enters (the settings files, a typed limit, an answer that would raise one past it). One computed
+# record (a step's estimate, a call's attempts) is held at the most; every sum of amounts stays far below what a float
+# holds, so its cents are exact.
 
-BIG = 1.7e308  # a valid amount; two of them are more than a float holds
+MAX = 1_000_000.0
+BIG = 1.7e308  # a float, and no amount
 
 
-def test_a_sum_of_amounts_past_what_a_float_holds_is_held_at_the_most_never_infinite(db):
+def test_no_value_past_the_most_an_amount_can_be_is_one_and_one_computed_record_is_held_there(db):
+    # A-F1's values cannot enter: a spend at what a float holds, a limit just below it, an estimate of 1.7e308
+    import math
     import sys
+    from backend import budget_router
+    assert spending.MAX_USD == MAX and spending.amount(MAX) == MAX
+    for value in (MAX + 0.01, 2e6, BIG, sys.float_info.max, math.nextafter(sys.float_info.max, 0)):
+        assert spending.amount(value) is None, value
+    project = add_project(db)
+    conversation, run = add_turn(db, project)
+    with pytest.raises(ValueError):
+        reserve(db, project, conversation, run, BIG, project_budget=None, conversation_budget=None)
+    assert spending.combined(BIG + BIG) == MAX and spending.combined(0.1 + 0.2) == 0.3
+    assert budget_router.request_cost({"input": BIG, "output": BIG, "request": 0.0}, 10, 10) == MAX
+    assert budget_router.cost_from_usage({"input": 1.0, "output": 0.0, "request": 0.0},
+                                         {"prompt_tokens": 10 ** 300, "completion_tokens": 0}) is None
+    assert budget_router.cost_from_usage({"input": 0.5, "output": 0.0, "request": 0.0},
+                                         {"prompt_tokens": 2_000_000, "completion_tokens": 0}) == MAX
+
+
+def test_sums_of_amounts_at_the_most_are_exact_and_a_spend_past_a_limit_fits_no_step(db):
+    from backend import budgets
     from backend.runs import _accounting
     project = add_project(db)
     conversation, run = add_turn(db, project)
-    for step in (0, 1):
+    for step in (0, 1, 2):
         reservation = reserve(db, project, conversation, run, 0.01, step=step, project_budget=None, conversation_budget=None)
-        db.write(lambda conn: spending.settle(conn, reservation, BIG))
-    held = [reserve(db, project, None, add_turn(db, project)[1], BIG, project_budget=None) for _ in (0, 1)]
-    assert held and project_spent(db, project) == sys.float_info.max
-    assert db.read(lambda conn: spending.spent(conn, conversation_id=conversation)) == sys.float_info.max
-    assert db.read(lambda conn: spending.run_cost(conn, run)) == sys.float_info.max
-    assert db.read(lambda conn: _accounting(conn, run))["reported_usd"] == sys.float_info.max
-    from backend import budgets
-    assert db.read(lambda conn: budgets.totals(conn, project_id=project)) == (sys.float_info.max, sys.float_info.max)
-    assert db.read(lambda conn: budgets.bases(conn, project_id=project))["reported_usd"] == sys.float_info.max
-    with pytest.raises(spending.BudgetExceeded):  # a spend held at the most fits no step under a limit below it
-        reserve(db, project, conversation, run, 0.01, step=2, project_budget=1.7e308, conversation_budget=None)
-    assert spending.combined(BIG + BIG) == sys.float_info.max
-    assert spending.combined(0.1 + 0.2) == 0.3  # the kept precision, as before
+        db.write(lambda conn: spending.settle(conn, reservation, MAX))
+    reserve(db, project, None, add_turn(db, project)[1], MAX, project_budget=None)  # open, at its estimate
+    assert project_spent(db, project) == 4 * MAX
+    assert db.read(lambda conn: spending.spent(conn, conversation_id=conversation)) == 3 * MAX
+    assert db.read(lambda conn: spending.run_cost(conn, run)) == 3 * MAX
+    assert db.read(lambda conn: _accounting(conn, run))["reported_usd"] == 3 * MAX
+    assert db.read(lambda conn: budgets.totals(conn, project_id=project)) == (3 * MAX, MAX)
+    assert db.read(lambda conn: budgets.bases(conn, project_id=project))["reported_usd"] == 3 * MAX
+    with pytest.raises(spending.BudgetExceeded):
+        reserve(db, project, conversation, run, 0.01, step=3, project_budget=None, conversation_budget=MAX)
 
 
-@pytest.mark.parametrize("already, estimate", [(19423135.578402165, 6.435008896), (1e9, 0.045496), (123456789012.5, 0.75),
-                                               (1.7e308, 0.04), (1e308, 1e308)])
-def test_the_limit_go_ahead_sets_admits_its_step_at_any_spend(db, already, estimate):
+@pytest.mark.parametrize("already, estimate", [(999999.5, 0.4), (123456.789123456, 0.75), (500000.0, 500000.0),
+                                               (999999.999999999, 0.000000001), (0.0, MAX)])
+def test_the_limit_go_ahead_sets_admits_its_step_at_any_spend_within_the_most(db, already, estimate):
     # A6 (the internal review's F1): Go ahead sets the limit to what the step needs, summed as budgets.decide sums it;
     # admission sums spend and estimate the same way, so that limit admits the step, never asks again
     project = add_project(db)
     conversation, run = add_turn(db, project)
-    reserve(db, project, conversation, run, already, project_budget=None, conversation_budget=None)
+    if already:
+        reserve(db, project, conversation, run, already, project_budget=None, conversation_budget=None)
     spent = db.read(lambda conn: spending.spent(conn, conversation_id=conversation))
-    needed = spending.combined(spent + spending.amount(estimate))
+    needed = round(spent + spending.amount(estimate), 9)
+    assert needed <= MAX
     assert reserve(db, project, conversation, run, estimate, step=1, project_budget=None, conversation_budget=needed)
 
 
-def test_the_limit_go_ahead_sets_admits_a_step_and_its_judges_share_reserved_together_at_any_spend(db):
+def test_the_limit_go_ahead_sets_admits_a_step_and_its_judges_share_reserved_together_within_the_most(db):
     # The recheck's F1-residual (pre-existing at 87371d7): an answer step reserves its request and its judge's share in
-    # one transaction; Go ahead's limit is spent + (request + share), the rows sum as (spent + request) + share, and at
-    # large spends the two differ in the float's last place. Within a few of those units, the step is admitted.
+    # one transaction; Go ahead's limit is spent + (request + share), the rows sum as (spent + request) + share. Within
+    # the most a limit can be, the step is always admitted.
     import random
     rng = random.Random(7)
-    cases = [((33619774.470715225,), 4.363519406, 7.995511916)] + [
-        (tuple(round(rng.uniform(1, 10) * 10 ** rng.choice([5, 7, 8, 9, 11, 13]), 9) for _ in range(3)),
-         round(rng.uniform(0.01, 9), 9), round(rng.uniform(0.01, 9), 9)) for _ in range(200)]
+    cases = [((333619.774470715,), 4.363519406, 7.995511916)] + [
+        (tuple(round(rng.uniform(0, 333333) / 10 ** rng.choice([0, 0, 1, 3]), 9) for _ in range(3)),
+         round(rng.uniform(0.000000001, 9), 9), round(rng.uniform(0.000000001, 9), 9)) for _ in range(500)]
     for rows, request, share in cases:
         project = add_project(db)
         conversation, run = add_turn(db, project)
         for step, usd in enumerate(rows):
             reserve(db, project, conversation, run, usd, project_budget=None, conversation_budget=None, step=step)
         spent = db.read(lambda conn: spending.spent(conn, conversation_id=conversation))
-        needed = spending.combined(spent + spending.combined(request + share))  # as budgets.decide sets it
+        needed = round(spent + round(request + share, 9), 9)  # as budgets.decide sets it
 
         def both(conn):
             for usd in (request, share):
@@ -2091,78 +2114,161 @@ def test_the_limit_go_ahead_sets_admits_a_step_and_its_judges_share_reserved_tog
         db.write(both)  # never BudgetExceeded
 
 
-def test_a_calls_attempts_whose_costs_sum_past_what_a_float_holds_settle_as_reported_at_the_most(db):
-    # SPEC:425: the call reported both attempts; their sum overflowed, and settle took infinity for no amount, so the
-    # call settled at its estimate, marked estimated, its reported charges lost.
-    import sys
+def test_a_calls_attempts_settle_as_reported_up_to_the_most_and_an_attempt_reporting_more_counts_its_estimate(db):
+    # SPEC:425: two attempts of $1,000,000 settle as reported at the most (one call's record); two that each reported
+    # 1.7e308 reported no amount, so the call settles at its estimate, marked estimated, as for any invalid report
     from backend.openrouter import Attempt, ModelResult
     from backend.runs import _settle_attempts
     project = add_project(db)
     conversation, run = add_turn(db, project)
-    reservation = reserve(db, project, conversation, run, 0.04)
+    free = {"input": 0, "output": 0, "request": 0}
+    reservation = reserve(db, project, conversation, run, 0.04, project_budget=None, conversation_budget=None)
+    attempts = [Attempt("request", 400, 5, {"cost": MAX}), Attempt("ok", 200, 5, {"cost": MAX})]
+    db.write(lambda conn: _settle_attempts(conn, reservation, free, attempts))
+    assert row(db, reservation)[2:] == ("settled", MAX, "reported")
+    assert ModelResult("Hi.", None, None, attempts).reported_cost == MAX
+    over = reserve(db, project, conversation, run, 0.04, step=1, project_budget=None, conversation_budget=None)
     attempts = [Attempt("request", 400, 5, {"cost": BIG}), Attempt("ok", 200, 5, {"cost": BIG})]
-    db.write(lambda conn: _settle_attempts(conn, reservation, {"input": 0, "output": 0, "request": 0}, attempts))
-    assert row(db, reservation)[2:] == ("settled", sys.float_info.max, "reported")
-    assert ModelResult("Hi.", None, None, attempts).reported_cost == sys.float_info.max
-    counted = [Attempt("ok", 200, 5, {"prompt_tokens": 10 ** 300, "completion_tokens": 0})]  # tokens at the step's rates
-    other = reserve(db, project, conversation, run, 0.04, step=1, project_budget=None, conversation_budget=None)
+    db.write(lambda conn: _settle_attempts(conn, over, free, attempts))
+    assert row(db, over)[2:] == ("settled", 0.04, "estimated")
+    assert ModelResult("Hi.", None, None, attempts).reported_cost is None
+    counted = [Attempt("ok", 200, 5, {"prompt_tokens": 10 ** 300, "completion_tokens": 0})]  # tokens priced past it
+    other = reserve(db, project, conversation, run, 0.04, step=2, project_budget=None, conversation_budget=None)
     db.write(lambda conn: _settle_attempts(conn, other, {"input": 1e10, "output": 0, "request": 0}, counted))
-    assert row(db, other)[2:] == ("settled", sys.float_info.max, "estimated")
+    assert row(db, other)[2:] == ("settled", 0.04, "estimated")
 
 
 @pytest.mark.asyncio
-async def test_spend_answers_with_totals_held_at_the_most_when_its_settled_calls_sum_past_what_a_float_holds(tmp_path):
-    # N3: two settled calls of 1.7e308 each made GET /spend answer 500 (an infinite total is not JSON).
-    import sys
+async def test_spend_answers_with_exact_totals_when_its_settled_calls_sum_past_the_most_one_can_be(tmp_path):
+    # N3 (two settled calls of 1.7e308 made GET /spend answer 500): three of $1,000,000 give $3,000,000, and the limits
+    # it gives are those an amount can be
     async with await _app(tmp_path) as client:
-        conversation, project = await _conversation(client, budget=2.0)
-        for _ in range(2):
-            await _spent(client, project, BIG, conversation)
+        conversation, project = await _conversation(client, budget=10.0)
+        await _project_budget(client, project, 5.0)
+        for _ in range(3):
+            await _spent(client, project, MAX, conversation)
         response = await client.get(f"/api/projects/{project}/spend", params={"conversation_id": conversation})
         assert response.status_code == 200, response.text
-        for budget in ("project", "conversation"):
-            assert {k: response.json()[budget][k] for k in ("settled_usd", "reported_usd")} == {
-                "settled_usd": sys.float_info.max, "reported_usd": sys.float_info.max}
+        for budget, limit in (("project", 5.0), ("conversation", 10.0)):
+            assert {k: response.json()[budget][k] for k in ("limit_usd", "settled_usd", "reported_usd")} == {
+                "limit_usd": limit, "settled_usd": 3 * MAX, "reported_usd": 3 * MAX}
+
+
+@pytest.mark.parametrize("schema, key", [("project", "project.budget_usd"), ("personal", "budget.conversation_usd")])
+def test_a_settings_budget_outside_a_billionth_to_the_most_is_refused_and_one_written_by_hand_is_unread(
+        tmp_path, schema, key):
+    # C-F3's limits cannot enter from a settings file: the Settings page's "A setting is not valid." (400)
+    from backend.runs import _budget_unread
+    from backend.settings import load_settings
+    project_id = "p" if schema == "project" else None
+    table, name = key.split(".")
+    for bad in (MAX + 0.01, 1e9, BIG, 1e-10):
+        with pytest.raises(ValueError):
+            load_settings(tmp_path, project_id).save({key: bad})
+    for good in (MAX, 1e-9, 25):
+        load_settings(tmp_path, project_id).save({key: good})
+    path = tmp_path / ("projects/p/config.toml" if project_id else "config.toml")
+    path.write_text(f"[{table}]\n{name} = 2000000.0\n")
+    assert _budget_unread(load_settings(tmp_path, project_id), table, name)  # E4's: no room, the ask says so
 
 
 @pytest.mark.asyncio
-async def test_notices_follow_the_share_of_a_limit_too_large_to_multiply(tmp_path):
-    # N2, SPEC:421: 1e307 settled against limits of 1.7e308 is about 5.9%, but settled * 100 and percent * limit both
-    # overflowed to infinity, so all six notices were recorded. At 94% each budget's three are, once.
+async def test_notices_follow_the_share_of_a_limit_at_the_most(tmp_path):
+    # N2, SPEC:421: 59,000 of $1,000,000 is 5.9%: no notice; 940,000 is 94%: each budget's three, once
     from scholia_app import MockProvider, background_idle, send
     async with await _app(tmp_path, MockProvider(cost=0.002)) as client:
-        conversation, project = await _conversation(client, budget=BIG)
-        await _project_budget(client, project, BIG)
-        await _spent(client, project, 1e307, conversation)
+        conversation, project = await _conversation(client, budget=MAX)
+        await _project_budget(client, project, MAX)
+        await _spent(client, project, 59000.0, conversation)
         stream = await send(client, conversation, "Short?")
         assert stream[-1]["status"] == "succeeded"
         await background_idle(client)  # its memory extraction settles against the project too
         assert [e for e in stream if e["type"] == "budget"] == []
         assert await _rows(client, "SELECT count(*) FROM run_events WHERE type = 'budget_notice'") == [(0,)]
-        await _spent(client, project, 1.5e308, conversation)  # 1.6e308 of 1.7e308: about 94%
+        await _spent(client, project, 881000.0, conversation)
         stream = await send(client, conversation, "Again?")
         assert sorted((e["budget"], e["percent"]) for e in stream if e["type"] == "budget") == [
             (budget, percent) for budget in ("conversation", "project") for percent in (50, 85, 90)]
 
 
 @pytest.mark.asyncio
-async def test_continue_past_what_a_float_holds_raises_the_limit_to_the_most_never_to_infinity(tmp_path):
-    # A5: a limit of 1e308 past its cap; Continue adds 1e308 again, a sum past what a float holds, which was written as
-    # an infinite limit. It is held at the most a float holds, and the step goes out under it.
-    import sys
+async def test_at_the_most_a_limit_can_be_only_stop_ends_the_cap_ask_and_nothing_raises_a_limit_past_it(tmp_path):
+    # A5, A7 at the bound: the project at $1,000,000 past its cap. Continue would add $1,000,000 again, and any limit
+    # that covers the step is past the most: each is refused with the new text and no needed amount, nothing changes,
+    # and Stop ends the turn at its limit
     async with await _app(tmp_path) as client:
-        conversation, project = await _conversation(client, budget=1e308)
-        await _project_budget(client, project, BIG)
-        await _spent(client, project, 1.1e308, conversation)
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, MAX)
+        await _spent(client, project, MAX, conversation)
         sending, ask = await _asking(client, conversation)
-        assert (ask["params"]["form"], ask["params"]["budget"]) == ("cap", "conversation")
-        answered = await _answer(client, ask, option="continue")
-        assert answered.status_code == 200, answered.text
-        assert answered.json()["budget"] == {"applied": True, "budget": "conversation", "limit_usd": sys.float_info.max}
-        assert (await sending)[-1]["status"] == "succeeded"
-        assert await _own_budget(client, conversation) == sys.float_info.max
-        [decision] = await _decisions(client, ask["run_id"])
-        assert (decision["to_usd"], decision["applied"]) == (sys.float_info.max, True)
+        assert (ask["params"]["form"], ask["params"]["budget"]) == ("cap", "project")
+        for body in ({"option": "continue"}, {"text": "1000000.01"}, {"text": "2000000"}, {"text": "1000000"},
+                     {"text": "US$1,000,000.00"}):
+            refused = await _answer(client, ask, **body)
+            assert (refused.status_code, refused.json()["code"]) == (400, "limit_too_high"), body
+            assert "needed_usd" not in refused.json()
+        assert await _project_budget(client, project) == MAX and await _decisions(client, ask["run_id"]) == []
+        assert (await _answer(client, ask, option="stop")).status_code == 200
+        assert [(e["type"], e.get("status")) for e in await sending][-1] == ("run_finished", "cancelled")
+        assert await _project_budget(client, project) == MAX
+
+
+@pytest.mark.asyncio
+async def test_a_step_needing_more_than_the_most_says_no_needed_amount_and_go_ahead_is_refused(tmp_path):
+    # C-F2: a step needing 46847608461976.055 had its needed text say a cent too little, so the amount typed as said was
+    # refused again. Such a spend is stored only from before the bound (stored values are not checked again on read):
+    # no limit can cover the step, so a typed limit is refused with no needed amount. And a step ask whose Go ahead
+    # would set a limit past the most is refused too; Not now ends it.
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, MAX)
+        await _spent(client, project, 46847608461976.05, conversation)
+        sending, ask = await _asking(client, conversation)
+        for text in ("46847608461976.06", "999999"):
+            refused = await _answer(client, ask, text=text)
+            assert (refused.status_code, refused.json()["code"], "needed_usd" in refused.json()) == (
+                400, "limit_too_high", False), text
+        assert (await _answer(client, ask, option="stop")).status_code == 200
+        await sending
+    (tmp_path / "step").mkdir()
+    async with await _app(tmp_path / "step") as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, MAX)
+        await _spent(client, project, MAX - 0.01, conversation)
+        sending, ask = await _asking(client, conversation)
+        assert (ask["params"]["form"], ask["params"]["budget"]) == ("step", "project")
+        for body in ({"option": "go_ahead"}, {"text": "999999.99"}):
+            refused = await _answer(client, ask, **body)
+            assert (refused.status_code, refused.json()["code"], "needed_usd" in refused.json()) == (
+                400, "limit_too_high", False), body
+        assert (await _answer(client, ask, option="not_now")).status_code == 200
+        assert [(e["type"], e.get("status")) for e in await sending][-1] == ("run_finished", "cancelled")
+
+
+@pytest.mark.asyncio
+async def test_the_least_limit_a_step_needs_just_under_the_most_typed_back_as_said_applies_and_a_cent_less_does_not(
+        tmp_path):
+    # C-F2 in range: the needed amount, as the interface says it in English and in Chinese (rounded up to the cent and
+    # grouped), typed back applies; a cent less is refused with the same needed amount
+    import math
+    async with await _app(tmp_path) as client:
+        for shown in ("${:,.2f}", "US${:,.2f}"):
+            conversation, project = await _conversation(client, budget=999990.0)
+            await _project_budget(client, project, MAX)
+            await _spent(client, project, 999998.5, conversation)
+            sending, ask = await _asking(client, conversation)
+            refused = await _answer(client, ask, text="999990.5")
+            needed = refused.json()["needed_usd"]
+            assert refused.json()["code"] == "limit_too_low" and needed <= MAX
+            cents = math.ceil(needed * 100 - 1e-9) / 100
+            less = await _answer(client, ask, text=shown.format(cents - 0.01))
+            assert (less.json()["code"], less.json()["needed_usd"]) == ("limit_too_low", needed)
+            answered = await _answer(client, ask, text=shown.format(cents))
+            assert answered.json()["budget"]["limit_usd"] == cents, answered.text
+            assert (await sending)[-1]["status"] == "succeeded"
+            await _project_budget(client, project, 50.0)  # back to the General project's own room for the next pass
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                "DELETE FROM budget_reservations WHERE project_id = ?", (project,)))
 
 
 # PR 52's follow-up (cycle 5 B2; SPEC:672, SPEC:732, A9, G9): a run whose terminal write failed is no longer held by this

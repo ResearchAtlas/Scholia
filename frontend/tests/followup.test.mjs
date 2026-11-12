@@ -1005,15 +1005,20 @@ test('a seeded random matrix of sends, steers, Sends, edits, removals, refusals,
   assert.deepEqual(found.slice(0, 10), []);
 });
 
-// PR 52's follow-up (cycle 5 A-F2): a share of a budget is settled / limit, which a limit too large to multiply cannot
-// overflow: 1e307 of 1.7e308 is about 5.9%, never Infinity with a full bar.
-test('the bar reads the share of a limit too large to multiply, never Infinity (A-F2)', () => {
-  const huge = (settled) => ({ conversation: { limit_usd: 1.7e308, settled_usd: settled, open_usd: 0, own: true },
-    project: { limit_usd: 1.7e308, settled_usd: settled, open_usd: 0 }, notice_percents: [50, 85, 90] });
-  assert.equal(budgetBar(huge(1e307)), null); // about 5.9%: below the lowest notice percent
-  const near = budgetBar(huge(1.6e308));
-  assert.ok(Math.abs(near.percent - 94.1176) < 0.001 && near.meter === 94, JSON.stringify(near));
-  assert.equal(budgetBar(huge(Number.MAX_VALUE)).meter, 100); // a total held at the most a float holds: over it
+// PR 52's follow-up (cycle 5 A-F2, the first review's C-F3; design review V's Option 1, Harold's decision of
+// 2026-11-13): a budget's limit is at most $1,000,000 and at least a billionth of a dollar, so a share never overflows
+// and the bar names the budget with the higher share: $3,000,000 settled against $10 and $5 is the project's.
+test('the bar names the budget with the higher share at the largest spends and limits an amount can be (A-F2, C-F3)', () => {
+  const spend = (settled, conversation, project) => ({
+    conversation: { limit_usd: conversation, settled_usd: settled, open_usd: 0, own: true },
+    project: { limit_usd: project, settled_usd: settled, open_usd: 0 }, notice_percents: [50, 85, 90] });
+  const bar = budgetBar(spend(3e6, 10, 5));
+  assert.deepEqual([bar.budget, bar.limit, bar.meter], ['project', 5, 100]);
+  assert.ok(Number.isFinite(bar.percent), JSON.stringify(bar));
+  assert.equal(budgetBar(spend(59000, 1e6, 1e6)), null); // 5.9%: below the lowest notice percent
+  const near = budgetBar(spend(940000, 1e6, 1e6));
+  assert.ok(Math.abs(near.percent - 94) < 1e-9 && near.meter === 94, JSON.stringify(near));
+  assert.equal(budgetBar(spend(3e6, 1e-9, 1e6)).budget, 'conversation'); // the smallest limit, still a finite share
 });
 
 // PR 52's follow-up (cycle 5 C3; SPEC:415, F4): the view's conversation read, taken from its source and run with what it
@@ -1047,13 +1052,19 @@ test('an older conversation read answering late never restores a waiting message
   }
 });
 
-// The internal review's F2: a needed limit too large to count in cents is said as it is, never as "null".
-test('a limit too low for the step says the least it needs even past what cents can count (A-F2)', async () => {
+// The internal review's F2 and the first review's C-F2 (design review V's Option 1, Harold's decision of 2026-11-13): a
+// needed limit is at most $1,000,000, so it is said rounded up to the cent, grouped, in both languages, and the backend
+// takes it typed back as said (tests/test_budgets.py).
+test('a limit too low for the step says the least it needs, rounded up to the cent, up to the most a limit can be (C-F2)', async () => {
   const { ApiError } = await import('../src/api.js');
   const { problemText } = await import('../src/action.js');
-  const { makeT } = await import('../src/i18n/index.js');
-  for (const needed of [1.7e307, Number.MAX_VALUE]) {
-    const text = problemText(makeT('en'), new ApiError(400, 'limit_too_low', needed), 'en');
-    assert.ok(!/null|Infinity|NaN/.test(text) && /\$\d{1,3}(,\d{3})+/.test(text), text);
+  const { loadLanguage, makeT } = await import('../src/i18n/index.js');
+  await loadLanguage('zh-CN');
+  for (const [needed, en, zh] of [[999999.981, '$999,999.99', 'US$999,999.99'], [1e6, '$1,000,000.00', 'US$1,000,000.00'],
+    [1234.0500001, '$1,234.06', 'US$1,234.06'], [0.031, '$0.04', 'US$0.04']]) {
+    assert.ok(problemText(makeT('en'), new ApiError(400, 'limit_too_low', needed), 'en').includes(` ${en}.`), en);
+    assert.ok(problemText(makeT('zh-CN'), new ApiError(400, 'limit_too_low', needed), 'zh-CN').includes(` ${zh}。`), zh);
   }
+  assert.equal(problemText(makeT('en'), new ApiError(400, 'limit_too_high'), 'en'), 'A budget can be at most $1,000,000.');
+  assert.equal(problemText(makeT('zh-CN'), new ApiError(400, 'limit_too_high'), 'zh-CN'), '预算最多为 US$1,000,000。');
 });
