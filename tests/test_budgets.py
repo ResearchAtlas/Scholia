@@ -567,6 +567,44 @@ async def test_set_a_new_limit_takes_a_typed_amount_that_fits_the_step(tmp_path)
         assert (decision["decision"], decision["to_usd"]) == ("set_limit", 2.5)
 
 
+@pytest.mark.parametrize("text, usd", [
+    ("$1,234.05", 1234.05), ("US$1,234.05", 1234.05), ("1,234", 1234.0), ("$999,999.99", 999999.99),
+    ("US$1,000,000.00", 1000000.0), ("＄１，２３４．０５", 1234.05), (" 25 ", 25.0), ("$2.50", 2.5)])
+def test_a_typed_limit_is_taken_as_the_needed_text_shows_amounts_grouped_in_thousands(text, usd):
+    # Design review V's adjacent finding: the needed text says amounts from $1,000 with grouping ("$1,234.05", in
+    # zh-CN "US$1,234.05"), and typing one exactly as shown was refused invalid_limit
+    from backend import budgets
+    assert budgets._typed(text) == usd
+
+
+@pytest.mark.parametrize("text", ["1,23", "12,3456", ",123", "1,,234", "1,234,5", "1.234,05", "1 234", "1,234.", "$,5"])
+def test_a_typed_limit_grouped_any_other_way_is_still_refused(text):
+    from backend import budgets
+    with pytest.raises(budgets.Refused) as refused:
+        budgets._typed(text)
+    assert refused.value.code == "invalid_limit"
+
+
+@pytest.mark.asyncio
+async def test_the_least_limit_a_step_needs_typed_back_as_the_interface_says_it_applies(tmp_path):
+    # The needed text's amount (frontend/src/action.js: rounded up to the cent, grouped in thousands, "$" in English and
+    # "US$" in Chinese), typed back exactly, applies; a cent less is refused with the same needed amount
+    import math
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client, budget=1000.0)
+        await _project_budget(client, project, 5000.0)
+        await _spent(client, project, 1234.0, conversation)
+        sending, ask = await _asking(client, conversation)
+        refused = await _answer(client, ask, text="1000.5")
+        assert (refused.status_code, refused.json()["code"]) == (400, "limit_too_low")
+        cents = math.ceil(refused.json()["needed_usd"] * 100 - 1e-9) / 100
+        less = await _answer(client, ask, text=f"${cents - 0.01:,.2f}")
+        assert (less.json()["code"], less.json()["needed_usd"]) == ("limit_too_low", refused.json()["needed_usd"])
+        answered = await _answer(client, ask, text=f"US${cents:,.2f}")
+        assert answered.json()["budget"] == {"applied": True, "budget": "conversation", "limit_usd": cents}
+        assert (await sending)[-1]["status"] == "succeeded"
+
+
 @pytest.mark.asyncio
 async def test_two_conversations_admitting_075_against_1_left_one_is_admitted_and_one_asks(tmp_path):
     # SPEC:1197 end to end: two turns, each a $0.75 step, against $1 left of the project's budget.
