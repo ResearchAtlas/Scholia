@@ -132,7 +132,8 @@ export function libraryChanged(projectId) {
   const mine = chosen.papers.length > 0 && (projectId === null || projectId === chosen.projectId);
   if (mine) choosePapers(chosen.projectId, chosen.papers.map((paper) => ({ id: paper.id, title: null })));
   libraryEvents.dispatchEvent(new CustomEvent('changed', { detail: projectId }));
-  if (mine) retitleChosen(asked);
+  // A change of another project moves the generation too, so a refresh it leaves unanswered is asked again (batch 3).
+  if (mine || retitling !== null) retitleChosen(asked);
 }
 
 // S1-19b (Harold, 2026-10-21: no client-held derived state): which reads of a view may be shown after library
@@ -177,16 +178,22 @@ export const MAX_CHOSEN = 50; // as the backend takes them (backend/app.py Messa
 // chosen paper"): dropping them would send the next message unrestricted (slice-1 spec: literature restricted to the
 // selection), and the backend refuses a deleted one (selection_invalid). An answer is applied only in the generation it
 // was asked in, to the papers chosen when it was asked, and only while the same project's papers are chosen.
+let retitling = null; // the generation of the chosen papers' refresh still unanswered, or null
 async function retitleChosen(asked) {
   const { projectId, papers } = chosen;
+  retitling = papers.length ? asked : null;
+  if (!papers.length) return;
   const ids = new Set(papers.map((paper) => paper.id));
   let titles;
   try {
     titles = new Map((await get(`/api/projects/${encodeURIComponent(projectId)}/materials`)).materials.map((m) => [m.id, m.title]));
   } catch {
+    if (asked === generation) retitling = null;
     return;
   }
-  if (asked !== generation || chosen.projectId !== projectId) return;
+  if (asked !== generation) return; // a newer change asked again
+  retitling = null;
+  if (chosen.projectId !== projectId) return;
   choosePapers(projectId, chosen.papers.filter((paper) => !ids.has(paper.id) || titles.has(paper.id))
     .map((paper) => (ids.has(paper.id) ? { ...paper, title: titles.get(paper.id) } : paper)));
 }

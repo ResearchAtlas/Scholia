@@ -306,6 +306,36 @@ test('a read asked before a change made with nothing chosen never retitles a pap
   }
 });
 
+// Batch 3 (PR 61 recheck round 3, pass 1's probe): a change in another project moves the generation while the chosen
+// papers' refresh is pending; a refresh of the new generation replaces it, so the deleted paper still leaves and the
+// others still take their titles.
+test('another project\'s change while the chosen papers are refreshed asks again, and its answer is applied', async () => {
+  const original = globalThis.fetch;
+  const asked = [];
+  globalThis.fetch = (path) => new Promise((resolve) => asked.push({ path, resolve }));
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const listed = (...materials) => ({ ok: true, json: async () => ({ materials }) });
+  try {
+    choosePapers('p1', [{ id: 'kept', title: 'Kept' }, { id: 'gone', title: 'Deleted Next' }]);
+    libraryChanged('p1'); // the deletion: R0 asked
+    libraryChanged('p2'); // an upload finishing in another project, before R0 answers
+    await settle();
+    assert.deepEqual(asked.map((r) => r.path), ['/api/projects/p1/materials', '/api/projects/p1/materials']);
+    asked[0].resolve(listed({ id: 'kept', title: 'Kept' }, { id: 'gone', title: 'Deleted Next' })); // asked before: dropped
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'kept', title: null }, { id: 'gone', title: null }]);
+    asked[1].resolve(listed({ id: 'kept', title: 'Kept, retitled' }));
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'kept', title: 'Kept, retitled' }]);
+    libraryChanged('p2'); // nothing pending: another project's change asks nothing
+    await settle();
+    assert.equal(asked.length, 2);
+  } finally {
+    globalThis.fetch = original;
+    choosePapers('p1', []);
+  }
+});
+
 // Design review F's rider 2: a memory change is heard by the conversation side, and moves no papers' generation.
 test('a memory change moves no papers\' generation, and a change to the papers does', async () => {
   const { memoryChanged } = await import('../src/memory.js');
