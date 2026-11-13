@@ -1798,3 +1798,29 @@ async def test_a_stop_landing_while_a_turns_end_is_written_still_gets_that_end_o
         else:
             assert turn["status"] == "failed"
             assert stream[-2:] == [{"type": "error", "code": "malformed"}, {**stream[-1], "status": "failed"}]
+
+
+async def test_model_requests_in_flight_app_wide_wait_for_the_cap_in_the_settings(tmp_path):
+    # M2 audit area 3, item 8 (section 13: 8 model requests in flight app-wide, limits.requests_in_flight): a request
+    # past the cap waits on the dispatch path for one to end, whichever conversation or background run sends it.
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        current = (await client.get("/api/settings")).json()
+        saved = await client.put("/api/settings", json={"hash": current["hash"],
+                                                        "updates": {"limits.requests_in_flight": 2}})
+        assert saved.status_code == 200, saved.text
+        conversations = [(await client.post("/api/conversations", json={})).json()["id"] for _ in range(3)]
+        await send(client, conversations[0])  # the catalog and endpoint listing read and kept, its title run made
+        await background_idle(client)
+        provider.hold, before = asyncio.Event(), len(provider.chats)
+        sending = [asyncio.create_task(send(client, c, "Another question?")) for c in conversations]
+        deadline = asyncio.get_running_loop().time() + 5
+        while len(provider.chats) - before < 2:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.3)  # the third would have been sent by now
+        assert len(provider.chats) - before == 2
+        provider.hold.set()
+        streams = await asyncio.gather(*sending)
+        assert [s[-1]["status"] for s in streams] == ["succeeded"] * 3
+        await background_idle(client)

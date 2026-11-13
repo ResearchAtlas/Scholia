@@ -62,7 +62,7 @@ import threading
 import time
 import traceback
 import unicodedata
-from contextlib import nullcontext, suppress
+from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 
 from backend import (agent, budget_router, citations, compaction, context, credentials, governance, memory, openrouter,
@@ -456,6 +456,23 @@ class Harness:
         # its own after one (_take_queued). shortcut: one id per run cancelled in this launch, never taken out; a bounded
         # log if that grows large
         self.stopped = set()
+        self._flying, self._landed = 0, asyncio.Event()  # model requests in flight app-wide (_in_flight)
+
+    @asynccontextmanager
+    async def _in_flight(self):
+        """A place under the app-wide cap on model requests in flight (section 13: limits.requests_in_flight, read for
+        each request): one past it waits for another to end, so recovery's restarts and many background runs never
+        all send at once. Taken on the dispatch path only (_call), around the provider adapter's request."""
+        limit = (await asyncio.to_thread(load_settings, self.data_dir)).values["limits"]["requests_in_flight"]
+        while self._flying >= limit:
+            self._landed.clear()
+            await self._landed.wait()
+        self._flying += 1
+        try:
+            yield
+        finally:
+            self._flying -= 1
+            self._landed.set()
 
     async def _write(self, fn):
         return await asyncio.to_thread(self.db.write, fn)
@@ -2442,13 +2459,14 @@ class Harness:
         async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id, past, off,
                                                                                          revoked),
                                           provider=route.provider.name) as client:
-            result = await openrouter.query_model(
-                client, route, key, request.messages, timeout=timeout or MODEL_CALL_SECONDS, effort=facts["effort"],
-                max_tokens=request.max_tokens, zdr_enabled=zero_retention, attempts=call.attempts, on_body=keep,
-                tools=request.tools or None,  # S1-19c: the agent loop's function tools, counted with the request
-                # The catalog row the route's facts were read from, so the request is the one they
-                # describe; a Private call is limited to the endpoints it lists, as the gate checks.
-                model_entry=facts["row"])
+            async with self._in_flight():  # the app-wide cap on requests in flight (section 13)
+                result = await openrouter.query_model(
+                    client, route, key, request.messages, timeout=timeout or MODEL_CALL_SECONDS, effort=facts["effort"],
+                    max_tokens=request.max_tokens, zdr_enabled=zero_retention, attempts=call.attempts, on_body=keep,
+                    tools=request.tools or None,  # S1-19c: the agent loop's function tools, counted with the request
+                    # The catalog row the route's facts were read from, so the request is the one they
+                    # describe; a Private call is limited to the endpoints it lists, as the gate checks.
+                    model_entry=facts["row"])
             finished = {"step": call.step, "outcome": "turn_deadline" if call.declined else result.error_kind or "ok",
                         **({"cut": "output_limit"} if result.cut else {})}  # stopped at its output limit
             # S1-19c: an agent step's reply is kept whole as it arrives (model-route rule 5: each assistant step stored
