@@ -24,7 +24,7 @@ from backend import governance, openrouter, spending
 from backend.runs import _budgets_now, _event, _limit_unread
 from backend.settings import PERSONAL, PROJECT, load_settings
 
-_EPSILON = 1e-9
+_EPSILON = 1e-9  # a tolerance for sums against a limit (as spending.reserve's), never whether an amount changed (_same)
 EVALUATION_ATTEMPTS = openrouter.MAX_ATTEMPTS  # the HTTP attempts one call may make, each charged if it goes out
 STOPS = ("stop", "not_now")
 
@@ -35,6 +35,11 @@ class Refused(Exception):
     def __init__(self, code, message, needed_usd=None):
         super().__init__(message)
         self.code, self.message, self.needed_usd = code, message, needed_usd
+
+
+def _same(a, b):
+    """Whether two amounts are one as amounts are kept, to a billionth: $1e-9, the least limit, is a change from $0."""
+    return round(a, 9) == round(b, 9)
 
 
 def options(form):
@@ -181,7 +186,7 @@ def _amount(conn, data_dir, budget, scope_id, current, default):
             " AND json_extract(e.data, '$.budget') = ? AND json_extract(e.data, '$.amount_usd') IS NOT NULL"
             " AND json_extract(e.data, '$.applied') = 1"
             " ORDER BY e.rowid DESC LIMIT 1", (scope_id, budget)).fetchone()
-    found = row[1] if row is not None and abs(row[0] - current) <= _EPSILON else current
+    found = row[1] if row is not None and _same(row[0], current) else current
     return found if found > 0 else default
 
 
@@ -216,8 +221,8 @@ def decide(conn, run_id, ask, option, text, data_dir):
         wanted = {"continue": round(current + amount, 9), "go_ahead": max(current, needed)}.get(option, current)
     # An ask raised while the project's file did not give its budget (unread, PR 52 cycle 3, E4): only a typed limit
     # means anything; Continue and Go ahead have no amount to add to, so they apply nothing and the step is checked again
-    stale = abs(current - params["limit_usd"]) > _EPSILON or (bool(params.get("unread")) and text is None)
-    applied = not stale and decision not in STOPS and abs(wanted - current) > _EPSILON
+    stale = not _same(current, params["limit_usd"]) or (bool(params.get("unread")) and text is None)
+    applied = not stale and decision not in STOPS and not _same(wanted, current)
     if applied and wanted > spending.MAX_USD:  # Continue or Go ahead past the most a limit can be: only Stop or Not now
         raise _too_high()
     # what the records say the limit was: nothing when its file does not give it, never $0 (and no amount to add to)

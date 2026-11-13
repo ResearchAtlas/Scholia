@@ -2360,6 +2360,122 @@ def test_a_background_call_that_costs_nothing_is_not_admitted_against_a_budget_o
     assert reserve(db, project, None, add_turn(db, project)[1], 0.0, project_budget=1e-9, conversation_budget=None)
 
 
+# Cycle 2's A2-F1 and B-R2-F2 (Harold, 2026-11-13: an ordinary fix): whether an answer changes a limit is read as amounts
+# are kept, to a billionth, apart from the tolerance a sum is admitted with, so $1e-9 (the least limit, design review V)
+# is a change: a typed $0.000000001 on a step that costs nothing applies, and Continue on a limit of $1e-9 (or with a
+# default of $1e-9) adds it. The stale check, the amount Continue adds and the saved read-back compare the same way.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["conversation", "project", "own zero"])
+async def test_the_least_typed_limit_applies_to_a_step_that_costs_nothing(tmp_path, budget):
+    from scholia_app import MockProvider
+    async with await _app(tmp_path, MockProvider(endpoints={budget_router_model(): [_FREE]})) as client:
+        conversation, project = await _conversation(client, budget=0 if budget == "own zero" else None)
+        if budget == "conversation":  # the personal file gives no conversation budget (unread)
+            personal = tmp_path / "data" / "config.toml"
+            personal.write_bytes(b'[budget]\nconversation_usd = "broken"\n' + personal.read_bytes())
+        elif budget == "project":  # the project's file gives no budget (unread)
+            await _project_budget(client, project, 50.0)
+            _hand_set(tmp_path, project, '"broken"')
+        sending, ask = await _asking(client, conversation)
+        assert client.provider.answers == []
+        answered = (await _answer(client, ask, text="0.000000001")).json()["budget"]
+        assert (answered["applied"], answered["limit_usd"]) == (True, 1e-9)
+        stream = await asyncio.wait_for(sending, 20)
+        assert stream[-1]["status"] == "succeeded" and len(client.provider.answers) == 1
+        assert (await _project_budget(client, project) if budget == "project" else
+                await _own_budget(client, conversation)) == 1e-9
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["conversation", "project", "default"])
+async def test_continue_adds_the_least_amount_a_limit_can_be(tmp_path, budget):
+    from scholia_app import MockProvider
+    async with await _app(tmp_path, MockProvider(endpoints={budget_router_model(): [_FREE]})) as client:
+        conversation, project = await _conversation(client, budget={"conversation": 1e-9, "default": 0}.get(budget))
+        if budget == "default":  # the conversation's own $0, the personal default $1e-9: Continue adds the default
+            personal = tmp_path / "data" / "config.toml"
+            personal.write_bytes(b"[budget]\nconversation_usd = 1e-9\n" + personal.read_bytes())
+        else:  # a limit of $1e-9 with $3e-9 spent against it
+            if budget == "project":
+                await _project_budget(client, project, 1e-9)
+            await _spent(client, project, 3e-9, conversation if budget == "conversation" else None)
+        sending, ask = await _asking(client, conversation)
+        assert (ask["params"]["budget"], ask["params"]["form"]) == (
+            "project" if budget == "project" else "conversation", "cap")
+        answered = (await _answer(client, ask, option="continue")).json()["budget"]
+        wanted = 1e-9 if budget == "default" else 2e-9
+        assert (answered["applied"], answered["limit_usd"]) == (True, wanted)
+        stream = await asyncio.wait_for(sending, 20)
+        assert stream[-1]["status"] == "succeeded" and len(client.provider.answers) == 1
+        assert (await _project_budget(client, project) if budget == "project" else
+                await _own_budget(client, conversation)) == wanted
+
+
+@pytest.mark.asyncio
+async def test_whether_an_answer_changes_a_limit_is_read_to_a_billionth(tmp_path):
+    from scholia_app import MockProvider, background_idle, send
+    from backend import budgets
+    from backend.runs import _event
+    data = tmp_path / "data"
+    async with await _app(tmp_path, MockProvider(endpoints={budget_router_model(): [_FREE]})) as client:
+        conversation, project = await _conversation(client)
+        run_id = (await send(client, conversation, "Short?"))[0]["run_id"]
+        await background_idle(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "DELETE FROM budget_reservations WHERE paying_conversation_id = ?", (conversation,)))  # nothing spent
+
+        def decide(own, option=None, text=None, limit=None, estimate=0.0, earlier=None):
+            def go(conn):
+                conn.execute("UPDATE conversations SET budget_usd = ? WHERE id = ?", (own, conversation))
+                if earlier is not None:  # the conversation's last applied decision: (the limit it left, its amount)
+                    _event(conn, run_id, "budget_decision", {"budget": "conversation", "to_usd": earlier[0],
+                                                             "amount_usd": earlier[1], "applied": True})
+                ask = {"ask_id": new_id(), "project_id": project, "params": {
+                    "form": "cap", "budget": "conversation", "conversation_id": conversation,
+                    "limit_usd": own if limit is None else limit, "estimate_usd": estimate}}
+                found = budgets.decide(conn, run_id, ask, option, text, data)[0]
+                return found["applied"], found["limit_usd"]
+            return asyncio.to_thread(client.state["db"].write, go)
+        # an unchanged answer applies nothing, a float's last place included
+        assert await decide(0.1 + 0.2, text="0.3") == (False, 0.1 + 0.2)
+        assert await decide(1e-9, text="0.000000001") == (False, 1e-9)
+        assert await decide(5.0, option="go_ahead", estimate=1.0) == (False, 5.0)
+        # the limit changed by $1e-9 since the ask: stale, nothing applied (never Continue on the new limit)
+        assert await decide(2e-9, option="continue", limit=1e-9) == (False, 2e-9)
+        # the last decision left $1e-9 and the limit is $2e-9 now: Continue adds the limit itself, not that amount
+        assert await decide(2e-9, option="continue", earlier=(1e-9, 7e-9)) == (True, 4e-9)
+        assert await decide(1e-9, option="continue", earlier=(1e-9, 7e-9)) == (True, 8e-9)  # still what it left
+
+
+@pytest.mark.asyncio
+async def test_a_project_budget_not_saved_is_not_read_back_as_saved_when_it_differs_by_the_least_amount(
+        tmp_path, monkeypatch):
+    from backend import asks, settings
+    async with await _app(tmp_path) as client:
+        _, project = await _conversation(client)
+        await _project_budget(client, project, 1e-9)
+
+        def failing(self, updates, answer=False):
+            raise OSError("the disk is full")
+        monkeypatch.setattr(settings.Settings, "save", failing)
+        decided = {"project_id": project, "to_usd": 2e-9, "amount_usd": 1e-9}
+        assert asks._save_project_budget(tmp_path / "data", decided) is False
+        assert asks._save_project_budget(tmp_path / "data", {**decided, "to_usd": 1e-9}) is True  # what the file holds
+
+
+@pytest.mark.asyncio
+async def test_nothing_spent_of_the_least_limit_asks_about_the_step_not_the_cap(tmp_path):
+    # the cap is the settled spend and open reservations reaching the limit: $0 of $1e-9 has not
+    async with await _app(tmp_path) as client:
+        conversation, _ = await _conversation(client, budget=1e-9)
+        sending, ask = await _asking(client, conversation)
+        assert (ask["params"]["form"], ask["options"]) == ("step", ["go_ahead", "not_now"])
+        assert (await _answer(client, ask, option="not_now")).status_code == 200
+        await asyncio.wait_for(sending, 20)
+
+
 # PR 52's follow-up (Harold, 2026-11-12, the batch 3 readings' (3)): E4's rule for the personal config.toml. While it gives
 # no valid conversation budget, its loader's shipped $10 says nothing of what it holds: a conversation without a limit of
 # its own has no room, so each step asks and the ask says the budget could not be read (never that it is $0); Continue

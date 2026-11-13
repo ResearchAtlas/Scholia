@@ -1327,7 +1327,8 @@ class Harness:
         conversation_id = paying_conversation_id if refused.budget == "conversation" else None
         spent = await self._read(lambda conn: spending.spent(
             conn, **({"conversation_id": conversation_id} if conversation_id else {"project_id": project_id})))
-        form = "cap" if spent + 1e-9 >= refused.limit_usd else "step"
+        # the cap is reached as amounts are kept, to a billionth: $0 spent of a $1e-9 limit is not
+        form = "cap" if spent >= round(refused.limit_usd, 9) else "step"
         # a budget its file does not give: the ask says so, never that the budget is $0 (PR 52 cycle 3, E4)
         unread = await self._read(lambda conn: _limit_unread(conn, self.data_dir, refused.budget, project_id,
                                                              paying_conversation_id))

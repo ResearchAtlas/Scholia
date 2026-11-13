@@ -298,7 +298,7 @@ def _save_project_budget(data_dir, decided):
         return False
     if _budget_unread(loaded):  # an unreadable file, or this value, gives the default, never what it holds: unknown,
         return False  # so not saved
-    return abs(loaded.values["project"]["budget_usd"] - decided["to_usd"]) <= 1e-9
+    return round(loaded.values["project"]["budget_usd"], 9) == round(decided["to_usd"], 9)  # as amounts are kept
 
 
 def _budget_saved(conn, run_id, decided, saved):
