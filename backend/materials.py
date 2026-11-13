@@ -569,15 +569,16 @@ def _resolve(conn, sha256, extractor, extraction_id):
     # never a reference passage (section 7.1: not evidence), its old passage's text first, then its page, so its chip
     # opens and highlights it there, at that passage's page (none for a file without pages). Its verdict stands only
     # when that passage's text is its old passage's (B18). One stored removed while its quote was gone (an answer
-    # committed during a replacement) exists again. One whose quote is not here keeps its passage, and reads as
+    # committed during a replacement) exists again, on this reading's passage, even one it already points at (its own
+    # file restored, whose reading is shared again). One whose quote is not here keeps its passage, and reads as
     # removed (answers.resolve_now).
     for citation, quote, page, text, version, kind in conn.execute(
             f"SELECT d.id, d.quote, d.page, p.text, v.id, {_VERSION_TYPE} FROM citations d"
             " JOIN passages p ON p.id = d.passage_id"
             " JOIN material_versions v ON v.material_id = d.material_id AND v.is_current = 1"
             " LEFT JOIN content_files c ON c.sha256 = v.file_sha256"
-            " WHERE v.file_sha256 = ? AND p.extraction_id != ? AND d.existence IN ('ok', 'source_removed')"
-            " AND d.quote != ''", (sha256, extraction_id)).fetchall():
+            " WHERE v.file_sha256 = ? AND (p.extraction_id != ? OR d.existence = 'source_removed')"
+            " AND d.existence IN ('ok', 'source_removed') AND d.quote != ''", (sha256, extraction_id)).fetchall():
         if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
             continue
         found = conn.execute("SELECT id, page, text FROM passages WHERE extraction_id = ? AND kind != 'reference'"

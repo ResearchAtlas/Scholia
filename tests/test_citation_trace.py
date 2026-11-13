@@ -152,6 +152,34 @@ async def test_a_replacement_by_the_same_bytes_read_as_another_format_moves_the_
         assert chip["existence"] == "ok"
 
 
+async def test_a_citation_stored_removed_on_its_passage_exists_again_when_its_own_file_is_restored(tmp_path):
+    # Batch 2 (1): answered while its paper's file was replaced by one without the quote, the citation is stored
+    # removed on its old passage; the paper's first file restored (its reading shared, the same passages), the
+    # citation exists again there, and can be checked again.
+    from scholia_app import run_finished
+    from test_materials import added
+    from test_search import idle
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        [first] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        await added(client, project, paper("Wage Floors", "Rents rose in the synthetic city."), material_id=material)
+        await idle(client, project)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # what that answer's commit stores
+            "UPDATE citations SET existence = 'source_removed', support = 'unchecked'"))
+        await added(client, project, WAGES, material_id=material)  # its first file again: read already, shared
+        await idle(client, project)
+        [chip] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert (chip["passage_id"], chip["existence"], chip["quote"]) == (first["passage_id"], "ok", OLD)
+        assert await rows(client, "SELECT existence, passage_id FROM citations") == [("ok", first["passage_id"])]
+        client.provider.verdicts = lambda body: "1: supported"
+        response = await client.post("/api/citations/check", json={"run_id": run_id})
+        assert response.status_code == 202, response.text
+        [check] = response.json()["run_ids"]
+        assert (await run_finished(client, check))["status"] == "succeeded"
+
+
 async def test_a_replacement_by_a_file_read_already_moves_the_citation_to_that_reading(tmp_path):
     # Its sweep: a file whose reading is shared (read before, here the paper's first file) has no reading to commit,
     # so its version's addition points the citations as a reading's commit does.
