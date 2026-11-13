@@ -1297,9 +1297,14 @@
   "memory.savedLive": "已存入记忆",
   "memory.updated": "已更新记忆：{content}",
   "memory.updatedLive": "已更新记忆",
+  "memory.updatedFrom": "已更新记忆：{content}（替换了：{replaced}）",
   "memory.forgotten": {
     "other": "已忘记 {count} 条记忆"
   },
+  "memory.forgottenNamed": {
+    "other": "已忘记你的消息所指的 {count} 条记忆"
+  },
+  "memory.appliedBefore": "这条记忆指令已在消息首次发送时执行，因此没有再做改动。",
   "memory.memoryOff": "本项目的记忆已关闭，因此没有保存、更改或忘记任何内容。",
   "memory.noMatch": "没有匹配的记忆条目，因此没有改动。",
   "memory.noCandidate": "没有可以保存的先前回答。",

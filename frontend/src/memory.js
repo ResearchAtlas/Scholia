@@ -9,16 +9,20 @@ import { errorText } from './text.js';
 // A turn's memory actions (backend/runs.py Harness._memory_command, update_progress), as catalog keys.
 export const MEMORY_ACTIONS = { saved: 'memory.saved', updated: 'memory.updated', forgotten: 'memory.forgotten',
   memory_off: 'memory.memoryOff', no_match: 'memory.noMatch', no_candidate: 'memory.noCandidate',
-  declined: 'memory.declined', noted: 'memory.noted' };
+  declined: 'memory.declined', noted: 'memory.noted', applied_before: 'memory.appliedBefore' };
 
-// One action's lines: a saved or updated record's own text, read back from it; else the action in words.
+// One action's lines: a saved or updated record's own text, read back from it (and what an update replaced, while that
+// version is kept); a forget of the records the message's words named, said so; else the action in words.
 export function actionLines(t, item) {
   const key = MEMORY_ACTIONS[item.action];
   if (!key) return [];
   if ((item.action === 'saved' || item.action === 'updated') && item.records?.length) {
-    return item.records.map((record) => t(key, { content: record.content }));
+    return item.records.map((record) => (record.replaced != null
+      ? t('memory.updatedFrom', { content: record.content, replaced: record.replaced })
+      : t(key, { content: record.content })));
   }
   if (item.action === 'saved' || item.action === 'updated') return [t(`${key}Live`)];
+  if (item.action === 'forgotten' && item.named) return [t('memory.forgottenNamed', { count: item.count ?? 0 })];
   return [t(key, { count: item.count ?? 0 })];
 }
 

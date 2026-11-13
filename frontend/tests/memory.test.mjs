@@ -26,6 +26,17 @@ test('a turn\'s memory actions read back the records saved, and say the rest in 
   assert.deepEqual(actionLines(makeT('en'), { action: 'updated', records: [{ content: 'x' }] }), ['Updated in memory: x']);
 });
 
+test('a forget by its words, what an update replaced and a command Continue sent again are said', () => {
+  // M2 audit area 4, item 1: the forgotten record's content is gone, so the line says the message named it
+  assert.deepEqual(actionLines(t, { action: 'forgotten', count: 1, named: true }),
+    ['Forgot the memory record your message names']);
+  assert.deepEqual(actionLines(t, { action: 'updated',
+    records: [{ content: 'the sample is 35', replaced: 'the sample is 30' }] }),
+    ['Updated in memory: the sample is 35 (it replaced: the sample is 30)']);
+  assert.deepEqual(actionLines(t, { action: 'applied_before', count: 0 }), [t('memory.appliedBefore')]);
+  assert.notEqual(t('memory.appliedBefore'), 'memory.appliedBefore');
+});
+
 test('the live turn takes a memory event only as the backend sends it, after its commit', () => {
   const turn = apply({ text: 'Remember: x' }, { type: 'memory', action: 'saved', count: 1 });
   assert.deepEqual(turn.memory, [{ action: 'saved', count: 1 }]);

@@ -9,7 +9,7 @@ import pytest
 
 from scholia_app import MockProvider, background_idle, send, started
 from test_materials import project_of
-from test_memory import conversation_in, extracted, candidate, records, rows
+from test_memory import conversation_in, extracted, candidate, memory_off, records, rows, set_project
 
 pytestmark = pytest.mark.asyncio
 
@@ -750,3 +750,115 @@ async def test_a_forget_of_three_is_read_back_and_said_as_one_item(tmp_path, mon
         assert [json.loads(d)["count"] for (d,) in found] == [1, 1, 1]
         assert [e for e in stream if e.get("type") == "memory"] == [{"type": "memory", "action": "forgotten", "count": 3}]
         assert await _read_back(client, conversation) == [("forgotten", 3)]
+
+
+# M2 audit area 4, item 1 (Fable F1, P1): a forget deletes without an ask only the records its words name exactly
+# (normalized, as a save matches); words only like a record ask first, so Not now leaves it. Probe H's six cases.
+@pytest.mark.parametrize("stored, message", [
+    ("The sample is 30 interviews", "Forget that the sample is 35 interviews"),
+    ("We exclude studies before 2010", "Forget that we exclude studies before 2015"),
+    ("I prefer APA style citations", "Forget that I prefer Chicago style citations"),
+    ("我们的样本是30次访谈", "忘记：我们的样本是35次访谈"),
+    ("We use surveys instead of interviews", "Forget that idea, let's use surveys instead"),
+    ("We focus on the argument about wage effects",
+     "Forget about the formatting for now and focus on the argument about wage effects"),
+])
+async def test_a_forget_whose_words_are_only_like_a_record_asks_first_and_not_now_keeps_it(tmp_path, stored, message):
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        record = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content=stored, status="confirmed",
+            sources=[("project", project)]))
+        sending = asyncio.create_task(send(client, conversation, message))
+        ask = await open_ask(client, conversation)
+        assert ask["kind"] == "memory_forget" and [r["id"] for r in ask["params"]["records"]] == [record]
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "not_now"})
+        assert {"type": "memory", "action": "declined", "count": 0} in await sending
+        assert await rows(client, "SELECT content FROM memory_records WHERE id = ?", record) == [(stored,)]
+
+
+async def test_a_forget_by_a_records_own_words_says_so_and_continue_never_forgets_again(tmp_path):
+    # Probe E: Continue sends the message again; the record the words named is gone, and another, only like them, was
+    # deleted at once. Now the command is applied once along the chain, and said; the conversation names what went.
+    from backend import memory
+    from scholia_app import events
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        first, second = [await asyncio.to_thread(client.state["db"].write, lambda conn, text=text: memory.write(
+            conn, project_id=project, scope="project", kind="project_state", content=text, status="confirmed",
+            sources=[("project", project)]))
+            for text in ("The sample is 30 interviews", "The sample is 35 interviews with nurses")]
+        stream = await send(client, conversation, "Forget that the sample is 30 interviews")
+        assert {"type": "memory", "action": "forgotten", "count": 1} in stream
+        assert await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'") == [(second,)]
+        run = stream[0]["run_id"]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'cancelled', cancel_reason = 'revoked' WHERE id = ?", (run,)))
+        again = events(await client.post(f"/api/runs/{run}/continue"))
+        assert again[-1]["status"] == "succeeded"
+        assert await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'") == [(second,)]
+        assert {"type": "memory", "action": "applied_before", "count": 0} in again
+        turns = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert turns[0]["memory"] == [{"action": "forgotten", "count": 1, "records": [], "named": True}]
+        assert turns[1]["memory"] == [{"action": "applied_before", "count": 0, "records": []}]
+        assert first not in json.dumps(turns)
+
+
+async def test_continue_of_a_save_whose_steps_read_a_note_saves_the_first_message_once(tmp_path, monkeypatch):
+    # The auditor's site 6: Continue's text is the message and the notes its steps read; the command is the first
+    # message's words alone, applied once (also two Continues in a row)
+    from backend import budgets
+    from scholia_app import events
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Remember: my method is interviews")
+        run = stream[0]["run_id"]
+        for _ in range(2):
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                "UPDATE runs SET status = 'cancelled', cancel_reason = 'revoked' WHERE id = ?", (run,)))
+            monkeypatch.setattr(budgets, "read_notes", lambda conn, run_id: ["Also keep answers short"])
+            again = events(await client.post(f"/api/runs/{run}/continue"))
+            monkeypatch.undo()
+            assert {"type": "memory", "action": "applied_before", "count": 0} in again
+            run = again[0]["run_id"]
+        assert await rows(client, "SELECT content FROM memory_records WHERE type != 'progress'") == [
+            ("my method is interviews",)]
+
+
+async def test_a_command_not_applied_when_first_sent_is_applied_by_continue_from_the_first_words(tmp_path, monkeypatch):
+    from backend import budgets
+    from scholia_app import events
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await memory_off(client, project)
+        stream = await send(client, conversation, "Remember: my method is interviews")
+        assert {"type": "memory", "action": "memory_off", "count": 0} in stream
+        await set_project(client, project, {"memory.enabled": True})
+        run = stream[0]["run_id"]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'cancelled', cancel_reason = 'revoked' WHERE id = ?", (run,)))
+        monkeypatch.setattr(budgets, "read_notes", lambda conn, run_id: ["Also keep answers short"])
+        again = events(await client.post(f"/api/runs/{run}/continue"))
+        assert {"type": "memory", "action": "saved", "count": 1} in again
+        assert await rows(client, "SELECT content FROM memory_records WHERE type != 'progress'") == [
+            ("my method is interviews",)]
+
+
+async def test_an_update_or_correction_says_which_record_it_replaced(tmp_path):
+    # The auditor's site 3: update and correct still replace the record most like them (the old version is kept,
+    # superseded), and the conversation now shows what was replaced
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Remember: the pilot sample is 30 interviews")
+        await send(client, conversation, "Correct: the sample is 35 interviews")
+        turns = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        [item] = turns[1]["memory"]
+        assert item["action"] == "updated" and item["records"][0]["content"] == "the sample is 35 interviews"
+        assert item["records"][0]["replaced"] == "the pilot sample is 30 interviews"
+        assert "replaced" not in turns[0]["memory"][0]["records"][0]

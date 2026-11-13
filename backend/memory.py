@@ -392,9 +392,20 @@ def forget_candidates(conn, project_id, text=None, previous=None):
     return [(1.0, r) for r in (made or in_scope(conn, project_id, kinds=TYPES)[:1])][:3]
 
 
-def clear(scored):
-    """Whether a forget with text names one record clearly: much like it, or the only one fairly like it."""
-    return bool(scored) and (scored[0][0] >= 0.6 or (len(scored) == 1 and scored[0][0] >= 0.4))
+def named(conn, project_id, text):
+    """The records a forget's words name exactly (normalized, as a save command matches its record): only these are
+    forgotten without an ask; a forget whose words are only like a record asks first (M2 audit area 4, item 1)."""
+    return [r for r in in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"), kinds=TYPES)
+            if normalized(r["content"]) == normalized(text)]
+
+
+def replaced(conn, record):
+    """{"replaced": the text an update or correction command replaced}, while that version is kept, else {}: the
+    conversation shows which record the command's words chose (M2 audit area 4, item 1)."""
+    if record["structured"].get("command") not in ("update", "correct") or not record["supersedes_id"]:
+        return {}
+    found = conn.execute("SELECT content FROM memory_records WHERE id = ?", (record["supersedes_id"],)).fetchone()
+    return {"replaced": found[0]} if found else {}
 
 
 def previous_answer(conn, conversation_id, run_id):

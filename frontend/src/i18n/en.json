@@ -1341,10 +1341,16 @@
   "memory.savedLive": "Saved to memory",
   "memory.updated": "Updated in memory: {content}",
   "memory.updatedLive": "Updated in memory",
+  "memory.updatedFrom": "Updated in memory: {content} (it replaced: {replaced})",
   "memory.forgotten": {
     "one": "Forgot {count} memory record",
     "other": "Forgot {count} memory records"
   },
+  "memory.forgottenNamed": {
+    "one": "Forgot the memory record your message names",
+    "other": "Forgot the {count} memory records your message names"
+  },
+  "memory.appliedBefore": "This memory command was carried out when the message was first sent, so nothing more changed.",
   "memory.memoryOff": "Memory is off in this project, so nothing was saved, changed or forgotten.",
   "memory.noMatch": "No memory record matched, so nothing changed.",
   "memory.noCandidate": "There was no earlier answer to save.",

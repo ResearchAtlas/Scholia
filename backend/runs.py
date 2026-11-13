@@ -323,6 +323,23 @@ def _revoked(conn, run_id) -> bool:
     return row is not None and row[0] == "revoked"
 
 
+def _first_sent(conn, run_id):
+    """Along the Continue chain from a turn back to the one the researcher sent: (that turn's message text, whether a
+    turn of the chain applied its memory command). Each Continue sends the message again with the notes its steps read,
+    so only the first message holds the command's own words (M2 audit area 4, item 1)."""
+    text, applied, seen = "", False, set()
+    while run_id is not None and run_id not in seen:
+        seen.add(run_id)
+        row = conn.execute("SELECT user_message, retry_of_run_id FROM turns WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            break
+        applied = applied or conn.execute(
+            "SELECT 1 FROM run_events WHERE run_id = ? AND type = 'memory_proposed' AND json_extract(data, '$.command')"
+            " IS NOT NULL AND json_extract(data, '$.applied') = 1", (run_id,)).fetchone() is not None
+        text, run_id = (json.loads(row[0]) or {}).get("text", ""), row[1]
+    return text, applied
+
+
 def _let_go(conn, run_id):
     """A background run's terminal record takes out what its inputs hold only while it runs (`held`:
     a merge's record, backend/references.py), so nothing of it outlasts the run however it ends."""
@@ -689,11 +706,11 @@ class Harness:
         which run it continues, and its request tells the model why that run ended (not for a revoked one). Its
         recorded steps are not reused (M2 audit area 3, item 3: carrying them is reported, not built)."""
         from backend import budgets  # it imports this module
-        row, notes = await self._read(lambda conn: (conn.execute(
+        row, notes, (first, applied) = await self._read(lambda conn: (conn.execute(
             "SELECT t.conversation_id, t.user_message, r.status, r.cancel_reason,"
             " t.seq = (SELECT max(seq) FROM turns WHERE conversation_id = t.conversation_id), t.reason_code"
             " FROM turns t JOIN runs r ON r.id = t.run_id WHERE t.run_id = ?", (run_id,)).fetchone(),
-            budgets.read_notes(conn, run_id)))
+            budgets.read_notes(conn, run_id), _first_sent(conn, run_id)))
         if row is None:
             raise AdmissionError(404, "not_found", "No such turn")
         conversation_id, message, status, cancel_reason, latest, reason = row
@@ -706,6 +723,9 @@ class Harness:
         text = "\n\n".join([message.get("text", ""), *notes])
         claim = await self.admit_turn(conversation_id, text, model=model, provider=provider,
                                       effort=effort, retry_of=run_id, material_ids=message.get("material_ids"))
+        # a memory command is the first message's words alone, never the notes after them, and is applied once
+        asked = memory.command(first)
+        claim.context["command"] = {**asked, "applied": True} if asked and applied else asked
         # its request says why the previous run ended; a revoked run's ending is not carried (section 10)
         ended = _ENDED.get("interrupted" if status == "interrupted" else reason if cancel_reason == "limit" else None)
         if ended:
@@ -1608,12 +1628,13 @@ class Harness:
     async def _memory_command(self, claim, ctx, turn):
         """An explicit memory command in the researcher's message (memory.command), applied before any model call:
         a save, update or correction that carries its text is written at once, confirmed (the researcher's own
-        words); a forget whose text names one record clearly deletes it through the deletion service; a bare "save
-        this", "update this" or "forget this", or a forget naming no record clearly, asks first on the shared
-        confirmation, and only the researcher's answer saves or forgets (section 8, Words that count). With memory
-        off nothing is written. Each outcome is a content-free `memory_proposed` event (`command`; `applied` 1 when
-        something changed; a forget's, one for each record it deleted, in that deletion's commit), a `memory` stream
-        event, and a line in USER MEMORY telling the model what was done, so its answer confirms it; the conversation
+        words); a forget whose text is a record's own (normalized, as a save matches) deletes it through the deletion
+        service; a bare "save this", "update this" or "forget this", or a forget whose text is only like a record,
+        asks first on the shared confirmation, and only the researcher's answer saves or forgets (section 8, Words
+        that count; M2 audit area 4, item 1). A command Continue sends again is applied once: when a turn it continues
+        applied it, it is said, not applied again. With memory off nothing is written. Each outcome is a content-free
+        `memory_proposed` event (`command`; `applied` 1 when something changed; a forget's, one for each record it
+        deleted, in that deletion's commit, `named` when its words named them), a `memory` stream event, and a line in USER MEMORY telling the model what was done, so its answer confirms it; the conversation
         shows it read back from the record."""
         ctx["memory_notes"] = []
         asked = ctx.get("command")
@@ -1651,24 +1672,30 @@ class Harness:
             if said:
                 ctx["memory_notes"].append(said)
 
+        if asked.get("applied"):  # Continue: a turn it continues applied this command already (continue_turn)
+            return await done("applied_before", line="The researcher's memory command in this message was carried out "
+                                                     "when it was first sent: nothing more was saved, changed or "
+                                                     "forgotten now.")
         if not ctx["memory_on"]:
             return await done("memory_off", line="Memory is off in this project: nothing was saved, changed or forgotten.")
-        previous = await self._read(lambda conn: memory.previous_answer(conn, claim.conversation_id, claim.run_id))
+        previous =await self._read(lambda conn: memory.previous_answer(conn, claim.conversation_id, claim.run_id))
         if text is not None and action != "forget":
             return await done("saved" if action == "save" else "updated", change=lambda conn: memory.save_command(
                 conn, project_id=project_id, run_id=claim.run_id, action=action, text=text),
                 line=lambda did: f"{'Saved to' if did == 'saved' else 'Updated in'} memory at the researcher's request, "
                                  f"confirmed: {text}")
         if action == "forget":
-            scored = await self._read(lambda conn: memory.forget_candidates(conn, project_id, text, previous and previous[0]))
-            ids = [r["id"] for _, r in scored]
-            seen = {r["id"]: (r["version"], r["status"]) for _, r in scored}  # as decided, and as the ask names them
-            if text is not None and memory.clear(scored):
-                ids = ids[:1]
-            elif not ids:
+            scored, named = await self._read(lambda conn: (
+                memory.forget_candidates(conn, project_id, text, previous and previous[0]),
+                memory.named(conn, project_id, text) if text is not None else []))
+            # only the records its words name exactly go without an ask; words only like a record ask first
+            chosen = named or [r for _, r in scored]
+            ids = [r["id"] for r in chosen]
+            seen = {r["id"]: (r["version"], r["status"]) for r in chosen}  # as decided, and as the ask names them
+            if not ids:
                 return await done("no_match", line="The researcher asked to forget something, but no memory record "
                                                     "matches it: nothing was forgotten.")
-            else:
+            if not named:
                 reply = await self._ask(turn, "memory_forget", ["forget", "not_now"], {"records": ids}, None)
                 if (reply or {}).get("option") != "forget":
                     return await done("declined", line="Nothing was forgotten: the researcher chose not now.")
@@ -1708,7 +1735,8 @@ class Harness:
                             raise ValueError("changed")  # (or moved to another project with its conversation since)
                         # its record commits with it or not at all (cycle 3's B-R3-F1, design review M's Option 2)
                         _event(conn, claim.run_id, "memory_proposed", {"command": action, "applied": 1,
-                                                                       "action": "forgotten", "count": 1})
+                                                                       "action": "forgotten", "count": 1,
+                                                                       **({"named": 1} if named else {})})
                     try:
                         await asyncio.to_thread(deletion.delete, self.db, self.content, "memory", record,
                                                 check=as_seen, on_committed=committed)
