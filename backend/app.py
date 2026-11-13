@@ -105,9 +105,9 @@ async def _valid_text(request: Request):
         return
     try:
         stack = [await request.json()]
-    except ValueError:  # not JSON: the route's own parse answers it
-        return
-    while stack:  # a loop, not recursion: however deep the JSON, never RecursionError
+    except (ValueError, RecursionError):  # not JSON, or nested past what Python parses: the route's parse answers it
+        return  # (a route that takes no body ignores it)
+    while stack:  # a loop, not recursion, over what was parsed
         value = stack.pop()
         if isinstance(value, str) and not value.isascii():  # ASCII (a file's base64) is valid, and says so at once
             try:

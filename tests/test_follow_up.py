@@ -1328,6 +1328,9 @@ async def test_every_api_route_refuses_a_body_whose_text_holds_half_a_surrogate_
             refused = await raw(client, method, path, body)
             assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request"), path
         assert (await raw(client, "POST", "/api/projects", b'{"name": "a\\ud83d\\ude00b"}')).status_code == 201  # a pair
+        deep = b"[" * 50000 + b"]" * 50000  # past what Python parses: a route that takes no body ignores it, as before
+        assert (await raw(client, "GET", "/api/health", deep)).status_code == 200
+        assert (await raw(client, "POST", "/api/projects", deep)).status_code == 400
 
 
 async def test_one_runs_record_its_recovery_cannot_read_never_stops_the_others_or_the_launch(tmp_path, caplog):
@@ -1358,3 +1361,25 @@ async def test_one_runs_record_its_recovery_cannot_read_never_stops_the_others_o
             assert await rows(client, "SELECT status FROM runs WHERE id = ?", runs[bad]) == [("running",)]
     said = [r.getMessage() for r in caplog.records if runs[bad] in r.getMessage()]
     assert said and "Secret" not in caplog.text
+
+
+async def test_a_failing_write_still_stops_recovery_whole_rather_than_leaving_one_run_half_recovered(tmp_path):
+    # The internal review's second finding: only a record that cannot be read is left behind. Any other failure (here a
+    # constraint) rolls the whole recovery back as before, so a call in flight at the crash is still known to be one.
+    import sqlite3
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        run_id = (await send(client, conversation, "First?"))[0]["run_id"]
+        await background_idle(client)
+
+        def as_crashed(conn):
+            conn.execute("UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (run_id,))
+            conn.execute("CREATE TRIGGER refuse BEFORE UPDATE OF status ON runs BEGIN SELECT RAISE(ABORT, 'no'); END")
+        client.state["harness"].registry.finished.discard(run_id)
+        await asyncio.to_thread(client.state["db"].write, as_crashed)
+        with pytest.raises(sqlite3.IntegrityError):
+            await client.state["harness"].recover(kick=False)
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", run_id) == [("running",)]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute("DROP TRIGGER refuse"))
+        await client.state["harness"].recover(kick=False)
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", run_id) == [("interrupted",)]

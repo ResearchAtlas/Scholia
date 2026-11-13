@@ -512,7 +512,9 @@ class Harness:
                         " accounting = ? WHERE run_id = ?",
                         ("cancelled" if revoked else "interrupted",
                          json.dumps(_accounting(conn, run_id, complete=run_id not in in_flight)), run_id))
-                except (sqlite3.Error, ValueError) as error:  # never the message: it can hold the record's text
+                except (sqlite3.OperationalError, UnicodeError) as error:  # never the message: it can hold the text
+                    if isinstance(error, sqlite3.OperationalError) and not str(error).startswith("Could not decode"):
+                        raise  # a locked, full or failing database stops the launch, as before
                     conn.execute("ROLLBACK TO recover_run")
                     log.warning("run %s not recovered (%s); the others were", run_id, type(error).__name__)
                 conn.execute("RELEASE recover_run")
