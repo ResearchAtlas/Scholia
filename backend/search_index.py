@@ -13,6 +13,8 @@ thread makes every change, in order; searches read on connections of their own.
   record's content (backend/memory.py), keyed by `memory_rows` (its rowid, the record's id and scope; no text). Written by
   index runs (backend/search.py), removed through the queue (target `memory`) with the deletion's or replacement's
   commit, checked gone; at open, every row of a record the main database no longer holds active goes (_purge).
+  `memory_refused`: a record whose content the helper refused, with the digest of that content (no text): not asked
+  for again while its content and the model are unchanged; it goes with the record's row and the vectors.
 - `index_rows`: the rowid the two share for one project's passage, its material and kind, a digest
   of its index text and whether it is embedded (1), not yet (0), or refused by the helper (-1: not
   asked for again while its text and the model are unchanged; a changed text or dropped vectors set it
@@ -114,6 +116,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory USING vec0(
     scope TEXT PARTITION KEY, +memory_id TEXT, embedding float[{DIMENSIONS}] distance_metric=cosine);
 CREATE TABLE IF NOT EXISTS memory_rows (id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id TEXT NOT NULL UNIQUE,
     scope TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS memory_refused (memory_id TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
 """
 
 
@@ -534,7 +537,8 @@ class SearchIndex:
                     if pid not in grants[project]:
                         removed += self._remove(project, pid)
         if self.vectors:  # S1-21a: a memory record's vector, of a record no longer held active in the main database
-            held = [m for (m,) in self._conn.execute("SELECT memory_id FROM memory_rows")]
+            held = [m for (m,) in self._conn.execute("SELECT memory_id FROM memory_rows UNION SELECT memory_id FROM"
+                                                      " memory_refused")]
             active = self.db.read(lambda conn: {m for (m,) in conn.execute(
                 "SELECT id FROM memory_records WHERE status IN ('confirmed', 'inferred')"
                 " AND id IN (SELECT value FROM json_each(?))", (json.dumps(held),))}) if held else set()
@@ -566,7 +570,7 @@ class SearchIndex:
         with self._conn:
             if self.vectors:
                 self._conn.execute("DROP TABLE IF EXISTS vec_passages; DROP TABLE IF EXISTS vec_memory;"
-                                   " DROP TABLE IF EXISTS memory_rows")
+                                   " DROP TABLE IF EXISTS memory_rows; DROP TABLE IF EXISTS memory_refused")
                 self._conn.execute(VECTORS)
             self._conn.execute("UPDATE index_rows SET embedded = 0")
             self._meta(**self.identity)
@@ -933,18 +937,23 @@ class SearchIndex:
         return [row[0]]
 
     def _remove_memory(self, memory_id):
-        """A memory record's vector and row, in the pass's transaction, checked gone (rowids are never reused)."""
+        """A memory record's vector and row, and its refusal, in the pass's transaction, checked gone (rowids are never
+        reused)."""
         if not self.vectors:
             return []
+        # its refusal's digest, as the removed rows, leaves the file with the checkpoint after the pass
+        removed = [memory_id] if self._conn.execute("DELETE FROM memory_refused WHERE memory_id = ? RETURNING memory_id",
+                                                    (memory_id,)).fetchall() else []
         row = self._conn.execute("SELECT id FROM memory_rows WHERE memory_id = ?", (memory_id,)).fetchone()
-        if row is None:
-            return []
-        self._conn.execute("DELETE FROM vec_memory WHERE rowid = ?", (row[0],))
-        self._conn.execute("DELETE FROM memory_rows WHERE id = ?", (row[0],))
-        if self._conn.execute("SELECT (SELECT count(*) FROM vec_memory WHERE rowid = ?1)"
-                              " + (SELECT count(*) FROM memory_rows WHERE id = ?1)", (row[0],)).fetchone()[0]:
+        if row is not None:
+            self._conn.execute("DELETE FROM vec_memory WHERE rowid = ?", (row[0],))
+            self._conn.execute("DELETE FROM memory_rows WHERE id = ?", (row[0],))
+            removed.append(row[0])
+        if self._conn.execute("SELECT (SELECT count(*) FROM vec_memory WHERE rowid = ?1) + (SELECT count(*) FROM"
+                              " memory_rows WHERE id = ?1) + (SELECT count(*) FROM memory_refused WHERE memory_id = ?2)",
+                              (row[0] if row else None, memory_id)).fetchone()[0]:
             raise CleanupFailed()
-        return [row[0]]
+        return removed
 
     def _verify(self, rowid):
         """Inside the pass's transaction, as a row is removed: nothing of it is left in any table, or
@@ -1060,6 +1069,28 @@ class SearchIndex:
         return {m for (m,) in self._read(lambda conn: conn.execute(
             "SELECT memory_id FROM memory_rows WHERE memory_id IN (SELECT value FROM json_each(?))",
             (json.dumps(sorted(memory_ids)),)).fetchall())}
+
+    def memory_refused(self, marks):
+        """The ones of marks ({memory id: digest of its content}) whose refusal is kept for that content."""
+        if not self.vectors or not marks:
+            return set()
+        return {m for m, mark in self._read(lambda conn: conn.execute(
+            "SELECT memory_id, digest FROM memory_refused WHERE memory_id IN (SELECT value FROM json_each(?))",
+            (json.dumps(sorted(marks)),)).fetchall()) if marks.get(m) == mark}
+
+    def refuse_memory(self, memory_id, mark, still=None):
+        """Keep the helper's refusal of a record's content (its digest), while still([memory id]) holds it (asked of the
+        main database in the writer: the record is active). Returns whether it was kept."""
+        return self._write(self._refuse_memory, memory_id, mark, still)
+
+    def _refuse_memory(self, memory_id, mark, still):
+        if self.unusable:
+            raise Unavailable()
+        if not self.vectors or self.building or (still is not None and memory_id not in still([memory_id])):
+            return False
+        with self._conn:
+            self._conn.execute("INSERT OR REPLACE INTO memory_refused (memory_id, digest) VALUES (?, ?)", (memory_id, mark))
+        return True
 
     def store_memory(self, embedded, still=None):
         """Write [(memory id, scope, vector)] in one transaction, each only while still(memory id) holds (asked of the

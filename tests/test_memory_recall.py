@@ -396,6 +396,46 @@ async def test_the_opening_rebuild_asks_for_the_runs_of_what_lacks_vectors_once_
         gate.set()
 
 
+async def test_a_memory_record_the_helper_refuses_is_asked_for_again_only_once_its_text_or_the_model_changes(
+        tmp_path, monkeypatch):
+    # batch 1 (PR 60 recheck 2): its refusal is kept for its text, as a passage's is, so no launch asks for it again;
+    # an edit (a new version) or another model asks once more. Recall reads it as without a vector throughout.
+    from test_search import app, runs_of
+    text = "Wage floors raise the earnings of low-paid workers"
+    async with app(tmp_path) as client:
+        client.remote.refuse = "Wage floors"
+        project = await project_of(client)
+        record = (await entered(client, project, text))["id"]
+        await background_idle(client)
+        assert [r["status"] for r in await runs_of(client, "index", project)] == ["succeeded"]
+        assert await asyncio.to_thread(client.state["index"].memory_embedded, [record]) == set()
+    for _ in range(2):
+        async with app(tmp_path) as client:
+            client.remote.refuse = "Wage floors"
+            await background_idle(client)
+            assert len(await runs_of(client, "index", project)) == 1
+    real = search.identity
+    monkeypatch.setattr(search, "identity", lambda config: {**real(config), "revision": "another"})
+    async with app(tmp_path) as client:  # another model: asked for once more, and embedded this time
+        assert await _vectors(client, [record]) == {record}
+        assert len(await runs_of(client, "index", project)) == 2
+        client.remote.refuse = "earnings"
+        response = await client.patch(f"/api/memory/{record}", json={"version": 1, "content": text + " in 2024"})
+        assert response.status_code == 200, response.text
+        edited = response.json()["id"]
+        await background_idle(client)
+        assert await asyncio.to_thread(client.state["index"].memory_embedded, [edited]) == set()  # refused: no vector
+    async with app(tmp_path) as client:  # the same model as the launch before
+        client.remote.refuse = "earnings"
+        await background_idle(client)
+        assert len(await runs_of(client, "index", project)) == 3  # the edit's own run; the launch asks for none
+        marks = lambda: asyncio.to_thread(client.state["index"]._read, lambda conn: conn.execute(  # noqa: E731
+            "SELECT memory_id FROM memory_refused").fetchall())
+        assert await marks() == [(edited,)]
+        assert (await forget(client, edited)).json() == {"ok": True}
+        assert await marks() == []  # the refusal's digest goes with the record
+
+
 async def test_a_whole_rebuild_while_the_app_runs_asks_for_the_runs_of_memory_it_dropped(tmp_path):
     # M2 audit area 2: the rebuilt file's runs (index.rebuilt) take the projects whose memory lacks vectors too
     from test_search import app

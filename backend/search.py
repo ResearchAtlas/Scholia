@@ -288,16 +288,23 @@ def _memory_pending(index, read=True):
     if not index.vectors:
         return set()
     found, first = index.db.read(lambda conn: (conn.execute(
-        "SELECT id, project_id FROM memory_records WHERE status IN (SELECT value FROM json_each(?))"
+        "SELECT id, project_id, content FROM memory_records WHERE status IN (SELECT value FROM json_each(?))"
         " AND type IN (SELECT value FROM json_each(?))", (json.dumps(memory.ACTIVE), json.dumps(memory.RECALLED))).fetchall(),
         conn.execute("SELECT id FROM projects ORDER BY id LIMIT 1").fetchone()))
     have = set()
     if read and found:
         try:
-            have = index.memory_embedded([m for m, _ in found])
+            have = _memory_done(index, {m: content for m, _, content in found})
         except Exception as error:  # unreadable now (being replaced): every record is taken as pending
             log.warning("the search index's memory could not be read (%s)", type(error).__name__)
-    return {project or (first[0] if first else None) for m, project in found if m not in have} - {None}
+    return {project or (first[0] if first else None) for m, project, _ in found if m not in have} - {None}
+
+
+def _memory_done(index, contents):
+    """The ones of contents ({memory id: its content}) with a vector, or with the helper's refusal of that content kept
+    (asked for again only once the content, a new version, or the model changes, as a passage's refusal)."""
+    return index.memory_embedded(list(contents)) | index.memory_refused(
+        {m: digest(content) for m, content in contents.items()})
 
 
 async def _embed_all(state):
@@ -625,7 +632,7 @@ async def _embed_memory(state, harness, active, project_id, drained):
         return [(r["id"], "personal" if r["scope"] == "personal" else f"project:{project_id}", r["content"])
                 for r in memory.in_scope(conn, project_id, kinds=memory.RECALLED)]
     records = await asyncio.to_thread(db.read, wanted)
-    have = await asyncio.to_thread(index.memory_embedded, [m for m, _, _ in records]) if records else set()
+    have = await asyncio.to_thread(_memory_done, index, {m: content for m, _, content in records}) if records else set()
     stored = 0
     for memory_id, scope, content in (r for r in records if r[0] not in have):
         def admit(conn, memory_id=memory_id):
@@ -633,7 +640,9 @@ async def _embed_memory(state, harness, active, project_id, drained):
             return tuple(row or ()) == ("running", None) and memory_id in _active_memory(conn, [memory_id], project_id)
         try:
             [vector] = await local_helper.embed(state, [content], project_id=project_id, admit=admit)
-        except InputRefused:
+        except InputRefused:  # its content, refused as such: kept, while the record is still of this scope
+            await drained(index.refuse_memory, memory_id, digest(content),
+                          lambda ids: db.read(lambda conn: _active_memory(conn, ids, project_id)))
             continue
         except HelperUnavailable as unavailable:  # as for a passage (_index_run): refused by the check, or failed
             def now(conn, memory_id=memory_id):
