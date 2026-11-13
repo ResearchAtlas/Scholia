@@ -230,6 +230,24 @@ async def test_a_full_backup_never_holds_a_key_typed_into_a_settings_file(tmp_pa
     assert b"citation_style" in read(export, "settings/config.toml") and b"#" not in read(export, "settings/config.toml")
 
 
+async def test_the_zotero_switch_survives_a_full_backup_and_its_restore(tmp_path):
+    # M2 audit 6 F2: [zotero] was an open section, which the archive's filter (known_only) leaves out
+    from backend import zotero
+    data, destination = tmp_path / "data", tmp_path / "chosen"
+    destination.mkdir()
+    async with started(data) as client:
+        current = (await client.get("/api/settings")).json()
+        saved = await client.put("/api/settings", json={"hash": current["hash"], "updates": {"zotero.enabled": False}})
+        assert saved.status_code == 200, saved.text
+        run = await archived_run(client, "/api/backups/full", {"destination": str(destination)})
+        assert run.status == "succeeded", run
+        assert b"enabled = false" in read(destination / run.result["file"].rsplit("/", 1)[1], "config.toml")
+        response = await client.post("/api/backups/restore", json={"file": run.result["file"]})
+        assert response.status_code == 200, response.text
+        assert not zotero.enabled(data)
+        assert (await client.get("/api/zotero/status")).json() == {"state": "off"}
+
+
 async def test_a_full_backup_is_recorded_before_anything_is_written_and_removed_if_it_fails(tmp_path, monkeypatch):
     import errno
     import backend.db.database as database_module
