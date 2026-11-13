@@ -14,7 +14,7 @@ import pytest
 import backend.db.database as database_module
 import backend.db.deletion as deletion_module
 from backend.db import DB_NAME, ContentStore, Database, delete, new_id
-from backend.db.content import referenced_sql
+from backend.db.content import IDLE_AFTER, referenced_sql
 from backend.db.deletion import DELETE, KINDS, NOT_DELETED, ON_DELETE
 from backend.db.migrations import MIGRATIONS
 from backend.extraction import PDF, extractor_of
@@ -309,7 +309,8 @@ def test_a_file_put_again_and_named_by_a_new_record_while_the_deletion_collects_
                 db.write(lambda conn: conn.execute(
                     "INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current)"
                     " VALUES (?, ?, 1, ?, 0)", (new_id(), other, again[0])))
-            past = time.time() - 60  # the clock set back a minute while it was put
+            # the clock set back past the idle window while it was put, so only the put counter keeps the file
+            past = time.time() - IDLE_AFTER.total_seconds() - 60
             os.utime(self._path(again[0]), (past, past))
         yield from real(self)
 
