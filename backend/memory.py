@@ -180,6 +180,32 @@ def allowed(conn, project_id, record_ids, versions=None):
     return True
 
 
+def _automatic(conn, record):
+    """Whether a record's version is an extraction's own write (section 8's automatic replacement, or its confirmation of
+    what was only inferred), never the researcher's: an edit, a Keep and a command each are written by no memory run, or
+    carry a source from the researcher."""
+    return conn.execute(
+        "SELECT 1 FROM memory_records m JOIN runs r ON r.id = m.created_by_run_id WHERE m.id = ? AND r.workflow = 'memory'"
+        " AND NOT EXISTS (SELECT 1 FROM memory_sources s WHERE s.memory_id = m.id AND s.source_kind = 'researcher')",
+        (record,)).fetchone() is not None
+
+
+def _left_alone(conn, target, since):
+    """Whether the researcher has not changed a record since an extraction started then (section 8's third condition):
+    it has not changed since, or every version of it written since is an extraction's own and the current one is as
+    it was written (an earlier extraction's write is no edit of the researcher's; M2 audit area 4, item 3)."""
+    if target["updated_at"] <= since:
+        return True
+    if target["updated_at"] != target["created_at"]:  # changed in place since it was written (a Keep, a move)
+        return False
+    current = target
+    while current is not None and current["created_at"] > since:
+        if not _automatic(conn, current["id"]):
+            return False
+        current = row(conn, current["supersedes_id"]) if current["supersedes_id"] else None
+    return True
+
+
 def scope_for(conn, project_id, kind):
     """Personal for profile and preference, unless the project is Private or Local only: its records stay its own
     (nothing from it reaches another project's request)."""
@@ -647,7 +673,7 @@ def apply_extraction(conn, run_id, candidates):
                     status = "proposed"
             authoritative = status == "confirmed" or (status == "inferred" and target["status"] in ("inferred", "proposed"))
             newer = turn_started > _latest_turn(conn, target)
-            untouched = target["updated_at"] <= run_started
+            untouched = _left_alone(conn, target, run_started)
             if authoritative and newer and untouched and not late:
                 written.append(write(conn, project_id=project_id, scope=target["scope"], kind=target["type"],
                                      content=candidate["content"], status=status, sources=sources, run_id=run_id,

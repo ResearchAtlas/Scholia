@@ -93,6 +93,31 @@ async def test_an_earlier_turns_extraction_finishing_last_waits_as_a_proposal_ma
         assert (await state(client))["The sample is 40 interviews"][0] == "superseded"
 
 
+async def test_overlapping_extractions_the_later_turns_replaces_the_earlier_ones_when_the_earlier_finishes_first(
+        tmp_path):
+    # Section 14's opposite order with both extractions running at once (M2 audit area 4, item 3, astra F2): an earlier
+    # extraction's own write is no edit of the researcher's, so the later turn's statement ends up active
+    provider = MockProvider()
+    earlier, later = asyncio.Event(), asyncio.Event()
+    async with started(tmp_path / "data", provider) as client:
+        project, conversation, record = await setup(client)
+        reply(provider, says("The sample is 35 interviews", record), release=earlier)
+        reply(provider, says("The sample is 40 interviews", record), release=later)
+        first = await send(client, conversation, "The sample is 35 interviews")
+        await wait_for(lambda: provider.extractions)
+        await send(client, conversation, "The sample is 40 interviews")
+        await wait_for(lambda: len(provider.extractions) == 2)
+        earlier.set()
+        while not await rows(client, "SELECT 1 FROM runs WHERE workflow = 'memory' AND source_turn_id = ?"
+                                     " AND status = 'succeeded'", first[0]["run_id"]):
+            await asyncio.sleep(0.02)
+        later.set()
+        await background_idle(client)
+        assert await state(client) == {"the sample is 30 interviews": ("superseded", False, False),
+                                       "The sample is 35 interviews": ("superseded", False, False),
+                                       "The sample is 40 interviews": ("confirmed", False, False)}
+
+
 @pytest.mark.parametrize("later", ["Correct: the sample is 50 interviews", "Forget: the sample is 30 interviews"])
 async def test_an_extraction_finishing_after_a_later_command_stores_only_a_proposal_and_restores_nothing(tmp_path, later):
     provider = MockProvider()
