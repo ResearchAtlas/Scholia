@@ -11,8 +11,10 @@ import { useAction } from '../action.js';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 
-// target: { kind: "project", "conversation" or "material", id, title, body }, or null when closed.
-export function DeleteDialog({ target, onClose, onDone }) {
+// target: { kind: "project", "conversation" or "material", id, title, body }, or null when closed. onSettled, if given,
+// is called as soon as the deletion's request ends, however it ends (deleted, deleted with something to say, or
+// failed: it may have been deleted all the same), before the dialog closes (M2 audit, area 1, design review F's rider 1).
+export function DeleteDialog({ target, onClose, onDone, onSettled }) {
   const t = useT();
   const traceId = useId();
   const [removeAllTrace, setRemoveAllTrace] = useState(false);
@@ -27,6 +29,7 @@ export function DeleteDialog({ target, onClose, onDone }) {
 
   async function remove(everywhere) {
     const result = await run(() => api('DELETE', deletePath(target.kind, target.id, { everywhere, removeAllTrace })));
+    onSettled?.(target.id);
     if (!result) return;
     const said = deletionNotices(result);
     if (said.length) setNotices(said); // deleted, but not wholly: say so before it closes

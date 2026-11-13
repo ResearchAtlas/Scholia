@@ -283,6 +283,28 @@ test('a library change drops chosen papers deleted since and retitles the others
   }
 });
 
+// Round 2 (R5; design review F's test 6): a change while nothing is chosen still moves the papers' generation, so an
+// older read never retitles papers chosen after it.
+test('a read asked before a change made with nothing chosen never retitles a paper chosen after it', async () => {
+  const original = globalThis.fetch;
+  let late;
+  globalThis.fetch = () => new Promise((resolve) => { late = resolve; });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  try {
+    choosePapers('p1', [{ id: 'a', title: 'A' }]);
+    libraryChanged('p1'); // its read, R0, waits
+    choosePapers('p1', []);
+    libraryChanged('p1'); // nothing chosen: no read, but a new generation
+    choosePapers('p1', [{ id: 'b', title: 'B, as it is now' }]);
+    late({ ok: true, json: async () => ({ materials: [{ id: 'b', title: 'B, as it was' }] }) });
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'b', title: 'B, as it is now' }]);
+  } finally {
+    globalThis.fetch = original;
+    choosePapers('p1', []);
+  }
+});
+
 test('papers chosen for the next message are one project\'s, kept once each, and a cited paper opens once', () => {
   let heard = 0;
   const stop = watchChosen(() => { heard += 1; });

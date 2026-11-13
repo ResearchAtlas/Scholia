@@ -115,7 +115,25 @@ async function upload(projectId, files, { conversationId, materialId, replaces }
 // memoryChanged), and every view, question and read guard drops what it shows and reads again. detail: the project,
 // or null for every project.
 export const libraryEvents = new EventTarget();
-export const libraryChanged = (projectId) => libraryEvents.dispatchEvent(new CustomEvent('changed', { detail: projectId }));
+// M2 audit, area 1 (design review F, option 2.2, pending Harold): a change to the papers moves the papers' generation
+// at once, before any listener runs, and the chosen papers lose their titles in the same step (one may be a deleted
+// paper's), so no holder can miss a change, move its own count late, or show a title from before it. What the Library
+// and the message box show of the papers is read through libraryRead.js, which shows only what was read in the current
+// generation. A memory change moves no generation (memory.js): the Library holds no memory text.
+let generation = 0;
+export const libraryGeneration = () => generation;
+export function watchLibrary(listener) {
+  libraryEvents.addEventListener('changed', listener);
+  return () => libraryEvents.removeEventListener('changed', listener);
+}
+export function libraryChanged(projectId) {
+  generation += 1;
+  const asked = generation;
+  const mine = chosen.papers.length > 0 && (projectId === null || projectId === chosen.projectId);
+  if (mine) choosePapers(chosen.projectId, chosen.papers.map((paper) => ({ id: paper.id, title: null })));
+  libraryEvents.dispatchEvent(new CustomEvent('changed', { detail: projectId }));
+  if (mine) retitleChosen(asked);
+}
 
 // S1-19b (Harold, 2026-10-21: no client-held derived state): which reads of a view may be shown after library
 // changes. libraryChanged() starts a new generation at once, in the change's own handler; ask() is called as a
@@ -154,29 +172,24 @@ export function watchChosen(listener) {
 }
 export const MAX_CHOSEN = 50; // as the backend takes them (backend/app.py Message.material_ids)
 
-// M2 audit, area 1 (no client-held derived state): a change to the chosen papers' project drops their titles at once
-// (one may be a deleted paper's), then drops those deleted since and gives the others their titles now, from its
-// papers read again. A read that fails keeps their ids, untitled (the composer names each "a chosen paper"):
-// dropping them would send the next message unrestricted (slice-1 spec: literature restricted to the selection), and
-// the backend refuses a deleted one (selection_invalid). A read asked before a later change, or once another
-// project's papers are chosen, is not applied.
-const reconciled = newest();
-libraryEvents.addEventListener('changed', async (event) => {
+// The chosen papers after a change (libraryChanged): those deleted since are dropped and the others take their titles
+// now, from the project's papers read again. A read that fails keeps their ids, untitled (the composer names each "a
+// chosen paper"): dropping them would send the next message unrestricted (slice-1 spec: literature restricted to the
+// selection), and the backend refuses a deleted one (selection_invalid). An answer is applied only in the generation it
+// was asked in, to the papers chosen when it was asked, and only while the same project's papers are chosen.
+async function retitleChosen(asked) {
   const { projectId, papers } = chosen;
-  if (!papers.length || (event.detail !== null && event.detail !== projectId)) return;
-  const current = reconciled();
-  const asked = new Set(papers.map((paper) => paper.id));
-  choosePapers(projectId, papers.map((paper) => ({ id: paper.id, title: null })));
+  const ids = new Set(papers.map((paper) => paper.id));
   let titles;
   try {
     titles = new Map((await get(`/api/projects/${encodeURIComponent(projectId)}/materials`)).materials.map((m) => [m.id, m.title]));
   } catch {
     return;
   }
-  if (!current() || chosen.projectId !== projectId) return;
-  choosePapers(projectId, chosen.papers.filter((paper) => !asked.has(paper.id) || titles.has(paper.id))
-    .map((paper) => (titles.has(paper.id) ? { ...paper, title: titles.get(paper.id) } : paper)));
-});
+  if (asked !== generation || chosen.projectId !== projectId) return;
+  choosePapers(projectId, chosen.papers.filter((paper) => !ids.has(paper.id) || titles.has(paper.id))
+    .map((paper) => (ids.has(paper.id) ? { ...paper, title: titles.get(paper.id) } : paper)));
+}
 
 // S1-19b: a cited paper opened at its passage, from an answer's chip: the Library shows it when it is
 // next drawn for its project, or at once when it is open.

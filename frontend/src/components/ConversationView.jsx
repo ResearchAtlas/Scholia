@@ -16,6 +16,7 @@ import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
 import { messageRoute } from '../settings.js';
+import { useLibraryRead } from '../libraryRead.js';
 import { ACCEPT, afterAsksRead, asksChanged, choosePapers, chosenPapers, followAsks, libraryChanged, libraryEvents, newest, NO_ASKS, openPaperAt,
   readGuard, readGuardedAsks, pollsAsks, watchChosen } from '../library.js';
 import { addTo } from './Library.jsx';
@@ -594,35 +595,13 @@ function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
 const MENTION = /(^|\s)@([^\s@]*)$/u;
 
 function useMention(projectId, text) {
-  const [read, setRead] = useState(null); // { projectId, papers }: the project's papers, read when an @ is first typed
-  // M2 audit, area 1: a library change drops them at once, and an answer to a read asked before it (readGuard), and
-  // they are read again
-  const [generation, setGeneration] = useState(0);
-  const [guard] = useState(readGuard);
   const [picked, setPicked] = useState({ query: '', index: 0 }); // the highlighted paper, for the query it was moved at
   const [closed, setClosed] = useState(null); // the text an Escape closed the list at
   const typed = projectId && closed !== text ? MENTION.exec(text) : null;
-  const papers = read?.projectId === projectId ? read.papers : null;
-  const wanted = Boolean(typed) && !papers;
-  useEffect(() => {
-    const changed = (event) => {
-      if (event.detail !== null && event.detail !== projectId) return;
-      guard.libraryChanged();
-      setRead(null);
-      setGeneration((n) => n + 1);
-    };
-    libraryEvents.addEventListener('changed', changed);
-    return () => libraryEvents.removeEventListener('changed', changed);
-  }, [projectId, guard]);
-  useEffect(() => {
-    if (!wanted) return undefined;
-    let live = true;
-    const settle = guard.ask();
-    get(`/api/projects/${encodeURIComponent(projectId)}/materials`).then(
-      (found) => live && settle(true) && setRead({ projectId, papers: found.materials.map((m) => ({ id: m.id, title: m.title })) }),
-      () => live && settle(false) && setRead({ projectId, papers: [] }));
-    return () => { live = false; };
-  }, [wanted, projectId, generation, guard]);
+  // The project's papers, read while an @ is typed, through libraryRead.js: a change drops them at once, and nothing
+  // read before it is offered (M2 audit, area 1, design review F's option 2.2). A read that fails offers none.
+  const read = useLibraryRead(typed ? projectId : null, () => get(`/api/projects/${encodeURIComponent(projectId)}/materials`));
+  const papers = read.value ? read.value.materials.map((m) => ({ id: m.id, title: m.title })) : read.error ? [] : null;
   const query = typed?.[2].toLocaleLowerCase() ?? '';
   const matching = (papers ?? []).filter((paper) => (paper.title ?? '').toLocaleLowerCase().includes(query)).slice(0, 8);
   const open = Boolean(typed && papers);

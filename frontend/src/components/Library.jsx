@@ -10,9 +10,12 @@ import { ApiError, get, post } from '../api.js';
 import { useAction } from '../action.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { ACCEPT, addFiles, authorNames, choosePapers, chosenPapers, detailsSource, latestLookup, libraryEvents, newest, ocrPages,
-  readGuard, reasonKey, sortFiles, stateKey, takeOpening, typeKey, unsettled, uploadsWaiting, watchChosen, watchUploads,
-  yearOf } from '../library.js';
+import { ACCEPT, addFiles, authorNames, choosePapers, chosenPapers, detailsSource, latestLookup, libraryChanged, libraryEvents,
+  newest, ocrPages, reasonKey, sortFiles, stateKey, takeOpening, typeKey, unsettled, uploadsWaiting, watchChosen,
+  watchUploads, yearOf } from '../library.js';
+import { useLibraryRead } from '../libraryRead.js';
+import { problemText } from '../action.js';
+import { DeleteDialog } from './DeleteDialog.jsx';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
 import { AddMenu } from './AddMenu.jsx'; // S1-14: Add offers a reference file
@@ -27,52 +30,20 @@ import { LocalOnlySearchNote } from './LocalHelper.jsx';
 
 const POLL_MS = 1500; // while a paper is read, a lookup runs or a question waits
 
-// Reads the project's papers, again while anything is under way and whenever they change. Only the
-// newest read's answer is kept: one asked for another project, or before a later read, is dropped. After a
-// change (library.js readGuard), a read asked before it is never shown, and one that fails before a read asked
-// after it succeeds drops the papers shown (Harold, 2026-10-21: a failed reload never shows old text), whichever
-// read it was. forget(id) takes a deleted paper out of the papers shown at once.
+// Reads the project's papers, again while anything is under way and whenever they change: what libraryRead.js shows
+// (only the newest read of the papers' current generation: after a change nothing read before it, loading until a
+// read asked after it answers, and a failed one shows the error and nothing old).
 export function useLibrary(projectId) {
-  const [listing, setListing] = useState(null);
-  const [problem, setProblem] = useState(null);
-  const [reads, setReads] = useState(0);
-  const [asked] = useState(newest);
-  const [guard] = useState(readGuard);
-  const load = useCallback(async () => {
-    const current = asked();
-    const settle = guard.ask();
-    if (!projectId) return;
-    try {
-      const found = await get(`/api/projects/${encodeURIComponent(projectId)}/materials`);
-      if (!current() || !settle(true)) return;
-      setListing(found);
-      setProblem(null);
-    } catch (error) {
-      if (!current() || !settle(false)) return;
-      setProblem(error instanceof ApiError ? error.code : 'internal');
-      if (guard.changed()) setListing(null);
-    } finally {
-      if (current()) setReads((n) => n + 1);
-    }
-  }, [projectId, asked, guard]);
-  useEffect(() => { setListing(null); load(); }, [load]);
-  useEffect(() => {
-    const changed = (event) => {
-      if (event.detail !== null && event.detail !== projectId) return;
-      guard.libraryChanged();
-      load();
-    };
-    libraryEvents.addEventListener('changed', changed);
-    return () => libraryEvents.removeEventListener('changed', changed);
-  }, [projectId, load, guard]);
+  const read = useLibraryRead(projectId || null, () => get(`/api/projects/${encodeURIComponent(projectId)}/materials`));
+  const listing = read.value;
+  const problem = read.error ? (read.error instanceof ApiError ? read.error.code : 'internal') : null;
+  const load = read.reload;
   useEffect(() => {
     if (!unsettled(listing) && !problem) return undefined;
     const timer = setTimeout(load, POLL_MS);
     return () => clearTimeout(timer);
-  }, [listing, problem, reads, load]);
-  const forget = useCallback((id) => setListing((shown) => shown && { ...shown,
-    materials: shown.materials.filter((material) => material.id !== id) }), []);
-  return { listing, problem, load, forget };
+  }, [listing, read.error, load]);
+  return { listing, problem, load };
 }
 
 // Adds files to the project, after leaving out those Scholia does not read: resolves to the
@@ -93,7 +64,10 @@ export async function addTo(projectId, fileList, t, notify, options) {
 
 export function Library({ project }) {
   const t = useT();
-  const { listing, problem, load, forget } = useLibrary(project?.id);
+  const { listing, problem, load } = useLibrary(project?.id);
+  const [deleting, setDeleting] = useState(null); // the paper whose delete dialog is open, above the read (rider 1)
+  const [saved, setSaved] = useState(null); // the paper whose details were just saved: its page is drawn again
+  const [paperNotice, setPaperNotice] = useState(null); // what a paper's own action said, kept as its page is drawn again
   const [open, setOpen] = useState(null); // the paper whose page is shown: { id, target } (a result's passage)
   const index = useIndex(project?.id, listing);
   const search = useSearch(project?.id);
@@ -114,18 +88,33 @@ export function Library({ project }) {
     setNotice(null);
     const result = await addTo(project.id, files, t, setNotice);
     if (result?.materials.some((m) => m.existing)) setNotice(t('library.alreadyHere'));
-    load();
+    if (result) libraryChanged(project.id);
   }
 
+  // A paper's delete dialog stays open above the read with its notice or its error, while the panel behind it reads
+  // the papers again: its change is fired when its request settles, however it ends (design review F's rider 1).
+  const dialog = <DeleteDialog target={deleting ? { kind: 'material', id: deleting.id,
+    title: t('paper.deleteTitle', { title: deleting.title }), body: t('paper.deleteBody') } : null}
+    onClose={() => setDeleting(null)} onSettled={() => libraryChanged(project.id)}
+    onDone={() => { setDeleting(null); setOpen(null); }} />;
   const paper = open && listing?.materials.find((m) => m.id === open.id);
   if (paper) {
-    return <Paper material={paper} project={project} index={index} target={open.target}
-      onBack={() => { setOpen(null); load(); }} onChanged={load}
-      onDeleted={() => { forget(paper.id); setOpen(null); }} />; // its listing read again with the change
+    return (
+      <>
+        <Paper material={paper} project={project} index={index} target={open.target}
+          onBack={() => { setOpen(null); setSaved(null); setPaperNotice(null); load(); }} onChanged={load}
+          onDelete={() => setDeleting({ id: paper.id, title: paper.title })}
+          saved={saved === paper.id} onSaved={(done) => setSaved(done ? paper.id : null)}
+          notice={paperNotice} onNotice={setPaperNotice} />
+        {dialog}
+      </>
+    );
   }
   const searching = Boolean(search.shown);
   const materials = listing?.materials ?? [];
   return (
+    <>
+    {dialog}
     <div className={cn('flex h-full min-h-0 flex-col', over && 'bg-brand-soft/40')}
       onDragOver={(event) => { if (event.dataTransfer?.types?.includes('Files')) { event.preventDefault(); setOver(true); } }}
       onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOver(false); }}
@@ -137,7 +126,7 @@ export function Library({ project }) {
         <input ref={input} type="file" multiple accept={ACCEPT} className="hidden" aria-hidden="true" tabIndex={-1}
           data-testid="library-files" onChange={(event) => { add(event.target.files); event.target.value = ''; }} />
         <AddMenu project={project} onFiles={() => input.current?.click()} onStart={() => setNotice(null)}
-          onDone={(text) => { setNotice(text); load(); }}>
+          onDone={(text) => { setNotice(text); libraryChanged(project.id); }}>
           {(importing) => (
             <Button size="sm" variant="outline" className="h-8" disabled={adding || !project || importing}>
               <FilePlus2 aria-hidden="true" />{t('library.add')}
@@ -184,6 +173,7 @@ export function Library({ project }) {
         )}
       </div>
     </div>
+    </>
   );
 }
 
@@ -353,48 +343,29 @@ export function useIndex(projectId, listing) {
   return index;
 }
 
-// The search field's text and the newest search's results; a search asked before a later one, or
-// for another project, is dropped. A change to the project's papers (one deleted, retitled or given another
-// file) drops the results shown and any search asked before it, and searches again (M2 audit, area 1: no
-// client-held copy of a paper's text or title outlives its change).
+// The search field's text and the newest search's results, read through libraryRead.js with the query searched: a
+// change to the papers drops the results shown and searches again, and only the newest search's answer, its error and
+// whether it is under way are shown (a search asked before a change, or before a later search, never is). Asking for
+// the query shown searches it again.
 function useSearch(projectId) {
+  const t = useT();
+  const language = useContext(LanguageContext);
   const [text, setText] = useState('');
-  const [shown, setShown] = useState(null); // { query, found }
-  const [asked] = useState(newest);
-  const searched = useRef(null); // the newest search's query, shown or asked
-  const { busy, problem, run, reset } = useAction();
-  useEffect(() => { asked(); searched.current = null; setText(''); setShown(null); reset(); }, [projectId]);
-  async function find(query) {
-    const current = asked();
-    searched.current = query;
-    const found = await run(() => searchProject(projectId, query));
-    if (found && current()) setShown({ query, found });
-  }
-  const again = useRef(find);
-  again.current = find;
-  useEffect(() => {
-    const changed = (event) => {
-      if (event.detail !== null && event.detail !== projectId) return;
-      asked();
-      setShown(null);
-      if (searched.current) again.current(searched.current);
-    };
-    libraryEvents.addEventListener('changed', changed);
-    return () => libraryEvents.removeEventListener('changed', changed);
-  }, [projectId, asked]);
-  async function search() {
-    const query = queryOf(text);
-    if (!query || !projectId) return;
-    await find(query);
+  const [query, setQuery] = useState(null); // the query searched, or null
+  useEffect(() => { setText(''); setQuery(null); }, [projectId]);
+  const read = useLibraryRead(projectId && query ? `${projectId}\n${query}` : null, () => searchProject(projectId, query));
+  function search() {
+    const wanted = queryOf(text);
+    if (!wanted || !projectId) return;
+    if (wanted === query) read.reload();
+    else setQuery(wanted);
   }
   function clear() {
-    asked();
-    searched.current = null;
     setText('');
-    setShown(null);
-    reset();
+    setQuery(null);
   }
-  return { text, setText, shown, busy, problem, search, clear };
+  return { text, setText, shown: read.value ? { query, found: read.value } : null, busy: read.busy,
+    problem: read.error ? problemText(t, read.error, language) : null, search, clear };
 }
 
 // The search field: Enter searches (not while an input method composes: onFieldKey), Escape clears.

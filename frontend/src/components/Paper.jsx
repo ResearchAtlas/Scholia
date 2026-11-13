@@ -14,7 +14,6 @@ import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPoi
   pageLines, pageOffsets, pagePart, pagesWithin, pageWindow, PAGE_WIDTH, partMove, passOn, PASSAGE_STRETCH, passageStretch, pointing,
   rectStyle, reasonKey, selectedParts, takeSaved, unionRect, validYear, viewOf, waitsOn, withFocus, withNear } from '../library.js';
 import { addTo, Byline, Facts, NoFullText, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
-import { DeleteDialog } from './DeleteDialog.jsx';
 import { revealPassage } from '../search.js'; // S1-17: opened at a search result's passage
 import { Segmented } from './fields.jsx';
 import { Button } from '@/components/ui/button';
@@ -24,18 +23,19 @@ import { cn } from '@/lib/utils';
 
 // index: the project's search index status, for Details (S1-17); target: a search result's passage
 // ({ id, ordinal }), which the text view opens at.
-export function Paper({ material, project, index, target, onBack, onChanged, onDeleted }) {
+// onDelete opens its delete dialog, which the Library keeps above its read of the papers; saved and notice (what its
+// save and its file's replacement said) are the Library's too, so they stay as the page is drawn again after the change
+// (M2 audit, area 1, design review F's option 2.2 and rider 1).
+export function Paper({ material, project, index, target, onBack, onChanged, onDelete, saved, onSaved, notice, onNotice }) {
   const t = useT();
-  const [deleting, setDeleting] = useState(false);
-  const [notice, setNotice] = useState(null);
   const replace = useRef(null);
   const reason = reasonKey(material.reason);
   const { busy: replacing, run } = useAction(); // one replacement at a time: none finishes after a later choice
 
   function replaceFile(files) {
-    setNotice(null);
+    onNotice(null);
     return run(async () => {
-      if (await addTo(project.id, [...files].slice(0, 1), t, setNotice, { materialId: material.id,
+      if (await addTo(project.id, [...files].slice(0, 1), t, onNotice, { materialId: material.id,
         replaces: material.version?.id })) libraryChanged(project.id); // the version shown when the file was chosen;
       // every view showing the paper's text or title reads it again (the Library's listing among them)
     });
@@ -54,7 +54,7 @@ export function Paper({ material, project, index, target, onBack, onChanged, onD
           <FileUp aria-hidden="true" />{material.version?.media_type ? t(replacing ? 'paper.replacing' : 'paper.replace')
             : t(replacing ? 'paper.attaching' : 'paper.attach')}
         </Button>
-        <Button variant="ghost" size="sm" className="h-8 text-destructive hover:text-destructive" onClick={() => setDeleting(true)}>
+        <Button variant="ghost" size="sm" className="h-8 text-destructive hover:text-destructive" onClick={onDelete}>
           <Trash2 aria-hidden="true" />{t('common.delete')}
         </Button>
       </div>
@@ -68,29 +68,24 @@ export function Paper({ material, project, index, target, onBack, onChanged, onD
           {material.readable && <ReadAgain material={material} onDone={onChanged} />}
           {notice && <p role="status" className="rounded-md bg-muted px-3 py-2 text-sm">{notice}</p>}
         </header>
-        <Details material={material} onSaved={() => libraryChanged(project.id)} />
+        <Details material={material} saved={saved} onSaved={(done) => { onSaved(done); if (done) libraryChanged(project.id); }} />
         <section className="grid gap-2 text-sm">
           <h4 className="font-semibold">{t('paper.about')}</h4>
           <Facts material={material} project={project} index={index} />
         </section>
         {material.extraction && material.version && <Contents key={material.version.id} material={material} target={target} />}
       </div>
-      <DeleteDialog target={deleting ? { kind: 'material', id: material.id, title: t('paper.deleteTitle', { title: material.title }),
-        body: t('paper.deleteBody') } : null}
-        onClose={() => setDeleting(false)}
-        onDone={() => { setDeleting(false); libraryChanged(project.id); onDeleted(); }} />
     </div>
   );
 }
 
 // The details the researcher may correct; a save is kept as checked by the researcher, so no lookup
 // replaces it, and says it was saved only once the backend has saved it.
-function Details({ material, onSaved }) {
+function Details({ material, saved, onSaved }) {
   const t = useT();
   const id = useId();
   const before = detailsOf(material);
   const [form, setForm] = useState(before);
-  const [saved, setSaved] = useState(false);
   const { busy, problem, run } = useAction();
   const shown = useRef(before); // the saved details the form last took
   const key = `${material.id}:${material.updated_at}`;
@@ -102,14 +97,11 @@ function Details({ material, onSaved }) {
 
   async function save(event) {
     event.preventDefault();
-    setSaved(false);
-    if (await run(() => patch(`/api/materials/${encodeURIComponent(material.id)}`, body))) {
-      setSaved(true);
-      onSaved();
-    }
+    onSaved(false);
+    if (await run(() => patch(`/api/materials/${encodeURIComponent(material.id)}`, body))) onSaved(true);
   }
 
-  const set = (name) => (event) => { setSaved(false); setForm((current) => ({ ...current, [name]: event.target.value })); };
+  const set = (name) => (event) => { if (saved) onSaved(false); setForm((current) => ({ ...current, [name]: event.target.value })); };
   const field = (name, label, control) => (
     <div className="grid gap-1.5">
       <label htmlFor={`${id}-${name}`} className="text-xs font-medium text-muted-foreground">{label}</label>

@@ -481,15 +481,19 @@ test('focus on the note goes to the view switch when the note goes, every page f
   assert.deepEqual(run(15_836, 20_000, true, 'body'), [[], true]); // the note still there
 });
 
-// M2 audit, area 1 (no client-held derived state): a paper's new file, its saved details and its deletion are changes every
-// view hears, and a deletion takes the paper out of the Library's listing at once (the hooks that follow the change:
-// tests/hooks.test.mjs; the chosen papers: tests/answers.test.mjs).
+// M2 audit, area 1 (no client-held derived state): a paper's new file and its saved details are changes every view hears;
+// its delete dialog is the Library's, above the read, and fires its change when its request settles (design review F's
+// rider 1; the dialog itself: tests/hooks.test.mjs); what the page's save and replacement said is the Library's, so it
+// stays as the page is drawn again after the change.
 test('a paper\'s new file, saved details and deletion are library changes', () => {
   const paper = source('Paper.jsx');
+  const library = source('Library.jsx');
   assert.match(paper, /replaces: material\.version\?\.id \}\)\) libraryChanged\(project\.id\);/);
-  assert.match(paper, /<Details material=\{material\} onSaved=\{\(\) => libraryChanged\(project\.id\)\} \/>/);
-  assert.match(paper, /onDone=\{\(\) => \{ setDeleting\(false\); libraryChanged\(project\.id\); onDeleted\(\); \}\}/);
-  assert.match(source('Library.jsx'), /onDeleted=\{\(\) => \{ forget\(paper\.id\); setOpen\(null\); \}\}/);
+  assert.match(paper, /onSaved=\{\(done\) => \{ onSaved\(done\); if \(done\) libraryChanged\(project\.id\); \}\}/);
+  assert.doesNotMatch(paper, /DeleteDialog/);
+  assert.match(paper, /onClick=\{onDelete\}/);
+  assert.match(library, /onSettled=\{\(\) => libraryChanged\(project\.id\)\}/);
+  assert.match(library, /saved=\{saved === paper\.id\}/);
   // a chosen paper whose title is being read again (library.js) is named, never blank
   assert.match(source('ConversationView.jsx'), /chosen\.map\(\(paper\) => \(\{ \.\.\.paper, title: paper\.title \?\? t\('composer\.chosenPaper'\) \}\)\)/);
 });
