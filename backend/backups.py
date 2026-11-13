@@ -774,12 +774,13 @@ async def _replace(state, body, staging, purges):
 
         restore_id = str(uuid.uuid4())  # its journal's: only that journal is ever undone for it
         try:
-            # An automatic backup the safety copy left in the folder is already the backup before the restored
-            # database's migrations: a second copy of it would rotate out one more of the week's backups, and stay
-            # when the restore is rolled back (PR 59 batch 1, item 5). Restored from a file, or from a backup the
-            # safety copy rotated out, its state is in no backup here: the migrations take one.
-            kept = body.generation is not None and await asyncio.to_thread(
-                _generation_folder(data_dir, body.generation).is_dir)
+            # An automatic backup the safety copy left in the folder (where it was, or promoted to weekly) is already
+            # the backup before the restored database's migrations: a second copy of it would rotate out one more of
+            # the week's backups, and stay when the restore is rolled back (PR 59 batch 1, item 5). Restored from a
+            # file, or from a backup the safety copy rotated out, its state is in no backup here: they take one.
+            kept = body.generation is not None and await asyncio.to_thread(lambda: any(
+                (data_dir / "backups" / kind / _generation_folder(data_dir, body.generation).name).is_dir()
+                for kind in KINDS))
             journal = await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside, restore_id, earlier)
             restored = await asyncio.to_thread(Database, data_dir, backup=not kept)  # its checks and migrations
             await state["start"](restored, kick=False)  # recovered; nothing is served or runs on its own yet

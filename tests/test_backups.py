@@ -525,26 +525,36 @@ async def test_a_restore_of_an_older_automatic_backup_still_in_the_folder_takes_
         assert listed[added]["schema_version"] == len(MIGRATIONS) and old in listed
 
 
-async def test_a_restore_of_a_backup_its_safety_copy_rotated_away_keeps_a_copy_of_it_before_migrating(tmp_path):
-    # PR 59 batch 1, item 5: with the backup restored no longer where it was, the copy its migrations take is the one
-    # backup of the state they start from
+@pytest.mark.parametrize("rotation", ["promoted", "deleted"])
+async def test_a_restore_of_a_backup_its_safety_copy_rotates_keeps_one_backup_of_it_before_migrating(tmp_path,
+                                                                                                  rotation):
+    # PR 59 batch 1, item 5: promoted to weekly, the backup restored is still the one; deleted, the copy the
+    # migrations take is the one backup of the state they start from
     from datetime import UTC, datetime, timedelta
     data = tmp_path / "data"
+    now = datetime.now(UTC)
 
-    def older():
+    def older():  # with "deleted", a weekly one two days older than it, so the rotation deletes it
         with Database(data, migrations=MIGRATIONS[:3]) as db:
-            return db.backup(now=datetime.now(UTC) - timedelta(days=6)).name
+            if rotation == "deleted":
+                db.backup(now=now - timedelta(days=8))
+            return db.backup(now=now - timedelta(days=6)).name
 
     name = await asyncio.to_thread(older)
-    async with started(data) as client:  # its upgrade's backup, then five more: seven daily, the oldest restored
+    async with started(data) as client:  # its upgrade's backup, then five more: the one restored the oldest daily
         for _ in range(5):
             assert (await client.post("/api/backups")).status_code == 200
         before = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+        assert f"daily/{name}" in before and len([b for b in before if b.startswith("daily/")]) == 7
         response = await client.post("/api/backups/restore", json={"generation": f"daily/{name}"})
         assert response.status_code == 200, response.text
         listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
-        added = {listed[i]["schema_version"] for i in set(listed) - before if not i.endswith(name)}
-        assert added == {3, len(MIGRATIONS)} and f"daily/{name}" not in listed  # the copy and the safety copy
+    names = {i.split("/")[1] for i in before}  # by name: the rotation may move one to weekly
+    added = sorted(b["schema_version"] for i, b in listed.items() if i.split("/")[1] not in names)
+    if rotation == "promoted":
+        assert f"weekly/{name}" in listed and added == [len(MIGRATIONS)]  # the safety copy only
+    else:
+        assert not any(i.endswith(name) for i in listed) and added == [3, len(MIGRATIONS)]  # and the copy
 
 
 async def test_a_restore_stops_a_running_turn(tmp_path):
