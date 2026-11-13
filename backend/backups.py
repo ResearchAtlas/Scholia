@@ -45,8 +45,8 @@ from pydantic import BaseModel, Field
 from backend import APP_VERSION, budgets, i18n
 from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseCloseError, DatabaseClosedError,
                         DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError, close_failed, utc_now)
-from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _open_checked, _stamp_of, \
-    closing_connection, list_generations
+from backend.db.database import DAILY_KEPT, KINDS, SETTINGS_FILES, WEEKLY_KEPT, _fsync, _generations, _mkdir_private, \
+    _open_checked, _stamp_of, closing_connection, list_generations
 from backend.db.content import IDLE_AFTER
 from backend.db.migrations import MIGRATIONS
 from backend.runs import RunOutcome, _event, _through
@@ -651,6 +651,16 @@ def _write_full_backup(db, destination, passphrase, archive, stop=None, progress
     return {"ok": True, "file": str(path), **record, "size": path.stat().st_size}
 
 
+def _stays_through_a_backup(data_dir, name):
+    """Whether the automatic backup named name is in the folder and the next backup's rotation leaves it there: not
+    the oldest of a full set (database._rotate moves or removes the oldest daily, and a promotion the oldest weekly)."""
+    for kind, kept in (("daily", DAILY_KEPT), ("weekly", WEEKLY_KEPT)):
+        generations = [generation.name for generation in _generations(data_dir / "backups" / kind)]
+        if name in generations:
+            return len(generations) < kept or generations[0] != name
+    return False
+
+
 def _listing(store, held):
     """ContentStore.listing for an archive that holds what it lists (store and held given); else nothing."""
     return store.listing() if store is not None and held is not None else contextlib.nullcontext()
@@ -774,13 +784,13 @@ async def _replace(state, body, staging, purges):
 
         restore_id = str(uuid.uuid4())  # its journal's: only that journal is ever undone for it
         try:
-            # An automatic backup the safety copy left in the folder (where it was, or promoted to weekly) is already
-            # the backup before the restored database's migrations: a second copy of it would rotate out one more of
-            # the week's backups, and stay when the restore is rolled back (PR 59 batch 1, item 5). Restored from a
-            # file, or from a backup the safety copy rotated out, its state is in no backup here: they take one.
-            kept = body.generation is not None and await asyncio.to_thread(lambda: any(
-                (data_dir / "backups" / kind / _generation_folder(data_dir, body.generation).name).is_dir()
-                for kind in KINDS))
+            # An automatic backup the safety copy left in the folder (where it was, or promoted to weekly), and which
+            # the next backup does not rotate, is already the backup before the restored database's migrations: a
+            # second copy of it would rotate out one more of the week's backups, and stay when the restore is rolled
+            # back (PR 59 batch 1, item 5). Restored from a file, from a backup the safety copy rotated out, or from
+            # one next in line to rotate, its state would soon be in no backup here: they take one (batch 2, item 3).
+            kept = body.generation is not None and await asyncio.to_thread(
+                _stays_through_a_backup, data_dir, _generation_folder(data_dir, body.generation).name)
             journal = await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside, restore_id, earlier)
             restored = await asyncio.to_thread(Database, data_dir, backup=not kept)  # its checks and migrations
             await state["start"](restored, kick=False)  # recovered; nothing is served or runs on its own yet

@@ -567,6 +567,28 @@ async def test_a_restore_of_a_backup_its_safety_copy_rotates_keeps_one_backup_of
         assert not any(i.endswith(name) for i in listed) and added == [3, len(MIGRATIONS)]  # and the copy
 
 
+async def test_a_restored_backup_next_in_line_to_rotate_is_copied_before_the_migrations(tmp_path):
+    # PR 59 batch 2, item 3: kept by the safety copy as the oldest of a full daily set, the backup restored stood in for
+    # the backup before the migrations, and the next backup rotated it out: no copy of that state was left
+    from datetime import UTC, datetime, timedelta
+    data = tmp_path / "data"
+    now = datetime.now(UTC)
+
+    def older():  # weekly ones 16 and 9 days old, daily ones 6 to 1 days old (Fable's folder)
+        with Database(data, migrations=MIGRATIONS[:3]) as db:
+            return [db.backup(now=now - timedelta(days=days)).name for days in (16, 9, 6, 5, 4, 3, 2, 1)][3]
+
+    name = await asyncio.to_thread(older)  # the 5-day one
+    async with started(data) as client:
+        before = {b["id"].split("/")[1] for b in (await client.get("/api/backups")).json()["backups"]}
+        response = await client.post("/api/backups/restore", json={"generation": f"daily/{name}"})
+        assert response.status_code == 200, response.text
+        assert (await client.post("/api/backups")).status_code == 200  # the next backup rotates the source out
+        listed = (await client.get("/api/backups")).json()["backups"]
+    assert not any(b["id"].endswith(name) for b in listed)
+    assert [b["schema_version"] for b in listed if b["id"].split("/")[1] not in before].count(3) == 1
+
+
 async def test_a_restore_stops_a_running_turn(tmp_path):
     async with started(tmp_path / "data") as client:
         backup = (await client.post("/api/backups")).json()["id"]
