@@ -295,6 +295,27 @@ def test_a_deletion_removes_at_once_the_files_only_it_referenced(db, store, kind
         assert store.read(sha256)  # still referenced (the body by its run's event)
 
 
+def test_a_file_whose_row_was_made_in_the_deletions_own_millisecond_goes_with_it(db, store, monkeypatch):
+    # PR 59 batch 1, item 3: rows keep milliseconds, the deletion's start microseconds, so a row made in the same
+    # millisecond, before the deletion started, was left for the idle rule
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    made = datetime.now(UTC).replace(microsecond=123000)
+    db.write(lambda conn: conn.execute("UPDATE content_files SET created_at = ? WHERE sha256 = ?",
+                                       (made.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z", x["paper"])))
+    os.utime(store._path(x["paper"]), (made.timestamp() - 1, made.timestamp() - 1))
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return made + timedelta(microseconds=400)  # the deletion starts later in the same millisecond
+
+    monkeypatch.setattr(deletion_module, "datetime", Clock)
+    delete(db, store, "material", x["m1"])
+    with pytest.raises(FileNotFoundError):
+        store.read(x["paper"])
+    assert one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", x["paper"]) == (0,)
+
+
 def test_a_file_added_again_while_a_deletion_runs_keeps_the_idle_rule(db, store, monkeypatch):
     x = populate(db, store, add_project(db, "Thesis"), "p")
     real = deletion_module._delete

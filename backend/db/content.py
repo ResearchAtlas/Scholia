@@ -171,7 +171,9 @@ class ContentStore:
         def remove_rows(conn):
             candidates = [sha256 for (sha256,) in conn.execute(
                 "SELECT sha256 FROM content_files c WHERE (created_at < strftime('%Y-%m-%dT%H:%M:%fZ', ?, 'unixepoch')"
-                " OR (created_at < strftime('%Y-%m-%dT%H:%M:%fZ', ?, 'unixepoch') AND sha256 IN"
+                # a row keeps milliseconds: one made in the deletion's own millisecond counts as before it, and
+                # one made again since (the same bytes put again) is kept by its file's time below
+                " OR (created_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?, 'unixepoch') AND sha256 IN"
                 f" (SELECT value FROM json_each(?)))) AND sha256 NOT IN ({referenced_sql(conn)})",
                 (cutoff.timestamp(), (since or cutoff).timestamp(), json.dumps(sorted(released))),
             )]
