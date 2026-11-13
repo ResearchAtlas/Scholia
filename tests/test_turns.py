@@ -1807,16 +1807,25 @@ async def _until(check, what, timeout=10.0):
         await asyncio.sleep(0.02)
 
 
-def _arrivals(monkeypatch):
-    """The model requests that reached the in-flight cap (Harness._in_flight), counted as each arrives (batch 1 (6):
-    a test waits for them to be there, not for a time)."""
-    arrived, real = [], runs_module.Harness._in_flight
+class _Blocked(asyncio.Event):
+    """The in-flight cap's wake-up (Harness._landed), counting the requests blocked on it: each has read the cap and
+    found no place (batch 2 (2): a test waits for them to be blocked, not for them to have called in)."""
 
-    def counted(self, *args):
-        arrived.append(1)
-        return real(self, *args)
-    monkeypatch.setattr(runs_module.Harness, "_in_flight", counted)
-    return arrived
+    def __init__(self):
+        super().__init__()
+        self.waiting = 0
+
+    async def wait(self):
+        self.waiting += 1
+        try:
+            return await super().wait()
+        finally:
+            self.waiting -= 1
+
+
+def _blocked(client):
+    blocked = client.state["harness"]._landed = _Blocked()
+    return blocked
 
 
 async def _save(client, updates):
@@ -1825,20 +1834,20 @@ async def _save(client, updates):
     assert saved.status_code == 200, saved.text
 
 
-async def test_model_requests_in_flight_app_wide_wait_for_the_cap_in_the_settings(tmp_path, monkeypatch):
+async def test_model_requests_in_flight_app_wide_wait_for_the_cap_in_the_settings(tmp_path):
     # M2 audit area 3, item 8 (section 13: 8 model requests in flight app-wide, limits.requests_in_flight): a request
     # past the cap waits on the dispatch path for one to end, whichever conversation or background run sends it.
-    provider, arrived = MockProvider(), _arrivals(monkeypatch)
+    provider = MockProvider()
     async with started(tmp_path / "data", provider) as client:
+        blocked = _blocked(client)
         await _save(client, {"limits.requests_in_flight": 2})
         conversations = [(await client.post("/api/conversations", json={})).json()["id"] for _ in range(3)]
         await send(client, conversations[0])  # the catalog and endpoint listing read and kept, its title run made
         await background_idle(client)
-        provider.hold, before, came = asyncio.Event(), len(provider.chats), len(arrived)
+        provider.hold, before = asyncio.Event(), len(provider.chats)
         sending = [asyncio.create_task(send(client, c, "Another question?")) for c in conversations]
-        await _until(lambda: len(arrived) - came == 3 and len(provider.chats) - before == 2,
-                     lambda: (len(arrived) - came, len(provider.chats) - before))  # all three at the cap, two let out
-        await asyncio.sleep(0.2)  # time for a third to go out, were it let
+        await _until(lambda: blocked.waiting == 1 and len(provider.chats) - before == 2,
+                     lambda: (blocked.waiting, len(provider.chats) - before))  # two let out, the third blocked at the cap
         assert len(provider.chats) - before == 2 and client.state["harness"]._flying == 2
         provider.hold.set()
         streams = await asyncio.wait_for(asyncio.gather(*sending), 30)
@@ -1846,10 +1855,11 @@ async def test_model_requests_in_flight_app_wide_wait_for_the_cap_in_the_setting
         await background_idle(client)
 
 
-async def test_requests_waiting_for_a_place_read_a_raised_cap_when_one_ends(tmp_path, monkeypatch):
+async def test_requests_waiting_for_a_place_read_a_raised_cap_when_one_ends(tmp_path):
     # Internal review (P3): each waiter reads the cap again, so raising it lets every request it now allows go.
-    provider, arrived = MockProvider(), _arrivals(monkeypatch)
+    provider = MockProvider()
     async with started(tmp_path / "data", provider) as client:
+        blocked = _blocked(client)
         await _save(client, {"limits.requests_in_flight": 1})
         conversations = [(await client.post("/api/conversations", json={})).json()["id"] for _ in range(3)]
         await send(client, conversations[0])  # the catalog and endpoint listing read and kept, its title run made
@@ -1861,10 +1871,10 @@ async def test_requests_waiting_for_a_place_read_a_raised_cap_when_one_ends(tmp_
                 await gate.wait()
                 return provider.answer("An answer.")
             return lambda body: reply(body)
-        provider.replies, before, came = [waiting(g) for g in gates], len(provider.answers), len(arrived)
+        provider.replies, before = [waiting(g) for g in gates], len(provider.answers)
         sending = [asyncio.create_task(send(client, c, "Another question?")) for c in conversations]
-        await _until(lambda: len(arrived) - came == 3 and len(provider.answers) - before == 1,
-                     lambda: (len(arrived) - came, len(provider.answers) - before))
+        await _until(lambda: blocked.waiting == 2 and len(provider.answers) - before == 1,
+                     lambda: (blocked.waiting, len(provider.answers) - before))  # both waiters read cap 1 and blocked
         assert client.state["harness"]._flying == 1
         await _save(client, {"limits.requests_in_flight": 3})
         gates[0].set()  # one ends: both waiters look again, under the raised cap
@@ -1876,11 +1886,11 @@ async def test_requests_waiting_for_a_place_read_a_raised_cap_when_one_ends(tmp_
         await background_idle(client)
 
 
-async def test_a_router_request_waiting_for_a_place_falls_back_at_its_own_deadline(tmp_path, monkeypatch):
+async def test_a_router_request_waiting_for_a_place_falls_back_at_its_own_deadline(tmp_path):
     # Batch 1 (3): section 7.3's router deadline counts the wait for a place under the cap; past it, the turn takes
     # the fallback and the router request is never sent.
     from backend import budget_router, router
-    provider, arrived = MockProvider(), _arrivals(monkeypatch)
+    provider = MockProvider()
     routed = lambda: [b for b in provider.chats if b["messages"][0]["content"].startswith(router.ROUTER_RULES)]
     async with started(tmp_path / "data", provider) as client:
         await _save(client, {"limits.requests_in_flight": 1, "models.router": sorted(budget_router.RECOMMENDED)[0],
