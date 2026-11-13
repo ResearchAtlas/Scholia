@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.requests import ClientDisconnect
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend import backups
@@ -106,8 +107,8 @@ async def _valid_text(request: Request):
         return
     try:  # an empty or absent body is not JSON either
         stack = [await request.json()]
-    except (ValueError, RecursionError):  # not JSON, or nested past what Python parses: the route's parse answers it
-        return  # (a route that takes no body ignores it)
+    except (ValueError, RecursionError, ClientDisconnect):  # not JSON, nested past what Python parses, or the client
+        return  # left before it was read: the route answers as it would have (one that takes no body ignores it)
     while stack:  # a loop, not recursion, over what was parsed
         value = stack.pop()
         if isinstance(value, str) and not value.isascii():  # ASCII (a file's base64) is valid, and says so at once

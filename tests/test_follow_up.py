@@ -1463,3 +1463,22 @@ async def test_a_run_left_behind_has_nothing_of_its_recovery_written(tmp_path, m
                           runs[bad]) == [(1,)]  # its first turn's, from before the crash copy
         assert await rows(client, "SELECT q.text FROM queued_messages q WHERE q.conversation_id = ?", bad) == []
         assert [q["text"] for q in (await conversation_read(client, good))["queued"]] == ["Left at the crash"]
+
+
+async def test_a_request_whose_client_left_before_its_body_was_read_is_answered_as_before(tmp_path):
+    # Batch 1's internal review (P3): with no Content-Length shortcut, the check read the body of a GET whose client had
+    # already gone, and Starlette's ClientDisconnect escaped the app where the route had answered before.
+    async with started(tmp_path / "data") as client:
+        sent = []
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send_(message):
+            sent.append(message)
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET", "scheme": "http",
+                 "path": "/api/conversations", "raw_path": b"/api/conversations", "query_string": b"", "root_path": "",
+                 "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8765),
+                 "headers": [(b"host", b"127.0.0.1:8765"), (b"x-scholia-client", b"local")]}
+        await asyncio.wait_for(client.app(scope, receive, send_), 10)
+        assert sent[0]["type"] == "http.response.start" and sent[0]["status"] == 200
