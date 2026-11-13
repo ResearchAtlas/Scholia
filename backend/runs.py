@@ -1012,9 +1012,9 @@ class Harness:
             verdicts, outcome = await self._support(claim, ctx, checked, judge)
             ctx["cited"] = (result.content, numbered, verdicts)  # checked again in the primary commit
             ctx["check_outcome"] = outcome
-            unsearched = (found.get("trace") or {}).get("index") in ("building", "unavailable")
-            notices = [n for n, shown in (("index_unavailable", unsearched),
-                                          ("keyword_only", found["mode"] == "keyword_only" and not unsearched),
+            degraded = ctx.get("degraded", ())
+            notices = [n for n, shown in (("index_unavailable", "index_unavailable" in degraded),
+                                          ("keyword_only", "keyword_only" in degraded),
                                           ("unchecked", outcome["failed"] > 0),
                                           ("unchecked_budget", outcome["budget"] > 0),
                                           ("skills_unavailable", not ctx["tools"]),  # no tools here
@@ -1429,6 +1429,9 @@ class Harness:
         trace = found["trace"] if not call_id else {**found["trace"], "query": {"chars": len(found["trace"]["query"])},
                                                     "tool_call_id": call_id}
         await self._record(claim, "retrieval_trace", {**trace, "mode": found["mode"], "reason": found["reason"]})
+        # the answer's notices cover every retrieval of the turn, the tools' too (F4 step 6)
+        claim.context.setdefault("degraded", set()).add(
+            "index_unavailable" if agent.unsearched(found) else "keyword_only" if found["mode"] == "keyword_only" else None)
 
     async def _record(self, claim, kind, data, also=None):
         """One event of a running turn (none when kind is None), and also(conn), if given, in its transaction; a
@@ -2203,9 +2206,11 @@ class Harness:
         before = set(turn.evidence.numbered)
         keys = list(dict.fromkeys(turn.evidence.add(found["records"])))
         held = {k: turn.evidence.numbered[k] for k in keys}
+        head = agent.KEYWORD_ONLY if found["mode"] == "keyword_only" else ""
         if not held:
-            return ToolResult(id=call_id, ok=True, text="No passage in the library matched this question: the library "
-                                                       "holds no evidence for it.", meta={"passages": []})
+            return ToolResult(id=call_id, ok=True, text=agent.UNSEARCHED if agent.unsearched(found) else head + (
+                "No passage in the library matched this question: the library holds no evidence for it."),
+                meta={"passages": []})
         lines = citations.bundle(held)
         try:  # a pipeline needing evidence refuses when too little room is left for it (section 8, final review F15)
             request = assembled(held, found)
@@ -2253,7 +2258,7 @@ class Harness:
         checks = [f"- {c['marker']} {c['existence'] if c['existence'] != 'ok' else verdicts.get((c['sentence'], c['passage_id']), 'unchecked')}"
                   for c in checked]
         return ToolResult(id=call_id, ok=True,
-                          text=result.content + ("\n\nCitation checks, in order:\n" + "\n".join(checks) if checks else ""),
+                          text=head + result.content + ("\n\nCitation checks, in order:\n" + "\n".join(checks) if checks else ""),
                           meta={"passages": [r["passage_id"] for r in held.values()], "pairs": outcome})
 
     async def _judge_route(self, ctx):
