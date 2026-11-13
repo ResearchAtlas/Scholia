@@ -380,10 +380,16 @@ def _delete(conn, kind, object_id, remove_all_trace):
                      (f'$.identifiers."{material}"', material))
         # A Zotero import's keys of the items that came to it: its own item's, in every import of its library, and any
         # other item an earlier build's step named it for (merged into it, or already there by its PDF).
-        keys = {run: {item} for (run, item) in conn.execute(
-            "SELECT e.run_id, json_extract(e.data, '$.key') FROM run_events e JOIN runs r ON r.id = e.run_id"
-            " WHERE r.project_id = ? AND r.workflow = 'zotero_import' AND e.type = 'step_finished'"
-            " AND json_extract(e.data, '$.material_id') = ? AND json_type(e.data, '$.key') = 'text'", (project, material))}
+        # (A running import names them in inputs.papers.)
+        keys = {}
+        for run, item in conn.execute(
+                "SELECT e.run_id, json_extract(e.data, '$.key') FROM run_events e JOIN runs r ON r.id = e.run_id"
+                " WHERE r.project_id = ? AND r.workflow = 'zotero_import' AND e.type = 'step_finished'"
+                " AND json_extract(e.data, '$.material_id') = ? AND json_type(e.data, '$.key') = 'text'"
+                " UNION ALL SELECT r.id, j.value FROM runs r, json_each(r.inputs, ?) j"
+                " WHERE r.project_id = ? AND r.workflow = 'zotero_import'",
+                (project, material, f'$.papers."{material}"', project)):
+            keys.setdefault(run, set()).add(item)
         library, _, key = (source_key or "").rpartition("/items/")
         if source == "zotero" and library:
             for (run,) in conn.execute("SELECT id FROM runs WHERE project_id = ? AND workflow = 'zotero_import'"
@@ -394,6 +400,8 @@ def _delete(conn, kind, object_id, remove_all_trace):
             inputs = json.loads(row[0] or "{}") if row else {}
             kept = {name: [k for k in inputs[name] if k not in gone] for name in ("items", "done")
                     if gone & set(inputs.get(name) or [])}
+            if material in (inputs.get("papers") or {}):
+                kept["papers"] = {paper: items for paper, items in inputs["papers"].items() if paper != material}
             if kept:
                 conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps({**inputs, **kept}), run))
         # Events an earlier build wrote with them (a lookup step's identifier, its question's covers, a Zotero step's

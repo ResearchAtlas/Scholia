@@ -408,8 +408,8 @@ def test_identifiers_an_earlier_build_wrote_in_events_leave_with_the_paper_and_e
                      " ?, 'succeeded')", (lookup, project, json.dumps({"material_ids": [doomed, kept]})))
         conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, status) VALUES (?, ?, 'background',"
                      " 'zotero_import', ?, 'succeeded')", (zotero, project, json.dumps({
-                         "library": "users/0", "items": ["AAAA2222", "BBBB3333", "CCCC4444"],
-                         "done": ["AAAA2222", "BBBB3333", "CCCC4444"]})))
+                         "library": "users/0", "items": ["AAAA2222", "BBBB3333", "CCCC4444", "DDDD5555", "EEEE6666"],
+                         "done": ["AAAA2222", "BBBB3333", "CCCC4444", "DDDD5555", "EEEE6666"]})))
         events = [(lookup, "ask", {"ask_id": "a1", "options": ["lookup", "skip"], "covers": ["doi:10.5555/gone.1",
                                                                                           "doi:10.5555/kept.1"]}),
                   (lookup, "step_finished", {"material_id": doomed, "identifier": "doi:10.5555/gone.1", "outcome": "resolved"}),
@@ -417,6 +417,8 @@ def test_identifiers_an_earlier_build_wrote_in_events_leave_with_the_paper_and_e
                   (zotero, "step_finished", {"key": "AAAA2222", "material_id": doomed, "outcome": "imported"}),
                   (zotero, "step_finished", {"key": "BBBB3333", "material_id": kept, "outcome": "imported"}),
                   (zotero, "step_finished", {"key": "CCCC4444", "material_id": doomed, "outcome": "already"}),
+                  (zotero, "step_finished", {"key": "DDDD5555", "material_id": doomed, "outcome": "already"}),
+                  (zotero, "step_finished", {"key": "EEEE6666", "material_id": doomed, "outcome": "waiting"}),
                   (lookup, "step_finished", {"material_id": doomed, "identifier": None, "outcome": "no_identifier"})]
         for seq, (run, kind, data) in enumerate(events):
             conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, ?, ?)", (run, seq, kind, json.dumps(data)))
@@ -429,7 +431,9 @@ def test_identifiers_an_earlier_build_wrote_in_events_leave_with_the_paper_and_e
                      {"material_id": kept, "identifier": "doi:10.5555/kept.1", "outcome": "resolved"},
                      {"material_id": doomed, "outcome": "imported"},
                      {"key": "BBBB3333", "material_id": kept, "outcome": "imported"},
-                     {"material_id": doomed, "outcome": "already"},  # another item, matched to it
+                     {"material_id": doomed, "outcome": "already"},  # other items, matched to it
+                     {"material_id": doomed, "outcome": "already"},
+                     {"material_id": doomed, "outcome": "waiting"},
                      {"material_id": doomed, "identifier": None, "outcome": "no_identifier"}]  # none to take out
     [(inputs,)] = db.read(lambda conn: conn.execute("SELECT inputs FROM runs WHERE id = ?", (zotero,)).fetchall())
     assert (json.loads(inputs)["items"], json.loads(inputs)["done"]) == (["BBBB3333"], ["BBBB3333"])
