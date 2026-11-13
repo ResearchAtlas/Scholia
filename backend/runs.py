@@ -329,7 +329,7 @@ def _let_go(conn, run_id):
                  " AND json_type(inputs, '$.held') IS NOT NULL", (run_id,))
 
 
-def may_dispatch(conn, run_id, past_deadline=None, memory_off=None, memory_changed=None):
+def may_dispatch(conn, run_id, past_deadline=None, memory_off=None, revoke=None):
     """The check before every dispatch (slice-1 spec section 10, Revocation), which the outbound
     gate reads in its decision transaction, so retries are covered too: the run is still running
     and not revoked; every owner it has still exists (a turn's project and conversation; detached
@@ -343,11 +343,13 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None, memory_chang
     storage, the gate, the stream's reader): past it the request is refused, "turn_deadline". memory_off(), if given,
     reads the project's memory switch as it is now (S1-21a fix batch 3, R4): a request holding memory is refused once it
     is off, whichever step of the run sends it (a nested tool's included), and so is a memory extraction's.
-    memory_changed(), if given, is told when a memory record the request holds is no longer allowed (edited, superseded,
-    forgotten or out of scope since): the caller ends the run revoked, as for memory off (S1-21a follow-up MB11). With
-    it (the dispatch path, Harness._call), a refusal for memory revokes the run in the record here, in the gate's
-    decision transaction (conn), so the revocation is durable before anything after the refusal can be cancelled, fail
-    or wait: a terminal write, a shutdown, a receipt that is never recorded and recovery all find it revoked (Q14)."""
+    revoke(), if given, is told when the request is refused for what it holds: a memory record no longer allowed (edited,
+    superseded, forgotten or out of scope since) or memory off (S1-21a follow-up MB11), a paper it carries gone or no
+    longer allowed, a summary's record gone, or a passage its paper no longer reads (M2 audit: each is a revocation,
+    section 10): the caller ends the run revoked. With it (the dispatch path, Harness._call), such a refusal revokes the
+    run in the record here, in the gate's decision transaction (conn), so the revocation is durable before anything
+    after the refusal can be cancelled, fail or wait: a terminal write, a shutdown, a receipt that is never recorded and
+    recovery all find it revoked (Q14)."""
     row = conn.execute(
         "SELECT r.status, r.cancel_reason, r.kind, p.review_lock,"
         " r.conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM conversations WHERE id = r.conversation_id),"
@@ -375,17 +377,15 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None, memory_chang
     refused = bool(remembered) and not memory.allowed(conn, project_id, remembered, json.loads(versions or "{}"))
     if not refused and (remembered or workflow == "memory") and memory_off is not None:  # an extraction holds memory
         refused = memory_off()  # work even when it was shown no record
-    if refused:
-        if memory_changed is not None:
-            conn.execute("UPDATE runs SET cancel_reason = 'revoked' WHERE id = ? AND status = 'running'"
-                         " AND cancel_reason IS NULL", (run_id,))
-            memory_changed()
-        return False
-    if held and not provenance.sendable(conn, project_id, json.loads(held)):  # a paper whose text it carries is
-        return False  # gone, or its project no longer allows this request (tightened, or review-locked)
-    if not compaction.sendable(conn, run_id):  # S1-21b: a memory record a summary it carries follows is gone
-        return False
-    return not wanted or still_read(conn, project_id, wanted) == wanted
+    # a paper whose text it carries is gone, or its project no longer allows this request (tightened, or review-locked)
+    refused = refused or bool(held) and not provenance.sendable(conn, project_id, json.loads(held))
+    refused = refused or not compaction.sendable(conn, run_id)  # S1-21b: a memory record a summary it carries follows is gone
+    refused = refused or bool(wanted) and still_read(conn, project_id, wanted) != wanted
+    if refused and revoke is not None:
+        conn.execute("UPDATE runs SET cancel_reason = 'revoked' WHERE id = ? AND status = 'running'"
+                     " AND cancel_reason IS NULL", (run_id,))
+        revoke()
+    return not refused
 
 
 @dataclass
@@ -403,8 +403,8 @@ class _Call:
     bodies: list = field(default_factory=list)  # S1-19: each attempt's request body as stored (its sha256, or None)
     materials: tuple = ()  # the papers whose text its request holds, for the bodies' deletion links
     declined: bool = False  # S1-19c: an attempt refused at dispatch because the turn's time limit had passed
-    memory_off: bool = False  # S1-21a: an attempt holding memory refused at dispatch: memory switched off, or a record
-    # it holds changed since (MB11)
+    revoked: bool = False  # S1-21a: an attempt refused at dispatch for what it holds: memory switched off, a record it
+    # holds changed since (MB11), or a paper, passage or summary record it carries no longer sendable (M2 audit)
 
     @property
     def dispatched(self) -> bool:
@@ -2423,14 +2423,13 @@ class Harness:
             return call.declined
 
         def off():  # the project's memory switch, read by the dispatch check of a request that holds memory
-            call.memory_off = not memory.enabled(load_settings(self.data_dir, project_id[0]).values)
-            return call.memory_off
+            return not memory.enabled(load_settings(self.data_dir, project_id[0]).values)
 
-        def changed():  # a memory record the request holds changed since it was assembled: the run ends revoked
-            call.memory_off = True
+        def revoked():  # refused for what the request holds (memory, papers, passages): the run ends revoked
+            call.revoked = True
 
         async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id, past, off,
-                                                                                         changed),
+                                                                                         revoked),
                                           provider=route.provider.name) as client:
             result = await openrouter.query_model(
                 client, route, key, request.messages, timeout=timeout or MODEL_CALL_SECONDS, effort=facts["effort"],
@@ -2496,12 +2495,13 @@ class Harness:
             raise asyncio.CancelledError()
         if call.declined:  # refused at dispatch for the turn's time limit: recorded and settled, the turn stops there
             raise _LimitReached("turn_minutes")
-        if call.memory_off:
+        if call.revoked:
             # Refused at dispatch: memory was switched off while the run's requests held it (recalled, or a memory
-            # tool's result in a chain that is never cut or rewritten: model-route rule 5), or a record it holds was
-            # edited, superseded or forgotten since (MB11). The run ends here as a
+            # tool's result in a chain that is never cut or rewritten: model-route rule 5), a record it holds was
+            # edited, superseded or forgotten since (MB11), or a paper, passage or summary record it carries is no
+            # longer sendable (M2 audit). The run ends here as a
             # change to its project ends a run (section 10): cancelled, revoked; a turn offers Continue, which builds
-            # the next turn with memory off.
+            # the next turn under the project as it is now.
             active.cancel_reason = "revoked"
             active.cancel_requested.set()
             raise asyncio.CancelledError()

@@ -43,7 +43,8 @@ async def test_a_paper_deleted_after_retrieval_does_not_reach_dispatch_through_a
         monkeypatch.setattr(pipeline, "evidence", then_delete)
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, QUESTION)
-        assert client.provider.answers == [] and stream[-1]["status"] in ("cancelled", "failed")
+        assert client.provider.answers == [] and (stream[-1]["status"], stream[-1]["cancel_reason"]) == (
+            "cancelled", "revoked")  # section 10: a revocation, never a failure (M2 audit area 3, item 4)
         assert await rows(client, "SELECT count(*) FROM citations") == [(0,)]
 
 
@@ -388,7 +389,8 @@ async def test_a_paper_deleted_after_a_history_only_request_is_registered_stops_
         monkeypatch.setattr(runs_module.Harness, "_register_context", then_delete)
         before = len(provider.answers)
         stream = await send(client, conversation, "Rewrite your last answer more formally.")
-        assert len(provider.answers) == before and stream[-1]["status"] in ("cancelled", "failed")
+        assert len(provider.answers) == before and (stream[-1]["status"], stream[-1]["cancel_reason"]) == (
+            "cancelled", "revoked")
 
 
 async def test_deleting_a_paper_leaves_no_cited_sentence_in_rows_events_or_the_trace(tmp_path):
@@ -515,7 +517,7 @@ async def test_a_call_stopped_before_it_left_keeps_no_body(tmp_path, monkeypatch
         project, _ = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, QUESTION)
-        assert stream[-1]["status"] in ("cancelled", "failed")
+        assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "researcher")  # a stop, not a refusal
         assert await rows(client, "SELECT count(*) FROM run_bodies") == [(0,)]
 
 
@@ -785,7 +787,38 @@ async def test_a_history_dependency_tightened_after_registration_stops_the_dispa
         monkeypatch.setattr(runs_module.Harness, "_register_context", then_tighten)
         before = len(provider.answers)
         stream = await send(client, conversation, "Rewrite your last answer more formally.")
-        assert len(provider.answers) == before and stream[-1]["status"] in ("cancelled", "failed")
+        # M2 audit area 3, item 4: a refusal for another project's tightening is a revocation (section 10), with Continue
+        assert len(provider.answers) == before and (stream[-1]["status"], stream[-1]["cancel_reason"]) == (
+            "cancelled", "revoked")
+        monkeypatch.setattr(runs_module.Harness, "_register_context", real)
+        continued = await client.post(f"/api/runs/{stream[0]['run_id']}/continue")
+        assert continued.status_code == 200 and events(continued)[-1]["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("key, gone", [
+    ("evidence", lambda material: [["00000000-0000-4000-8000-0000000000e1", material]]),  # a passage no longer read
+    ("summary_memory", lambda material: ["00000000-0000-4000-8000-0000000000e2"])])  # a summary's record gone
+async def test_a_dispatch_refused_for_a_passage_no_longer_read_or_a_summarys_record_gone_ends_revoked(
+        tmp_path, monkeypatch, key, gone):
+    # M2 audit area 3, item 4 (section 10): each refusal of the dispatch check is a revocation, marked in the gate's
+    # transaction, so the turn ends cancelled/revoked with Continue, as a deletion's or a tightening's does.
+    provider = Provider(answer_text=QUOTING)
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        real = runs_module.Harness._register_context
+
+        async def then_unread(self, claim, numbered):  # registered, then no longer sendable, nothing else told
+            await real(self, claim, numbered)
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                "UPDATE runs SET inputs = json_set(inputs, '$.' || ?, json(?)) WHERE id = ?",
+                (key, json.dumps(gone(material)), claim.run_id)))
+        monkeypatch.setattr(runs_module.Harness, "_register_context", then_unread)
+        stream = await send(client, conversation, QUESTION)
+        assert provider.answers == [] and (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "revoked")
+        monkeypatch.setattr(runs_module.Harness, "_register_context", real)
+        continued = await client.post(f"/api/runs/{stream[0]['run_id']}/continue")
+        assert continued.status_code == 200 and events(continued)[-1]["status"] == "succeeded"
 
 
 async def test_the_answers_unspent_is_held_again_in_order_with_a_budget_save(tmp_path, monkeypatch):
