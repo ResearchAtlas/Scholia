@@ -459,18 +459,24 @@ class Harness:
         self._flying, self._landed = 0, asyncio.Event()  # model requests in flight app-wide (_in_flight)
 
     @asynccontextmanager
-    async def _in_flight(self):
+    async def _in_flight(self, ends):
         """A place under the app-wide cap on model requests in flight (section 13: limits.requests_in_flight, read for
         each request): one past it waits for another to end, so recovery's restarts and many background runs never
-        all send at once. Taken on the dispatch path only (_call), around the provider adapter's request."""
+        all send at once. Taken on the dispatch path only (_call), around the provider adapter's request. The wait is
+        part of the call's time (ends, on the monotonic clock: the router's deadline included, section 7.3): once it
+        passes, it goes on with no place and no time left, so the adapter sends nothing and answers timeout."""
         def limit():
             return load_settings(self.data_dir).values["limits"]["requests_in_flight"]
         while True:  # the cap read again each time a waiter looks (a raised one applies at the next request's end)
             cap = await asyncio.to_thread(limit)
             if self._flying < cap:  # no await from here to the count, so two waiters never both take the last place
                 break
+            if ends <= time.monotonic():
+                yield
+                return
             self._landed.clear()
-            await self._landed.wait()
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._landed.wait(), ends - time.monotonic())
         self._flying += 1
         try:
             yield
@@ -2463,9 +2469,10 @@ class Harness:
         async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id, past, off,
                                                                                          revoked),
                                           provider=route.provider.name) as client:
-            async with self._in_flight():  # the app-wide cap on requests in flight (section 13)
+            ends = time.monotonic() + (timeout or MODEL_CALL_SECONDS)  # its bound counts the wait for a place
+            async with self._in_flight(ends):  # the app-wide cap on requests in flight (section 13)
                 result = await openrouter.query_model(
-                    client, route, key, request.messages, timeout=timeout or MODEL_CALL_SECONDS, effort=facts["effort"],
+                    client, route, key, request.messages, timeout=max(ends - time.monotonic(), 0), effort=facts["effort"],
                     max_tokens=request.max_tokens, zdr_enabled=zero_retention, attempts=call.attempts, on_body=keep,
                     tools=request.tools or None,  # S1-19c: the agent loop's function tools, counted with the request
                     # The catalog row the route's facts were read from, so the request is the one they
