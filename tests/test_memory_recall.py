@@ -331,6 +331,23 @@ async def test_a_launch_asks_for_the_runs_of_memory_the_index_lacks_vectors_for(
         assert await _vectors(client, ids) == set(ids)
 
 
+async def test_a_launch_without_sqlite_vec_asks_for_no_memory_runs_and_the_next_with_it_does(tmp_path, monkeypatch):
+    # internal review: no vector can be made while sqlite-vec does not load, so no run is asked for it at each launch
+    from backend import search_index
+    from test_search import app, runs_of
+    real = search_index.sqlite_vec.loadable_path
+    monkeypatch.setattr(search_index.sqlite_vec, "loadable_path", lambda: str(tmp_path / "missing" / "vec0"))
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        ids = [await write(client, _unindexed(project, "Wage floors raise the earnings of low-paid workers"))]
+    async with app(tmp_path) as client:
+        await background_idle(client)
+        assert await runs_of(client, "index", project) == []
+    monkeypatch.setattr(search_index.sqlite_vec, "loadable_path", real)
+    async with app(tmp_path) as client:
+        assert await _vectors(client, ids) == set(ids)
+
+
 async def test_a_whole_rebuild_while_the_app_runs_asks_for_the_runs_of_memory_it_dropped(tmp_path):
     # M2 audit area 2: the rebuilt file's runs (index.rebuilt) take the projects whose memory lacks vectors too
     from test_search import app

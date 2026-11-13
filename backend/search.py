@@ -279,6 +279,8 @@ def _memory_pending(index, read=True):
     is deleted, the first project. The queue never embeds a memory addition (SearchIndex._apply_queue): only these runs
     do (M2 audit, area 2)."""
     from backend import memory
+    if not index.vectors:  # sqlite-vec did not load: no vector can be made (the next launch where it loads asks)
+        return set()
     found, first = index.db.read(lambda conn: (conn.execute(
         "SELECT id, project_id FROM memory_records WHERE status IN (SELECT value FROM json_each(?))"
         " AND type IN (SELECT value FROM json_each(?))", (json.dumps(memory.ACTIVE), json.dumps(memory.RECALLED))).fetchall(),
