@@ -517,7 +517,7 @@ async def test_restoring_an_encrypted_full_backup_needs_its_passphrase_and_bring
         file = (await archived_run(client, "/api/backups/full", {"destination": str(destination),
                                                              "passphrase": PASSPHRASE})).result["file"]
         await client.delete(f"/api/projects/{project}")
-        (data / "content" / sha256[:2] / sha256).unlink()
+        assert not (data / "content" / sha256[:2] / sha256).exists()  # gone with the deletion (M2 audit 1 F8)
 
         for body, code in (({"file": file}, "passphrase_required"),
                            ({"file": file, "passphrase": "wrong"}, "wrong_passphrase")):
@@ -666,8 +666,8 @@ async def test_a_project_export_holds_its_citations_notes_asks_and_waiting_messa
                          " VALUES (?, 'answer', ?, ?, ?, 'n = 40 sufficed', ?, 4, 'ok', 'supported')",
                          (citation, run_id, material, version,
                           json.dumps({"marker": "[S1.1]", "offset": 3, "sentence": "Forty."})))
-            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, quote, context, existence)"
-                         " VALUES (?, 'answer', ?, ?, 'words of another project', ?, 'ok')",
+            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, quote, context, page, existence)"
+                         " VALUES (?, 'answer', ?, ?, 'words of another project', ?, 9, 'ok')",
                          (new_id(), run_id, foreign,
                           json.dumps({"marker": "[S2.1]", "offset": 9, "sentence": "Also."})))
             conn.execute("INSERT INTO queued_messages (id, conversation_id, text) VALUES (?, ?, 'And the power?')",
@@ -688,7 +688,7 @@ async def test_a_project_export_holds_its_citations_notes_asks_and_waiting_messa
     assert (asked["kind"], asked["options"], asked["answer"]["text"], asked["answer"]["by"]) == (
         "choice", ["1", "2"], "The 2019 one", "researcher")
     cited, moved = turn["citations"]
-    assert (moved["marker"], moved["material_id"], moved["quote"]) == ("[S2.1]", foreign, None)
+    assert (moved["marker"], moved["material_id"], moved["quote"], moved["page"]) == ("[S2.1]", foreign, None, None)
     assert not any(b"words of another project" in read(path, name) for name in names(path))
     assert "- [S2.1]" in markdown.splitlines()
     assert {k: cited[k] for k in ("id", "marker", "material_id", "material_version", "quote", "page", "existence",

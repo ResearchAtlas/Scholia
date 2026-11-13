@@ -1530,9 +1530,9 @@ def _turn_records(conn, turn, rows, project_id):
     steering notes a step read, the researcher's own words in the turn (unread ones wait as queued messages). Its asks
     and their answers: an agent's own question and option labels are model text kept only while its run runs, so an
     ask of a finished turn names its options by number. Its answer's citations, as recorded, so each marker resolves
-    to its paper (materials.json, by id), version, passage, quote and page, with its existence and support checks; the
-    quote only of this project's papers, as a conversation moved here may cite another project's, whose text the
-    export does not carry."""
+    to its paper (materials.json, by id), version, passage, quote and page, with its existence and support checks; of
+    another project's paper (a conversation moved here may cite one) only its id, as the export carries nothing of
+    another project's."""
     run_id, carried = turn["run_id"], budgets.carried_notes(conn, turn["run_id"])
     turn["steering"], turn["asks"], asks = [], [], {}
     for seq, at, kind, data in conn.execute(
@@ -1549,13 +1549,15 @@ def _turn_records(conn, turn, rows, project_id):
         elif data.get("ask_id") in asks:
             answer = {k: data[k] for k in ("by", "option", "text", "withdrawn") if k in data}
             asks[data["ask_id"]]["answer"] = {**answer, "at": at}
+    own = "CASE WHEN m.project_id = ?1 THEN {} END"  # what is drawn from the paper itself
     turn["citations"] = rows(
         "SELECT c.id, json_extract(c.context, '$.marker') AS marker, json_extract(c.context, '$.sentence') AS sentence,"
-        " c.material_id, v.seq AS material_version, c.passage_id, p.ordinal AS passage,"
-        " CASE WHEN m.project_id = ? THEN c.quote END AS quote, c.page, c.evidence_type, c.existence, c.support,"
-        " c.checked_at FROM citations c LEFT JOIN materials m ON m.id = c.material_id"
+        f" c.material_id, {own.format('v.seq')} AS material_version, c.passage_id,"
+        f" {own.format('p.ordinal')} AS passage, {own.format('c.quote')} AS quote, {own.format('c.page')} AS page,"
+        f" {own.format('c.evidence_type')} AS evidence_type, c.existence, c.support, c.checked_at FROM citations c"
+        " LEFT JOIN materials m ON m.id = c.material_id"
         " LEFT JOIN material_versions v ON v.id = c.material_version_id LEFT JOIN passages p ON p.id = c.passage_id"
-        " WHERE c.owner_kind = 'answer' AND c.owner_id = ? ORDER BY c.rowid", project_id, run_id)
+        " WHERE c.owner_kind = 'answer' AND c.owner_id = ?2 ORDER BY c.rowid", project_id, run_id)
 
 
 def _conversation_markdown(conversation, language="en", titles=None):
