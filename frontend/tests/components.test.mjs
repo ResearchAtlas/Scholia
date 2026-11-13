@@ -490,4 +490,6 @@ test('a paper\'s new file, saved details and deletion are library changes', () =
   assert.match(paper, /<Details material=\{material\} onSaved=\{\(\) => libraryChanged\(project\.id\)\} \/>/);
   assert.match(paper, /onDone=\{\(\) => \{ setDeleting\(false\); libraryChanged\(project\.id\); onDeleted\(\); \}\}/);
   assert.match(source('Library.jsx'), /onDeleted=\{\(\) => \{ forget\(paper\.id\); setOpen\(null\); \}\}/);
+  // a chosen paper whose title is being read again (library.js) is named, never blank
+  assert.match(source('ConversationView.jsx'), /chosen\.map\(\(paper\) => \(\{ \.\.\.paper, title: paper\.title \?\? t\('composer\.chosenPaper'\) \}\)\)/);
 });
