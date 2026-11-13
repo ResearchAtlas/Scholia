@@ -338,15 +338,15 @@ async def test_a_forget_answered_after_its_record_moved_to_another_project_leave
         moving, other, asking = (await conversation_in(client, project), await conversation_in(client, project),
                                  await conversation_in(client, project))
         await send(client, moving, "Remember: we exclude studies before 2000")
-        await send(client, other, "Remember: we exclude studies after 2020")
-        sending = asyncio.create_task(send(client, asking, "Forget: we exclude studies"))
-        ask = await open_ask(client, asking)
-        assert len(ask["params"]["records"]) == 2
+        await send(client, other, "Remember: we exclude studies after the pilot")
+        sending = asyncio.create_task(send(client, asking, "Forget: we exclude studies before 2000 and later"))
+        ask = await open_ask(client, asking)  # (batch 1: an ask over words only like records names the likeliest)
+        assert [r["content"] for r in ask["params"]["records"]] == ["we exclude studies before 2000"]
         assert (await client.post(f"/api/conversations/{moving}/move", json={"project_id": private})).status_code == 200
         await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "forget"})
-        assert {"type": "memory", "action": "forgotten", "count": 1} in await sending
-        assert await rows(client, "SELECT content, project_id FROM memory_records WHERE type != 'progress'") == [
-            ("we exclude studies before 2000", private)]
+        assert {"type": "memory", "action": "forgotten", "count": 0} in await sending
+        assert sorted(await rows(client, "SELECT content, project_id FROM memory_records WHERE type != 'progress'")) == [
+            ("we exclude studies after the pilot", project), ("we exclude studies before 2000", private)]
 
 
 async def test_a_forget_stopped_once_its_deletion_committed_still_records_and_says_what_it_forgot(tmp_path, monkeypatch):
@@ -797,7 +797,8 @@ async def test_a_forget_by_a_records_own_words_says_so_and_continue_never_forget
         run = stream[0]["run_id"]
         await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
             "UPDATE runs SET status = 'cancelled', cancel_reason = 'revoked' WHERE id = ?", (run,)))
-        again = events(await client.post(f"/api/runs/{run}/continue"))
+        # bounded: without the applied-once rule the continued turn would wait on an ask (Fable's recheck, finding 3)
+        again = events(await asyncio.wait_for(client.post(f"/api/runs/{run}/continue"), 10))
         assert again[-1]["status"] == "succeeded"
         assert await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'") == [(second,)]
         assert {"type": "memory", "action": "applied_before", "count": 0} in again
@@ -891,3 +892,69 @@ async def test_a_command_stopped_while_its_record_commits_still_asks_for_its_ind
             ("the pilot used a survey",)]
         assert asked == [project]
         assert {"type": "memory", "action": "saved", "count": 1} in stream
+
+
+# PR 62 batch 1 (Fable's recheck, findings 1 and 2; both astra passes, the read-back)
+async def test_a_forget_closing_with_a_period_still_names_its_record_and_words_only_like_several_ask_about_one(tmp_path):
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        ids = [await asyncio.to_thread(client.state["db"].write, lambda conn, text=text: memory.write(
+            conn, project_id=project, scope="project", kind="project_state", content=text, status="confirmed",
+            sources=[("project", project)]))
+            for text in ("The sample is 30 interviews", "The sample is 35 interviews with nurses", "The pilot sample was 12")]
+        stream = await asyncio.wait_for(send(client, conversation, "Forget that the sample is 35 interviews with nurses."), 10)
+        assert {"type": "memory", "action": "forgotten", "count": 1} in stream  # named: no ask
+        sending = asyncio.create_task(send(client, conversation, "Forget that the sample was 30 interviews"))
+        ask = await open_ask(client, conversation)
+        assert [r["id"] for r in ask["params"]["records"]] == [ids[0]]  # only the one most like the words
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "forget"})
+        assert {"type": "memory", "action": "forgotten", "count": 1} in await asyncio.wait_for(sending, 10)
+        assert await rows(client, "SELECT id FROM memory_records WHERE type = 'project_state'") == [(ids[2],)]
+
+
+async def test_continue_of_a_forget_cut_short_asks_again_about_the_records_it_chose_and_did_not_delete(tmp_path,
+                                                                                                   monkeypatch):
+    from scholia_app import events
+    async with started(tmp_path / "data") as client:
+        harness, done = client.state["harness"], []
+
+        def deleting(real, *args, **kwargs):  # after the first deletion the run is revoked in the record
+            found = real(*args, **kwargs)
+            if not done:
+                done.append(1)
+                run = next(iter(harness.registry.turns.values())).run_id
+                args[0].write(lambda conn: conn.execute(
+                    "UPDATE runs SET cancel_reason = 'revoked' WHERE id = ? AND status = 'running'", (run,)))
+            return found
+        sending, project, conversation = await _three_to_forget(client, monkeypatch, deleting)
+        stream = await asyncio.wait_for(sending, 10)
+        assert {"type": "memory", "action": "forgotten", "count": 1} in stream
+        assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "revoked")
+        assert len(await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")) == 2
+        continuing = asyncio.create_task(client.post(f"/api/runs/{stream[0]['run_id']}/continue"))
+        ask = await open_ask(client, conversation)
+        assert ask["kind"] == "memory_forget" and len(ask["params"]["records"]) == 2
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "forget"})
+        again = events(await asyncio.wait_for(continuing, 10))
+        assert {"type": "memory", "action": "forgotten", "count": 2} in again
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE type != 'progress'") == [(0,)]
+        run = again[0]["run_id"]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'cancelled', cancel_reason = 'revoked' WHERE id = ?", (run,)))
+        last = events(await asyncio.wait_for(client.post(f"/api/runs/{run}/continue"), 10))
+        assert {"type": "memory", "action": "applied_before", "count": 0} in last
+
+
+async def test_a_save_said_again_after_a_correction_shows_no_replacement_of_its_own(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Remember: the sample is 30 interviews")
+        await send(client, conversation, "Correct: the sample is 35 interviews")
+        await send(client, conversation, "Remember: the sample is 35 interviews")
+        turns = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert turns[1]["memory"][0]["records"][0]["replaced"] == "the sample is 30 interviews"
+        [item] = turns[2]["memory"]
+        assert item["action"] == "saved" and "replaced" not in item["records"][0]

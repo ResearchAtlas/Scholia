@@ -459,10 +459,13 @@ def forget_candidates(conn, project_id, text=None, previous=None):
 
 
 def named(conn, project_id, text):
-    """The records a forget's words name exactly (normalized, as a save command matches its record): only these are
-    forgotten without an ask; a forget whose words are only like a record asks first (M2 audit area 4, item 1)."""
+    """The records a forget's words name exactly (normalized, as a save command matches its record, a closing period or
+    the like aside): only these are forgotten without an ask; a forget whose words are only like a record asks first
+    (M2 audit area 4, item 1)."""
+    def plain(words):  # a sentence's closing punctuation aside (batch 1)
+        return normalized(words).rstrip(" .。!！;；,，…")
     return [r for r in in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"), kinds=TYPES)
-            if normalized(r["content"]) == normalized(text)]
+            if plain(r["content"]) == plain(text)]
 
 
 def replaced(conn, record):
