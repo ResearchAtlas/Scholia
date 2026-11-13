@@ -307,8 +307,8 @@ test('a read asked before a change made with nothing chosen never retitles a pap
 });
 
 // Batch 3 (PR 61 recheck round 3, pass 1's probe): a change in another project moves the generation while the chosen
-// papers' refresh is pending; a refresh of the new generation replaces it, so the deleted paper still leaves and the
-// others still take their titles.
+// papers' refresh is pending (or failed); a refresh of the new generation replaces it, so the deleted paper still leaves
+// and the others still take their titles. With none owed, another project's change asks nothing.
 test('another project\'s change while the chosen papers are refreshed asks again, and its answer is applied', async () => {
   const original = globalThis.fetch;
   const asked = [];
@@ -330,6 +330,17 @@ test('another project\'s change while the chosen papers are refreshed asks again
     libraryChanged('p2'); // nothing pending: another project's change asks nothing
     await settle();
     assert.equal(asked.length, 2);
+    libraryChanged('p1'); // a refresh that fails is owed: another project's change asks it again
+    await settle();
+    asked[2].resolve({ ok: false, status: 503, json: async () => ({ code: 'unreachable' }) });
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'kept', title: null }]);
+    libraryChanged('p2');
+    await settle();
+    assert.equal(asked.length, 4);
+    asked[3].resolve(listed({ id: 'kept', title: 'Kept, again' }));
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'kept', title: 'Kept, again' }]);
   } finally {
     globalThis.fetch = original;
     choosePapers('p1', []);

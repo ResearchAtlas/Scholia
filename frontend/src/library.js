@@ -178,7 +178,7 @@ export const MAX_CHOSEN = 50; // as the backend takes them (backend/app.py Messa
 // chosen paper"): dropping them would send the next message unrestricted (slice-1 spec: literature restricted to the
 // selection), and the backend refuses a deleted one (selection_invalid). An answer is applied only in the generation it
 // was asked in, to the papers chosen when it was asked, and only while the same project's papers are chosen.
-let retitling = null; // the generation of the chosen papers' refresh still unanswered, or null
+let retitling = null; // the generation of the chosen papers' refresh still unanswered or failed, or null
 async function retitleChosen(asked) {
   const { projectId, papers } = chosen;
   retitling = papers.length ? asked : null;
@@ -188,8 +188,7 @@ async function retitleChosen(asked) {
   try {
     titles = new Map((await get(`/api/projects/${encodeURIComponent(projectId)}/materials`)).materials.map((m) => [m.id, m.title]));
   } catch {
-    if (asked === generation) retitling = null;
-    return;
+    return; // still owed: the next change, of any project, asks again
   }
   if (asked !== generation) return; // a newer change asked again
   retitling = null;
