@@ -432,7 +432,11 @@ async def test_recall_with_no_record_embedded_yet_is_traced_as_the_newest(tmp_pa
     # M2 audit area 2: the nearest are none of the records (none has a vector yet): memory.ranked takes the newest,
     # and the trace says so
     from cited import cited
+    from test_search import setting
     async with cited(tmp_path) as client:
+        # recall's deadline covers the helper's start, cold here (no index run warms it): long enough for it, so the
+        # reason is the one under test, never the deadline (batch 1)
+        await setting(client, "retrieval.memory_ms", 30000)
         project = await project_of(client)
         await write(client, _unindexed(project, "We dropped the pilot because of cost."))
         stream = await send(client, await conversation_in(client, project), "What did we decide last time?")
