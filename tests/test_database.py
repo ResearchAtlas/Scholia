@@ -315,15 +315,43 @@ def test_artifact_versions_are_deleted_only_together_with_their_artifact(db):
     "INSERT INTO conversations (id, project_id) VALUES (:id, :id)",
     "INSERT INTO runs (id, project_id, kind, attempts) VALUES (:id, :general, 'background', 3)",
     "INSERT INTO memory_records (id, scope, type, content, status) VALUES (:id, 'personal', 'progress', 'x', 'confirmed')",
+    "INSERT INTO materials (id, project_id, source, lookup_filled) VALUES (:id, :general, 'upload', '[\"page\",')",
 ], ids=[
     "invalid-json", "invalid-json-csl", "id-not-uuid", "id-uppercase", "id-not-version-4",
     "id-only-hyphens", "id-hyphen-inside-a-group",
     "time-without-zone", "time-with-offset", "time-without-milliseconds",
     "unknown-enum", "strict-type", "missing-foreign-key", "background-attempts", "confirmed-progress",
+    "invalid-json-lookup-filled",
 ])
 def test_the_schema_refuses_invalid_values(db, sql):
     with pytest.raises(sqlite3.IntegrityError):
         db.write(lambda conn: conn.execute(sql, {"id": new_id(), "general": general_id(conn)}))
+
+
+@pytest.mark.parametrize("before", [None, 3, 12], ids=["new", "m1", "m2-before-0013"])
+def test_lookup_filled_is_checked_with_json_valid_on_a_new_and_a_migrated_database(tmp_path, before):
+    """M2 audit, area 1 (section 4.2: JSON columns are checked with json_valid): materials.lookup_filled refuses what
+    is not JSON when written or changed, on a new database and on one migrated from M1's schema (three migrations) or
+    from the one before; a paper written before keeps its value."""
+    data, kept = tmp_path / "data", new_id()
+    if before is not None:
+        with Database(data, migrations=MIGRATIONS[:before]) as old:
+            old.write(lambda conn: conn.execute("INSERT INTO materials (id, project_id, source, title) VALUES"
+                                                " (?, ?, 'upload', 'Kept')", (kept, general_id(conn))))
+            if before >= 6:  # the column came with migration 0006
+                old.write(lambda conn: conn.execute("UPDATE materials SET lookup_filled = '[\"page\"]' WHERE id = ?", (kept,)))
+    with Database(data) as db:
+        if before is None:
+            db.write(lambda conn: conn.execute("INSERT INTO materials (id, project_id, source, title, lookup_filled)"
+                                               " VALUES (?, ?, 'upload', 'Kept', '[\"page\"]')", (kept, general_id(conn))))
+        assert db.read(lambda conn: conn.execute("SELECT title, lookup_filled FROM materials WHERE id = ?", (kept,)).fetchone()) \
+            == ("Kept", None if before == 3 else '["page"]')
+        for sql in ("UPDATE materials SET lookup_filled = '{not json' WHERE id = :kept",
+                    "INSERT INTO materials (id, project_id, source, lookup_filled) VALUES (:id, :general, 'upload', 'x')"):
+            with pytest.raises(sqlite3.IntegrityError):
+                db.write(lambda conn: conn.execute(sql, {"kept": kept, "id": new_id(), "general": general_id(conn)}))
+        db.write(lambda conn: conn.execute("UPDATE materials SET lookup_filled = NULL WHERE id = ?", (kept,)))
+        db.write(lambda conn: conn.execute("UPDATE materials SET lookup_filled = '[]' WHERE id = ?", (kept,)))
 
 
 def test_the_schema_refuses_the_word_now_as_a_time(db):

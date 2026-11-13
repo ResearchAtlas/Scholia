@@ -724,4 +724,21 @@ _0012 = r"""
 ALTER TABLE queued_messages ADD COLUMN material_ids TEXT CHECK (material_ids IS NULL OR json_valid(material_ids));
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009, _0010, _0011, _0012)
+# M2 audit, area 1 (section 4.2: JSON columns are checked with json_valid): materials.lookup_filled (0006) is checked by
+# triggers, as a STRICT table's CHECK cannot be added to a column in place; a paper written before keeps its value.
+_0013 = r"""
+CREATE TRIGGER materials_lookup_filled_valid BEFORE INSERT ON materials
+WHEN NEW.lookup_filled IS NOT NULL AND NOT json_valid(NEW.lookup_filled)
+BEGIN
+    SELECT RAISE(ABORT, 'materials.lookup_filled is not JSON');
+END;
+
+CREATE TRIGGER materials_lookup_filled_valid_update BEFORE UPDATE OF lookup_filled ON materials
+WHEN NEW.lookup_filled IS NOT NULL AND NOT json_valid(NEW.lookup_filled)
+BEGIN
+    SELECT RAISE(ABORT, 'materials.lookup_filled is not JSON');
+END;
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009, _0010, _0011, _0012,
+                               _0013)
