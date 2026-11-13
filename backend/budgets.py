@@ -18,7 +18,6 @@ becomes $20 and then $30, never compounding; a typed limit becomes the amount fr
 import json
 import math
 import re
-import unicodedata
 
 from backend import governance, openrouter, spending
 from backend.runs import _budgets_now, _event, _limit_unread
@@ -149,11 +148,17 @@ def notices(conn, run_id, data_dir):
     return recorded
 
 
+# The full-width forms of ASCII (U+FF01 to U+FF5E: digits, comma, full stop, the dollar sign and letters), as an input
+# method types them, folded to ASCII; no other compatibility digit (a superscript, a circled one) is (the M2 audit's
+# Fable 5 F3: NFKC read "5²" as 52).
+_FULL_WIDTH = {c: c - 0xFEE0 for c in range(0xFF01, 0xFF5F)}
+
+
 def _typed(text):
     """A typed limit in dollars ("25", "$2.50", " 10 ", full-width digits too, and grouped in thousands as the needed
     text says it: "$1,234.05", "US$1,234.05"), or Refused."""
     found = re.fullmatch(r"\s*(?:US\s*)?\$?\s*((?:[0-9]+|[1-9][0-9]{0,2}(?:,[0-9]{3})+)(?:\.[0-9]+)?)\s*",
-                         unicodedata.normalize("NFKC", text or ""))
+                         (text or "").translate(_FULL_WIDTH))
     value = round(float(found.group(1).replace(",", "")), 9) if found else math.nan  # digits past a float: inf
     if math.isnan(value) or value <= 0:  # kept to a billionth, more than zero
         raise Refused("invalid_limit", "Type a budget in US dollars, more than zero")

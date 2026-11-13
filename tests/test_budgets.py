@@ -586,6 +586,22 @@ def test_a_typed_limit_grouped_any_other_way_is_still_refused(text):
     assert refused.value.code == "invalid_limit"
 
 
+@pytest.mark.parametrize("text", ["5²", "1²", "①０", "㊿", "５⁰", "²⁵", "₂₅", "Ⅻ", "１０⒈", "𝟓𝟎", "5․"])
+def test_a_typed_limit_with_other_compatibility_digits_is_refused_not_read_as_another_amount(text):
+    # The M2 audit's Fable 5 F3 (PR 56's known "1²"): NFKC folded superscript, circled and other compatibility digits
+    # too, so "5²" applied as $52 and "㊿" as $50. Only the full-width forms fold, as the docstring says.
+    from backend import budgets
+    with pytest.raises(budgets.Refused) as refused:
+        budgets._typed(text)
+    assert refused.value.code == "invalid_limit"
+
+
+@pytest.mark.parametrize("text, usd", [("５０", 50.0), ("１，０００", 1000.0), ("ＵＳ＄２．５０", 2.5), ("　２５　", 25.0)])
+def test_a_typed_limit_in_full_width_forms_is_still_taken(text, usd):
+    from backend import budgets
+    assert budgets._typed(text) == usd
+
+
 @pytest.mark.asyncio
 async def test_the_least_limit_a_step_needs_typed_back_as_the_interface_says_it_applies(tmp_path):
     # The needed text's amount (frontend/src/action.js: rounded up to the cent, grouped in thousands, "$" in English and
