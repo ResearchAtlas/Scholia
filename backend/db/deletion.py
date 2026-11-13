@@ -378,14 +378,32 @@ def _delete(conn, kind, object_id, remove_all_trace):
                      f" AND rowid NOT IN {_doomed('runs')}"
                      " AND EXISTS (SELECT 1 FROM json_each(runs.inputs, '$.material_ids') j WHERE j.value = ?)",
                      (f'$.identifiers."{material}"', material))
+        # A Zotero import's keys of the items that came to it: its own item's, in every import of its library, and any
+        # other item an earlier build's step named it for (merged into it, or already there by its PDF).
+        keys = {run: {item} for (run, item) in conn.execute(
+            "SELECT e.run_id, json_extract(e.data, '$.key') FROM run_events e JOIN runs r ON r.id = e.run_id"
+            " WHERE r.project_id = ? AND r.workflow = 'zotero_import' AND e.type = 'step_finished'"
+            " AND json_extract(e.data, '$.material_id') = ? AND json_type(e.data, '$.key') = 'text'", (project, material))}
+        library, _, key = (source_key or "").rpartition("/items/")
+        if source == "zotero" and library:
+            for (run,) in conn.execute("SELECT id FROM runs WHERE project_id = ? AND workflow = 'zotero_import'"
+                                       " AND json_extract(inputs, '$.library') = ?", (project, library)).fetchall():
+                keys.setdefault(run, set()).add(key)
+        for run, gone in keys.items():
+            row = conn.execute(f"SELECT inputs FROM runs WHERE id = ? AND rowid NOT IN {_doomed('runs')}", (run,)).fetchone()
+            inputs = json.loads(row[0] or "{}") if row else {}
+            kept = {name: [k for k in inputs[name] if k not in gone] for name in ("items", "done")
+                    if gone & set(inputs.get(name) or [])}
+            if kept:
+                conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps({**inputs, **kept}), run))
         # Events an earlier build wrote with them (a lookup step's identifier, its question's covers, a Zotero step's
         # item key) lose them here: the deletion service's purge path is the one exception to the events' append-only
         # rule (slice-1 spec section 4.2), so their trigger is lifted for this transaction only.
         legacy = [rowid for (rowid,) in conn.execute(
             "SELECT e.rowid FROM run_events e JOIN runs r ON r.id = e.run_id WHERE r.project_id = ?"
             f" AND r.rowid NOT IN {_doomed('runs')} AND ((r.workflow IN ('lookup', 'zotero_import') AND e.type = 'step_finished'"
-            " AND json_extract(e.data, '$.material_id') = ? AND (json_type(e.data, '$.identifier') IS NOT NULL"
-            " OR json_type(e.data, '$.key') IS NOT NULL)) OR (r.workflow = 'lookup' AND e.type = 'ask'"
+            " AND json_extract(e.data, '$.material_id') = ? AND (json_type(e.data, '$.identifier') = 'text'"
+            " OR json_type(e.data, '$.key') = 'text')) OR (r.workflow = 'lookup' AND e.type = 'ask'"
             " AND json_type(e.data, '$.covers') IS NOT NULL"
             " AND EXISTS (SELECT 1 FROM json_each(r.inputs, '$.material_ids') j WHERE j.value = ?)))",
             (project, material, material))]
@@ -396,16 +414,6 @@ def _delete(conn, kind, object_id, remove_all_trace):
             conn.execute("UPDATE run_events SET data = json_remove(data, '$.identifier', '$.covers', '$.key')"
                          " WHERE rowid IN (SELECT value FROM json_each(?))", (json.dumps(legacy),))
             conn.execute(trigger)
-        library, _, key = (source_key or "").rpartition("/items/")
-        if source != "zotero" or not library:
-            continue
-        for run, inputs in conn.execute(
-                "SELECT id, inputs FROM runs WHERE project_id = ? AND workflow = 'zotero_import'"
-                f" AND json_extract(inputs, '$.library') = ? AND rowid NOT IN {_doomed('runs')}", (project, library)).fetchall():
-            inputs = json.loads(inputs or "{}")
-            kept = {name: [k for k in inputs[name] if k != key] for name in ("items", "done") if key in (inputs.get(name) or [])}
-            if kept:
-                conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps({**inputs, **kept}), run))
     # S1-21a: what's done, from AAB's own records: papers removed from a project that stays (no title is kept)
     from backend import memory
     for removed_from, count in conn.execute(
