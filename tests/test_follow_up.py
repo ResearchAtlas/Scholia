@@ -1058,7 +1058,7 @@ async def test_a_note_read_by_a_step_that_went_out_is_said_read_when_stop_lands_
 async def test_a_note_queued_by_the_answers_commit_is_said_queued_when_stop_lands_during_that_commit(tmp_path,
                                                                                                     monkeypatch):
     # A note sent while the last step ran is queued by the answer's commit (L7, F6); Stop lands while that write runs.
-    # Once it commits, the stream says a message was queued, before the turn's end.
+    # Once it commits, the read holds the queued message, and the stream says the answer (`queued` there a live label).
     import time
     from backend import runs
     gate = Gate(0)

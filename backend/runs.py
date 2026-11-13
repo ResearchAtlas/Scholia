@@ -2505,8 +2505,9 @@ class Harness:
         the writer itself marks the run finished here (Registry.finished), so no cancellation of this await
         can separate the mark from the commit, and the run is known finished before it is released. A write
         that raises marks nothing. A turn's are awaited through _through (_end_turn, _stop_turn, the answer's commit),
-        so what one queued is streamed once it commits, whatever cancellation came (PR 52 cycle 4, G5's class), and so
-        is what its record owes the stream (_owed, read in that transaction), before the run's end."""
+        so what its record owes the stream (_owed, read in that transaction) is said before the run's end, whatever
+        cancellation came (PR 52 cycle 4, G5's class); a note it queued is streamed then too, as a live label (Harold,
+        2026-11-13: the read at the turn's end holds it)."""
         final = await asyncio.to_thread(self.db.write, fn, committed=lambda: self.registry.finished.add(active.run_id))
         if isinstance(final, dict):
             _say(active, final.pop("owed", ()))
