@@ -147,14 +147,14 @@ def notices(conn, run_id, data_dir):
 def _typed(text):
     """A typed limit in dollars ("25", "$2.50", " 10 ", full-width digits too, and grouped in thousands as the needed
     text says it: "$1,234.05", "US$1,234.05"), or Refused."""
-    found = re.fullmatch(r"\s*(?:US\s*)?\$?\s*((?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.[0-9]+)?)\s*",
+    found = re.fullmatch(r"\s*(?:US\s*)?\$?\s*((?:[0-9]+|[1-9][0-9]{0,2}(?:,[0-9]{3})+)(?:\.[0-9]+)?)\s*",
                          unicodedata.normalize("NFKC", text or ""))
-    value = float(found.group(1).replace(",", "")) if found else math.nan
-    if not math.isfinite(value) or value <= 0:
+    value = round(float(found.group(1).replace(",", "")), 9) if found else math.nan  # digits past a float: inf
+    if math.isnan(value) or value <= 0:  # kept to a billionth, more than zero
         raise Refused("invalid_limit", "Type a budget in US dollars, more than zero")
-    if round(value, 9) > spending.MAX_USD:
+    if value > spending.MAX_USD:
         raise _too_high()
-    return round(value, 9)
+    return value
 
 
 def _too_high():

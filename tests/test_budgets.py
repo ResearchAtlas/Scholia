@@ -577,7 +577,8 @@ def test_a_typed_limit_is_taken_as_the_needed_text_shows_amounts_grouped_in_thou
     assert budgets._typed(text) == usd
 
 
-@pytest.mark.parametrize("text", ["1,23", "12,3456", ",123", "1,,234", "1,234,5", "1.234,05", "1 234", "1,234.", "$,5"])
+@pytest.mark.parametrize("text", ["1,23", "12,3456", ",123", "1,,234", "1,234,5", "1.234,05", "1 234", "1,234.", "$,5",
+                                  "0,123", "00,123", "0.0000000001"])  # the internal review: never shown so, or $0
 def test_a_typed_limit_grouped_any_other_way_is_still_refused(text):
     from backend import budgets
     with pytest.raises(budgets.Refused) as refused:
@@ -2203,7 +2204,7 @@ async def test_at_the_most_a_limit_can_be_only_stop_ends_the_cap_ask_and_nothing
         sending, ask = await _asking(client, conversation)
         assert (ask["params"]["form"], ask["params"]["budget"]) == ("cap", "project")
         for body in ({"option": "continue"}, {"text": "1000000.01"}, {"text": "2000000"}, {"text": "1000000"},
-                     {"text": "US$1,000,000.00"}):
+                     {"text": "US$1,000,000.00"}, {"text": "1" * 400}):  # the internal review: digits past a float too
             refused = await _answer(client, ask, **body)
             assert (refused.status_code, refused.json()["code"]) == (400, "limit_too_high"), body
             assert "needed_usd" not in refused.json()
