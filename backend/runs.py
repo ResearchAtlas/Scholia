@@ -3234,10 +3234,13 @@ def _budgets_now(data_dir, project_id):
     """The project's budget and the default conversation budget, as the settings files say now. A budget its
     config.toml does not give (_budget_unread) is 0, never the loader's default, which says nothing of what the file
     holds (PR 52 cycle 3, E4): nothing is admitted against it, so a step asks again (Harold, 2026-10-21). The same for
-    the personal file's default (Harold, 2026-11-12): a conversation without a limit of its own then has no room."""
+    the personal file's default (Harold, 2026-11-12): a conversation without a limit of its own then has no room. Each
+    is read as amounts are kept, to a billionth (a file may hold more places), so admission and an answer compared with
+    it (budgets.decide) read one amount (cycle 3's A3-F1)."""
     personal, project = load_settings(data_dir), load_settings(data_dir, project_id)
-    return (0.0 if _budget_unread(project) else project.values["project"]["budget_usd"],
-            0.0 if _budget_unread(personal, "budget", "conversation_usd") else personal.values["budget"]["conversation_usd"])
+    return (0.0 if _budget_unread(project) else round(project.values["project"]["budget_usd"], 9),
+            0.0 if _budget_unread(personal, "budget", "conversation_usd")
+            else round(personal.values["budget"]["conversation_usd"], 9))
 
 
 def _budget_unread(loaded, table="project", key="budget_usd"):

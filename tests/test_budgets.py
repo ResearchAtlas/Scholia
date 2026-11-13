@@ -2633,3 +2633,44 @@ def test_the_apps_own_project_saves_move_no_key_in_any_layout_and_are_written(tm
     written = _project_file(tmp_path, monkeypatch, raw)
     load_settings(tmp_path, "p").save(updates, answer=answer)
     assert len(written) == 1
+
+
+# Cycle 3's A3-F1: a limit Settings keeps past a billionth (it takes what the researcher types) is read by admission as
+# amounts are kept, as an answer is compared with it (runs._budgets_now), so a typed limit that admits the step is
+# never read as no change: saved $0.00000000151 is $0.000000002 for admission and asks alike.
+
+_TWO_BILLIONTHS = {"tag": "tiny", "context_length": 128000, "pricing": {"prompt": "0", "completion": "0.00000000000025"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["conversation", "project"])
+@pytest.mark.parametrize("saved, spent, typed, asks", [
+    (1.51e-9, 1e-9, "0.000000002", False), (1.00000000051, 1.0, "1.000000001", False),
+    (1.49e-9, 1e-9, "0.000000002", True), (1.00000000049, 1.0, "1.000000001", True)])  # controls: kept as one less
+async def test_a_limit_saved_past_a_billionth_admits_a_step_as_the_typed_limit_it_is_kept_as(
+        tmp_path, budget, saved, spent, typed, asks):
+    # the reviewer's four cases, through the Settings save and the ask: the step's $2e-9 fits the typed limit, so it
+    # goes out once, with no ask or with one whose typed answer applies; never an answer applying nothing and asking again.
+    # Saved as a billionth less, the step asks and the typed limit applies, before this fix and after
+    from scholia_app import MockProvider, send
+    async with await _app(tmp_path, MockProvider(endpoints={budget_router_model(): [_TWO_BILLIONTHS]})) as client:
+        conversation, project = await _conversation(client)
+        if budget == "project":
+            await _project_budget(client, project, saved)
+        else:
+            read = (await client.get("/api/settings")).json()
+            response = await client.put("/api/settings", json={"hash": read["hash"],
+                                                               "updates": {"budget.conversation_usd": saved}})
+            assert response.status_code == 200, response.text
+        await _spent(client, project, spent, conversation if budget == "conversation" else None)
+        sending, answers = asyncio.create_task(send(client, conversation, "Short?")), []
+        while not sending.done():
+            found = (await client.get(f"/api/asks?conversation_id={conversation}")).json()["asks"]
+            if found:
+                assert (found[0]["params"]["budget"], found[0]["params"]["estimate_usd"]) == (budget, 2e-9)
+                assert not answers, "the step asked again after its typed limit"
+                answers.append((await _answer(client, found[0], text=typed)).json()["budget"])
+                assert answers[-1]["applied"], answers[-1]
+            await asyncio.sleep(0.05)
+        assert (await sending)[-1]["status"] == "succeeded" and len(client.provider.answers) == 1
+        assert bool(answers) == asks
