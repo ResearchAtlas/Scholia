@@ -1253,3 +1253,232 @@ async def test_a_turns_budget_and_steering_note_events_are_built_only_from_its_r
     for kind in ('"type": "budget"', '"type": "steering_note"'):
         assert source.count(kind) == owed.count(kind) == 1, kind
     assert "notes" not in inspect.signature(runs.Harness._call).parameters
+
+
+# M2 audit, area 5, Fable 5 F1 and its note A: half a surrogate pair (a JSON escape such as "\ud83d" with no partner) in
+# a researcher's text is refused at the API, as an ask's answer, a title or a project name already was, so no reader of a
+# record (json_extract in SQLite, a conversation's read, recovery) ever meets text it cannot decode.
+
+HALF = b'"a\\ud83db"'  # JSON whose text holds half a surrogate pair
+WRITTEN = "SELECT (SELECT count(*) FROM turns), (SELECT group_concat(text || coalesce(material_ids, '')) FROM queued_messages)"
+
+
+async def raw(client, method, path, body):
+    return await client.request(method, path, content=body, headers={"content-type": "application/json"})
+
+
+async def test_a_steering_note_with_half_a_surrogate_pair_is_refused_and_its_turn_and_the_next_launch_go_on(tmp_path):
+    # The audit's reproduction: the note was accepted (200), its turn never ended, and every later launch failed in
+    # Harness.recover.
+    gate = Gate(0)
+    provider = Scripted(None, "Done.")
+    provider.script[0] = gate.wrap(provider, {"calls": [call("list_materials")]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Q?"))
+        reached = asyncio.ensure_future(gate.reached.wait())
+        await asyncio.wait({sending, reached}, timeout=30, return_when=asyncio.FIRST_COMPLETED)
+        reached.cancel()
+        # a turn that ended (or failed) before its step reached the provider says so, rather than waiting for ever
+        assert gate.reached.is_set(), sending.result() if sending.done() else "the step never reached the provider"
+        run_id = await running_run(client, conversation)
+        refused = await raw(client, "POST", f"/api/runs/{run_id}/steering", b'{"content": ' + HALF + b'}')
+        assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")
+        gate.open.set()
+        stream = await sending
+        assert (stream[-1]["type"], stream[-1]["status"]) == ("run_finished", "succeeded")
+        assert (await client.get(f"/api/conversations/{conversation}")).status_code == 200
+        await background_idle(client)
+    async with started(tmp_path / "data", Scripted("Fine.")) as client:
+        assert (await client.get(f"/api/conversations/{conversation}")).status_code == 200
+
+
+@pytest.mark.parametrize("entry", ["message", "queue", "queue_paper", "queue_edit", "steer_ended"])
+async def test_text_with_half_a_surrogate_pair_is_refused_at_each_entry_and_writes_nothing(tmp_path, entry):
+    # Note A (a message: its turn failed and its conversation could not be read again) and the queue's entries (500).
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        stream = await send(client, conversation, "First?")
+        queued = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"})).json()["id"]
+        before = await rows(client, WRITTEN)
+        method, path, body = {
+            "message": ("POST", f"/api/conversations/{conversation}/message/stream", b'{"content": ' + HALF + b'}'),
+            "queue": ("POST", f"/api/conversations/{conversation}/queue", b'{"content": ' + HALF + b'}'),
+            "queue_paper": ("POST", f"/api/conversations/{conversation}/queue",
+                            b'{"content": "Fine", "material_ids": [' + HALF + b']}'),
+            "queue_edit": ("PUT", f"/api/conversations/{conversation}/queue/{queued}", b'{"content": ' + HALF + b'}'),
+            "steer_ended": ("POST", f"/api/runs/{stream[0]['run_id']}/steering", b'{"content": ' + HALF + b'}'),
+        }[entry]
+        refused = await raw(client, method, path, body)
+        assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")
+        assert await rows(client, WRITTEN) == before
+        assert (await client.get(f"/api/conversations/{conversation}")).status_code == 200
+
+
+async def test_every_api_route_refuses_a_body_whose_text_holds_half_a_surrogate_pair(tmp_path):
+    # The sweep: every route's body goes through the one check, those of the routers app.py includes too, so a field
+    # added later, a key of a dict (Settings' updates) or an item of a list (a selection's ids) cannot miss it.
+    from fastapi.routing import APIRoute
+    from backend import app as app_module
+    async with started(tmp_path / "data") as client:
+        routes = [r for r in client.app.app.routes if isinstance(r, APIRoute)]
+        assert len(routes) > 50
+        assert [r.path for r in routes if not any(d.call is app_module._valid_text for d in r.dependant.dependencies)] == []
+        for method, path, body in [
+                ("PUT", "/api/settings", b'{"updates": {"budget.conversation_usd": 1, ' + HALF + b': 1}}'),
+                ("PUT", "/api/instructions", b'{"text": ' + HALF + b'}'),
+                ("POST", "/api/memory", b'{"project_id": "x", "type": "preference", "content": ' + HALF + b'}'),
+                ("POST", "/api/projects", b'{"name": ' + HALF + b'}')]:  # refused before too, by its constraint
+            refused = await raw(client, method, path, body)
+            assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request"), path
+        assert (await raw(client, "POST", "/api/projects", b'{"name": "a\\ud83d\\ude00b"}')).status_code == 201  # a pair
+        deep = b"[" * 50000 + b"]" * 50000  # past what Python parses: a route that takes no body ignores it, as before
+        assert (await raw(client, "GET", "/api/health", deep)).status_code == 200
+        assert (await raw(client, "POST", "/api/projects", deep)).status_code == 400
+
+
+async def test_one_runs_record_its_recovery_cannot_read_never_stops_the_others_or_the_launch(tmp_path, caplog):
+    # The audit's second ask: recovery recorded every run in one transaction, so one run's bad record (a note written
+    # before the API refused half a surrogate pair) stopped every later launch. That run is left as it is, and said in
+    # the log by its id, never its text; the others recover.
+    data = tmp_path / "data"
+    async with started(data) as client:
+        bad, good = await named(client, "Bad"), await named(client, "Good")
+        runs = {c: (await send(client, c, "First?"))[0]["run_id"] for c in (bad, good)}
+        await background_idle(client)
+
+        def as_crashed(conn):
+            for conversation, run_id in runs.items():
+                conn.execute("UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (run_id,))
+                (seq,) = conn.execute("SELECT max(seq) + 1 FROM run_events WHERE run_id = ?", (run_id,)).fetchone()
+                text = "Secret \ud83d note" if conversation == bad else "Left at the crash"
+                conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, 'steering_note', ?)",
+                             (run_id, seq, json.dumps({"text": text})))
+        for run_id in runs.values():
+            client.state["harness"].registry.finished.discard(run_id)
+        await asyncio.to_thread(client.state["db"].write, as_crashed)
+    with caplog.at_level("WARNING"):
+        async with started(data) as client:
+            read = await conversation_read(client, good)
+            assert read["turns"][-1]["status"] == "interrupted"
+            assert [q["text"] for q in read["queued"]] == ["Left at the crash"]
+            assert await rows(client, "SELECT status FROM runs WHERE id = ?", runs[bad]) == [("running",)]
+    said = [r.getMessage() for r in caplog.records if runs[bad] in r.getMessage()]
+    assert said and "Secret" not in caplog.text
+
+
+async def test_a_failing_write_still_stops_recovery_whole_rather_than_leaving_one_run_half_recovered(tmp_path):
+    # The internal review's second finding: only a record that cannot be read is left behind. Any other failure (here a
+    # constraint) rolls the whole recovery back as before, so a call in flight at the crash is still known to be one.
+    import sqlite3
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        run_id = (await send(client, conversation, "First?"))[0]["run_id"]
+        await background_idle(client)
+
+        def as_crashed(conn):
+            conn.execute("UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (run_id,))
+            conn.execute("CREATE TRIGGER refuse BEFORE UPDATE OF status ON runs BEGIN SELECT RAISE(ABORT, 'no'); END")
+        client.state["harness"].registry.finished.discard(run_id)
+        await asyncio.to_thread(client.state["db"].write, as_crashed)
+        with pytest.raises(sqlite3.IntegrityError):
+            await client.state["harness"].recover(kick=False)
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", run_id) == [("running",)]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute("DROP TRIGGER refuse"))
+        await client.state["harness"].recover(kick=False)
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", run_id) == [("interrupted",)]
+
+
+# PR 57's rechecks (batch 1): the body check reads only what the guard bounds, never rests on a Content-Length, and a
+# run it leaves behind is rolled back whole.
+
+async def test_a_static_pages_request_body_is_never_read(tmp_path):
+    # Astra pass 2 (P2) and Fable's finding 1: the guard bounds and authenticates /api only; a static GET is passed on
+    # as it is, so the body check read its whole body, one past MAX_BODY or one never sent. Here it is never sent.
+    async with started(tmp_path / "data") as client:
+        sent = []
+        never = asyncio.Event()
+
+        async def receive():
+            await never.wait()  # the body never comes
+            return {"type": "http.disconnect"}
+
+        async def send_(message):
+            sent.append(message)
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET", "scheme": "http",
+                 "path": "/index.html", "raw_path": b"/index.html", "query_string": b"", "root_path": "",
+                 "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8765),
+                 "headers": [(b"host", b"127.0.0.1:8765"), (b"content-type", b"application/json"),
+                             (b"content-length", b"1000")]}
+        await asyncio.wait_for(client.app(scope, receive, send_), 10)
+        assert sent and sent[0]["type"] == "http.response.start"
+
+
+async def test_a_body_with_no_content_length_is_checked_all_the_same(tmp_path):
+    # Fable's finding 2: the check returned at once without a Content-Length, resting on the guard refusing a chunked
+    # body. Sent to the app inside the guard, such a body is parsed by its route, and checked too.
+    import httpx
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        await send(client, conversation, "First?")
+
+        async def chunked():
+            yield b'{"content": ' + HALF + b'}'
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app.app), base_url=client.base_url) as inner:
+            refused = await inner.post(f"/api/conversations/{conversation}/queue", content=chunked(),
+                                       headers={"content-type": "application/json"})
+        assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")
+        assert await rows(client, "SELECT count(*) FROM queued_messages") == [(0,)]
+
+
+async def test_a_run_left_behind_has_nothing_of_its_recovery_written(tmp_path, monkeypatch):
+    # Fable's finding 3 (mutation M8): a record found unreadable after the run's first writes (here its accounting, the
+    # block's last read) leaves none of them: no note queued, no run_finished, the run still running.
+    from backend import runs as runs_module
+    async with started(tmp_path / "data") as client:
+        bad, good = await named(client, "Bad"), await named(client, "Good")
+        runs = {c: (await send(client, c, "First?"))[0]["run_id"] for c in (bad, good)}
+        await background_idle(client)
+
+        def as_crashed(conn):
+            for run_id in runs.values():
+                conn.execute("UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (run_id,))
+                (seq,) = conn.execute("SELECT max(seq) + 1 FROM run_events WHERE run_id = ?", (run_id,)).fetchone()
+                conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, 'steering_note', ?)",
+                             (run_id, seq, json.dumps({"text": "Left at the crash"})))
+        for run_id in runs.values():
+            client.state["harness"].registry.finished.discard(run_id)
+        await asyncio.to_thread(client.state["db"].write, as_crashed)
+        accounting = runs_module._accounting
+
+        def unreadable(conn, run_id, **options):
+            if run_id == runs[bad]:
+                import sqlite3
+                raise sqlite3.OperationalError("Could not decode to UTF-8 column 'data' with text '...'")
+            return accounting(conn, run_id, **options)
+        monkeypatch.setattr(runs_module, "_accounting", unreadable)
+        await client.state["harness"].recover(kick=False)
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", runs[bad]) == [("running",)]
+        assert await rows(client, "SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'run_finished'",
+                          runs[bad]) == [(1,)]  # its first turn's, from before the crash copy
+        assert await rows(client, "SELECT q.text FROM queued_messages q WHERE q.conversation_id = ?", bad) == []
+        assert [q["text"] for q in (await conversation_read(client, good))["queued"]] == ["Left at the crash"]
+
+
+async def test_a_request_whose_client_left_before_its_body_was_read_is_answered_as_before(tmp_path):
+    # Batch 1's internal review (P3): with no Content-Length shortcut, the check read the body of a GET whose client had
+    # already gone, and Starlette's ClientDisconnect escaped the app where the route had answered before.
+    async with started(tmp_path / "data") as client:
+        sent = []
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send_(message):
+            sent.append(message)
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET", "scheme": "http",
+                 "path": "/api/conversations", "raw_path": b"/api/conversations", "query_string": b"", "root_path": "",
+                 "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8765),
+                 "headers": [(b"host", b"127.0.0.1:8765"), (b"x-scholia-client", b"local")]}
+        await asyncio.wait_for(client.app(scope, receive, send_), 10)
+        assert sent[0]["type"] == "http.response.start" and sent[0]["status"] == 200

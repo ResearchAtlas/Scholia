@@ -58,6 +58,7 @@ import asyncio
 import json
 import logging
 import math
+import sqlite3
 import threading
 import time
 import traceback
@@ -535,18 +536,29 @@ class Harness:
                     "SELECT id, cancel_reason = 'revoked' FROM runs WHERE status = 'running' AND kind IN ('turn', 'child')"
             ).fetchall():
                 status = "cancelled" if revoked else "interrupted"  # a revoked run stays revoked
-                _queue_unread_notes(conn, run_id)  # S1-33: a steering note no step read waits as the next turn
-                _close_asks(conn, run_id)  # an open ask closes with its run, its question's text going with it
-                _let_go(conn, run_id)
-                _event(conn, run_id, "run_finished", {"status": status, **({"cancel_reason": "revoked"} if revoked else {})})
-                conn.execute(
-                    "UPDATE runs SET status = ?, finished_at = ?, settled_cost_usd = ? WHERE id = ?",
-                    (status, now, spending.run_cost(conn, run_id), run_id))
-                conn.execute(
-                    "UPDATE turns SET reason_code = ?, memory_status = coalesce(memory_status, 'skipped'),"
-                    " accounting = ? WHERE run_id = ?",
-                    ("cancelled" if revoked else "interrupted",
-                     json.dumps(_accounting(conn, run_id, complete=run_id not in in_flight)), run_id))
+                # One run's record that cannot be read (a note with half a surrogate pair, from before the API refused
+                # one: the M2 audit's Fable 5 F1) leaves that run as it is, said in the log by its id; the others recover.
+                conn.execute("SAVEPOINT recover_run")
+                try:
+                    _queue_unread_notes(conn, run_id)  # S1-33: a steering note no step read waits as the next turn
+                    _close_asks(conn, run_id)  # an open ask closes with its run, its question's text going with it
+                    _let_go(conn, run_id)
+                    _event(conn, run_id, "run_finished",
+                           {"status": status, **({"cancel_reason": "revoked"} if revoked else {})})
+                    conn.execute(
+                        "UPDATE runs SET status = ?, finished_at = ?, settled_cost_usd = ? WHERE id = ?",
+                        (status, now, spending.run_cost(conn, run_id), run_id))
+                    conn.execute(
+                        "UPDATE turns SET reason_code = ?, memory_status = coalesce(memory_status, 'skipped'),"
+                        " accounting = ? WHERE run_id = ?",
+                        ("cancelled" if revoked else "interrupted",
+                         json.dumps(_accounting(conn, run_id, complete=run_id not in in_flight)), run_id))
+                except (sqlite3.OperationalError, UnicodeError) as error:  # never the message: it can hold the text
+                    if isinstance(error, sqlite3.OperationalError) and not str(error).startswith("Could not decode"):
+                        raise  # a locked, full or failing database stops the launch, as before
+                    conn.execute("ROLLBACK TO recover_run")
+                    log.warning("run %s not recovered (%s); the others were", run_id, type(error).__name__)
+                conn.execute("RELEASE recover_run")
 
         await self._write(record)
         if kick:
