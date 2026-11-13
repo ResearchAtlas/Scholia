@@ -248,6 +248,26 @@ async def test_the_zotero_switch_survives_a_full_backup_and_its_restore(tmp_path
         assert (await client.get("/api/zotero/status")).json() == {"state": "off"}
 
 
+async def test_a_restored_full_backup_shows_its_own_run_as_it_ended(tmp_path):
+    # M2 audit 6 F4: its copy of the database was taken while its run ran, so recovery ended that run interrupted
+    data, destination = tmp_path / "data", tmp_path / "chosen"
+    destination.mkdir()
+    async with started(data) as client:
+        run = await archived_run(client, "/api/backups/full", {"destination": str(destination)})
+        assert run.status == "succeeded", run
+        response = await client.post("/api/backups/restore", json={"file": run.result["file"]})
+        assert response.status_code == 200, response.text
+        [(status, finished, summary)] = await rows(client, "SELECT status, finished_at, summary FROM runs WHERE id = ?",
+                                                   run.row["run_id"])
+        assert status == "succeeded" and finished and json.loads(summary)["projects"] == run.result["projects"]
+        events = [kind for (kind,) in await rows(client, "SELECT type FROM run_events WHERE run_id = ? ORDER BY seq",
+                                                 run.row["run_id"])]
+        assert events[-1:] == ["run_finished"] and events.count("run_finished") == 1
+        [listed] = [r for r in (await client.get("/api/activity")).json()["runs"] if r["run_id"] == run.row["run_id"]]
+        assert listed["status"] == "succeeded"
+    assert not [p for p in destination.iterdir() if p.suffix != ".zip"]  # nothing else left beside it
+
+
 async def test_a_full_backup_is_recorded_before_anything_is_written_and_removed_if_it_fails(tmp_path, monkeypatch):
     import errno
     import backend.db.database as database_module

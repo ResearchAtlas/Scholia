@@ -49,7 +49,7 @@ from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _
     closing_connection, list_generations
 from backend.db.content import IDLE_AFTER
 from backend.db.migrations import MIGRATIONS
-from backend.runs import RunOutcome, _through
+from backend.runs import RunOutcome, _event, _through
 from backend.settings import known_only, write_private
 
 log = logging.getLogger(__name__)
@@ -578,7 +578,7 @@ def register(harness, state):
                                             state.get("content"), memory=inputs.get("memory", True))
                 else:
                     write = lambda: _full_backup(db, destination, passphrase, state["archives"], stop,  # noqa: E731
-                                                 progress, state.get("content"))
+                                                 progress, state.get("content"), active.run_id)
                 result = await harness.work(active, write)
         except BackupError as error:
             raise RunOutcome("failed", error.code) from None
@@ -591,14 +591,16 @@ def register(harness, state):
     harness.workflows["project_export"] = archive
 
 
-def _full_backup(db, destination, passphrase, archives, stop=None, progress=None, store=None):
+def _full_backup(db, destination, passphrase, archives, stop=None, progress=None, store=None, run_id=None):
     with _written(), _watched(archives, None, passphrase) as archive, contextlib.ExitStack() as held:
-        return _write_full_backup(db, destination, passphrase, archive, stop, progress, store, held)
+        return _write_full_backup(db, destination, passphrase, archive, stop, progress, store, held, run_id)
 
 
-def _write_full_backup(db, destination, passphrase, archive, stop=None, progress=None, store=None, held=None):
+def _write_full_backup(db, destination, passphrase, archive, stop=None, progress=None, store=None, held=None,
+                       run_id=None):
     """store and held: the content store and a stack, which holds the files the backup lists from collection
-    until it is written (ContentStore.hold)."""
+    until it is written (ContentStore.hold). run_id: the backup's own run, which its copy of the database shows
+    ended (_ended_in_copy)."""
     staging = _staging(db.data_dir)
     try:
         with _backup_errors():
@@ -635,6 +637,8 @@ def _write_full_backup(db, destination, passphrase, archive, stop=None, progress
                 missing += 1
         record = {"encrypted": passphrase is not None, "projects": projects, "content_files": len(hashes) - missing,
                   "missing_files": missing, "settings_left_out": left_out, "schema_version": info["schema_version"]}
+        if run_id is not None:
+            _ended_in_copy(staging / "copy" / DB_NAME, run_id, record)
         path = _write_zip(destination, "scholia-backup", entries, passphrase, stop=stop or (lambda: db.closed),
                           archive=archive, progress=progress,
                           audit=lambda file: db.write(lambda conn: conn.execute(  # its destination, never content
@@ -643,6 +647,20 @@ def _write_full_backup(db, destination, passphrase, archive, stop=None, progress
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return {"ok": True, "file": str(path), **record, "size": path.stat().st_size}
+
+
+def _ended_in_copy(path, run_id, summary):
+    """The full backup's own run ended succeeded in its copy of the database, which was taken while the run ran: a
+    restore of it would otherwise find the run running, and recovery would end it interrupted (M2 audit 6 F4). The copy
+    leaves the data folder only once the backup is written, which is the run's success; summary is its result but for
+    the file's name and size, known only then."""
+    with closing_connection(sqlite3.connect(path, autocommit=True)) as copy:
+        copy.execute("BEGIN IMMEDIATE")
+        if copy.execute("SELECT 1 FROM runs WHERE id = ? AND status = 'running'", (run_id,)).fetchone():
+            _event(copy, run_id, "run_finished", {"status": "succeeded"})
+            copy.execute("UPDATE runs SET status = 'succeeded', waiting = NULL, finished_at = ?, summary = ?,"
+                         " settled_cost_usd = 0 WHERE id = ?", (utc_now(), json.dumps(summary), run_id))
+        copy.execute("COMMIT")
 
 
 # Restore
