@@ -274,3 +274,20 @@ async def test_forget_in_the_views_offers_delete_everywhere_including_backups(tm
         stale = await client.delete(f"/api/memory/{purged}", params={"version": 1, "purge_backups": "true"})
         assert stale.status_code == 404  # nothing purged for a record not forgotten
         assert await rows(client, "SELECT count(*) FROM audit_log WHERE event = 'backup_purge'") == [(1,)]
+
+
+async def test_whats_done_takes_no_edit_so_what_is_shown_sent_and_kept_agree(tmp_path):
+    # M2 audit area 4, item 7 (Fable F5, probe C): a progress record is drawn from its count and rewritten by the next
+    # paper, so an edit was neither shown nor kept; it is refused, and the views offer no Edit on it
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await added(client, project, MARKDOWN)
+        await settled(client, project)
+        [done] = [r for r in await records(client, project) if r["type"] == "progress"]
+        refused = await client.patch(f"/api/memory/{done['id']}", json={"project_id": project, "version": done["version"],
+                                                                         "content": "We screened the 2020 cohort papers"})
+        assert (refused.status_code, refused.json()["code"]) == (400, "not_editable")
+        assert await rows(client, "SELECT content, status, version FROM memory_records WHERE type = 'progress'") == [
+            (done["content"], "inferred", done["version"])]
+        lines, _ = await asyncio.to_thread(client.state["db"].read, lambda conn: memory.project_state(conn, project))
+        assert lines == [f"- [done] {done['content']}"]

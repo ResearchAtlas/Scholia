@@ -309,3 +309,13 @@ test('Forget in the views and the card opens the delete dialog for the record at
   assert.notEqual(t('memory.forgetTitle'), 'memory.forgetTitle');
   assert.match(t('memory.forgetBody', { content: 'We use interviews' }), /We use interviews/);
 });
+
+// M2 audit area 4, item 7: what's done is drawn from its count, so the views offer no Edit on it; a refusal changes
+// nothing, so the view and an open editor stay as they are
+test('what\'s done offers no Edit, and its refusal is said in words', async () => {
+  const { readsAgain } = await import('../src/memory.js');
+  const view = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
+  assert.match(view, /\{record\.type !== 'progress' && \( \/\/ what's done/);
+  assert.equal(readsAgain({ code: 'not_editable' }), false);
+  assert.notEqual(t('errors.not_editable'), 'errors.not_editable');
+});

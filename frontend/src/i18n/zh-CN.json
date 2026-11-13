@@ -1361,6 +1361,7 @@
   "errors.version_changed": "这条记录在显示后已更改，请重新查看。",
   "errors.out_of_date": "它要替换的条目已更改，因此已标为过时。",
   "errors.not_confirmable": "已完成事项和智能体的笔记永远不会被确认。",
+  "errors.not_editable": "已完成事项根据你的文献库自身的记录写成，因此不能编辑。可以忘记它。",
   "errors.invalid_scope": "只有个人资料和偏好条目属于个人记忆。",
   "errors.empty": "内容为空。",
   "audit.event.memory_allowance_notice": "记忆提取因额度被跳过（提示一次）",

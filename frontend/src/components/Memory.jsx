@@ -149,8 +149,10 @@ function Row({ record, projectId, onFailed }) {
             <Button size="sm" variant="outline" className="h-7" disabled={busy}
               onClick={() => act(() => changeRecord(record, { status: 'confirmed' }, projectId), false, record.id)}>{t('memory.confirm')}</Button>
           )}
-          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setEditing(record.content)}>
-            {t('memory.edit')}</Button>
+          {record.type !== 'progress' && ( // what's done is drawn and counted from the library's records: never edited
+            <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setEditing(record.content)}>
+              {t('memory.edit')}</Button>
+          )}
           <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setForgetting(true)}>
             {t('memory.forget')}</Button>
         </div>

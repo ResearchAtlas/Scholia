@@ -312,9 +312,10 @@ def listing(conn, project_id=None, statuses=None):
 def edit(conn, record, version, *, content=None, confirm=False):
     """The researcher's change to a record at the version they saw (the memory views, Things to confirm). A pending
     proposal takes the new content and is kept (keep). An active record gets a new version that replaces it, with
-    content (or the same content), confirmed; progress and agent notes stay inferred (never confirmed). Raises
-    LookupError, or ValueError: "changed" when it is not at that version any more (or superseded), or "not_confirmable".
-    None when a proposal is out of date (keep)."""
+    content (or the same content), confirmed; progress and agent notes stay inferred (never confirmed). Progress takes
+    no new text: it is drawn and counted from AAB's own records, so an edit would be neither shown nor kept (M2 audit
+    area 4, item 7). Raises LookupError, or ValueError: "changed" when it is not at that version any more (or
+    superseded), "not_confirmable" or "not_editable". None when a proposal is out of date (keep)."""
     old = row(conn, record)
     if old is None:
         raise LookupError(record)
@@ -323,6 +324,8 @@ def edit(conn, record, version, *, content=None, confirm=False):
     code_written = old["type"] in ("progress", "agent_note")
     if code_written and confirm:
         raise ValueError("not_confirmable")
+    if old["type"] == "progress" and content is not None:
+        raise ValueError("not_editable")
     if old["status"] == "proposed":
         if content is not None and content != old["content"]:
             # its next version, under the same id (Forget, the late rule and revocation follow the id): a request that
@@ -952,6 +955,7 @@ def _refused(error):
 _CHANGE_ERRORS = {"changed": (409, "version_changed", "This record changed since it was shown; look again"),
                   "out_of_date": (409, "out_of_date", "The record this would replace changed; look again"),
                   "not_confirmable": (400, "not_confirmable", "Progress and the agent's notes are never confirmed"),
+                  "not_editable": (400, "not_editable", "Progress is written from the library's own records"),
                   "personal_from_strict": (400, "personal_from_strict",
                                            "Personal memory is written and changed only from a Normal, unlocked"
                                            " project")}

@@ -1410,6 +1410,7 @@
   "errors.version_changed": "This record changed since it was shown. Look again.",
   "errors.out_of_date": "The record this would replace changed, so it is marked out of date.",
   "errors.not_confirmable": "What's done and the agent's notes are never confirmed.",
+  "errors.not_editable": "What's done is written from your library's own records, so it cannot be edited. You can forget it.",
   "errors.invalid_scope": "Only profile and preference records are personal.",
   "errors.empty": "The text is empty.",
   "audit.event.memory_allowance_notice": "Memory extraction skipped for its allowance (noticed once)",

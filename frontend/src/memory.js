@@ -73,7 +73,8 @@ export async function attempt(t, action, edit = false, id = null) {
 // Whether the views read again after an action: always, but for a failure the server gives only before any write
 // (nothing changed: the view, and its open editor, stay as they are). A record changed meanwhile, or an outcome unknown
 // (a dropped connection, an error after a commit), reads again, which closes the editor, with the notice.
-const REFUSED_BEFORE_WRITING = new Set(['personal_from_strict', 'invalid_request', 'empty', 'not_confirmable']);
+const REFUSED_BEFORE_WRITING = new Set(['personal_from_strict', 'invalid_request', 'empty', 'not_confirmable',
+  'not_editable']);
 export const readsAgain = (failed) => !failed || !REFUSED_BEFORE_WRITING.has(failed.code);
 
 // What an action could not save, kept by view and project (`settings:<project>`, `leftOff:<project>`) outside the
