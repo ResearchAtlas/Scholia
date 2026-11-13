@@ -811,6 +811,18 @@ async def test_a_project_export_holds_its_citations_notes_asks_and_waiting_messa
     assert lines[-2:] == ["## Waiting to send", "And the power?"]
 
 
+async def step_reached(gate, sending, timeout=15):
+    """Wait for the gated step, at most timeout seconds; a send that ended first raises its error or fails."""
+    reached = asyncio.ensure_future(gate.reached.wait())
+    done, _ = await asyncio.wait({reached, sending}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    if reached not in done:
+        reached.cancel()
+        if sending in done:
+            raise AssertionError(f"the turn ended before its gated step: {sending.result()}")
+        sending.cancel()
+        raise AssertionError("the gated step did not start in time")
+
+
 async def exported_conversation(client, project, conversation, destination):
     """A project export's record and Markdown of one conversation."""
     run = await archived_run(client, f"/api/projects/{project}/export", {"destination": str(destination)})
@@ -834,14 +846,14 @@ async def test_an_export_holds_a_note_not_read_yet_and_then_as_read_once(tmp_pat
         project = await new_project(client)
         conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
         sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
-        await gate.reached.wait()
+        await step_reached(gate, sending)
         assert (await steer(client, await running_run(client, conversation), "Only recent ones")).status_code == 200
         waiting, markdown = await exported_conversation(client, project, conversation, destination)
         [turn] = waiting["turns"]
         assert [(n["text"], n["state"]) for n in turn["steering"]] == [("Only recent ones", "pending")]
         assert waiting["queued"] == [] and "*Note for Scholia, not read yet: Only recent ones*" in markdown
         gate.open.set()
-        assert (await sending)[-1]["status"] == "succeeded"
+        assert (await asyncio.wait_for(sending, 30))[-1]["status"] == "succeeded"
         done, markdown = await exported_conversation(client, project, conversation, destination)
         assert [(n["text"], n["state"]) for n in done["turns"][0]["steering"]] == [("Only recent ones", "read")]
         assert done["queued"] == [] and markdown.count("Only recent ones") == 1
@@ -861,10 +873,10 @@ async def test_an_export_holds_a_note_queued_at_its_turns_end_only_as_waiting(tm
         project = await new_project(client)
         conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
         sending = asyncio.create_task(send(client, conversation, "How many?"))
-        await gate.reached.wait()  # the last step (an answer) is in flight
+        await step_reached(gate, sending)  # the last step (an answer) is in flight
         assert (await steer(client, await running_run(client, conversation), "Also say how many")).status_code == 200
         gate.open.set()
-        assert (await sending)[-1]["status"] == "succeeded"
+        assert (await asyncio.wait_for(sending, 30))[-1]["status"] == "succeeded"
         found, markdown = await exported_conversation(client, project, conversation, destination)
     assert found["turns"][0]["steering"] == [] and [q["text"] for q in found["queued"]] == ["Also say how many"]
     assert markdown.count("Also say how many") == 1
