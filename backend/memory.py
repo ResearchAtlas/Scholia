@@ -882,7 +882,7 @@ def _on(state, project_id):
 
 async def _embed_soon(state, project_id):
     """The index runs that embed what memory written in the project lacks, when the search model is installed
-    (search.embed_memory_soon: the project's, and the General project's for personal records)."""
+    (search.embed_memory_soon: the project's, and the General project's, at every write)."""
     from backend import search  # it imports backend.runs, which imports this module
     if state.get("harness") is not None:
         try:
