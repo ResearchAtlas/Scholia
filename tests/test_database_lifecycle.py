@@ -140,19 +140,31 @@ def test_an_existing_database_at_version_zero_is_backed_up_before_migrating(tmp_
     conn.close()
 
     Database(data).close()
-    # one backup before each migration; past the daily ones kept, the oldest is promoted to weekly (S1-21a's 0008
-    # made them eight), and one more taken the same day is rotated out (S1-21b's 0009): the first, the database as it
-    # was before any migration, is the one kept
-    from backend.db.database import DAILY_KEPT
-    found = sorted([(name, "weekly") for name in generations(data, "weekly")] + [(name, "daily") for name in generations(data)])
-    assert len(found) == min(len(MIGRATIONS), DAILY_KEPT + 1)
-    generation, kind = found[0]
-    backup = sqlite3.connect((data / "backups" / kind / generation / DB_NAME).as_uri() + "?mode=ro", uri=True)
+    # one backup before the first migration, the database as it was before any of them (M2 audit 6 F1)
+    assert not generations(data, "weekly")
+    [generation] = generations(data)
+    backup = sqlite3.connect((data / "backups" / "daily" / generation / DB_NAME).as_uri() + "?mode=ro", uri=True)
     try:
         assert backup.execute("PRAGMA user_version").fetchone()[0] == 0
         assert backup.execute("SELECT text FROM notes").fetchall() == [("kept",)]
     finally:
         backup.close()
+
+
+def test_an_upgrade_keeps_the_backups_it_found_and_the_one_taken_before_its_first_migration(tmp_path):
+    # M2 audit 6 F1: a backup before each of nine migrations rotated out the week of daily backups an M1 folder held
+    data = tmp_path / "data"
+    now = datetime.now(UTC)
+    with Database(data, migrations=MIGRATIONS[:3]) as db:  # as an M1 build leaves it: schema 3, a backup a day
+        for days in range(6, 0, -1):
+            db.backup(now=now - timedelta(days=days))
+    found = generations(data)
+
+    Database(data).close()
+    daily = generations(data)
+    assert daily[:-1] == found and not generations(data, "weekly")
+    assert [user_version(data / "backups" / "daily" / name / DB_NAME) for name in daily] == [3] * 7
+    assert database_module._stamp_of(Path(daily[-1])) >= now  # the data as it was upgraded
 
 
 def test_the_database_carries_the_scholia_identity_and_reopens(tmp_path):
@@ -204,7 +216,7 @@ def test_an_empty_existing_file_becomes_this_apps_database(tmp_path, content):
     assert stamped == (APPLICATION_ID, len(MIGRATIONS))
 
 
-def test_a_backup_is_taken_before_each_migration_of_an_existing_database(tmp_path):
+def test_one_backup_is_taken_before_the_migrations_of_an_existing_database(tmp_path):
     data = tmp_path / "data"
     Database(data).close()
     assert not (data / "backups").exists()  # a new database had nothing to back up
@@ -213,7 +225,7 @@ def test_a_backup_is_taken_before_each_migration_of_an_existing_database(tmp_pat
     with Database(data, migrations=MIGRATIONS + later) as db:
         assert {"second", "third"} <= table_names(db)
     daily = data / "backups" / "daily"
-    assert [user_version(daily / name / DB_NAME) for name in generations(data)] == [len(MIGRATIONS), len(MIGRATIONS) + 1]
+    assert [user_version(daily / name / DB_NAME) for name in generations(data)] == [len(MIGRATIONS)]  # before the first
 
 
 def test_a_failed_migration_keeps_the_previous_schema(tmp_path):

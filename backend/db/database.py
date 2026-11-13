@@ -125,7 +125,7 @@ class Database:
 
     Opening checks an existing file read-only (a newer schema is refused and
     quick_check must pass), then migrates it on the writer thread, taking a
-    backup before each migration unless the database is new and empty.
+    backup before its first migration unless the database is new and empty.
     """
 
     def __init__(self, data_dir, *, migrations=MIGRATIONS):
@@ -421,10 +421,11 @@ class Database:
             if _switch_to_wal(conn) != "wal":
                 raise RuntimeError("the database could not switch to WAL mode")
             new = None  # whether this startup found a new, empty database
+            backed_up = False
             while True:
                 # Decide under the write lock, so migrations another connection applied
                 # meanwhile are seen and not run again. The backup then copies exactly
-                # the state the migration starts from.
+                # the state the first migration starts from.
                 conn.execute("BEGIN IMMEDIATE")
                 version, has_schema = _usable_state(conn, len(migrations))
                 if new is None:
@@ -432,11 +433,15 @@ class Database:
                 if version == len(migrations):
                     conn.execute("ROLLBACK")
                     break
-                if not new:  # a database this startup created holds nothing to back up, before any migration
+                # A database this startup created holds nothing to back up. One backup, of the version the
+                # app last ran at, is what going back needs (section 16); one per migration would rotate
+                # out the daily backups and a restore's safety copy (M2 audit 6 F1).
+                if not new and not backed_up:
                     with self._backup_lock:
                         generation = self._backup(datetime.now(UTC))
                     if not (generation / DB_NAME).is_file():
                         raise RuntimeError("the backup taken before this migration is missing, so it did not run")
+                    backed_up = True
                 # One transaction: the script, then the user_version bump, then COMMIT.
                 conn.executescript(f"{migrations[version]}\nPRAGMA user_version = {version + 1};\nCOMMIT;")
         except BaseException:

@@ -570,10 +570,8 @@ def test_a_database_at_schema_1_gets_the_guard_for_its_earlier_deletions(tmp_pat
                 "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (deleted, project)))
         db.write(lambda conn: conn.execute(
             "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (new_id(), project)))
-    # taken before the first migration it ran: the oldest generation, promoted to weekly once more than the daily
-    # generations kept were taken (S1-21b's migration 0009 made it eight)
-    generation = min((g for kind in ("daily", "weekly") if (data / "backups" / kind).is_dir()
-                      for g in (data / "backups" / kind).iterdir()), key=lambda g: g.name)
+    # the one backup, taken before the first migration it ran (M2 audit 6 F1)
+    [generation] = (data / "backups" / "daily").iterdir()
     backup = sqlite3.connect(f"{(generation / DB_NAME).as_uri()}?mode=ro", uri=True)
     try:
         assert backup.execute("PRAGMA user_version").fetchone() == (1,)

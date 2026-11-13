@@ -405,6 +405,30 @@ async def test_a_restore_works_where_the_file_system_has_no_hard_links(tmp_path,
         assert (await client.get(f"/api/projects/{later}")).status_code == 200
 
 
+async def test_a_restore_of_an_older_schemas_backup_keeps_its_safety_copy(tmp_path):
+    # M2 audit 6 F1: the backups taken before the restored database's migrations rotated the safety copy out
+    data = tmp_path / "data"
+
+    def older():  # an M1 data folder (schema 3) and its backup
+        with Database(data, migrations=MIGRATIONS[:3]) as db:
+            return db.backup().name
+
+    name = await asyncio.to_thread(older)
+    async with started(data) as client:
+        later = await new_project(client, "Later")
+        [old] = [b["id"] for b in (await client.get("/api/backups")).json()["backups"] if b["id"].endswith(name)]
+        response = await client.post("/api/backups/restore", json={"generation": old})
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["schema_version"] == len(MIGRATIONS)
+        listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
+        assert result["safety_copy"] in listed and listed[result["safety_copy"]]["schema_version"] == len(MIGRATIONS)
+        conn = sqlite3.connect((data / "backups" / result["safety_copy"] / DB_NAME).as_uri() + "?mode=ro", uri=True)
+        assert later in {project for (project,) in conn.execute("SELECT id FROM projects")}
+        conn.close()
+        assert old in listed  # and the backup restored from
+
+
 async def test_a_restore_stops_a_running_turn(tmp_path):
     async with started(tmp_path / "data") as client:
         backup = (await client.post("/api/backups")).json()["id"]
