@@ -552,6 +552,53 @@ async def test_the_installs_requests_go_on_after_one_fails(tmp_path, monkeypatch
         assert asked == [first, second]
 
 
+async def test_a_record_moved_away_and_back_before_its_removal_applies_gets_its_vector_again(tmp_path):
+    # batch 2, internal review F1: a queued removal deletes the vector by id, so a record moved back to its project
+    # counts as lacking one until that removal applies; the move asks for its project's run
+    from cited import cited
+    from test_materials import added
+    from test_search import WAGES, runs_of
+    async with cited(tmp_path) as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        conversation = await conversation_in(client, first)
+        await send(client, conversation, "Remember: wage floors raise the earnings of low-paid workers")
+        [(record,)] = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+        await background_idle(client, timeout=20)
+        assert await _vectors(client, [record]) == {record}
+        client.remote.hold, client.remote.free = asyncio.Event(), len(client.remote.indexing)
+        await added(client, second, WAGES)  # the second project's run, held on its paper's embedding
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        for to in (second, first):  # its removals queued; the second project's run applies them only as it reruns
+            response = await client.post(f"/api/conversations/{conversation}/move", json={"project_id": to})
+            assert response.status_code == 200, response.text
+        client.remote.hold.set()
+        assert await _vectors(client, [record]) == {record}
+        assert await asyncio.to_thread(client.state["index"]._read, lambda conn: conn.execute(
+            "SELECT scope FROM memory_rows WHERE memory_id = ?", (record,)).fetchall()) == [(f"project:{first}",)]
+        assert all(r["status"] == "succeeded" for r in await runs_of(client, "index"))
+
+
+async def test_a_project_record_written_elsewhere_never_restarts_the_general_projects_cancelled_run(tmp_path):
+    # batch 2, internal review F2: a write asks only for the runs of the records written from its project (R29)
+    from test_search import app, runs_of
+    async with app(tmp_path) as client:
+        client.remote.hold, client.remote.free = asyncio.Event(), 0
+        project, other = await project_of(client, "First"), await project_of(client, "Second")
+        general = await _general(client)
+        await entered(client, project, "I prefer short answers", kind="preference", scope="personal")
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = await runs_of(client, "index", general)
+        assert (await client.post(f"/api/runs/{run['run_id']}/cancel")).json()["status"] == "cancelled"
+        client.remote.hold.set()
+        await background_idle(client)
+        record = (await entered(client, other, "We dropped the pilot"))["id"]
+        assert await _vectors(client, [record]) == {record}
+        assert len(await runs_of(client, "index", general)) == 1  # still the one cancelled
+        await entered(client, project, "I prefer answers in English", kind="preference", scope="personal")
+        await background_idle(client)
+        assert len(await runs_of(client, "index", general)) == 2  # saving personal memory asks again (a later trigger)
+
+
 @pytest.mark.parametrize("site", ["create", "edit", "keep", "move"])
 async def test_a_memory_write_whose_request_goes_away_after_its_commit_still_asks_for_its_run(tmp_path, monkeypatch,
                                                                                               site):
