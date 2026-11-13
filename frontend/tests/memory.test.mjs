@@ -203,7 +203,6 @@ test('a notice is cleared only by a success on the record it names', async () =>
   assert.equal(settled(unnamed, null, null), unnamed);
   const source = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
   assert.match(source, /act\(\(\) => changeRecord\(record, \{ status: 'confirmed' \}, projectId\), false, record\.id\)/);
-  assert.match(source, /act\(\(\) => forgetRecord\(record\), false, record\.id\)/);
 });
 
 // Q16 (PR 51 recheck 5; the simplification, for Harold): no unsaved text outside the editor. The editor keeps its text
@@ -249,7 +248,7 @@ test('an action on a memory record tells every project, once done or of unknown 
         tree = Proposal({ proposal: { id: 'r1', version: 1, content: 'x', structured: {} }, onFailed: () => {} });
         return null;
       }));
-      const buttons = tree.props.children.flat().at(-1).props.children;
+      const buttons = tree.props.children.flat().at(-2).props.children; // the last is its Forget dialog
       const button = buttons.find((b) => b.props.children === t(label));
       globalThis.fetch = reply;
       const heard = [];
@@ -259,9 +258,8 @@ test('an action on a memory record tells every project, once done or of unknown 
       return heard;
     };
     const json = (status, body) => async () => new Response(JSON.stringify(body), { status });
-    assert.deepEqual(await click('memory.forget', json(200, { ok: true })), [null]);
     assert.deepEqual(await click('memory.keep', json(200, { project_id: 'p1' })), [null]);
-    assert.deepEqual(await click('memory.forget', async () => { throw new TypeError('dropped'); }), [null]); // unknown outcome
+    assert.deepEqual(await click('memory.keep', async () => { throw new TypeError('dropped'); }), [null]); // unknown outcome
     assert.deepEqual(await click('memory.keep', json(409, { code: 'version_changed' })), [null]); // the record changed
     assert.deepEqual(await click('memory.keep', json(400, { code: 'personal_from_strict' })), []); // refused: nothing changed
   } finally {
@@ -292,4 +290,22 @@ test('a memory change and a Things to confirm answer name the project they are m
   assert.match(card, /<Proposal key=\{proposal\.id\} proposal=\{proposal\} projectId=\{projectId\}/);
   const memory = readFileSync(join(SRC, 'memory.js'), 'utf8');
   assert.match(memory, /\{ version: record\.version, project_id: projectId \?\? null, \.\.\.body \}/);
+});
+
+// M2 audit area 4, item 6 (ticket 18, Retention): the views' and the card's Forget is the delete dialog, with its backup
+// note and "Delete everywhere including backups", at the version shown
+test('Forget in the views and the card opens the delete dialog for the record at the version shown', () => {
+  const view = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
+  assert.equal((view.match(/onClick=\{\(\) => setForgetting\(true\)\}/g) ?? []).length, 2); // a record's row, a proposal
+  assert.equal((view.match(/<Forget record=\{(record|proposal)\} open=\{forgetting\}/g) ?? []).length, 2);
+  assert.match(view, /<DeleteDialog target=\{open \? \{ kind: 'memory', id: record\.id, version: record\.version,/);
+  assert.doesNotMatch(view, /action: 'forget'/);
+  // done, or closed after a failure, every view reads again (MB12)
+  assert.match(view, /onClose=\{\(failed\) => \{ onClose\(\); if \(failed\) memoryChanged\(null\); \}\}/);
+  assert.match(view, /onDone=\{\(\) => \{ onClose\(\); memoryChanged\(null\); \}\}/);
+  const dialog = readFileSync(join(SRC, 'components', 'DeleteDialog.jsx'), 'utf8');
+  assert.match(dialog, /else onClose\(Boolean\(problem\)\);/);
+  assert.match(dialog, /shown\.current\?\.kind !== 'memory' && <details/); // a forgotten record keeps no title anyway
+  assert.notEqual(t('memory.forgetTitle'), 'memory.forgetTitle');
+  assert.match(t('memory.forgetBody', { content: 'We use interviews' }), /We use interviews/);
 });

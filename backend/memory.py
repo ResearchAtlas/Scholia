@@ -1055,14 +1055,19 @@ async def change_memory(record_id: str, body: Change, request: Request):
 
 
 @router.delete("/api/memory/{record_id}")
-async def delete_memory(record_id: str, request: Request, version: int | None = None):
+async def delete_memory(record_id: str, request: Request, version: int | None = None, purge_backups: bool = False):
     """Forget: the record's content is deleted (with the versions it replaced), its vector removed, its audit record
     written without content, and the runs whose request holds it revoked. version: the one the view showed; a record
     changed or replaced since is not forgotten (409, as an edit at a stale version; S1-21a follow-up MB10). Without
-    it nothing is forgotten (400): which version was shown cannot be told (PR 51 review 1)."""
+    it nothing is forgotten (400): which version was shown cannot be told (PR 51 review 1). purge_backups: the delete
+    dialog's "Delete everywhere including backups" (ticket 18, Retention), as for a project, conversation or paper:
+    after the forget, a fresh backup and no older one; a request that goes away still purges."""
+    from backend import backups
+    from backend.runs import _through  # it imports this module
     state = request.app.state.scholia
     if version is None:
         return _refused(Refused(400, "invalid_request", "Name the version shown"))
+    project = []
 
     def shown(conn):
         found = row(conn, record_id)
@@ -1070,13 +1075,30 @@ async def delete_memory(record_id: str, request: Request, version: int | None = 
             raise LookupError(record_id)
         if found["version"] != version or found["status"] == "superseded":
             raise ValueError("changed")
-    try:
+        project.append(found["project_id"])
+
+    async def forgetting():
         await _forget(state, record_id, check=shown)
+        if not purge_backups:
+            return {"ok": True}
+        try:
+            async with state["backups_lock"]:
+                purged = await asyncio.to_thread(backups.purge, state["db"], project[-1],
+                                                 {"kind": "memory", "object_id": record_id})
+        except Exception as error:  # forgotten all the same; the older backups keep it until they are replaced
+            import logging
+            logging.getLogger(__name__).warning("purging the backups after a forget failed (%s)", type(error).__name__)
+            purged = {"purge_failed": True}
+        return {"ok": True, **purged}
+    try:
+        done, cancelled = await _through(forgetting())
+        if cancelled:
+            raise asyncio.CancelledError()
+        return done
     except LookupError:
         return _refused(Refused(404, "not_found", "No such record"))
     except ValueError as error:
         return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
-    return {"ok": True}
 
 
 @router.get("/api/memory/review")

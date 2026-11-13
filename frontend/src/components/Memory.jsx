@@ -7,10 +7,11 @@ import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalSt
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError } from '../api.js';
 import { visible } from '../text.js';
-import { attempt, changeRecord, forgetRecord, keepUnsaved, keptEvents, keptUnsaved, memoryChanged, readMemory, readsAgain,
+import { attempt, changeRecord, keepUnsaved, keptEvents, keptUnsaved, memoryChanged, readMemory, readsAgain,
   recordText, review, settled } from '../memory.js';
 import { libraryEvents, readGuard } from '../library.js';
 import { LoadState, Section } from './fields.jsx';
+import { DeleteDialog } from './DeleteDialog.jsx';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 
@@ -118,6 +119,7 @@ function Row({ record, projectId, onFailed }) {
   const language = useContext(LanguageContext);
   const { busy, act } = useMemoryAction(onFailed);
   const [editing, setEditing] = useState(null);
+  const [forgetting, setForgetting] = useState(false);
   const written = record.type === 'progress' || record.type === 'agent_note'; // by the app or the agent: never confirmed
   const since = record.valid_from ? new Intl.DateTimeFormat(language, { dateStyle: 'medium' }).format(new Date(record.valid_from)) : null;
   const kinds = [...new Set(record.sources.map((s) => s.kind))];
@@ -149,10 +151,11 @@ function Row({ record, projectId, onFailed }) {
           )}
           <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setEditing(record.content)}>
             {t('memory.edit')}</Button>
-          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => act(() => forgetRecord(record), false, record.id)}>
+          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setForgetting(true)}>
             {t('memory.forget')}</Button>
         </div>
       )}
+      <Forget record={record} open={forgetting} onClose={() => setForgetting(false)} />
     </li>
   );
 }
@@ -164,6 +167,7 @@ export function Proposal({ proposal, projectId, onFailed }) {
   const t = useT();
   const { busy, act: acted } = useMemoryAction(onFailed);
   const [editing, setEditing] = useState(null);
+  const [forgetting, setForgetting] = useState(false);
   const act = (body) => acted(() => review({ id: proposal.id, version: proposal.version, project_id: projectId ?? null,
     ...body }), body.action === 'edit',
     proposal.id);
@@ -191,10 +195,25 @@ export function Proposal({ proposal, projectId, onFailed }) {
             onClick={() => act({ action: 'keep' })}>{t('memory.keep')}</Button>
           <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setEditing(proposal.content)}>
             {t('memory.edit')}</Button>
-          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => act({ action: 'forget' })}>
+          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setForgetting(true)}>
             {t('memory.forget')}</Button>
         </div>
       )}
+      <Forget record={proposal} open={forgetting} onClose={() => setForgetting(false)} />
     </li>
+  );
+}
+
+// Forget through the delete dialog (ticket 18, Retention; M2 audit area 4, item 6): its note that deleted data stays in
+// the automatic backups for about five weeks, and "Delete everywhere including backups", at the version shown. What it
+// could not do is said in the dialog; once forgotten, or closed after a failure (the record changed, or the outcome is
+// unknown), every view reads again, naming no project (MB12).
+function Forget({ record, open, onClose }) {
+  const t = useT();
+  return (
+    <DeleteDialog target={open ? { kind: 'memory', id: record.id, version: record.version, title: t('memory.forgetTitle'),
+      body: t('memory.forgetBody', { content: recordText(t, record) }) } : null}
+      onClose={(failed) => { onClose(); if (failed) memoryChanged(null); }}
+      onDone={() => { onClose(); memoryChanged(null); }} />
   );
 }

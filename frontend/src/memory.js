@@ -2,7 +2,7 @@
 // agent's note did, read back from the record (the conversation's turns carry it); project state's progress in words;
 // Where we left off's dismissal for this return; and the message box filled by its next-step button (nothing is sent
 // until Send).
-import { ApiError, del, get, patch, post } from './api.js';
+import { ApiError, get, patch, post } from './api.js';
 import { libraryChanged } from './library.js';
 import { errorText } from './text.js';
 
@@ -56,7 +56,6 @@ export const readMemory = (projectId) => get(`/api/memory${projectId ? `?project
 // projectId: the project the change is made from (a personal record changes only from a Normal, unlocked one)
 export const changeRecord = (record, body, projectId) => patch(`/api/memory/${encodeURIComponent(record.id)}`,
   { version: record.version, project_id: projectId ?? null, ...body });
-export const forgetRecord = (record) => del(`/api/memory/${encodeURIComponent(record.id)}?version=${record.version}`);
 export const review = (body) => post('/api/memory/review', body);
 
 // A memory action from the views: null once done, else what was not saved: the error in words and its code, whether it
