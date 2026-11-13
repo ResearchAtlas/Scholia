@@ -2358,6 +2358,7 @@ class Harness:
             async with self.gate.async_client(await self._general()) as client:
                 listing = await openrouter_client.endpoints(client, route.provider, route.model)
         reasoning, pin = openrouter.resolve_model_reasoning(route, effort, model_entry=row, zdr_enabled=zero_retention)
+        effort = effort if reasoning else None  # the effort sent: none without a reasoning object (Private, unknown)
         # The output limit is always relied on, so every endpoint must take max_tokens (rule 2).
         needs = ("max_tokens", "reasoning") if reasoning else ("max_tokens",)
         found = reach.reach(route.provider, row, listing, zero_retention=zero_retention, pin=pin, needs=needs)

@@ -74,6 +74,28 @@ async def test_every_private_request_to_openrouter_carries_zdr_and_no_plugins_or
         assert decisions == [("allow", "private")] * 3
 
 
+async def test_a_private_turn_records_no_effort_and_the_picker_offers_no_effort_steps(tmp_path, monkeypatch):
+    # M2 audit area 3, item 5 (section 6.2): a step records the effort it was sent with, and a Private request is sent
+    # with none, so its route and steps record none and the picker offers no effort step there.
+    from backend import reasoning_capability
+    monkeypatch.setattr(reasoning_capability, "get_capability",
+                        lambda records, model, row=None: {"control_surface": "levels", "levels": ["low", "high"]})
+    provider = provider_for_private()
+    async with started(tmp_path / "data", provider) as client:
+        project, conversation = await private_conversation(client)
+        stream = await send(client, conversation, model=ZDR_MODEL, effort="high")
+        assert stream[-1]["status"] == "succeeded" and "reasoning" not in provider.answers[0]
+        recorded = await rows(client, "SELECT type, data ->> 'effort' FROM run_events WHERE run_id = ?"
+                                      " AND type IN ('route', 'step_started') AND data ->> 'route' IS NOT NULL",
+                              stream[0]["run_id"])
+        assert recorded and all(effort is None for _, effort in recorded), recorded
+        normal = (await client.post("/api/projects", json={"name": "Open"})).json()["id"]
+        for where, steps in ((project, []), (normal, ["low", "high"])):
+            listed = (await client.get(f"/api/providers/openrouter/models?project_id={where}")).json()["models"]
+            assert {m["id"]: m["effort"]["steps"] for m in listed}[ZDR_MODEL] == steps
+        await background_idle(client)
+
+
 async def test_a_private_agent_turns_tool_calling_steps_carry_the_private_controls(tmp_path):
     # S1-19c (I10): every step of a Private agent turn, its tool chain included, is a Private request (a
     # server-side tool is refused by the gate: test_outbound_gate.py's unsupported_feature cases).
@@ -451,6 +473,8 @@ async def test_a_private_request_that_requires_its_parameters_still_passes_the_g
         [body] = provider.answers
         assert body["provider"] == {"zdr": True, "only": ["example"], "require_parameters": True}
         assert body["reasoning"] == {"effort": "high"}
+        assert await rows(client, "SELECT data ->> 'effort' FROM run_events WHERE run_id = ? AND type = 'route'"
+                                  " AND data ->> 'route' IS NOT NULL", stream[0]["run_id"]) == [("high",)]  # as sent
         await background_idle(client)
 
 
