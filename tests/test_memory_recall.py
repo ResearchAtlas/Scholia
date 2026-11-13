@@ -352,28 +352,30 @@ async def test_a_launch_without_sqlite_vec_asks_for_no_memory_runs_and_the_next_
         assert await _vectors(client, ids) == set(ids)
 
 
-@pytest.mark.parametrize("meanwhile", ["damaged_file", "model_installed"])
+@pytest.mark.parametrize("meanwhile", ["damaged_file", "damaged_file_rebuilt_before_the_harness", "model_installed"])
 async def test_the_opening_rebuild_asks_for_the_runs_of_what_lacks_vectors_once_it_is_ready(tmp_path, monkeypatch,
                                                                                            meanwhile):
-    # batch 1 (PR 60 rechecks): a launch's whole rebuild, held until the launch has asked for its runs. A file damaged
-    # at open fails before sqlite-vec loads, so the launch cannot yet tell that vectors are wanted; a model installed
-    # while it runs finds the index unreadable. Its end asks for the runs of what then lacks vectors.
+    # batch 1 (PR 60 rechecks): a launch's whole rebuild, held until the launch has asked for its runs, or (its internal
+    # review) ending before the app holds its harness. A file damaged at open fails before sqlite-vec loads, which tells
+    # nothing then; a model installed while it runs finds the index unreadable, and its end asks.
     import threading
     from backend.local_helper import EMBEDDING
+    from backend.runs import Harness
     from backend.search_index import FILE, SearchIndex
     from test_local_helper import WEIGHTS
-    from test_search import app
-    installed = meanwhile == "damaged_file"
+    from test_search import app, runs_of
+    installed = meanwhile != "model_installed"
     async with app(tmp_path, install=installed) as client:
         project = await project_of(client)
         ids = [(await entered(client, project, "Wage floors raise the earnings of low-paid workers"))["id"]]
         await background_idle(client)
         await asyncio.to_thread(client.state["index"].apply)  # its addition has left the queue
         assert await asyncio.to_thread(client.state["index"].memory_embedded, ids) == (set(ids) if installed else set())
+        before = len(await runs_of(client, "index", project))
     path = tmp_path / "data" / FILE
     for found in path.parent.glob(path.name + "*"):
         found.unlink()
-    if meanwhile == "damaged_file":
+    if meanwhile.startswith("damaged_file"):
         path.write_bytes(b"not a database " * 512)
     gate, real = threading.Event(), SearchIndex._rebuild_all
 
@@ -381,6 +383,16 @@ async def test_the_opening_rebuild_asks_for_the_runs_of_what_lacks_vectors_once_
         gate.wait(20)
         return real(self)
     monkeypatch.setattr(SearchIndex, "_rebuild_all", held)
+    if meanwhile == "damaged_file_rebuilt_before_the_harness":
+        recover = Harness.recover
+
+        async def rebuilt_first(self, *args, **kwargs):  # start() stores the harness only after this
+            gate.set()
+            index = search._STATES[self]["index"]
+            while index.building:
+                await asyncio.sleep(0.01)
+            return await recover(self, *args, **kwargs)
+        monkeypatch.setattr(Harness, "recover", rebuilt_first)
     try:
         async with app(tmp_path, install=installed) as client:  # the launch has asked for its runs
             if meanwhile == "model_installed":
@@ -389,9 +401,11 @@ async def test_the_opening_rebuild_asks_for_the_runs_of_what_lacks_vectors_once_
                 helper.path.write_bytes(WEIGHTS)
                 helper.model_installed()
             await asyncio.sleep(0.2)  # what the launch or the install asks for, asked while the rebuild is held
-            assert client.state["index"].building
+            assert client.state["index"].building == (meanwhile != "damaged_file_rebuilt_before_the_harness")
             gate.set()
             assert await _vectors(client, ids) == set(ids)
+            if installed:  # asked for once, at the launch: no rerun for the rebuild's end
+                assert len(await runs_of(client, "index", project)) == before + 1
     finally:
         gate.set()
 

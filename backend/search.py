@@ -196,9 +196,9 @@ async def open_index(state, db):
     await asyncio.to_thread(db.write, requested)
     if rebuilding is None:
         index.apply_soon()
-    else:  # the opening's rebuild, once ready, asks for what then lacks embeddings (index.rebuilt), as later rebuilds do:
-        # a file that failed at open did so before sqlite-vec loaded (index.vectors told nothing then), and a model
-        # installed meanwhile found the index unreadable. One that failed is retried, its retry asking (_rebuild_soon).
+    elif not installed:  # a model installed while the opening's rebuild runs finds the index unreadable (_embed_all):
+        # the rebuild, once ready, asks for what lacks embeddings (index.rebuilt), as later rebuilds do; one that failed is
+        # retried, its retry asking (_rebuild_soon). With the model installed, the runs above already take everything.
         rebuilding.add_done_callback(lambda _: index.building or index.closed or rebuilt())
 
 
@@ -283,9 +283,9 @@ def _memory_pending(index, read=True):
     is deleted, the first project. The queue never embeds a memory addition (SearchIndex._apply_queue): only these runs
     do (M2 audit, area 2)."""
     from backend import memory
-    # sqlite-vec did not load: no vector can be made (the next launch where it loads asks). Or not yet: a file that failed
-    # at open did so before loading it, and the rebuild that replaces it asks once it is ready (open_index).
-    if not index.vectors:
+    # Read: sqlite-vec did not load, so no vector can be made (the next launch where it loads asks). Unread, it tells
+    # nothing: a file that failed at open did so before loading it, and the rebuild replacing it keeps no vector.
+    if read and not index.vectors:
         return set()
     found, first = index.db.read(lambda conn: (conn.execute(
         "SELECT id, project_id, content FROM memory_records WHERE status IN (SELECT value FROM json_each(?))"
