@@ -38,7 +38,7 @@ from backend import search  # S1-17: the search index, index runs and the search
 from backend import zotero  # S1-15: Zotero's library, read only
 from backend.db import (ContentStore, Database, DatabaseCloseError, DatabaseClosedError, close_failed, delete, new_id,
                         utc_now)
-from backend.local_guard import LocalRequestGuard
+from backend.local_guard import LocalRequestGuard, _is_api
 from backend.outbound_gate import OutboundGate, local_origin
 from backend import governance
 from backend.runs import MAX_MESSAGE_CHARS, AdmissionError, Harness, _through, derived_status
@@ -100,10 +100,11 @@ async def _valid_text(request: Request):
     """Every API request's JSON body holds only valid Unicode text: half a surrogate pair, which a JSON escape can give
     (as "\\ud83d"), is refused as any invalid request is, in a string, a key or a list's item, whatever the route's model
     says (the M2 audit's Fable 5 F1). Stored, the database could not read it back. FastAPI has parsed the body already
-    for a route that takes one, so this reads the same parse."""
-    if request.headers.get("content-length", "0") == "0":
+    for a route that takes one, so this reads the same parse. Outside /api (the static pages) it reads nothing: the guard
+    bounds and authenticates only the API's bodies (PR 57's rechecks)."""
+    if not _is_api(request.scope["path"]):
         return
-    try:
+    try:  # an empty or absent body is not JSON either
         stack = [await request.json()]
     except (ValueError, RecursionError):  # not JSON, or nested past what Python parses: the route's parse answers it
         return  # (a route that takes no body ignores it)

@@ -1276,7 +1276,11 @@ async def test_a_steering_note_with_half_a_surrogate_pair_is_refused_and_its_tur
     async with started(tmp_path / "data", provider) as client:
         conversation = await named(client)
         sending = asyncio.create_task(send(client, conversation, "Q?"))
-        await gate.reached.wait()
+        reached = asyncio.ensure_future(gate.reached.wait())
+        await asyncio.wait({sending, reached}, timeout=30, return_when=asyncio.FIRST_COMPLETED)
+        reached.cancel()
+        # a turn that ended (or failed) before its step reached the provider says so, rather than waiting for ever
+        assert gate.reached.is_set(), sending.result() if sending.done() else "the step never reached the provider"
         run_id = await running_run(client, conversation)
         refused = await raw(client, "POST", f"/api/runs/{run_id}/steering", b'{"content": ' + HALF + b'}')
         assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")
@@ -1383,3 +1387,79 @@ async def test_a_failing_write_still_stops_recovery_whole_rather_than_leaving_on
         await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute("DROP TRIGGER refuse"))
         await client.state["harness"].recover(kick=False)
         assert await rows(client, "SELECT status FROM runs WHERE id = ?", run_id) == [("interrupted",)]
+
+
+# PR 57's rechecks (batch 1): the body check reads only what the guard bounds, never rests on a Content-Length, and a
+# run it leaves behind is rolled back whole.
+
+async def test_a_static_pages_request_body_is_never_read(tmp_path):
+    # Astra pass 2 (P2) and Fable's finding 1: the guard bounds and authenticates /api only; a static GET is passed on
+    # as it is, so the body check read its whole body, one past MAX_BODY or one never sent. Here it is never sent.
+    async with started(tmp_path / "data") as client:
+        sent = []
+        never = asyncio.Event()
+
+        async def receive():
+            await never.wait()  # the body never comes
+            return {"type": "http.disconnect"}
+
+        async def send_(message):
+            sent.append(message)
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET", "scheme": "http",
+                 "path": "/index.html", "raw_path": b"/index.html", "query_string": b"", "root_path": "",
+                 "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8765),
+                 "headers": [(b"host", b"127.0.0.1:8765"), (b"content-type", b"application/json"),
+                             (b"content-length", b"1000")]}
+        await asyncio.wait_for(client.app(scope, receive, send_), 10)
+        assert sent and sent[0]["type"] == "http.response.start"
+
+
+async def test_a_body_with_no_content_length_is_checked_all_the_same(tmp_path):
+    # Fable's finding 2: the check returned at once without a Content-Length, resting on the guard refusing a chunked
+    # body. Sent to the app inside the guard, such a body is parsed by its route, and checked too.
+    import httpx
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        await send(client, conversation, "First?")
+
+        async def chunked():
+            yield b'{"content": ' + HALF + b'}'
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app.app), base_url=client.base_url) as inner:
+            refused = await inner.post(f"/api/conversations/{conversation}/queue", content=chunked(),
+                                       headers={"content-type": "application/json"})
+        assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")
+        assert await rows(client, "SELECT count(*) FROM queued_messages") == [(0,)]
+
+
+async def test_a_run_left_behind_has_nothing_of_its_recovery_written(tmp_path, monkeypatch):
+    # Fable's finding 3 (mutation M8): a record found unreadable after the run's first writes (here its accounting, the
+    # block's last read) leaves none of them: no note queued, no run_finished, the run still running.
+    from backend import runs as runs_module
+    async with started(tmp_path / "data") as client:
+        bad, good = await named(client, "Bad"), await named(client, "Good")
+        runs = {c: (await send(client, c, "First?"))[0]["run_id"] for c in (bad, good)}
+        await background_idle(client)
+
+        def as_crashed(conn):
+            for run_id in runs.values():
+                conn.execute("UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (run_id,))
+                (seq,) = conn.execute("SELECT max(seq) + 1 FROM run_events WHERE run_id = ?", (run_id,)).fetchone()
+                conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, 'steering_note', ?)",
+                             (run_id, seq, json.dumps({"text": "Left at the crash"})))
+        for run_id in runs.values():
+            client.state["harness"].registry.finished.discard(run_id)
+        await asyncio.to_thread(client.state["db"].write, as_crashed)
+        accounting = runs_module._accounting
+
+        def unreadable(conn, run_id, **options):
+            if run_id == runs[bad]:
+                import sqlite3
+                raise sqlite3.OperationalError("Could not decode to UTF-8 column 'data' with text '...'")
+            return accounting(conn, run_id, **options)
+        monkeypatch.setattr(runs_module, "_accounting", unreadable)
+        await client.state["harness"].recover(kick=False)
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", runs[bad]) == [("running",)]
+        assert await rows(client, "SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'run_finished'",
+                          runs[bad]) == [(1,)]  # its first turn's, from before the crash copy
+        assert await rows(client, "SELECT q.text FROM queued_messages q WHERE q.conversation_id = ?", bad) == []
+        assert [q["text"] for q in (await conversation_read(client, good))["queued"]] == ["Left at the crash"]
