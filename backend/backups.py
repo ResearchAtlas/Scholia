@@ -1535,19 +1535,20 @@ def _turn_records(conn, turn, rows, project_id):
     export does not carry."""
     run_id, carried = turn["run_id"], budgets.carried_notes(conn, turn["run_id"])
     turn["steering"], turn["asks"], asks = [], [], {}
-    for seq, at, kind, data in conn.execute("SELECT seq, at, type, data FROM run_events WHERE run_id = ?"
-                                            " AND type IN ('steering_note', 'ask', 'ask_answered') ORDER BY seq", (run_id,)):
+    for seq, at, kind, data in conn.execute(
+            "SELECT seq, at, type, data FROM run_events WHERE run_id = ?"
+            " AND type IN ('steering_note', 'ask', 'ask_answered') ORDER BY seq", (run_id,)):
         data = json.loads(data)
         if kind == "steering_note":
             if seq in carried and data.get("text"):
                 turn["steering"].append({"text": data["text"], "at": at})
         elif "options" in data:  # the ask; else its answer (asks.asked)
-            asks[data["ask_id"]] = {"kind": data["kind"], "options": data["options"], "params": data.get("params") or {},
-                                    "asked_at": at, "answer": None}
+            asks[data["ask_id"]] = {"kind": data["kind"], "options": data["options"],
+                                    "params": data.get("params") or {}, "asked_at": at, "answer": None}
             turn["asks"].append(asks[data["ask_id"]])
         elif data.get("ask_id") in asks:
-            asks[data["ask_id"]]["answer"] = {**{k: data[k] for k in ("by", "option", "text", "withdrawn") if k in data},
-                                              "at": at}
+            answer = {k: data[k] for k in ("by", "option", "text", "withdrawn") if k in data}
+            asks[data["ask_id"]]["answer"] = {**answer, "at": at}
     turn["citations"] = rows(
         "SELECT c.id, json_extract(c.context, '$.marker') AS marker, json_extract(c.context, '$.sentence') AS sentence,"
         " c.material_id, v.seq AS material_version, c.passage_id, p.ordinal AS passage,"
@@ -1586,8 +1587,8 @@ def _conversation_markdown(conversation, language="en", titles=None):
                     where = ", ".join(part for part in ((titles or {}).get(c["material_id"]),
                                                         text("page", page=c["page"]) if c["page"] is not None else None)
                                       if part)
-                    lines.append(f"- {c['marker']}" + (f" {where}" if where else "") + (f": “{c['quote']}”" if c["quote"]
-                                                                                       else ""))
+                    quote = f": “{c['quote']}”" if c["quote"] else ""
+                    lines.append(f"- {c['marker']}" + (f" {where}" if where else "") + quote)
                 lines.append("")
         elif turn["status"] != "running":
             status = text(f"status.{turn['status']}")

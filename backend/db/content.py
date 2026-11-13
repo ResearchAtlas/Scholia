@@ -163,7 +163,8 @@ class ContentStore:
             )]
             # A held put that misses this check has its row put back by its own insert, which the one writer
             # runs after this transaction; its file, held, is kept below, under the lock.
-            idle = [sha256 for sha256 in candidates if sha256 not in self._held and _idle(self._path(sha256), due(sha256))]
+            idle = [sha256 for sha256 in candidates
+                    if sha256 not in self._held and _idle(self._path(sha256), due(sha256))]
             conn.executemany("DELETE FROM content_files WHERE sha256 = ?", [(sha256,) for sha256 in idle])
 
         self.db.write(remove_rows)
@@ -209,7 +210,8 @@ def referenced_sql(conn):
         "SELECT m.name, f.\"from\" FROM sqlite_schema m, pragma_foreign_key_list(m.name) f"
         " WHERE m.type = 'table' AND f.\"table\" = 'content_files'"
     ).fetchall()
-    return " UNION ALL ".join(f'SELECT "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL' for table, column in references)
+    return " UNION ALL ".join(
+        f'SELECT "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL' for table, column in references)
 
 
 class _Held(list):

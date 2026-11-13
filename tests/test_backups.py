@@ -662,12 +662,14 @@ async def test_a_project_export_holds_its_citations_notes_asks_and_waiting_messa
                 conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, ?, ?)",
                              (run_id, seq + i, kind, json.dumps(event)))
             conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, material_version_id, quote,"
-                         " context, page, existence, support) VALUES (?, 'answer', ?, ?, ?, 'n = 40 sufficed', ?, 4, 'ok',"
-                         " 'supported')", (citation, run_id, material, version,
-                                           json.dumps({"marker": "[S1.1]", "offset": 3, "sentence": "Forty."})))
+                         " context, page, existence, support)"
+                         " VALUES (?, 'answer', ?, ?, ?, 'n = 40 sufficed', ?, 4, 'ok', 'supported')",
+                         (citation, run_id, material, version,
+                          json.dumps({"marker": "[S1.1]", "offset": 3, "sentence": "Forty."})))
             conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, quote, context, existence)"
                          " VALUES (?, 'answer', ?, ?, 'words of another project', ?, 'ok')",
-                         (new_id(), run_id, foreign, json.dumps({"marker": "[S2.1]", "offset": 9, "sentence": "Also."})))
+                         (new_id(), run_id, foreign,
+                          json.dumps({"marker": "[S2.1]", "offset": 9, "sentence": "Also."})))
             conn.execute("INSERT INTO queued_messages (id, conversation_id, text) VALUES (?, ?, 'And the power?')",
                          (new_id(), conversation))
             conn.execute("INSERT INTO memory_records (id, scope, project_id, type, content, status) VALUES"
