@@ -1705,7 +1705,8 @@ class Harness:
             chosen = named or [r for _, r in scored][:1 if text is not None else None]
             if asked.get("remaining"):
                 named, chosen = [], await self._read(lambda conn: [memory.row(conn, i) for i in asked["remaining"]])
-                chosen = [r for r in chosen if r]
+                chosen = [r for r in chosen if r and (r["scope"] == "personal" or r["project_id"] == project_id)]
+                # (never another project's: its conversation moved here without them; the internal review of batch 1)
             ids = [r["id"] for r in chosen]
             seen = {r["id"]: (r["version"], r["status"]) for r in chosen}  # as decided, and as the ask names them
             if not ids:

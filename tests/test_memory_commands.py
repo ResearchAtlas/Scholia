@@ -951,6 +951,32 @@ async def test_continue_of_a_forget_cut_short_asks_again_about_the_records_it_ch
         assert {"type": "memory", "action": "applied_before", "count": 0} in last
 
 
+async def test_continue_of_a_forget_cut_short_never_asks_about_records_left_in_another_project(tmp_path, monkeypatch):
+    # the internal review of batch 1: the conversation moved to another project, the records it chose stayed behind
+    from scholia_app import events
+    async with started(tmp_path / "data") as client:
+        harness, done = client.state["harness"], []
+
+        def deleting(real, *args, **kwargs):
+            found = real(*args, **kwargs)
+            if not done:
+                done.append(1)
+                run = next(iter(harness.registry.turns.values())).run_id
+                args[0].write(lambda conn: conn.execute(
+                    "UPDATE runs SET cancel_reason = 'revoked' WHERE id = ? AND status = 'running'", (run,)))
+            return found
+        sending, project, conversation = await _three_to_forget(client, monkeypatch, deleting)
+        stream = await asyncio.wait_for(sending, 10)
+        other = await project_of(client, "Other one")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET project_id = ? WHERE id = ?", (other, conversation)))  # moved, records left
+        again = events(await asyncio.wait_for(client.post(f"/api/runs/{stream[0]['run_id']}/continue"), 10))
+        assert {"type": "memory", "action": "no_match", "count": 0} in again
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE type != 'progress' AND project_id = ?",
+                          project) == [(2,)]
+        assert (await client.get(f"/api/asks?conversation_id={conversation}")).json()["asks"] == []
+
+
 async def test_a_save_said_again_after_a_correction_shows_no_replacement_of_its_own(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
