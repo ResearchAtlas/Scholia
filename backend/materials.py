@@ -1212,6 +1212,7 @@ def _passage(row):
 
 
 _PASSAGE_COLUMNS = "id, ordinal, page, section_path, kind, text, char_start, char_end, boxes"
+_INT64_MAX = 2 ** 63 - 1  # SQLite's largest integer
 
 
 @router.get("/api/material-versions/{version_id}/passages")
@@ -1221,8 +1222,9 @@ async def version_passages(version_id: str, request: Request, offset: int = 0, l
     its file (the page viewer's, read as its page comes near the view). total counts them all. Without
     page, section is the section the passages before offset end in: the last of their paths that is not
     empty (a title has none), so a part of the text read on its own shows the headings the whole does."""
-    limit, offset = max(1, min(limit, PASSAGE_PAGE)), max(0, offset)
-    on_page = () if page is None else (page,)
+    # An offset or page past SQLite's integers is clamped to its largest, past every passage: none, never an error.
+    limit, offset = max(1, min(limit, PASSAGE_PAGE)), max(0, min(offset, _INT64_MAX))
+    on_page = () if page is None else (max(-_INT64_MAX, min(page, _INT64_MAX)),)
 
     def fetch(conn):
         row = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v"
