@@ -565,6 +565,20 @@ async def test_a_record_with_malformed_entries_skips_them_and_still_resolves():
     assert failed.value.code == "unavailable"
 
 
+async def test_a_record_whose_title_has_nothing_visible_is_no_record_and_an_invisible_field_is_left_out():
+    """M2 audit, area 1 (the invisible-title class): as a file's name and the details form, a looked-up title or field
+    with no visible character (only zero-width or direction marks) is none."""
+    for blank in ("\u200b", "\u202e \u200b"):
+        with pytest.raises(lookup.Failed):
+            lookup._openalex(DOI, json.dumps({**openalex_work(DOI, TITLE), "title": blank, "display_name": blank}).encode())
+        with pytest.raises(lookup.Failed):
+            lookup._crossref(DOI, json.dumps({"message": {**crossref_work(DOI, TITLE), "title": [blank]}}).encode())
+        with pytest.raises(lookup.Failed):
+            lookup._arxiv(synthetic.ARXIV, arxiv_feed(synthetic.ARXIV, blank))
+        record = {**openalex_work(DOI, TITLE), "primary_location": {"source": {"display_name": blank}}}
+        assert "container-title" not in lookup._openalex(DOI, json.dumps(record).encode()).csl
+
+
 async def test_a_records_fields_reach_the_csl_only_as_short_strings_and_plausible_years():
     def openalex(**fields):
         return lookup._openalex(DOI, json.dumps({**openalex_work(DOI, TITLE), **fields}).encode()).csl

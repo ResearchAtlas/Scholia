@@ -31,6 +31,7 @@ import httpx
 
 from backend.extraction import DOI_CHARS, Unreadable, clean_doi, untrusted_xml
 from backend.outbound_gate import OutboundDenied
+from backend.settings import visible
 
 OPENALEX = "https://api.openalex.org/works/doi:{}"
 CROSSREF = "https://api.crossref.org/works/{}"
@@ -222,7 +223,10 @@ def _year(value):
 
 
 def _text(value, limit=1000):
-    return " ".join(value.split())[:limit] if isinstance(value, str) and value.strip() else None
+    """A record's text, its spaces made single and cut to limit; None when nothing visible is left (a title of
+    zero-width or direction marks only is no title, as a file's name or the details form takes none)."""
+    text = " ".join(value.split())[:limit] if isinstance(value, str) else None
+    return text if visible(text) else None
 
 
 def _openalex(doi, body):
