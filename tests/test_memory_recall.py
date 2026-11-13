@@ -361,7 +361,7 @@ async def test_the_opening_rebuild_asks_for_the_runs_of_what_lacks_vectors_once_
     import threading
     from backend.local_helper import EMBEDDING
     from backend.runs import Harness
-    from backend.search_index import FILE, SearchIndex
+    from backend.search_index import FILE, SearchIndex, Unavailable
     from test_local_helper import WEIGHTS
     from test_search import app, runs_of
     installed = meanwhile != "model_installed"
@@ -394,6 +394,15 @@ async def test_the_opening_rebuild_asks_for_the_runs_of_what_lacks_vectors_once_
                 await asyncio.sleep(0.01)
             return await recover(self, *args, **kwargs)
         monkeypatch.setattr(Harness, "recover", rebuilt_first)
+    refused, unembedded = threading.Event(), SearchIndex.unembedded
+
+    def read(self):  # the install's read of the index, refused while the rebuild runs
+        try:
+            return unembedded(self)
+        except Unavailable:
+            refused.set()
+            raise
+    monkeypatch.setattr(SearchIndex, "unembedded", read)
     try:
         async with app(tmp_path, install=installed) as client:  # the launch has asked for its runs
             if meanwhile == "model_installed":
@@ -401,7 +410,7 @@ async def test_the_opening_rebuild_asks_for_the_runs_of_what_lacks_vectors_once_
                 helper.path.parent.mkdir(parents=True, exist_ok=True)
                 helper.path.write_bytes(WEIGHTS)
                 helper.model_installed()
-            await asyncio.sleep(0.2)  # what the launch or the install asks for, asked while the rebuild is held
+                assert await asyncio.to_thread(refused.wait, 10)  # its request met the rebuild, before the release
             assert client.state["index"].building == (meanwhile != "damaged_file_rebuilt_before_the_harness")
             gate.set()
             assert await _vectors(client, ids) == set(ids)
