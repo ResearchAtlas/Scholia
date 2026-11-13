@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Literal
 
 import anyio
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -94,6 +94,30 @@ class ApiError(Exception):
 
 def _error(status, code, message):
     return JSONResponse({"code": code, "message": message}, status_code=status)
+
+
+async def _valid_text(request: Request):
+    """Every API request's JSON body holds only valid Unicode text: half a surrogate pair, which a JSON escape can give
+    (as "\\ud83d"), is refused as any invalid request is, in a string, a key or a list's item, whatever the route's model
+    says (the M2 audit's Fable 5 F1). Stored, the database could not read it back. FastAPI has parsed the body already
+    for a route that takes one, so this reads the same parse."""
+    if request.headers.get("content-length", "0") == "0":
+        return
+    try:
+        stack = [await request.json()]
+    except ValueError:  # not JSON: the route's own parse answers it
+        return
+    while stack:  # a loop, not recursion: however deep the JSON, never RecursionError
+        value = stack.pop()
+        if isinstance(value, str) and not value.isascii():  # ASCII (a file's base64) is valid, and says so at once
+            try:
+                value.encode()
+            except UnicodeEncodeError:
+                raise ApiError(400, "invalid_request", "The request is not valid") from None
+        elif isinstance(value, dict):
+            stack += [*value, *value.values()]
+        elif isinstance(value, list):
+            stack += value
 
 
 def _visible(text):
@@ -387,7 +411,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             if ended and not running and not close_failed():
                 state["closed"] = True
 
-    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    # Every route's, the included routers' too (see _valid_text)
+    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, dependencies=[Depends(_valid_text)])
     app.state.scholia = state  # the desktop entry reaches the harness through it at shutdown
     app.include_router(backups.router)  # backups, restore and project export, ahead of the catch-all routes
     app.include_router(materials.router)  # materials, passages, page images and retries (S1-13)
