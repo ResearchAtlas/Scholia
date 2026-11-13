@@ -184,10 +184,13 @@ async def test_instructions_and_earlier_answers_go_into_the_request(tmp_path):
         await background_idle(client)
 
 
-async def test_a_turn_keeps_the_route_effort_and_request_admission_chose(tmp_path):
+async def test_a_turn_keeps_the_route_effort_and_request_admission_chose(tmp_path, monkeypatch):
     # Model-route rule 5: Auto picks the route and effort once per researcher request, and every step
     # records them; a catalog read between admission and the call changes nothing for the turn.
-    from backend import openrouter_client
+    from backend import openrouter, openrouter_client
+    # a model whose record allows a reasoning object, so the effort is sent and recorded (M2 audit area 3, item 5)
+    monkeypatch.setattr(openrouter, "resolve_model_reasoning",
+                        lambda route, effort, **kw: ({"effort": effort}, None) if effort else (None, None))
     provider = MockProvider()
     async with started(tmp_path / "data", provider) as client:
         conversation = await new_conversation(client)
