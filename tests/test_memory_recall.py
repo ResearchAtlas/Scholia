@@ -524,16 +524,6 @@ async def test_a_vector_counts_as_done_only_under_the_records_scope(tmp_path):
         assert await asyncio.to_thread(search._memory_pending, index) == {project}
 
 
-async def test_a_write_that_leaves_nothing_to_embed_records_no_index_run(tmp_path):
-    # batch 2: the write path asks the same derived question as a launch; project state is not recalled by meaning
-    from test_search import app, runs_of
-    async with app(tmp_path) as client:
-        project = await project_of(client)
-        await entered(client, project, "We use semi-structured interviews.", kind="project_state")
-        await background_idle(client)
-        assert await runs_of(client, "index") == []
-
-
 async def test_the_installs_requests_go_on_after_one_fails(tmp_path, monkeypatch):
     # batch 2: each project's request on its own
     from test_search import app
@@ -578,25 +568,26 @@ async def test_a_record_moved_away_and_back_before_its_removal_applies_gets_its_
         assert all(r["status"] == "succeeded" for r in await runs_of(client, "index"))
 
 
-async def test_a_project_record_written_elsewhere_never_restarts_the_general_projects_cancelled_run(tmp_path):
-    # batch 2, internal review F2: a write asks only for the runs of the records written from its project (R29)
+async def test_a_memory_write_asks_its_own_projects_run_and_the_general_projects_and_no_other(tmp_path):
+    # batch 3 (design review E2, Option A; replaces batch 2's F2 test): another project's cancelled run stays so;
+    # the General project's is asked at every memory write
     from test_search import app, runs_of
     async with app(tmp_path) as client:
         client.remote.hold, client.remote.free = asyncio.Event(), 0
-        project, other = await project_of(client, "First"), await project_of(client, "Second")
+        project, other = await project_of(client, "First"), await project_of(client, "Other")
         general = await _general(client)
-        await entered(client, project, "I prefer short answers", kind="preference", scope="personal")
+        await entered(client, other, "We sample thirty nurses")
         await asyncio.wait_for(client.remote.reached.wait(), 10)
-        [run] = await runs_of(client, "index", general)
+        [run] = [r for r in await runs_of(client, "index", other) if r["status"] == "running"]
         assert (await client.post(f"/api/runs/{run['run_id']}/cancel")).json()["status"] == "cancelled"
         client.remote.hold.set()
         await background_idle(client)
-        record = (await entered(client, other, "We dropped the pilot"))["id"]
+        asked = len(await runs_of(client, "index", general))
+        record = (await entered(client, project, "We dropped the pilot"))["id"]
         assert await _vectors(client, [record]) == {record}
-        assert len(await runs_of(client, "index", general)) == 1  # still the one cancelled
-        await entered(client, project, "I prefer answers in English", kind="preference", scope="personal")
-        await background_idle(client)
-        assert len(await runs_of(client, "index", general)) == 2  # saving personal memory asks again (a later trigger)
+        assert len(await runs_of(client, "index", other)) == 1  # still the one cancelled
+        assert len(await runs_of(client, "index", project)) == 1
+        assert len(await runs_of(client, "index", general)) == asked + 1
 
 
 @pytest.mark.parametrize("site", ["create", "edit", "keep", "move"])
@@ -633,10 +624,160 @@ async def test_a_memory_write_whose_request_goes_away_after_its_commit_still_ask
             await outer["task"]
         await asyncio.sleep(0.2)
         await background_idle(client, timeout=20)
-        assert len(await runs_of(client, "index")) == before + 1
+        assert len(await runs_of(client, "index")) == before + 2  # the project's run and the General project's (batch 3)
         records = [r for (r,) in await rows(client, "SELECT id FROM memory_records WHERE status IN ('confirmed', 'inferred')"
                                                     " AND type = 'decision'")]
         assert await _vectors(client, records) == set(records)
+
+
+def _personal_proposal(project, content="I prefer short answers"):
+    return lambda conn: memory.write(conn, project_id=project, scope="personal", kind="preference", content=content,
+                                     status="proposed", sources=[("researcher", "views")])
+
+
+@pytest.mark.parametrize("by", ["command", "extraction"])
+async def test_a_personal_proposal_confirmed_from_another_project_gets_its_vector(tmp_path, by):
+    # batch 3 (recheck round 3, pass 2 finding 1): the record keeps the project it was proposed in; the write is in
+    # another project, which asks its own run and the General project's
+    from cited import Provider, cited
+    from test_memory import candidate, extracted
+    provider = Provider()
+    if by == "extraction":
+        extracted(provider, candidate("I prefer short answers", kind="preference", span="I prefer short answers"))
+    async with cited(tmp_path, provider) as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        proposal = await write(client, _personal_proposal(first))
+        await background_idle(client, timeout=20)
+        text = "Remember: I prefer short answers" if by == "command" else "I prefer short answers"
+        await send(client, await conversation_in(client, second), text)
+        await background_idle(client, timeout=20)
+        assert await rows(client, "SELECT status, project_id FROM memory_records WHERE id = ?", proposal) == [
+            ("confirmed", first)]
+        assert await _vectors(client, [proposal]) == {proposal}
+
+
+def _deleting_on_ask(client, project):
+    """memory._embed_soon, deleting the project first (a deletion between a write's commit and its request)."""
+    real = memory._embed_soon
+
+    async def ask(state, project_id):
+        assert (await client.delete(f"/api/projects/{project}")).status_code == 200
+        await real(state, project_id)
+    return ask
+
+
+@pytest.mark.parametrize("site", ["create", "edit", "keep"])
+async def test_a_personal_record_whose_project_is_deleted_before_the_request_gets_its_vector(tmp_path, monkeypatch,
+                                                                                              site):
+    # batch 3 (recheck round 3, pass 1 finding 1 and pass 2 finding 1): the surviving record's project_id is NULL
+    from test_search import app
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        if site == "edit":
+            record = (await entered(client, project, "I prefer short answers", kind="preference", scope="personal"))["id"]
+            await background_idle(client)
+        elif site == "keep":
+            record = await write(client, _personal_proposal(project))
+        monkeypatch.setattr(memory, "_embed_soon", _deleting_on_ask(client, project))
+        response = {"create": lambda: client.post("/api/memory", json={"project_id": project, "type": "preference",
+                                                                       "content": "I prefer short answers",
+                                                                       "scope": "personal"}),
+                    "edit": lambda: client.patch(f"/api/memory/{record}", json={"version": 1,
+                                                                                "content": "I prefer brief answers"}),
+                    "keep": lambda: client.post("/api/memory/review", json={"id": record, "action": "keep",
+                                                                            "version": 1})}[site]()
+        assert (await response).status_code in (200, 201)
+        [(kept, scope, owner)] = await rows(client, "SELECT id, scope, project_id FROM memory_records"
+                                                    " WHERE status = 'confirmed'")
+        assert (scope, owner) == ("personal", None)
+        assert await _vectors(client, [kept]) == {kept}
+
+
+async def test_a_record_written_during_the_opening_rebuild_gets_its_vector(tmp_path, monkeypatch):
+    # batch 3 (recheck round 3, both passes, finding 2): the file damaged at open (sqlite-vec not loaded yet), the model
+    # installed, a record written while the rebuild runs, in a project with no run asked for
+    import threading
+    from backend.search_index import FILE, SearchIndex
+    from test_search import app
+    async with app(tmp_path):
+        pass
+    path = tmp_path / "data" / FILE
+    for found in path.parent.glob(path.name + "*"):
+        found.unlink()
+    path.write_bytes(b"not a database " * 512)
+    gate, real = threading.Event(), SearchIndex._rebuild_all
+
+    def held(self):
+        gate.wait(20)
+        return real(self)
+    monkeypatch.setattr(SearchIndex, "_rebuild_all", held)
+    try:
+        async with app(tmp_path) as client:
+            project = await project_of(client)
+            assert client.state["index"].building and not client.state["index"].vectors
+            record = (await entered(client, project, "Wage floors raise the earnings of low-paid workers"))["id"]
+            gate.set()
+            assert await _vectors(client, [record]) == {record}
+    finally:
+        gate.set()
+
+
+@pytest.mark.parametrize("site", ["edit", "keep"])
+async def test_a_project_deleted_between_an_edit_and_its_reread_restarts_no_other_projects_cancelled_run(
+        tmp_path, monkeypatch, site):
+    # batch 3 (recheck round 3, both passes, finding 3): the reread finds project_id NULL; a write never names a third
+    # project, whose cancelled run stays so
+    from test_search import app, runs_of
+    async with app(tmp_path) as client:
+        project, other = await project_of(client, "First"), await project_of(client, "Other")
+        if site == "edit":
+            record = (await entered(client, project, "I prefer short answers", kind="preference", scope="personal"))["id"]
+        else:
+            record = await write(client, _personal_proposal(project))
+        await background_idle(client)
+        client.remote.hold, client.remote.free = asyncio.Event(), len(client.remote.indexing)
+        await entered(client, other, "We sample thirty nurses")  # pending in Other, its run cancelled
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = [r for r in await runs_of(client, "index", other) if r["status"] == "running"]
+        assert (await client.post(f"/api/runs/{run['run_id']}/cancel")).json()["status"] == "cancelled"
+        client.remote.hold.set()
+        await background_idle(client)
+        db, loop, real = client.state["db"], asyncio.get_running_loop(), client.state["db"].write
+
+        def write_then_delete(fn, *args, **kwargs):  # the project deleted once the edit has committed, before the reread
+            done = real(fn, *args, **kwargs)
+            if getattr(fn, "__name__", "") in ("change", "answer"):
+                asyncio.run_coroutine_threadsafe(client.delete(f"/api/projects/{project}"), loop).result(20)
+            return done
+        monkeypatch.setattr(db, "write", write_then_delete)
+        response = await (client.patch(f"/api/memory/{record}", json={"version": 1, "content": "I prefer brief answers"})
+                          if site == "edit" else
+                          client.post("/api/memory/review", json={"id": record, "action": "keep", "version": 1}))
+        monkeypatch.setattr(db, "write", real)
+        assert response.status_code == 200, response.text
+        await background_idle(client)
+        assert len(await runs_of(client, "index", other)) == 1  # still the one cancelled
+        [(kept,)] = await rows(client, "SELECT id FROM memory_records WHERE status = 'confirmed' AND scope = 'personal'")
+        assert await _vectors(client, [kept]) == {kept}
+
+
+async def test_a_memory_write_still_asks_the_general_projects_run_when_its_projects_request_fails(tmp_path, monkeypatch):
+    # batch 3: each request on its own, the project's first
+    from test_search import app
+    async with app(tmp_path) as client:
+        project, general = await project_of(client), await _general(client)
+        asked = []
+
+        async def failing_for_the_project(harness, project_id, rebuild=False):
+            asked.append(project_id)
+            if project_id == project:
+                raise RuntimeError("a request that fails")
+        monkeypatch.setattr(search, "_request", failing_for_the_project)
+        await search.embed_memory_soon(client.state, project)
+        assert asked == [project, general]
+        asked.clear()
+        await search.embed_memory_soon(client.state, general)  # the General project's own write: once
+        assert asked == [general]
 
 
 async def test_a_whole_rebuild_while_the_app_runs_asks_for_the_runs_of_memory_it_dropped(tmp_path):
