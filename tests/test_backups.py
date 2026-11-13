@@ -475,19 +475,27 @@ async def test_a_restore_works_where_the_file_system_has_no_hard_links(tmp_path,
         assert (await client.get(f"/api/projects/{later}")).status_code == 200
 
 
-async def test_a_restore_of_an_older_schemas_backup_keeps_its_safety_copy(tmp_path):
-    # M2 audit 6 F1: the backups taken before the restored database's migrations rotated the safety copy out
+@pytest.mark.parametrize("source", ["automatic", "file"])
+async def test_a_restore_of_an_older_schemas_backup_keeps_its_safety_copy(tmp_path, source):
+    # M2 audit 6 F1: the backups taken before the restored database's migrations rotated the safety copy out. From a
+    # file, its state at its own schema is then in one backup, taken before the migrations (PR 59 batch 2, item 4).
     data = tmp_path / "data"
 
     def older():  # an M1 data folder (schema 3) and its backup
         with Database(data, migrations=MIGRATIONS[:3]) as db:
-            return db.backup().name
+            generation = db.backup()
+        with zipfile.ZipFile(tmp_path / "m1.zip", "w") as archive:  # the same backup as a file
+            for path in generation.iterdir():
+                archive.write(path, path.name)
+        return generation.name
 
     name = await asyncio.to_thread(older)
     async with started(data) as client:
         later = await new_project(client, "Later")
+        before = {b["id"].split("/")[1] for b in (await client.get("/api/backups")).json()["backups"]}
         [old] = [b["id"] for b in (await client.get("/api/backups")).json()["backups"] if b["id"].endswith(name)]
-        response = await client.post("/api/backups/restore", json={"generation": old})
+        body = {"generation": old} if source == "automatic" else {"file": str(tmp_path / "m1.zip")}
+        response = await client.post("/api/backups/restore", json=body)
         assert response.status_code == 200, response.text
         result = response.json()
         assert result["schema_version"] == len(MIGRATIONS)
@@ -497,6 +505,8 @@ async def test_a_restore_of_an_older_schemas_backup_keeps_its_safety_copy(tmp_pa
         assert later in {project for (project,) in conn.execute("SELECT id FROM projects")}
         conn.close()
         assert old in listed  # and the backup restored from
+        added = sorted(b["schema_version"] for i, b in listed.items() if i.split("/")[1] not in before)
+        assert added == ([len(MIGRATIONS)] if source == "automatic" else [3, len(MIGRATIONS)])
 
 
 @pytest.mark.parametrize("outcome", ["committed", "rolled back"])
