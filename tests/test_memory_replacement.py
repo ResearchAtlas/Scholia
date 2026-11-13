@@ -44,6 +44,18 @@ def says(text, record, status="confirmed"):
     return candidate(text, status, "project_state", span=text.lower(), replaces=record)
 
 
+async def extraction_succeeded(client, turn, timeout=5.0):
+    """Wait for the extraction of turn to succeed: within timeout, and failing at once on any other ending."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        found = await rows(client, "SELECT status FROM runs WHERE workflow = 'memory' AND source_turn_id = ?", turn)
+        if found and found[0][0] != "running":
+            assert found[0][0] == "succeeded", found
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("the extraction did not end in time")
+
+
 async def proposal(client, content):
     [(record, version)] = await rows(client, "SELECT id, version FROM memory_records WHERE content = ?", content)
     return record, version
@@ -108,9 +120,7 @@ async def test_overlapping_extractions_the_later_turns_replaces_the_earlier_ones
         await send(client, conversation, "The sample is 40 interviews")
         await wait_for(lambda: len(provider.extractions) == 2)
         earlier.set()
-        while not await rows(client, "SELECT 1 FROM runs WHERE workflow = 'memory' AND source_turn_id = ?"
-                                     " AND status = 'succeeded'", first[0]["run_id"]):
-            await asyncio.sleep(0.02)
+        await extraction_succeeded(client, first[0]["run_id"])
         later.set()
         await background_idle(client)
         assert await state(client) == {"the sample is 30 interviews": ("superseded", False, False),
@@ -239,9 +249,7 @@ async def test_an_extractions_restatement_is_a_source_and_keeps_the_later_statem
         await wait_for(lambda: provider.extractions)
         restating = await send(client, conversation, "No, the sample is 30 interviews")
         await wait_for(lambda: len(provider.extractions) == 2)
-        while not await rows(client, "SELECT 1 FROM runs WHERE workflow = 'memory' AND source_turn_id = ?"
-                                     " AND status = 'succeeded'", restating[0]["run_id"]):
-            await asyncio.sleep(0.02)  # the restatement's extraction finishes first
+        await extraction_succeeded(client, restating[0]["run_id"])  # the restatement's extraction finishes first
         assert ("turn", restating[0]["run_id"]) in await rows(
             client, "SELECT source_kind, source_id FROM memory_sources WHERE memory_id = ?", record)
         release.set()
