@@ -764,6 +764,45 @@ async def test_recalled_memory_edited_mid_turn_ends_the_turn_revoked_with_contin
         assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "revoked")
 
 
+@pytest.mark.parametrize("by", ["extraction", "keep"])
+async def test_an_extractions_own_replacement_of_recalled_memory_leaves_the_turn_running_and_a_keep_ends_it(tmp_path, by):
+    # M2 audit area 4, item 5 (Fable F3, probe D): a turn's extraction replacing a record the next turn holds no longer
+    # revokes that turn (it keeps the version it read); the researcher's own Keep of a proposal replacing it still does
+    from cited import cited, with_papers
+    from backend.db import new_id
+    from test_search import WAGES
+    held = {}
+
+    async def replace_then_list(body):
+        def replace(conn):
+            extraction = new_id()
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, status) VALUES (?, ?, 'background',"
+                         " 'memory', '{}', 'succeeded')", (extraction, held["project"]))
+            if by == "extraction":
+                return memory.write(conn, project_id=held["project"], scope="project", kind="decision",
+                                    content="We decided on 35 interviews", status="confirmed", run_id=extraction,
+                                    sources=[("run", extraction)], replaces=held["record"])
+            proposal = memory.write(conn, project_id=held["project"], scope="project", kind="decision",
+                                    content="We decided on 35 interviews", status="proposed", run_id=extraction,
+                                    sources=[("run", extraction)])
+            conn.execute("UPDATE memory_records SET supersedes_id = ? WHERE id = ?", (held["record"], proposal))
+            return memory.keep(conn, proposal, None)
+        await asyncio.to_thread(held["client"].state["db"].write, replace)
+        return steps_reply(provider, [call("list_materials")])
+    provider = Scripted(replace_then_list, "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "We decided on 30 interviews"})).json()["id"]
+        held.update(client=client, record=record, project=project)
+        stream = await send(client, await conversation_in(client, project), "What did we decide last time?")
+        assert "30 interviews" in json.dumps(provider.agent_steps[0])
+        if by == "extraction":
+            assert stream[-1]["status"] == "succeeded" and len(provider.agent_steps) == 2
+        else:
+            assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "revoked")
+
+
 async def test_an_extraction_whose_shown_proposal_was_edited_ends_revoked(tmp_path, monkeypatch):
     provider = MockProvider()
     async with started(tmp_path / "data", provider) as client:

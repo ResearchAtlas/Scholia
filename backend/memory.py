@@ -168,12 +168,14 @@ def personal_allowed(conn, project_id):
 
 def allowed(conn, project_id, record_ids, versions=None):
     """Whether every one of these records may still be in a request of project_id (section 10, at dispatch): it exists,
-    is current (never superseded: an edit since it was assembled means its old text may not leave; a proposal's edit
-    takes its next version: versions, {id: version} as the request held them, names it), and is valid there now (its
-    scope, the request's project's lock, its papers)."""
+    is current (never superseded by the researcher: an edit, Keep or command since it was assembled means its old text
+    may not leave; a proposal's edit takes its next version: versions, {id: version} as the request held them, names
+    it), and is valid there now (its scope, the request's project's lock, its papers). A record an extraction replaced
+    on its own since stays allowed: the request keeps the version it read (M2 audit area 4, item 5)."""
     for record in record_ids:
         found = row(conn, record)
-        if found is None or found["status"] == "superseded" or not valid(conn, project_id, found):
+        if found is None or not valid(conn, project_id, found) or (
+                found["status"] == "superseded" and not _replaced_automatically(conn, record)):
             return False
         if versions and versions.get(record, found["version"]) != found["version"]:
             return False
@@ -188,6 +190,21 @@ def _automatic(conn, record):
         "SELECT 1 FROM memory_records m JOIN runs r ON r.id = m.created_by_run_id WHERE m.id = ? AND r.workflow = 'memory'"
         " AND NOT EXISTS (SELECT 1 FROM memory_sources s WHERE s.memory_id = m.id AND s.source_kind = 'researcher')",
         (record,)).fetchone() is not None
+
+
+def _replaced_automatically(conn, record):
+    """Whether every version that replaced a superseded record is an extraction's own (_automatic)."""
+    seen = set()
+    while record not in seen:
+        seen.add(record)
+        newer = conn.execute("SELECT id, status FROM memory_records WHERE supersedes_id = ? AND status != 'proposed'"
+                             " ORDER BY version DESC LIMIT 1", (record,)).fetchone()
+        if newer is None or not _automatic(conn, newer[0]):
+            return False
+        if newer[1] != "superseded":
+            return True
+        record = newer[0]
+    return False
 
 
 def _left_alone(conn, target, since):
