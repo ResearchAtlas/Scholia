@@ -645,6 +645,33 @@ async def test_a_failed_lookup_leaves_the_material_imported_with_incomplete_meta
         assert paper["title"] == TITLE and paper["checked_by"] == "lookup"
 
 
+async def test_a_merges_fields_survive_the_retry_of_the_uploads_lookup(tmp_path):
+    """M2 audit, area 1: a Merge's fields are the researcher's choice, so a lookup of the upload tried again (with
+    its batch's failed paper) replaces its looked-up details and keeps them."""
+    from test_reference_import import answer, imported as imported_references, merge_asks, ris
+    other = "10.5555/never.answered"
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)})
+    mock.answers = {"api.crossref.org": [503, 503, 503]}  # the second paper's DOI: OpenAlex has none, Crossref no answer
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()),
+                             ("second.md", f"# Second\n\ndoi:{other}\n".encode()))
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "failed"
+        await imported_references(client, project, ris((TITLE, f"DO  - {DOI}\nAB  - The merged abstract.\nKW  - wages\n")))
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        paper = result["materials"][0]["id"]
+        merged = (await client.get(f"/api/materials/{paper}")).json()
+        assert (merged["csl"]["abstract"], merged["csl"]["keyword"]) == ("The merged abstract.", "wages")
+        mock.openalex[DOI] = openalex_work(DOI, TITLE, venue="Journal of Later Records")
+        again = await client.post(f"/api/runs/{result['lookup_run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        retried = (await client.get(f"/api/materials/{paper}")).json()
+        assert retried["csl"]["container-title"] == "Journal of Later Records"  # the lookup's details, replaced
+        assert (retried["csl"]["abstract"], retried["csl"]["keyword"]) == ("The merged abstract.", "wages")
+
+
 async def test_a_failed_lookup_tried_again_twice_at_once_is_tried_again_once(tmp_path):
     mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)})
     mock.answers = {"api.openalex.org": [503] * 3, "api.crossref.org": [503] * 3}

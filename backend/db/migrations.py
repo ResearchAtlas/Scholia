@@ -726,7 +726,11 @@ ALTER TABLE queued_messages ADD COLUMN material_ids TEXT CHECK (material_ids IS 
 
 # M2 audit, area 1 (section 4.2: JSON columns are checked with json_valid): materials.lookup_filled (0006) is checked by
 # triggers, as a STRICT table's CHECK cannot be added to a column in place; a paper written before keeps its value.
+# merge_filled: the fields a confirmed Merge gave the paper (a JSON list of CSL keys, or NULL), which a later record of
+# it (a Zotero re-import, a lookup tried again) keeps where that record gives none (backend/references.py _answered).
 _0013 = r"""
+ALTER TABLE materials ADD COLUMN merge_filled TEXT CHECK (merge_filled IS NULL OR json_valid(merge_filled));
+
 CREATE TRIGGER materials_lookup_filled_valid BEFORE INSERT ON materials
 WHEN NEW.lookup_filled IS NOT NULL AND NOT json_valid(NEW.lookup_filled)
 BEGIN

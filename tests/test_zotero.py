@@ -479,6 +479,38 @@ async def test_merge_fills_the_paper_from_the_zotero_record(tmp_path):
         assert paper["source"] == "reference_file" and paper["csl"]["author"] == [{"family": "Example", "given": "Ana"}]
 
 
+async def test_a_merges_fields_survive_a_reimport_of_the_unchanged_item_and_a_changed_one(tmp_path):
+    """M2 audit, area 1 (Harold, 2026-10-17, S1-15 questions 3 and 4): a Merge's fields are the researcher's choice,
+    kept as their edits are: a re-import of the item unchanged in Zotero is unchanged, looks nothing up again and
+    keeps them; one changed in Zotero takes its record's change and still keeps them."""
+    mock = library(tmp_path, pdfs=False)
+    async with started(tmp_path / "data", provider(mock, openalex={DOI: openalex_work(DOI, "Looked Up")})) as client:
+        project = await project_of(client)
+        await imported(client, project, KEYS[:1])
+        await background_idle(client, 30)
+        lookups = len(client.provider.scholarly.requests)
+        await imported_references(client, project, ris(("Synthetic Wages in Small Towns",
+                                                         f"DO  - {DOI}\nAB  - The merged abstract.\nKW  - wages\n")))
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        [paper] = (await papers(client, project)).values()
+        assert (paper["csl"]["abstract"], paper["csl"]["keyword"], paper["evidence_type"]) == (
+            "The merged abstract.", "wages", "abstract")
+        row = await imported(client, project, KEYS[:1])
+        assert (row["result"]["unchanged"], row["result"]["updated"]) == (1, 0)
+        await background_idle(client, 30)
+        [again] = (await papers(client, project)).values()
+        assert again["csl"] == paper["csl"] and again["evidence_type"] == "abstract"
+        assert len(client.provider.scholarly.requests) == lookups  # nothing looked up again
+        mock.items["users/0", KEYS[0]]["csljson"]["title"] = "Synthetic Wages in Small Towns, Revised"
+        row = await imported(client, project, KEYS[:1])
+        assert row["result"]["updated"] == 1
+        [changed] = (await papers(client, project)).values()
+        assert (changed["title"], changed["csl"]["abstract"], changed["csl"]["keyword"]) == (
+            "Synthetic Wages in Small Towns, Revised", "The merged abstract.", "wages")
+
+
 @pytest.mark.parametrize("option", ["merge", "keep_both"])
 async def test_a_zotero_items_answer_that_changes_the_papers_puts_the_project_first(tmp_path, option):
     mock = library(tmp_path)

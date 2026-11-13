@@ -352,7 +352,7 @@ def _answered(conn, project_id, material, record, option, harness, active, keep=
             new_material(conn, project_id, record)
             conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
         return
-    row = conn.execute("SELECT csl, checked_by, evidence_type, title, source, lookup_filled FROM materials"
+    row = conn.execute("SELECT csl, checked_by, evidence_type, title, source, lookup_filled, merge_filled FROM materials"
                        " WHERE id = ? AND project_id = ?", (material, project_id)).fetchone()
     if row is None:  # deleted meanwhile, which revokes the run first: nothing to merge into
         return
@@ -367,8 +367,12 @@ def _answered(conn, project_id, material, record, option, harness, active, keep=
 
     before = chosen(csl)
     csl.update(added)
-    conn.execute("UPDATE materials SET csl = ?, title = ?, evidence_type = ?, updated_at = ? WHERE id = ?",
-                 (json.dumps(csl), added.get("title", row[3]), _evidence(csl, row[2]), utc_now(), material))
+    # The fields it gave are the researcher's choice: a later record of the paper keeps them where it gives none
+    # (merge_filled; zotero._update, materials._apply).
+    merged = sorted(set(json.loads(row[6] or "[]")) | set(added))
+    conn.execute("UPDATE materials SET csl = ?, title = ?, evidence_type = ?, merge_filled = ?, updated_at = ? WHERE id = ?",
+                 (json.dumps(csl), added.get("title", row[3]), _evidence(csl, row[2]), json.dumps(merged) if merged else None,
+                  utc_now(), material))
     if added:  # the paper changed
         conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
     # A reference file's paper is identified by its record (materials._identifiers), which now holds it. A

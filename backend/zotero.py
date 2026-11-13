@@ -757,7 +757,7 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
     if fetched is not None:
         csl, dropped, sha256, why = fetched
         step.update(pdf=why, left_out=dropped)
-        found = conn.execute("SELECT id, csl, checked_by, lookup_filled, title, evidence_type FROM materials"
+        found = conn.execute("SELECT id, csl, checked_by, lookup_filled, title, evidence_type, merge_filled FROM materials"
                              " WHERE project_id = ? AND source = 'zotero' AND source_key = ?",
                              (project_id, source_key)).fetchone()
         if found is not None:
@@ -790,22 +790,28 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
     researcher has not edited them), and its PDF, when it is none of its files, its next version.
     Returns (material, version, its record or {}, whether its current version has a file) to look up
     when its details were replaced or a file added, else None."""
-    material, stored, checked_by, filled, title, evidence = found
+    material, stored, checked_by, filled, title, evidence, merge_filled = found
     step["material_id"] = material
     changed = False
     own = json.loads(stored or "{}")
     for field in json.loads(filled or "[]"):  # a lookup's fields are not the record's (S1-14's lookup_filled)
         own.pop(field, None)
     if csl is not None and checked_by != "researcher":
-        if own != csl:
+        # A Merge's fields are the researcher's choice (Harold, 2026-10-17, S1-15 questions 3 and 4): kept where the
+        # record gives none, as a Merge fills only what the paper lacks; a field the record now gives is its own.
+        merged = [key for key in json.loads(merge_filled or "[]") if key in own]
+        record = {**{key: own[key] for key in merged}, **csl}
+        if own != record:
             changed = True
             # its retraction check and resolution were about the identifier it had: a DOI or an arXiv ID changed or gone
-            moved = reference_files.identifier(own) != reference_files.identifier(csl)
-            conn.execute("UPDATE materials SET title = ?, csl = ?, evidence_type = ?, lookup_filled = NULL, updated_at = ?"
+            moved = reference_files.identifier(own) != reference_files.identifier(record)
+            still = [key for key in merged if key not in csl]
+            conn.execute("UPDATE materials SET title = ?, csl = ?, evidence_type = ?, lookup_filled = NULL, merge_filled = ?,"
+                         " updated_at = ?"
                          + (", resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL" if moved else "")
-                         + " WHERE id = ?", (csl["title"], json.dumps(csl), references._evidence(csl, evidence),
-                                            utc_now(), material))
-            if csl["title"] != title:  # the index text carries the title (S1-17)
+                         + " WHERE id = ?", (record["title"], json.dumps(record), references._evidence(record, evidence),
+                                            json.dumps(still) if still else None, utc_now(), material))
+            if record["title"] != title:  # the index text carries the title (S1-17)
                 search.retitled(conn, harness, project_id, material, recorded)
     current = conn.execute("SELECT id, file_sha256 FROM material_versions WHERE material_id = ? AND is_current = 1",
                            (material,)).fetchone()

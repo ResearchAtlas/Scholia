@@ -303,8 +303,8 @@ def _forget_file_lookup(conn, material):
                      " WHERE id = ?", (json.dumps(record), material))
     elif checked_by == "lookup":
         conn.execute("UPDATE materials SET csl = NULL, checked_by = NULL, checked_at = NULL, source_key = NULL,"
-                     " resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL WHERE id = ?",
-                     (material,))
+                     " merge_filled = NULL, resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL"
+                     " WHERE id = ?", (material,))
     else:  # an upload no lookup completed: only what a retraction check said goes
         conn.execute("UPDATE materials SET resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL"
                      " WHERE id = ?", (material,))
@@ -872,7 +872,8 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
     paper carries already) does not."""
     now, changed = utc_now(), False
     for material, version in pairs:
-        row = conn.execute("SELECT m.checked_by, v.id = ?, json_extract(m.csl, '$.DOI'), m.title, m.csl FROM materials m"
+        row = conn.execute("SELECT m.checked_by, v.id = ?, json_extract(m.csl, '$.DOI'), m.title, m.csl, m.merge_filled"
+                           " FROM materials m"
                            " JOIN material_versions v ON v.material_id = m.id AND v.is_current = 1"
                            " WHERE m.id = ? AND m.project_id = ?",
                            (version, material, project_id)).fetchone()
@@ -884,11 +885,16 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
         changed = changed or bool(filled)
         if mine is not None:
             if row[0] != "researcher" and filled is None:  # what the researcher edited stays
-                changed = changed or (mine.csl["title"], mine.csl) != (row[3], json.loads(row[4] or "null"))
+                # and a Merge's fields where the lookup's record gives none (references._answered's merge_filled)
+                stored = json.loads(row[4] or "{}")
+                merged = [key for key in json.loads(row[5] or "[]") if key in stored and key not in mine.csl]
+                csl = {**{key: stored[key] for key in merged}, **mine.csl}
+                changed = changed or (csl["title"], csl) != (row[3], json.loads(row[4] or "null"))
                 conn.execute("UPDATE materials SET title = ?, csl = ?, source_key = ?, resolved_at = ?, checked_at = ?,"
-                             " checked_by = 'lookup', updated_at = ? WHERE id = ?",
-                             (mine.csl["title"], json.dumps(mine.csl), mine.source_key, now, now, now, material))
-                if record is not None and mine.csl["title"] != row[3]:
+                             " checked_by = 'lookup', merge_filled = ?, updated_at = ? WHERE id = ?",
+                             (csl["title"], json.dumps(csl), mine.source_key, now, now,
+                              json.dumps(merged) if merged else None, now, material))
+                if record is not None and csl["title"] != row[3]:
                     search.retitled(conn, harness, project_id, material, record)
                 if mine.retracted is None and row[2] != mine.csl.get("DOI"):  # another work, of which no check is known
                     conn.execute("UPDATE materials SET retraction = 'unknown', retraction_checked_at = NULL WHERE id = ?",
