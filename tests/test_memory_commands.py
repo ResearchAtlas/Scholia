@@ -556,8 +556,39 @@ async def test_a_forget_revoked_in_the_record_before_the_turn_hears_of_it_delete
         assert len(calls) == 1
         assert len(await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")) == 2
         if change == "ended":  # nothing is recorded on a run that has ended
+            assert await rows(client, "SELECT 1 FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                              stream[0]["run_id"]) == []
             return
         assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")
         await _forgotten(client, stream, 1)
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1:]
         assert [(m["action"], m["count"]) for m in turn["memory"]] == [("forgotten", 1)]
+
+
+@pytest.mark.parametrize("message", ["Remember: the cohort is 40 nurses", "Correct: the cohort is 40 nurses"])
+async def test_a_save_or_update_command_on_a_run_revoked_in_the_record_before_the_turn_hears_of_it_writes_nothing(
+        tmp_path, monkeypatch, message):
+    # Fix batch 2's sweep of B-R2-F1: a save or update writes through _record, which reads the run in the transaction
+    # that writes, so a revocation committed before the harness hears of it (the flag still unset) keeps it out
+    async with started(tmp_path / "data") as client:
+        harness = client.state["harness"]
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Remember: the cohort is 30 nurses")
+        await background_idle(client)
+        before = await rows(client, "SELECT id, version, status FROM memory_records ORDER BY id")
+        real, calls = harness.memory_on, []
+
+        async def memory_on(project_id):  # its second read is the one just before the command's write
+            calls.append(project_id)
+            if len(calls) == 2:
+                run_id = harness.registry.turns[conversation].run_id
+                await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                    "UPDATE runs SET cancel_reason = 'revoked' WHERE id = ?", (run_id,)))
+            return await real(project_id)
+        monkeypatch.setattr(harness, "memory_on", memory_on)
+        stream = await send(client, conversation, message)
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")
+        assert await rows(client, "SELECT id, version, status FROM memory_records ORDER BY id") == before
+        assert await rows(client, "SELECT 1 FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                          stream[0]["run_id"]) == []
