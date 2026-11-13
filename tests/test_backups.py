@@ -634,6 +634,76 @@ async def test_a_project_exports_as_markdown_json_its_files_and_settings_without
     assert not any(b"Elsewhere" in read(path, name) for name in names(path)) and mode(path) == 0o600
 
 
+async def test_a_project_export_holds_its_citations_notes_asks_and_waiting_messages(tmp_path):
+    # M2 audit 6 F3 (and 5 F4): the export kept an answer's markers but not what they cite, nor the steering notes a
+    # step read, the asks a turn put and their answers, the messages waiting to send, or the turn a memory names
+    data, destination = tmp_path / "data", tmp_path / "chosen"
+    destination.mkdir()
+    async with started(data) as client:
+        project = await new_project(client)
+        conversation = (await client.post("/api/conversations", json={"project_id": project,
+                                                                      "title": "Sampling"})).json()["id"]
+        run_id = (await send(client, conversation, "How large a sample do I need?"))[0]["run_id"]
+        await stored_material(client, project, b"%PDF-1.7 a paper", "application/pdf")
+        [(material, version)] = await rows(client, "SELECT m.id, v.id FROM materials m JOIN material_versions v"
+                                                   " ON v.material_id = m.id WHERE m.project_id = ?", project)
+        elsewhere = await new_project(client, "Elsewhere")  # a paper of the project a moved conversation came from
+        await stored_material(client, elsewhere, b"%PDF-1.7 another paper", "application/pdf")
+        [(foreign,)] = await rows(client, "SELECT id FROM materials WHERE project_id = ?", elsewhere)
+        ask, citation, memory = new_id(), new_id(), new_id()
+
+        def record(conn):
+            (seq,) = conn.execute("SELECT max(seq) + 1 FROM run_events WHERE run_id = ?", (run_id,)).fetchone()
+            events = [("steering_note", {"text": "Only recent ones"}), ("step_started", {"step": 7, "steering": [seq]}),
+                      ("model_attempt", {"step": 7, "dispatched": True}), ("steering_note", {"text": "Never read"}),
+                      ("ask", {"ask_id": ask, "kind": "choice", "options": ["1", "2"], "text_box": True, "params": {}}),
+                      ("ask_answered", {"ask_id": ask, "by": "researcher", "text": "The 2019 one"})]
+            for i, (kind, event) in enumerate(events):
+                conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, ?, ?)",
+                             (run_id, seq + i, kind, json.dumps(event)))
+            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, material_version_id, quote,"
+                         " context, page, existence, support) VALUES (?, 'answer', ?, ?, ?, 'n = 40 sufficed', ?, 4, 'ok',"
+                         " 'supported')", (citation, run_id, material, version,
+                                           json.dumps({"marker": "[S1.1]", "offset": 3, "sentence": "Forty."})))
+            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, quote, context, existence)"
+                         " VALUES (?, 'answer', ?, ?, 'words of another project', ?, 'ok')",
+                         (new_id(), run_id, foreign, json.dumps({"marker": "[S2.1]", "offset": 9, "sentence": "Also."})))
+            conn.execute("INSERT INTO queued_messages (id, conversation_id, text) VALUES (?, ?, 'And the power?')",
+                         (new_id(), conversation))
+            conn.execute("INSERT INTO memory_records (id, scope, project_id, type, content, status) VALUES"
+                         " (?, 'project', ?, 'decision', 'We sample forty', 'confirmed')", (memory, project))
+            conn.execute("INSERT INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'turn', ?)",
+                         (memory, run_id))
+        await asyncio.to_thread(client.state["db"].write, record)
+        run = await archived_run(client, f"/api/projects/{project}/export", {"destination": str(destination)})
+        assert run.status == "succeeded", run
+    path = destination / run.result["file"].rsplit("/", 1)[1]
+    markdown = read(path, f"conversations/{conversation}.md").decode()
+    [exported] = json.loads(read(path, "conversations.json"))
+    [turn] = exported["turns"]
+    assert [note["text"] for note in turn["steering"]] == ["Only recent ones"]  # the unread one waits, not read
+    [asked] = turn["asks"]
+    assert (asked["kind"], asked["options"], asked["answer"]["text"], asked["answer"]["by"]) == (
+        "choice", ["1", "2"], "The 2019 one", "researcher")
+    cited, moved = turn["citations"]
+    assert (moved["marker"], moved["material_id"], moved["quote"]) == ("[S2.1]", foreign, None)
+    assert not any(b"words of another project" in read(path, name) for name in names(path))
+    assert "- [S2.1]" in markdown.splitlines()
+    assert {k: cited[k] for k in ("id", "marker", "material_id", "material_version", "quote", "page", "existence",
+                                  "support")} == {"id": citation, "marker": "[S1.1]", "material_id": material,
+                                                  "material_version": 0, "quote": "n = 40 sufficed", "page": 4,
+                                                  "existence": "ok", "support": "supported"}
+    assert material in {m["id"] for m in json.loads(read(path, "materials.json"))}
+    assert [q["text"] for q in exported["queued"]] == ["And the power?"]
+    [kept] = json.loads(read(path, "memory.json"))
+    assert kept["sources"] == [{"kind": "turn", "id": run_id}] and turn["run_id"] == run_id
+    lines = [line for line in markdown.splitlines() if line]
+    assert lines.index("*Note for Scholia: Only recent ones*") < lines.index(
+        "*Scholia asked (choice). The answer: The 2019 one*") < lines.index("## Scholia")
+    assert "- [S1.1] A paper, page 4: “n = 40 sufficed”" in lines and "Never read" not in markdown
+    assert lines[-2:] == ["## Waiting to send", "And the power?"]
+
+
 async def test_a_private_project_exports_only_encrypted(tmp_path):
     destination = tmp_path / "chosen"
     destination.mkdir()

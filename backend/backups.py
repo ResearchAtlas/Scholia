@@ -42,7 +42,7 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
-from backend import APP_VERSION, i18n
+from backend import APP_VERSION, budgets, i18n
 from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseCloseError, DatabaseClosedError,
                         DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError, close_failed, utc_now)
 from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _open_checked, _stamp_of, \
@@ -1424,8 +1424,10 @@ def _write_export(db, project_id, destination, passphrase, language, archive, st
                                        "exported_at": utc_now(), "project": data["project"]})),
                ("conversations.json", _json(data["conversations"]))]
     # Names in a zip are readable without its passphrase, so files are named by id, never by title.
+    titles = {material["id"]: material["title"] for material in data["materials"]}  # this project's papers only
     for conversation in data["conversations"]:
-        entries.append((f"conversations/{conversation['id']}.md", _conversation_markdown(conversation, language)))
+        entries.append((f"conversations/{conversation['id']}.md", _conversation_markdown(conversation, language,
+                                                                                          titles)))
     if data["artifacts"]:
         entries.append(("artifacts.json", _json(data["artifacts"])))
         for artifact in data["artifacts"]:
@@ -1487,14 +1489,17 @@ def _project_records(conn, project_id, memory=True):
     conversations = rows("SELECT id, title, title_source, created_at, updated_at FROM conversations"
                          " WHERE project_id = ? ORDER BY created_at, id", project_id)
     for conversation in conversations:
+        # run_id: what a memory record's turn source names (M2 audit 6 F3)
         conversation["turns"] = rows(
-            "SELECT t.seq, t.author, t.user_message AS message, t.answer, r.status, r.cancel_reason, t.reason_code,"
-            " r.settled_cost_usd AS cost_usd, t.accounting, r.started_at, r.finished_at,"
+            "SELECT t.run_id, t.seq, t.author, t.user_message AS message, t.answer, r.status, r.cancel_reason,"
+            " t.reason_code, r.settled_cost_usd AS cost_usd, t.accounting, r.started_at, r.finished_at,"
             " t.retry_of_run_id AS continues FROM turns t JOIN runs r ON r.id = t.run_id"
             " WHERE t.conversation_id = ? ORDER BY t.seq", conversation["id"])
         for turn in conversation["turns"]:
             for key in ("message", "answer", "accounting"):
                 turn[key] = json.loads(turn[key]) if turn[key] else None
+            _turn_records(conn, turn, rows, project_id)
+        conversation["queued"] = budgets.queued(conn, conversation["id"])  # the researcher's messages waiting to send
     materials = rows("SELECT id, title, csl, source, source_key, evidence_type, proposed_by, resolved_at, checked_at,"
                      " checked_by, retraction, created_at, updated_at FROM materials WHERE project_id = ?"
                      " ORDER BY created_at, id", project_id)
@@ -1520,7 +1525,39 @@ def _project_records(conn, project_id, memory=True):
             "memory": records}
 
 
-def _conversation_markdown(conversation, language="en"):
+def _turn_records(conn, turn, rows, project_id):
+    """What else a turn's record holds that its export needs (M2 audit 6 F3; ticket 16: readable without the app). The
+    steering notes a step read, the researcher's own words in the turn (unread ones wait as queued messages). Its asks
+    and their answers: an agent's own question and option labels are model text kept only while its run runs, so an
+    ask of a finished turn names its options by number. Its answer's citations, as recorded, so each marker resolves
+    to its paper (materials.json, by id), version, passage, quote and page, with its existence and support checks; the
+    quote only of this project's papers, as a conversation moved here may cite another project's, whose text the
+    export does not carry."""
+    run_id, carried = turn["run_id"], budgets.carried_notes(conn, turn["run_id"])
+    turn["steering"], turn["asks"], asks = [], [], {}
+    for seq, at, kind, data in conn.execute("SELECT seq, at, type, data FROM run_events WHERE run_id = ?"
+                                            " AND type IN ('steering_note', 'ask', 'ask_answered') ORDER BY seq", (run_id,)):
+        data = json.loads(data)
+        if kind == "steering_note":
+            if seq in carried and data.get("text"):
+                turn["steering"].append({"text": data["text"], "at": at})
+        elif "options" in data:  # the ask; else its answer (asks.asked)
+            asks[data["ask_id"]] = {"kind": data["kind"], "options": data["options"], "params": data.get("params") or {},
+                                    "asked_at": at, "answer": None}
+            turn["asks"].append(asks[data["ask_id"]])
+        elif data.get("ask_id") in asks:
+            asks[data["ask_id"]]["answer"] = {**{k: data[k] for k in ("by", "option", "text", "withdrawn") if k in data},
+                                              "at": at}
+    turn["citations"] = rows(
+        "SELECT c.id, json_extract(c.context, '$.marker') AS marker, json_extract(c.context, '$.sentence') AS sentence,"
+        " c.material_id, v.seq AS material_version, c.passage_id, p.ordinal AS passage,"
+        " CASE WHEN m.project_id = ? THEN c.quote END AS quote, c.page, c.evidence_type, c.existence, c.support,"
+        " c.checked_at FROM citations c LEFT JOIN materials m ON m.id = c.material_id"
+        " LEFT JOIN material_versions v ON v.id = c.material_version_id LEFT JOIN passages p ON p.id = c.passage_id"
+        " WHERE c.owner_kind = 'answer' AND c.owner_id = ? ORDER BY c.rowid", project_id, run_id)
+
+
+def _conversation_markdown(conversation, language="en", titles=None):
     """A conversation as Markdown, its headings in language (section 12)."""
     def text(key, **params):
         return i18n.render(f"export.{key}", language, **params)
@@ -1529,13 +1566,36 @@ def _conversation_markdown(conversation, language="en"):
     for turn in conversation["turns"]:
         author = text("researcher" if turn["author"] == "researcher" else "other_conversation")
         lines += [f"## {author} ({turn['started_at']})", "", (turn["message"] or {}).get("text", ""), ""]
+        # the notes and asks in the order they were said, before the answer they shaped
+        said = [(note["at"], f"*{text('note', text=note['text'])}*") for note in turn.get("steering", [])]
+        for ask in turn.get("asks", []):
+            answer = ask["answer"] or {}
+            reply = answer.get("text") or answer.get("option")
+            said.append((ask["asked_at"], f"*{text('asked', kind=ask['kind'], answer=reply)}*" if reply
+                         else f"*{text('asked_unanswered', kind=ask['kind'])}*"))
+        for _, line in sorted(said, key=lambda item: item[0]):
+            lines += [line, ""]
         if turn["answer"]:
             lines += ["## Scholia", "", turn["answer"].get("text", ""), ""]
             if turn["answer"].get("cut"):  # stopped at the model's output limit
                 lines += [f"*{text('cut')}*", ""]
+            cited = [c for c in turn.get("citations", []) if c["marker"]]
+            if cited:  # each marker with its paper, page and quote, so the answer reads without the app
+                lines += [f"### {text('sources')}", ""]
+                for c in cited:
+                    where = ", ".join(part for part in ((titles or {}).get(c["material_id"]),
+                                                        text("page", page=c["page"]) if c["page"] is not None else None)
+                                      if part)
+                    lines.append(f"- {c['marker']}" + (f" {where}" if where else "") + (f": “{c['quote']}”" if c["quote"]
+                                                                                       else ""))
+                lines.append("")
         elif turn["status"] != "running":
             status = text(f"status.{turn['status']}")
             lines += [f"*{text('no_answer', status=status)}*", ""]
+    if conversation.get("queued"):
+        lines += [f"## {text('waiting')}", ""]
+        for queued in conversation["queued"]:
+            lines += [queued["text"], ""]
     return "\n".join(lines).encode("utf-8")
 
 
