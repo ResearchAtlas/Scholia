@@ -1527,7 +1527,9 @@ def _project_records(conn, project_id, memory=True):
 
 def _turn_records(conn, turn, rows, project_id):
     """What else a turn's record holds that its export needs (M2 audit 6 F3; ticket 16: readable without the app). The
-    steering notes a step read, the researcher's own words in the turn (unread ones wait as queued messages). Its asks
+    steering notes, the researcher's own words in the turn: each read by a step, or, while the record has the turn
+    running, not read yet (pending); one its turn ended without reading is queued by that end in the same transaction,
+    so it is a waiting message instead, and never both (budgets.queue_unread_notes; PR 59 batch 1). Its asks
     and their answers: an agent's own question and option labels are model text kept only while its run runs, so an
     ask of a finished turn names its options by number. Its answer's citations, as recorded, so each marker resolves
     to its paper (materials.json, by id), version, passage, quote and page, with its existence and support checks; of
@@ -1540,8 +1542,9 @@ def _turn_records(conn, turn, rows, project_id):
             " AND type IN ('steering_note', 'ask', 'ask_answered') ORDER BY seq", (run_id,)):
         data = json.loads(data)
         if kind == "steering_note":
-            if seq in carried and data.get("text"):
-                turn["steering"].append({"text": data["text"], "at": at})
+            state = "read" if seq in carried else "pending" if turn["status"] == "running" else None
+            if state and data.get("text"):
+                turn["steering"].append({"text": data["text"], "state": state, "at": at})
         elif "options" in data:  # the ask; else its answer (asks.asked)
             asks[data["ask_id"]] = {"kind": data["kind"], "options": data["options"],
                                     "params": data.get("params") or {}, "asked_at": at, "answer": None}
@@ -1571,7 +1574,10 @@ def _conversation_markdown(conversation, language="en", titles=None):
         author = text("researcher" if turn["author"] == "researcher" else "other_conversation")
         lines += [f"## {author} ({turn['started_at']})", "", (turn["message"] or {}).get("text", ""), ""]
         # the notes and asks in the order they were said, before the answer they shaped
-        said = [(note["at"], f"*{text('note', text=note['text'])}*") for note in turn.get("steering", [])]
+        said = []
+        for note in turn.get("steering", []):
+            key = "note_pending" if note.get("state") == "pending" else "note"
+            said.append((note["at"], f"*{text(key, text=note['text'])}*"))
         for ask in turn.get("asks", []):
             answer = ask["answer"] or {}
             reply = answer.get("text") or answer.get("option")
