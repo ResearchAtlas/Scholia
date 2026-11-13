@@ -502,10 +502,17 @@ def save_answer(conn, *, project_id, run_id, previous, text=None):
 # Extraction
 
 
+def _said(conn, turn, message):
+    """The researcher's words in a turn: its message, then the steering notes its steps read, which are their own words
+    too (Harold's decision of 2026-11-11, as assembly, compaction and Continue read them; M2 audit area 4, item 9)."""
+    from backend import budgets  # it imports backend.runs, which imports this module
+    return "\n\n".join([(json.loads(message) or {}).get("text", ""), *budgets.read_notes(conn, turn)])
+
+
 def extraction_input(conn, run_id):
-    """What an extraction run's request holds, read now: (the researcher's message, the delivered answer, the turn's
-    author, the related records [(id, type, status, content)], the papers they and the answer carry), or None when
-    the source turn is gone."""
+    """What an extraction run's request holds, read now: (the researcher's message and the notes its steps read, the
+    delivered answer, the turn's author, the related records [(id, type, status, content)], the papers they and the
+    answer carry), or None when the source turn is gone."""
     from backend import provenance
     found = conn.execute(
         "SELECT t.user_message, t.answer, t.author, r.project_id, t.run_id FROM runs r JOIN turns t"
@@ -513,12 +520,13 @@ def extraction_input(conn, run_id):
     if found is None:
         return None
     message, answer, author, project_id, turn = found
+    message = _said(conn, turn, message)
     related = [r for r in in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"))
                if valid(conn, project_id, r)][:RELATED]  # as recall: none it may not be shown
     held = set(provenance.dependencies(conn, turn))
     for record in related:
         held |= {i for k, i in sources_of(conn, record["id"]) if k == "material"}
-    return ((json.loads(message) or {}).get("text", ""), (json.loads(answer or "{}") or {}).get("text", ""), author,
+    return (message, (json.loads(answer or "{}") or {}).get("text", ""), author,
             [(r["id"], r["type"], r["status"], r["content"], r["version"]) for r in related], sorted(held))
 
 
@@ -634,7 +642,7 @@ def apply_extraction(conn, run_id, candidates):
     if found is None:
         return None
     message, author, project_id, turn, turn_started, run_started = found
-    message = (json.loads(message) or {}).get("text", "")
+    message = _said(conn, turn, message)
     late_project = _command_since(conn, project_id, turn_started)
     late_anywhere = _command_since(conn, project_id, turn_started, anywhere=True)
     # every paper its request carried text of (the answer's, and the related records' it was shown), registered as
