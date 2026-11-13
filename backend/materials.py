@@ -986,18 +986,55 @@ _MATERIAL_COLUMNS = ("m.id, m.project_id, m.title, m.csl, m.source, m.source_key
                      f" v.id, v.seq, v.file_sha256, {_VERSION_TYPE}, c.size, v.created_at")
 
 
-def _describe(conn, row, registry):
-    """A material as the Library shows it, with its state: reading, ready or needs_attention (and why)."""
+def _runs_of(conn, rows):
+    """What the Library shows of the runs of the papers in rows (_MATERIAL_COLUMNS), read once for them all: each
+    scan of the runs reads every run, so a scan per paper cost papers times runs (M2 audit, area 1). (each version's
+    latest reading run, the reading runs still running by version, each paper's latest lookup run, that run's latest
+    step for it, and why each Zotero paper's latest import read no PDF)."""
+    papers = json.dumps([row[0] for row in rows])
+    versions = json.dumps([row[14] for row in rows if row[14]])
+    reading, running, lookups, steps, attachments = {}, {}, {}, {}, {}
+    for run in conn.execute("SELECT id, status, cancel_reason, summary, json_extract(inputs, '$.version_id') FROM runs"
+                            " WHERE workflow = 'extract' AND json_extract(inputs, '$.version_id') IN"
+                            " (SELECT value FROM json_each(?)) ORDER BY rowid", (versions,)):
+        reading[run[4]] = run[:4]  # the latest
+        if run[1] == "running":
+            running.setdefault(run[4], []).append(run[0])
+    for run in conn.execute("SELECT r.id, r.status, r.cancel_reason, r.waiting, r.summary, j.value FROM runs r,"
+                            " json_each(r.inputs, '$.material_ids') j WHERE r.workflow = 'lookup'"
+                            " AND j.value IN (SELECT value FROM json_each(?)) ORDER BY r.rowid", (papers,)):
+        lookups[run[5]] = run[:5]
+    latest = json.dumps(sorted({found[0] for found in lookups.values()}))
+    identifiers = {run: json.loads(found or "{}") for run, found in conn.execute(  # each run's once, however many papers
+        "SELECT id, json_extract(inputs, '$.identifiers') FROM runs WHERE id IN (SELECT value FROM json_each(?))", (latest,))}
+    for run, data in conn.execute("SELECT run_id, data FROM run_events WHERE type = 'step_finished' AND run_id IN"
+                                  " (SELECT value FROM json_each(?)) ORDER BY seq", (latest,)):
+        step = json.loads(data)
+        if lookups.get(step.get("material_id"), (None,))[0] == run:
+            steps[step["material_id"]] = step
+    for material, found in lookups.items():
+        steps.setdefault(material, {})["identifier"] = identifiers.get(found[0], {}).get(material)
+    if any(row[4] == "zotero" and row[16] is None for row in rows):  # S1-15: a paper with no file says why
+        for material, why in conn.execute(
+                "SELECT json_extract(e.data, '$.material_id'), json_extract(e.data, '$.pdf') FROM run_events e"
+                " JOIN runs r ON r.id = e.run_id WHERE r.workflow = 'zotero_import' AND e.type = 'step_finished'"
+                " AND json_extract(e.data, '$.material_id') IN (SELECT value FROM json_each(?)) ORDER BY e.rowid", (papers,)):
+            attachments[material] = why
+    return reading, running, lookups, steps, attachments
+
+
+def _describe(conn, row, registry, runs=None):
+    """A material as the Library shows it, with its state: reading, ready or needs_attention (and why). runs: what
+    _runs_of read for a listing's papers, row's among them (read for row alone when not given)."""
     (material, project, title, csl, source, source_key, evidence, resolved_at, checked_at, checked_by, retraction,
      retraction_checked_at, created_at, updated_at, version, seq, sha256, media_type, size, version_at) = row
+    reading, running, lookups, steps, attachments = runs or _runs_of(conn, [row])
     extracted = _extraction(conn, sha256, media_type)
-    run = conn.execute("SELECT id, status, cancel_reason, summary FROM runs WHERE workflow = 'extract'"
-                       " AND json_extract(inputs, '$.version_id') = ? ORDER BY rowid DESC LIMIT 1",
-                       (version,)).fetchone() if version else None
+    run = reading.get(version) if version else None
     status = run and derived_status(run[1], run[0], registry)  # as the background-run list reads it
     state, reason, progress = "ready", None, None
     if sha256 is None:  # metadata only; a Zotero paper whose PDF could not be read says why (S1-15)
-        if source == "zotero" and (why := _attachment_problem(conn, material)) is not None:
+        if source == "zotero" and (why := attachments.get(material)) is not None:
             state, reason = "needs_attention", why
     elif run is not None and status == "running":
         state = "reading"
@@ -1014,19 +1051,13 @@ def _describe(conn, row, registry):
                   or {"cancelled": "stopped"}.get(status, status))
     else:  # no reading by this extractor version: one by an earlier version (its own or shared), or none
         state, reason = "needs_attention", "outdated" if _earlier(conn, sha256, media_type) else "not_read"
-    found = conn.execute(
-        "SELECT r.id, r.status, r.cancel_reason, r.waiting, r.summary, r.inputs FROM runs r, json_each(r.inputs, '$.material_ids') j"
-        " WHERE r.workflow = 'lookup' AND j.value = ? ORDER BY r.rowid DESC LIMIT 1", (material,)).fetchone()
+    found = lookups.get(material)
     looked = None
     if found is not None:
-        event = conn.execute("SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished'"
-                             " AND json_extract(data, '$.material_id') = ? ORDER BY seq DESC LIMIT 1",
-                             (found[0], material)).fetchone()
-        outcome = json.loads(event[0]) if event else {}
+        outcome = steps[material]  # its latest step, and the identifier its run's inputs keep for it
         looked = {"run_id": found[0], "status": derived_status(found[1], found[0], registry),
                   "cancel_reason": found[2], "waiting": found[3] == "ask", "outcome": outcome.get("outcome"),
-                  "identifier": (json.loads(found[5] or "{}").get("identifiers") or {}).get(material),
-                  "source": outcome.get("source"),
+                  "identifier": outcome["identifier"], "source": outcome.get("source"),
                   "reason": json.loads(found[4] or "{}").get("reason")}  # what it recorded on ending: declined, say
     return {
         "id": material, "project_id": project, "title": title, "csl": json.loads(csl) if csl else {},
@@ -1039,7 +1070,7 @@ def _describe(conn, row, registry):
         "extraction": {"extractor": extracted[1], "version": extracted[2], "status": extracted[3],
                        "pages": extracted[4], "ocr_pages": extracted[5], "passages": extracted[6]} if extracted else None,
         "reading": {"run_id": run[0], "status": status} if run else None,
-        "readable": bool(version) and _unreadable(conn, version, registry) is None,  # Read again applies
+        "readable": bool(version) and _unreadable(conn, version, registry, running.get(version, ())) is None,  # Read again
         "lookup": looked,
     }
 
@@ -1059,7 +1090,8 @@ async def list_materials(project_id: str, request: Request):
             " ORDER BY m.created_at DESC, m.id", (project_id,)).fetchall()
         open_asks = asks.open_asks(conn, project_id=project_id, registry=registry)
         listed = {ask["run_id"] for ask in open_asks}
-        return {"materials": [_describe(conn, row, registry) for row in rows], "asks": open_asks,
+        runs = _runs_of(conn, rows)
+        return {"materials": [_describe(conn, row, registry, runs) for row in rows], "asks": open_asks,
                 # S1-14: merges still running whose question is not listed (not asked yet, asked under a
                 # policy the project no longer has and not yet asked again, or answered and applying it):
                 # the Library looks again
@@ -1393,29 +1425,20 @@ def _other(conn, run_id, workflow, status, registry):
     return references.run_details(conn, run_id, status, registry)
 
 
-def _attachment_problem(conn, material):
-    """Why a Zotero paper has no file, as its latest import recorded it (a PDF it could not read:
-    pdf_not_local, pdf_too_large, ...), or None (S1-15). ponytail: a scan of the paper's import
-    events; an index on them if imports run into the thousands."""
-    row = conn.execute("SELECT json_extract(e.data, '$.pdf') FROM run_events e JOIN runs r ON r.id = e.run_id"
-                       " WHERE r.workflow = 'zotero_import' AND e.type = 'step_finished'"
-                       " AND json_extract(e.data, '$.material_id') = ? ORDER BY e.rowid DESC LIMIT 1",
-                       (material,)).fetchone()
-    return row[0] if row else None
-
-
-def _unreadable(conn, version_id, registry):
+def _unreadable(conn, version_id, registry, running=None):
     """Why the version cannot be read (again) now, as (status, code, message), or None when it can:
     it is its material's current file, which has no reading by this version of its extractor (never
     read, read by an earlier version, or its reading failed or was stopped), and none is being made.
-    It need not have a reading run of its own: one that shared another's reading has none."""
+    It need not have a reading run of its own: one that shared another's reading has none. running: the
+    ids of its reading runs recorded running, when the caller read them already (_runs_of)."""
     version = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"
                            " content_files c ON c.sha256 = v.file_sha256 WHERE v.id = ? AND v.is_current = 1",
                            (version_id,)).fetchone()
     if version is None or version[0] is None or version[1] not in extraction.EXTRACTORS \
-            or _extraction(conn, *version) is not None or any(_live(run, registry) for (run,) in conn.execute(
-                "SELECT id FROM runs WHERE workflow = 'extract' AND status = 'running'"
-                " AND json_extract(inputs, '$.version_id') = ?", (version_id,))):
+            or _extraction(conn, *version) is not None or any(_live(run, registry) for run in (
+                running if running is not None else (run for (run,) in conn.execute(
+                    "SELECT id FROM runs WHERE workflow = 'extract' AND status = 'running'"
+                    " AND json_extract(inputs, '$.version_id') = ?", (version_id,))))):
         return 409, "not_retryable", "This paper is read already, or being read"
     return None
 

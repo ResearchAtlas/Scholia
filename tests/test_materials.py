@@ -452,6 +452,53 @@ async def test_an_offset_or_page_past_sqlites_integers_is_past_every_passage_nev
                 assert response.json()["section"] == end["section"]
 
 
+async def test_the_librarys_listing_reads_the_runs_once_however_many_papers_it_lists(tmp_path, monkeypatch):
+    """M2 audit, area 1: the listing (polled every 1.5 s while anything is under way) reads runs and their events in a
+    fixed number of statements, not one or more per paper: each such read scans every run of every project."""
+    from backend.db import new_id
+
+    async def statements(client, project):
+        found, read = [], client.state["db"].read
+
+        def traced(fn):
+            def run(conn):
+                conn.set_trace_callback(found.append)
+                try:
+                    return fn(conn)
+                finally:
+                    conn.set_trace_callback(None)
+            return read(run)
+        monkeypatch.setattr(client.state["db"], "read", traced)
+        try:
+            assert (await client.get(f"/api/projects/{project}/materials")).status_code == 200
+        finally:
+            monkeypatch.setattr(client.state["db"], "read", read)
+        return sum(" runs " in f" {sql} " or "run_events" in sql for sql in found)
+
+    def papers(project, count):
+        def seed(conn):
+            for i in range(count):
+                material, version = new_id(), new_id()
+                conn.execute("INSERT INTO materials (id, project_id, title, source, csl) VALUES (?, ?, ?, ?, '{}')",
+                             (material, project, f"Paper {i}", "zotero" if i % 2 else "upload"))
+                conn.execute("INSERT INTO material_versions (id, material_id, seq, is_current) VALUES (?, ?, 0, 1)",
+                             (version, material))
+                for workflow, inputs in (("extract", {"material_ids": [material], "version_id": version}),
+                                         ("lookup", {"material_ids": [material], "versions": {material: version}})):
+                    run = new_id()
+                    conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, status) VALUES"
+                                 " (?, ?, 'background', ?, ?, 'failed')", (run, project, workflow, json.dumps(inputs)))
+                    conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, 0, 'step_finished', ?)",
+                                 (run, json.dumps({"material_id": material, "outcome": "not_found"})))
+        return seed
+
+    async with started(tmp_path / "data") as client:
+        few, many = await project_of(client, "Few"), await project_of(client, "Many")
+        await asyncio.to_thread(client.state["db"].write, papers(few, 3))
+        await asyncio.to_thread(client.state["db"].write, papers(many, 30))
+        assert await statements(client, few) == await statements(client, many)
+
+
 async def test_the_same_file_is_one_paper_in_a_project_and_shares_its_reading_with_another(tmp_path, kept_queue):
     async with started(tmp_path / "data") as client:
         first, second = await project_of(client, "First"), await project_of(client, "Second")
