@@ -494,6 +494,17 @@ test('a paper\'s new file, saved details and deletion are library changes', () =
   assert.match(paper, /onClick=\{onDelete\}/);
   assert.match(library, /onSettled=\{\(\) => libraryChanged\(project\.id\)\}/);
   assert.match(library, /saved=\{saved === paper\.id\}/);
+  // the one dialog survives the page giving way to the list at the change (batch 2 review F1): keyed, and the last child
+  // of both forms of the panel, so its notice or its error stays on screen
+  assert.match(library, /<DeleteDialog key="delete"/);
+  const forms = [...library.matchAll(/return \(\n\s*<>([\s\S]*?)\n\s*<\/>\n\s*\);/g)].map((m) => m[1].trim());
+  assert.equal(forms.length, 2);
+  for (const form of forms) assert.ok(form.endsWith('{dialog}') && form.split('{dialog}').length === 2, form.slice(0, 80));
+  // and a page's notice and Saved line are not carried to the next page opened (review F2)
+  assert.match(library, /function openPaper\(found\) \{\s*setSaved\(null\);\s*setPaperNotice\(null\);\s*setOpen\(found\);/);
+  assert.equal([...library.matchAll(/setOpen\(/g)].length, 1); // only through openPaper
+  // a project's deletion in the Sidebar moves the papers' generation (rider 2: a memory change does not)
+  assert.match(source('Sidebar.jsx'), /if \(kind === 'deleteProject'\) libraryChanged\(null\);/);
   // a chosen paper whose title is being read again (library.js) is named, never blank
   assert.match(source('ConversationView.jsx'), /chosen\.map\(\(paper\) => \(\{ \.\.\.paper, title: paper\.title \?\? t\('composer\.chosenPaper'\) \}\)\)/);
 });

@@ -77,12 +77,18 @@ export function Library({ project }) {
   const input = useRef(null);
   // S1-19b: a cited paper opened from an answer's chip, at its passage; papers chosen for the next message
   useEffect(() => {
-    const take = () => { const found = takeOpening(project?.id); if (found) setOpen(found); };
+    const take = () => { const found = takeOpening(project?.id); if (found) openPaper(found); };
     take();
     libraryEvents.addEventListener('open', take);
     return () => libraryEvents.removeEventListener('open', take);
   }, [project?.id]);
   const chosen = useSyncExternalStore(watchChosen, () => chosenPapers(project?.id));
+  // A paper's page opened, or let go: what another page's save or replacement said is not this one's.
+  function openPaper(found) {
+    setSaved(null);
+    setPaperNotice(null);
+    setOpen(found);
+  }
 
   async function add(files) {
     setNotice(null);
@@ -92,17 +98,19 @@ export function Library({ project }) {
   }
 
   // A paper's delete dialog stays open above the read with its notice or its error, while the panel behind it reads
-  // the papers again: its change is fired when its request settles, however it ends (design review F's rider 1).
-  const dialog = <DeleteDialog target={deleting ? { kind: 'material', id: deleting.id,
+  // the papers again: its change is fired when its request settles, however it ends (design review F's rider 1). It is
+  // the last child, keyed, in both of the panel's forms (a paper's page, the list), so React keeps the one dialog, its
+  // notice and its error with it, as the page gives way to the list at the change.
+  const dialog = <DeleteDialog key="delete" target={deleting ? { kind: 'material', id: deleting.id,
     title: t('paper.deleteTitle', { title: deleting.title }), body: t('paper.deleteBody') } : null}
     onClose={() => setDeleting(null)} onSettled={() => libraryChanged(project.id)}
-    onDone={() => { setDeleting(null); setOpen(null); }} />;
+    onDone={() => { setDeleting(null); openPaper(null); }} />;
   const paper = open && listing?.materials.find((m) => m.id === open.id);
   if (paper) {
     return (
       <>
         <Paper material={paper} project={project} index={index} target={open.target}
-          onBack={() => { setOpen(null); setSaved(null); setPaperNotice(null); load(); }} onChanged={load}
+          onBack={() => { openPaper(null); load(); }} onChanged={load}
           onDelete={() => setDeleting({ id: paper.id, title: paper.title })}
           saved={saved === paper.id} onSaved={(done) => setSaved(done ? paper.id : null)}
           notice={paperNotice} onNotice={setPaperNotice} />
@@ -114,7 +122,6 @@ export function Library({ project }) {
   const materials = listing?.materials ?? [];
   return (
     <>
-    {dialog}
     <div className={cn('flex h-full min-h-0 flex-col', over && 'bg-brand-soft/40')}
       onDragOver={(event) => { if (event.dataTransfer?.types?.includes('Files')) { event.preventDefault(); setOver(true); } }}
       onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOver(false); }}
@@ -138,7 +145,7 @@ export function Library({ project }) {
       <div className="scroll-thin min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
         {project?.sensitivity === 'local_only' && <LocalOnlySearchNote />}
         <SearchResults search={search} project={project}
-          onOpen={(result) => setOpen({ id: result.material_id, target: { id: result.passage_id, ordinal: result.ordinal } })} />
+          onOpen={(result) => openPaper({ id: result.material_id, target: { id: result.passage_id, ordinal: result.ordinal } })} />
         {problem && <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{errorText(t, problem)}</p>}
         {notice && <p role="status" className="rounded-md bg-muted px-3 py-2 text-sm">{notice}</p>}
         {adding && <p role="status" className="text-sm text-muted-foreground">{t('library.adding')}</p>}
@@ -159,7 +166,7 @@ export function Library({ project }) {
               chosen={chosen.some((paper) => paper.id === material.id)}
               onChoose={(on) => choosePapers(project.id, on ? [...chosen, { id: material.id, title: material.title }]
                 : chosen.filter((paper) => paper.id !== material.id))}
-              onOpen={() => setOpen({ id: material.id })} onChanged={load} />)}
+              onOpen={() => openPaper({ id: material.id })} onChanged={load} />)}
           </ul>
         )}
         {listing && !searching && (
@@ -173,6 +180,7 @@ export function Library({ project }) {
         )}
       </div>
     </div>
+    {dialog}
     </>
   );
 }

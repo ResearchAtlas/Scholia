@@ -12,7 +12,8 @@ import { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import Answer, { Chip, backedSentences } from '../src/markdown.js';
 import { readTrace, summarize, turnRanges } from '../src/trace.js';
-import { MAX_CHOSEN, choosePapers, chosenPapers, libraryChanged, openPaperAt, readGuard, takeOpening, watchChosen } from '../src/library.js';
+import { MAX_CHOSEN, choosePapers, chosenPapers, libraryChanged, libraryEvents, libraryGeneration, openPaperAt, readGuard, takeOpening,
+  watchChosen } from '../src/library.js';
 import { NOTICES } from '../src/live.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
@@ -302,6 +303,23 @@ test('a read asked before a change made with nothing chosen never retitles a pap
   } finally {
     globalThis.fetch = original;
     choosePapers('p1', []);
+  }
+});
+
+// Design review F's rider 2: a memory change is heard by the conversation side, and moves no papers' generation.
+test('a memory change moves no papers\' generation, and a change to the papers does', async () => {
+  const { memoryChanged } = await import('../src/memory.js');
+  const before = libraryGeneration();
+  let heard = 0;
+  const listen = () => { heard += 1; };
+  libraryEvents.addEventListener('changed', listen);
+  try {
+    memoryChanged(null);
+    assert.deepEqual([libraryGeneration(), heard], [before, 1]);
+    libraryChanged('p1');
+    assert.deepEqual([libraryGeneration(), heard], [before + 1, 2]);
+  } finally {
+    libraryEvents.removeEventListener('changed', listen);
   }
 });
 
