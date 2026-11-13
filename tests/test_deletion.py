@@ -14,6 +14,7 @@ import pytest
 import backend.db.database as database_module
 import backend.db.deletion as deletion_module
 from backend.db import DB_NAME, ContentStore, Database, delete, new_id
+from backend.db.content import referenced_sql
 from backend.db.deletion import DELETE, KINDS, NOT_DELETED, ON_DELETE
 from backend.db.migrations import MIGRATIONS
 from backend.extraction import PDF, extractor_of
@@ -322,39 +323,92 @@ def test_a_file_put_again_and_named_by_a_new_record_while_the_deletion_collects_
     assert one(db, "SELECT count(*) FROM material_versions WHERE file_sha256 = ?", x["paper"]) == (1,)
 
 
-def test_a_file_whose_row_was_made_in_the_deletions_own_millisecond_goes_with_it(db, store, monkeypatch):
-    # PR 59 batch 1, item 3: rows keep milliseconds, the deletion's start microseconds, so a row made in the same
-    # millisecond, before the deletion started, was left for the idle rule
+@pytest.mark.parametrize("hours", [2, 24 * 30])
+def test_a_deletion_after_the_clock_was_set_back_removes_its_files_at_once(db, store, hours):
+    # Design review H, K5: rows and files written before the clock was set back looked later than the deletion, so
+    # its paper's file and row stayed, past the idle rule too, for as long as the clock was behind
     x = populate(db, store, add_project(db, "Thesis"), "p")
-    made = datetime.now(UTC).replace(microsecond=123000)
+    ahead = datetime.now(UTC) + timedelta(hours=hours)  # when they were written, by the clock as it was then
     db.write(lambda conn: conn.execute("UPDATE content_files SET created_at = ? WHERE sha256 = ?",
-                                       (made.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z", x["paper"])))
-    os.utime(store._path(x["paper"]), (made.timestamp() - 1, made.timestamp() - 1))
-
-    class Clock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return made + timedelta(microseconds=400)  # the deletion starts later in the same millisecond
-
-    monkeypatch.setattr(deletion_module, "datetime", Clock)
+                                       (ahead.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z", x["paper"])))
+    os.utime(store._path(x["paper"]), (ahead.timestamp(), ahead.timestamp()))
     delete(db, store, "material", x["m1"])
     with pytest.raises(FileNotFoundError):
         store.read(x["paper"])
     assert one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", x["paper"]) == (0,)
 
 
-def test_a_file_added_again_while_a_deletion_runs_keeps_the_idle_rule(db, store, monkeypatch):
+def test_a_paper_added_and_deleted_at_once_leaves_no_file(db, store, monkeypatch):
+    # Design review H, K6: a paper added after the deletion's request started, and deleted by it, kept the idle rule
+    started = datetime.now(UTC) - timedelta(minutes=1)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return started  # the deletion's request started before the paper was added
+
+    monkeypatch.setattr(deletion_module, "datetime", Clock, raising=False)
     x = populate(db, store, add_project(db, "Thesis"), "p")
-    real = deletion_module._delete
-
-    def put_meanwhile(conn, *args):
-        result = real(conn, *args)
-        os.utime(store._path(x["paper"]))  # the same bytes, put again while the deletion's write runs
-        return result
-
-    monkeypatch.setattr(deletion_module, "_delete", put_meanwhile)
     delete(db, store, "material", x["m1"])
+    with pytest.raises(FileNotFoundError):
+        store.read(x["paper"])
+
+
+def test_a_collection_whose_commit_fails_after_it_removed_a_file_leaves_no_record_naming_a_missing_file(
+        db, store, caplog):
+    # Design review H, option 2B: the file goes inside the collection's transaction; if that transaction then fails,
+    # its row is back but nothing names it, and a later collection removes the row
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    old = store.put(b"long unused")  # an idle row the same collection removes, after the paper's file
+    past = time.time() - 7200
+    os.utime(store._path(old), (past, past))
+    db.write(lambda conn: (
+        conn.execute("UPDATE content_files SET created_at = '2000-01-01T00:00:00.000Z' WHERE sha256 = ?", (old,)),
+        conn.execute(f"CREATE TRIGGER failing BEFORE DELETE ON content_files WHEN OLD.sha256 = '{old}'"
+                     " BEGIN SELECT RAISE(ABORT, 'injected'); END")))
+    with caplog.at_level(logging.WARNING):
+        delete(db, store, "material", x["m1"])
+    assert "content collection after a deletion failed" in caplog.text
+    assert not store._path(x["paper"]).exists()
+    assert one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", x["paper"]) == (1,)  # rolled back
+    assert not db.read(lambda conn: conn.execute(  # no record names it
+        f"SELECT 1 WHERE ? IN ({referenced_sql(conn)})", (x["paper"],)).fetchone())
+    db.write(lambda conn: conn.execute("DROP TRIGGER failing"))
+    store.collect_garbage(now=later())
+    assert one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", x["paper"]) == (0,)
+
+
+@pytest.mark.parametrize("held", [True, False])
+def test_a_put_in_progress_while_a_deletion_collects_keeps_its_file_and_its_row(db, store, monkeypatch, held):
+    # Design review H, option 2B (rewritten from "a file added again while a deletion runs keeps the idle rule"): the
+    # same bytes put again, their file in place and their row not yet committed, while the deletion collects
+    import threading
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    placed, go, real = threading.Event(), threading.Event(), db.write
+
+    def write(fn, committed=None):  # the put's own row insert waits until the deletion has collected
+        if threading.current_thread().name == "putter" and not go.is_set():
+            placed.set()
+            go.wait(10)
+        return real(fn, committed)
+
+    monkeypatch.setattr(db, "write", write)
+
+    def put():
+        if held:
+            with store.hold() as hold:
+                store.put(b"paper p", "application/pdf", hold)
+        else:
+            store.put(b"paper p", "application/pdf")
+
+    putter = threading.Thread(target=put, name="putter")
+    putter.start()
+    assert placed.wait(10)
+    delete(db, store, "material", x["m1"])
+    go.set()
+    putter.join(10)
     assert store.read(x["paper"]) == b"paper p"
+    assert one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", x["paper"]) == (1,)
 
 
 def test_the_general_project_cannot_be_deleted(db, store):
