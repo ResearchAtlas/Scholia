@@ -1012,8 +1012,9 @@ def _runs_of(conn, rows):
         step = json.loads(data)
         if lookups.get(step.get("material_id"), (None,))[0] == run:
             steps[step["material_id"]] = step
-    for material, found in lookups.items():
-        steps.setdefault(material, {})["identifier"] = identifiers.get(found[0], {}).get(material)
+    for material, found in lookups.items():  # (or, for a lookup an earlier build recorded, as its step said)
+        step = steps.setdefault(material, {})
+        step["identifier"] = identifiers.get(found[0], {}).get(material) or step.get("identifier")
     if any(row[4] == "zotero" and row[16] is None for row in rows):  # S1-15: a paper with no file says why
         for material, why in conn.execute(
                 "SELECT json_extract(e.data, '$.material_id'), json_extract(e.data, '$.pdf') FROM run_events e"

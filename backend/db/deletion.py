@@ -378,6 +378,24 @@ def _delete(conn, kind, object_id, remove_all_trace):
                      f" AND rowid NOT IN {_doomed('runs')}"
                      " AND EXISTS (SELECT 1 FROM json_each(runs.inputs, '$.material_ids') j WHERE j.value = ?)",
                      (f'$.identifiers."{material}"', material))
+        # Events an earlier build wrote with them (a lookup step's identifier, its question's covers, a Zotero step's
+        # item key) lose them here: the deletion service's purge path is the one exception to the events' append-only
+        # rule (slice-1 spec section 4.2), so their trigger is lifted for this transaction only.
+        legacy = [rowid for (rowid,) in conn.execute(
+            "SELECT e.rowid FROM run_events e JOIN runs r ON r.id = e.run_id WHERE r.project_id = ?"
+            f" AND r.rowid NOT IN {_doomed('runs')} AND ((r.workflow IN ('lookup', 'zotero_import') AND e.type = 'step_finished'"
+            " AND json_extract(e.data, '$.material_id') = ? AND (json_type(e.data, '$.identifier') IS NOT NULL"
+            " OR json_type(e.data, '$.key') IS NOT NULL)) OR (r.workflow = 'lookup' AND e.type = 'ask'"
+            " AND json_type(e.data, '$.covers') IS NOT NULL"
+            " AND EXISTS (SELECT 1 FROM json_each(r.inputs, '$.material_ids') j WHERE j.value = ?)))",
+            (project, material, material))]
+        if legacy:
+            (trigger,) = conn.execute("SELECT sql FROM sqlite_schema WHERE type = 'trigger'"
+                                      " AND name = 'run_events_no_update'").fetchone()
+            conn.execute("DROP TRIGGER run_events_no_update")
+            conn.execute("UPDATE run_events SET data = json_remove(data, '$.identifier', '$.covers', '$.key')"
+                         " WHERE rowid IN (SELECT value FROM json_each(?))", (json.dumps(legacy),))
+            conn.execute(trigger)
         library, _, key = (source_key or "").rpartition("/items/")
         if source != "zotero" or not library:
             continue

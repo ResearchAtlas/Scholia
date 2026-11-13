@@ -392,6 +392,43 @@ def test_deleting_a_material_removes_its_versions_and_marks_citations_elsewhere(
     assert store.read(x["body"]) == b"tool output p"  # still in a run's record
 
 
+def test_identifiers_an_earlier_build_wrote_in_events_leave_with_the_paper_and_events_stay_append_only(db, store):
+    """M2 audit, area 1: a data folder from before the rule (run events name papers by id only) has a lookup step's
+    identifier, its question's covers and a Zotero step's item key in its events. Deleting the paper takes them out
+    (the deletion service's purge path, slice-1 spec section 4.2's one exception), and only them: the other paper's
+    step, and every event after, stay as they were, and events are append-only again."""
+    project = add_project(db, "Thesis")
+    doomed, kept, lookup, zotero = new_id(), new_id(), new_id(), new_id()
+
+    def legacy(conn):
+        for material, key in ((doomed, "AAAA2222"), (kept, "BBBB3333")):
+            conn.execute("INSERT INTO materials (id, project_id, title, source, source_key) VALUES (?, ?, 'P', 'zotero', ?)",
+                         (material, project, f"users/0/items/{key}"))
+        conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, status) VALUES (?, ?, 'background', 'lookup',"
+                     " ?, 'succeeded')", (lookup, project, json.dumps({"material_ids": [doomed, kept]})))
+        conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, status) VALUES (?, ?, 'background',"
+                     " 'zotero_import', ?, 'succeeded')", (zotero, project, json.dumps({"library": "users/0"})))
+        events = [(lookup, "ask", {"ask_id": "a1", "options": ["lookup", "skip"], "covers": ["doi:10.5555/gone.1",
+                                                                                          "doi:10.5555/kept.1"]}),
+                  (lookup, "step_finished", {"material_id": doomed, "identifier": "doi:10.5555/gone.1", "outcome": "resolved"}),
+                  (lookup, "step_finished", {"material_id": kept, "identifier": "doi:10.5555/kept.1", "outcome": "resolved"}),
+                  (zotero, "step_finished", {"key": "AAAA2222", "material_id": doomed, "outcome": "imported"}),
+                  (zotero, "step_finished", {"key": "BBBB3333", "material_id": kept, "outcome": "imported"})]
+        for seq, (run, kind, data) in enumerate(events):
+            conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, ?, ?)", (run, seq, kind, json.dumps(data)))
+
+    db.write(legacy)
+    delete(db, store, "material", doomed, remove_all_trace=True)
+    found = [json.loads(d) for (d,) in db.read(lambda conn: conn.execute("SELECT data FROM run_events ORDER BY seq").fetchall())]
+    assert found == [{"ask_id": "a1", "options": ["lookup", "skip"]},
+                     {"material_id": doomed, "outcome": "resolved"},
+                     {"material_id": kept, "identifier": "doi:10.5555/kept.1", "outcome": "resolved"},
+                     {"material_id": doomed, "outcome": "imported"},
+                     {"key": "BBBB3333", "material_id": kept, "outcome": "imported"}]
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db.write(lambda conn: conn.execute("UPDATE run_events SET data = '{}'"))
+
+
 def test_the_papers_delete_dialog_says_what_becomes_of_its_citations():
     """M2 audit, area 1: the dialog shown before a paper's deletion says what it does (S1-19b, Harold 2026-10-21,
     option A): answers that drew on the paper keep their text, and their citations keep no quote."""
