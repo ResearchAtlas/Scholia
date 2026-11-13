@@ -367,6 +367,27 @@ def _delete(conn, kind, object_id, remove_all_trace):
     conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.held.output')"
                  " WHERE json_type(inputs, '$.held.output') IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(runs.inputs,"
                  f" '$.memory_ids') j WHERE j.value IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')}))")
+    # M2 audit, area 1 (backend/provenance.py's rule: run events name records by id only): a run that outlives a deleted
+    # paper keeps none of its identifiers in its inputs, the only place runs hold them: a lookup's identifier for it and
+    # its question's (covers, read only while the lookup runs, which this deletion revokes), and a Zotero import's key
+    # of its item, in its items and the items done.
+    for material, project, source, source_key in conn.execute(
+            f"SELECT id, project_id, source, source_key FROM materials WHERE rowid IN {_doomed('materials')} AND project_id"
+            f" NOT IN (SELECT id FROM projects WHERE rowid IN {_doomed('projects')})").fetchall():
+        conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.covers', ?) WHERE workflow = 'lookup'"
+                     f" AND rowid NOT IN {_doomed('runs')}"
+                     " AND EXISTS (SELECT 1 FROM json_each(runs.inputs, '$.material_ids') j WHERE j.value = ?)",
+                     (f'$.identifiers."{material}"', material))
+        library, _, key = (source_key or "").rpartition("/items/")
+        if source != "zotero" or not library:
+            continue
+        for run, inputs in conn.execute(
+                "SELECT id, inputs FROM runs WHERE project_id = ? AND workflow = 'zotero_import'"
+                f" AND json_extract(inputs, '$.library') = ? AND rowid NOT IN {_doomed('runs')}", (project, library)).fetchall():
+            inputs = json.loads(inputs or "{}")
+            kept = {name: [k for k in inputs[name] if k != key] for name in ("items", "done") if key in (inputs.get(name) or [])}
+            if kept:
+                conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps({**inputs, **kept}), run))
     # S1-21a: what's done, from AAB's own records: papers removed from a project that stays (no title is kept)
     from backend import memory
     for removed_from, count in conn.execute(

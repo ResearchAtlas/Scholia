@@ -103,6 +103,50 @@ async def test_a_change_while_a_lookup_is_in_flight_sends_nothing_more_and_write
             assert await rows(client, "SELECT count(*) FROM materials WHERE checked_by = 'lookup'") == [(0,)]
 
 
+def kept_anywhere(data, text):
+    """Where text is left in the data folder's database, its backups and its other files (the stored files
+    themselves, content/, aside), and in any value of the database: [] when nowhere."""
+    found = [str(path.relative_to(data)) for path in data.rglob("*") if path.is_file()
+             and "content" not in path.relative_to(data).parts and text.encode() in path.read_bytes()]
+    import sqlite3
+    conn = sqlite3.connect(data / "scholia.sqlite3")
+    try:
+        for (table,) in conn.execute("SELECT name FROM sqlite_schema WHERE type = 'table'").fetchall():
+            found += [f"{table}: {value}" for row in conn.execute(f'SELECT * FROM "{table}"')
+                      for value in row if isinstance(value, str) and text in value]
+    finally:
+        conn.close()
+    return found
+
+
+# M2 audit, area 1 (backend/provenance.py's rule: run events name things by id only; section 16): a paper deleted
+# with Remove all trace and Delete everywhere leaves its identifier in no run's events or inputs, nor in any backup,
+# whether its lookup resolved or waits on a Local only question; the batch's other paper keeps its own.
+@pytest.mark.parametrize("level", ["normal", "local_only"])
+async def test_a_deleted_papers_identifier_is_left_in_no_run_and_no_backup(tmp_path, level):
+    other = "10.5555/kept.paper"
+    records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "The Kept Paper")}
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client, level=level)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()),
+                             ("kept.md", f"# Kept\n\ndoi:{other}\n".encode()))
+        if level == "local_only":
+            [ask] = await ask_of(client, project)  # its question covers both identifiers
+        else:
+            assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        doomed, kept = (m["id"] for m in result["materials"])
+        response = await client.delete(f"/api/materials/{doomed}", params={"remove_all_trace": "true",
+                                                                            "purge_backups": "true"})
+        assert response.status_code == 200 and response.json()["ok"] is True
+        await background_idle(client)
+        assert kept_anywhere(tmp_path / "data", DOI) == []
+        paper = (await client.get(f"/api/materials/{kept}")).json()
+        if level == "normal":  # what the Library shows of the lookup of the paper that stays
+            assert (paper["title"], paper["lookup"]["identifier"]) == ("The Kept Paper", f"doi:{other}")
+        else:
+            assert paper["lookup"]["status"] == "cancelled" and paper["lookup"]["cancel_reason"] == "revoked"
+
+
 async def test_a_local_only_projects_ask_is_withdrawn_when_it_no_longer_needs_one(tmp_path):
     async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
         project = await project_of(client, level="local_only")

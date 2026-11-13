@@ -750,7 +750,9 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
 
     library = inputs["library"]
     source_key = f"{library}/items/{key}"
-    step = {"key": key, "material_id": None, "outcome": "not_found", "pdf": None, "version": False}
+    # No item key in the event, which outlives a deleted paper: the run's inputs keep the keys, and its deletion
+    # clears its own (backend/db/deletion.py); events name papers by id only (backend/provenance.py).
+    step = {"material_id": None, "outcome": "not_found", "pdf": None, "version": False}
     looked_up = None  # (material, version, record, whether a file came) to look up
     if fetched is not None:
         csl, dropped, sha256, why = fetched

@@ -660,7 +660,7 @@ async def _look_up(harness, active, project_id, inputs, pace):
         found = _identifiers(conn, project_id, materials, versions)
         for material, (_, identifier, read) in found.items():
             if identifier is None:
-                _event(conn, run_id, "step_finished", {"material_id": material, "identifier": None,
+                _event(conn, run_id, "step_finished", {"material_id": material,
                                                        "outcome": "no_identifier" if read else "not_read"})
         return found
 
@@ -806,10 +806,12 @@ def _gives(conn, material, version, identifier):
 async def _approval(read, write, run_id, project_id, inputs, distinct, wanted):
     """For a Local only project: the researcher's answer to this batch's ask, asked once. True to look
     up; the run ends cancelled when the researcher declines, and looks up without asking once the
-    project no longer needs it (made less strict), closing the ask. The ask records the identifiers
-    it asked about, and its answer covers exactly those: a run that finds others to send (after a
-    restart, its paper's file replaced meanwhile) closes it and asks again. An ask whose papers all
-    have another file since is closed (replaced): there is nothing left for it to send."""
+    project no longer needs it (made less strict), closing the ask. The run records, with its ask, the
+    identifiers it asked about (inputs `covers`, beside the ask's id), and its answer covers exactly those: a
+    run that finds others to send (after a restart, its paper's file replaced meanwhile) closes it and asks
+    again. They are kept in its inputs, which a deletion of one of its papers clears, never in the ask's
+    event (backend/provenance.py). An ask whose papers all have another file since is closed (replaced):
+    there is nothing left for it to send."""
     covers = sorted(f"{scheme}:{value}" for scheme, value in distinct)
     asked_for = [(m, v) for m, (v, found, _) in wanted.items() if found]  # the papers whose identifiers it covers
     ask, answer = await read(lambda conn: asks.asked(conn, run_id))
@@ -817,16 +819,21 @@ async def _approval(read, write, run_id, project_id, inputs, distinct, wanted):
         if ask is not None:
             await write(lambda conn: asks.withdraw(conn, run_id, ask["ask_id"], "replaced"))
         return False
-    if ask is None or ask.get("covers") != covers:
+    held = await read(lambda conn: json.loads(conn.execute("SELECT coalesce(json_extract(inputs, '$.covers'), 'null')"
+                                                           " FROM runs WHERE id = ?", (run_id,)).fetchone()[0]))
+    if ask is None or held != {"ask_id": ask["ask_id"], "identifiers": covers}:
         services = sorted({service for scheme, _ in distinct for service in lookup.SERVICES[scheme]})
 
         def ask_again(conn):
             if ask is not None:
                 asks.withdraw(conn, run_id, ask["ask_id"], "identifiers_changed")
-            return asks.raise_ask(conn, run_id, "identifier_lookup", ["lookup", "skip"],
-                                  {"services": services, "identifiers": len(distinct),  # where its papers came from:
-                                   **({"batch": inputs["batch"]} if inputs.get("batch") else {})},  # S1-14's
-                                  inputs.get("origin"), covers)
+            ask_id = asks.raise_ask(conn, run_id, "identifier_lookup", ["lookup", "skip"],
+                                    {"services": services, "identifiers": len(distinct),  # where its papers came from:
+                                     **({"batch": inputs["batch"]} if inputs.get("batch") else {})},  # S1-14's
+                                    inputs.get("origin"))
+            conn.execute("UPDATE runs SET inputs = json_set(inputs, '$.covers', json(?)) WHERE id = ?",
+                         (json.dumps({"ask_id": ask_id, "identifiers": covers}), run_id))
+            return ask_id
         try:
             ask_id = await write(ask_again)
         except asks.AskRefused:  # revoked or ended meanwhile
@@ -891,9 +898,12 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
             if mine.retracted is not None and (row[0] != "researcher" or row[2] == value):
                 conn.execute("UPDATE materials SET retraction = ?, retraction_checked_at = ? WHERE id = ?",
                              ("retracted" if mine.retracted else "none", now, material))
-        _event(conn, run_id, "step_finished", {"material_id": material, "identifier": f"{scheme}:{value}",
-                                               "source": mine.source if mine else None, "outcome": result,
-                                               **({"filled": filled} if filled else {})})
+        # The identifier is kept in the run's inputs, which a deletion of the paper clears (backend/db/deletion.py):
+        # its events, kept as long as the run, name papers by id only (backend/provenance.py).
+        conn.execute("UPDATE runs SET inputs = json_set(inputs, ?, ?) WHERE id = ?",
+                     (f'$.identifiers."{material}"', f"{scheme}:{value}", run_id))
+        _event(conn, run_id, "step_finished", {"material_id": material, "source": mine.source if mine else None,
+                                               "outcome": result, **({"filled": filled} if filled else {})})
     if changed:
         conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (now, project_id))
 
@@ -999,7 +1009,7 @@ def _describe(conn, row, registry):
     else:  # no reading by this extractor version: one by an earlier version (its own or shared), or none
         state, reason = "needs_attention", "outdated" if _earlier(conn, sha256, media_type) else "not_read"
     found = conn.execute(
-        "SELECT r.id, r.status, r.cancel_reason, r.waiting, r.summary FROM runs r, json_each(r.inputs, '$.material_ids') j"
+        "SELECT r.id, r.status, r.cancel_reason, r.waiting, r.summary, r.inputs FROM runs r, json_each(r.inputs, '$.material_ids') j"
         " WHERE r.workflow = 'lookup' AND j.value = ? ORDER BY r.rowid DESC LIMIT 1", (material,)).fetchone()
     looked = None
     if found is not None:
@@ -1009,7 +1019,8 @@ def _describe(conn, row, registry):
         outcome = json.loads(event[0]) if event else {}
         looked = {"run_id": found[0], "status": derived_status(found[1], found[0], registry),
                   "cancel_reason": found[2], "waiting": found[3] == "ask", "outcome": outcome.get("outcome"),
-                  "identifier": outcome.get("identifier"), "source": outcome.get("source"),
+                  "identifier": (json.loads(found[5] or "{}").get("identifiers") or {}).get(material),
+                  "source": outcome.get("source"),
                   "reason": json.loads(found[4] or "{}").get("reason")}  # what it recorded on ending: declined, say
     return {
         "id": material, "project_id": project, "title": title, "csl": json.loads(csl) if csl else {},

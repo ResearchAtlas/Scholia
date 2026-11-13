@@ -70,6 +70,13 @@ async def papers(client, project):
     return {m["source_key"]: m for m in await settled(client, project) if m["source"] == "zotero"}
 
 
+async def lookup_steps(client):
+    """Each lookup step's event, with the identifier its run's inputs keep for its paper (no event names one)."""
+    return [{**json.loads(d), "identifier": json.loads(i).get("identifiers", {}).get(json.loads(d)["material_id"])}
+            for d, i in await rows(client, "SELECT e.data, r.inputs FROM run_events e JOIN runs r ON r.id = e.run_id"
+                                           " WHERE r.workflow = 'lookup' AND e.type = 'step_finished' ORDER BY e.rowid")]
+
+
 def allowlisted(mock):
     """Every request Zotero got was a GET of an allowlisted call."""
     return all(method == "GET" and _ZOTERO_CALLS.fullmatch(path.encode()) for method, path, _ in mock.requests)
@@ -249,6 +256,22 @@ async def test_deleting_a_paper_an_import_made_stops_it_and_a_restart_never_make
     async with started(tmp_path / "data", provider(library(tmp_path)), setup=False) as client:
         await background_idle(client, 30)
         assert await papers(client, project) == {}
+
+
+async def test_a_deleted_zotero_paper_leaves_its_item_key_and_doi_in_no_run_and_no_backup(tmp_path):
+    from test_identifier_lookup import kept_anywhere
+    async with started(tmp_path / "data", provider(library(tmp_path), openalex={DOI: openalex_work(DOI, "Looked Up")})) as client:
+        project = await project_of(client)
+        assert (await imported(client, project, KEYS[:2]))["status"] == "succeeded"
+        await background_idle(client, 30)
+        found = await papers(client, project)
+        response = await client.delete(f"/api/materials/{found[f'users/0/items/{KEYS[0]}']['id']}",
+                                       params={"remove_all_trace": "true", "purge_backups": "true"})
+        assert response.status_code == 200
+        await background_idle(client)
+        assert kept_anywhere(tmp_path / "data", KEYS[0]) == [] and kept_anywhere(tmp_path / "data", DOI) == []
+        [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE workflow = 'zotero_import'")
+        assert (json.loads(inputs)["items"], json.loads(inputs)["done"]) == ([KEYS[1]], [KEYS[1]])  # the other item's
 
 
 async def test_a_restarted_import_whose_zotero_is_gone_fails(tmp_path):
@@ -750,8 +773,7 @@ async def test_a_lookup_for_a_doi_the_record_no_longer_gives_applies_nothing(tmp
         [paper] = (await papers(client, project)).values()
         assert paper["csl"]["DOI"] == other
         assert "container-title" not in paper["csl"] and paper["retraction"] != "retracted" and paper["resolved_at"] is None
-        steps = [json.loads(d) for (d,) in await rows(client, "SELECT data FROM run_events e JOIN runs r ON r.id = e.run_id"
-                                                         " WHERE r.workflow = 'lookup' AND e.type = 'step_finished'")]
+        steps = await lookup_steps(client)
         assert {(s["identifier"], s["outcome"]) for s in steps} == {(f"doi:{DOI}", "replaced"), (f"doi:{other}", "not_found")}
 
 
@@ -876,8 +898,7 @@ async def test_a_record_without_an_identifier_is_looked_up_by_its_attached_files
             "material_id": paper["id"], "replaces": paper["version"]["id"]})
         assert response.status_code == 201
         await background_idle(client, 30)
-        steps = [json.loads(d) for (d,) in await rows(client, "SELECT data FROM run_events e JOIN runs r ON r.id = e.run_id"
-                                                         " WHERE r.workflow = 'lookup' AND e.type = 'step_finished'")]
+        steps = await lookup_steps(client)
         assert (steps[-1]["identifier"], steps[-1]["outcome"]) == (f"doi:{DOI}", "resolved")
         assert ("api.openalex.org", f"/works/doi:{DOI}") in [(h, p) for h, p, _ in records.requests]
 
