@@ -293,15 +293,18 @@ def _dict(conn, found, with_sources=True):
 
 def listing(conn, project_id=None, statuses=None):
     """{"personal": [...], "project": [...]}: the records the memory views show, newest first; project records of
-    project_id only."""
+    project_id only; personal proposals only where they may be kept (personal_allowed)."""
     statuses = statuses or ("confirmed", "inferred", "proposed")
     rows = conn.execute(
         f"SELECT {_COLUMNS} FROM memory_records WHERE status IN (SELECT value FROM json_each(?))"
         " AND (scope = 'personal' OR project_id = ?) ORDER BY updated_at DESC, rowid DESC",
         (json.dumps(list(statuses)), project_id)).fetchall()
     found = {"personal": [], "project": []}
+    personal = personal_allowed(conn, project_id)
     for item in rows:
         record = _dict(conn, item)
+        if record["scope"] == "personal" and record["status"] == "proposed" and not personal:
+            continue
         found[record["scope"]].append(record)
     return found
 
@@ -844,9 +847,13 @@ def materials_removed(conn, project_id, count):
 
 def proposals(conn, project_id):
     """Things to confirm: the pending proposals of the project's scope, newest first, each with the record it would
-    replace (its current content, when it is still there)."""
+    replace (its current content, when it is still there); a personal one only in a Normal, unlocked project, the only
+    kind it may be kept from (M2 audit area 4, item 4)."""
     found = []
+    personal = personal_allowed(conn, project_id)
     for record in in_scope(conn, project_id, statuses=("proposed",)):
+        if record["scope"] == "personal" and not personal:
+            continue
         full = row(conn, record["id"])
         target = row(conn, full["supersedes_id"]) if full["supersedes_id"] else None
         full["replaces"] = {"id": target["id"], "content": target["content"], "status": target["status"],
@@ -917,6 +924,7 @@ class NewRecord(BaseModel):
 
 
 class Change(BaseModel):
+    project_id: str | None = Field(default=None, max_length=64)  # the project the change is made from
     version: int
     content: str | None = Field(default=None, max_length=MAX_CONTENT)
     status: Literal["confirmed"] | None = None
@@ -947,6 +955,15 @@ _CHANGE_ERRORS = {"changed": (409, "version_changed", "This record changed since
                   "personal_from_strict": (400, "personal_from_strict",
                                            "Personal memory is written and changed only from a Normal, unlocked"
                                            " project")}
+
+
+def _from(conn, record, project_id):
+    """A personal record is edited, confirmed or kept only from a Normal, unlocked project, the one the request is made
+    from (Harold's decision of 2026-10-23, point 1), never judged by the project it was written in (M2 audit area 4,
+    item 4). Forget is allowed from anywhere."""
+    found = row(conn, record)
+    if found is not None and found["scope"] == "personal" and not personal_allowed(conn, project_id):
+        raise ValueError("personal_from_strict")
 
 
 def _on(state, project_id):
@@ -1022,6 +1039,7 @@ async def change_memory(record_id: str, body: Change, request: Request):
             return _refused(Refused(400, "empty", "The record is empty"))
 
     def change(conn):
+        _from(conn, record_id, body.project_id)
         return edit(conn, record_id, body.version, content=content, confirm=body.status == "confirmed")
     try:
         record = await asyncio.to_thread(state["db"].write, change)
@@ -1109,6 +1127,7 @@ async def answer_review(body: Review, request: Request):
         found = row(conn, body.id)
         if found is None or found["status"] != "proposed":
             raise LookupError(body.id)
+        _from(conn, body.id, body.project_id)
         return edit(conn, body.id, body.version, content=content)
     try:
         record = await asyncio.to_thread(state["db"].write, answer)

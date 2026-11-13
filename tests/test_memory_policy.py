@@ -1088,3 +1088,39 @@ async def test_a_refused_extraction_stopped_by_a_shutdown_before_its_receipt_is_
         assert provider.extractions == []
         assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
             ("cancelled", "revoked")]
+
+
+# M2 audit area 4, item 4 (Fable F2, probes F and G): personal memory is written only from a Normal, unlocked project,
+# judged by the project the request is made from; a stricter project's card and views list no personal proposal.
+@pytest.mark.parametrize("how", ["private", "local_only", "lock"])
+async def test_personal_memory_is_never_edited_confirmed_or_kept_from_a_stricter_projects_views(tmp_path, how):
+    async with started(tmp_path / "data") as client:
+        normal = await project_of(client)
+        strict = await project_of(client, "Strict")
+        record = await personal(client, normal, "I prefer short answers")
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=normal, scope="personal", kind="preference", content="I prefer tables", status="proposed",
+            sources=[("project", normal)]))
+        await tighten(client, strict, how)
+        refused = [
+            await client.patch(f"/api/memory/{record}", json={"project_id": strict, "version": 1,
+                                                               "content": "I prefer tables of participant Alice's data"}),
+            await client.post("/api/memory/review", json={"project_id": strict, "id": proposal, "action": "edit",
+                                                           "version": 1, "content": "Reviewing manuscript 123"}),
+            await client.post("/api/memory/review", json={"project_id": strict, "id": proposal, "action": "keep",
+                                                           "version": 1})]
+        assert [(r.status_code, r.json()["code"]) for r in refused] == [(400, "personal_from_strict")] * 3
+        assert sorted(await rows(client, "SELECT content, status FROM memory_records")) == [
+            ("I prefer short answers", "confirmed"), ("I prefer tables", "proposed")]
+        assert (await client.get(f"/api/projects/{strict}/left-off")).json()["to_confirm"] == []
+        assert (await client.get(f"/api/memory/review?project_id={strict}")).json()["proposals"] == []
+        assert [r["id"] for r in (await client.get(f"/api/memory?project_id={strict}")).json()["personal"]] == [record]
+        # from the Normal project they are listed and may be changed
+        assert [p["id"] for p in (await client.get(f"/api/memory/review?project_id={normal}")).json()["proposals"]] == [
+            proposal]
+        kept = await client.post("/api/memory/review", json={"project_id": normal, "id": proposal, "action": "keep",
+                                                              "version": 1})
+        assert kept.status_code == 200, kept.text
+        edited = await client.patch(f"/api/memory/{record}", json={"project_id": normal, "version": 1,
+                                                                    "content": "I prefer brief answers"})
+        assert edited.status_code == 200 and edited.json()["scope"] == "personal"

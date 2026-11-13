@@ -202,7 +202,7 @@ test('a notice is cleared only by a success on the record it names', async () =>
   const unnamed = { problem: 'Not saved', code: 'empty', edit: false, id: null };
   assert.equal(settled(unnamed, null, null), unnamed);
   const source = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
-  assert.match(source, /act\(\(\) => changeRecord\(record, \{ status: 'confirmed' \}\), false, record\.id\)/);
+  assert.match(source, /act\(\(\) => changeRecord\(record, \{ status: 'confirmed' \}, projectId\), false, record\.id\)/);
   assert.match(source, /act\(\(\) => forgetRecord\(record\), false, record\.id\)/);
 });
 
@@ -280,4 +280,16 @@ test('a memory change names a project only where the change is confined to it', 
     'components/LeftOff.jsx: projectId', // the project's allowance notice (backend/memory.py notice)
     'components/Settings.jsx: project.id', // the project's own memory switch
   ]);
+});
+
+// M2 audit area 4, item 4: a change and an answer in Things to confirm name the project they are made from (a personal
+// record changes only from a Normal, unlocked project, judged by that project)
+test('a memory change and a Things to confirm answer name the project they are made from', () => {
+  const view = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
+  assert.match(view, /changeRecord\(record, \{ content: editing \}, projectId\)/);
+  assert.match(view, /review\(\{ id: proposal\.id, version: proposal\.version, project_id: projectId \?\? null,/);
+  const card = readFileSync(join(SRC, 'components', 'LeftOff.jsx'), 'utf8');
+  assert.match(card, /<Proposal key=\{proposal\.id\} proposal=\{proposal\} projectId=\{projectId\}/);
+  const memory = readFileSync(join(SRC, 'memory.js'), 'utf8');
+  assert.match(memory, /\{ version: record\.version, project_id: projectId \?\? null, \.\.\.body \}/);
 });
