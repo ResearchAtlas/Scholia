@@ -46,6 +46,7 @@ async def test_continue_after_a_crash_sends_the_message_again_as_a_new_turn(tmp_
         assert turns[1]["message"] == {"text": "Where were we?"}
         # The interrupted turn's own steps are not reused: one fresh call with the message again.
         assert [m["content"] for m in provider.answers[0]["messages"][1:]] == ["Where were we?"]
+        assert "previous run of this request stopped: it was interrupted" in provider.answers[0]["messages"][0]["content"]
         assert (await client.post(f"/api/runs/{interrupted}/continue")).json()["code"] == "not_continuable"
         await background_idle(client)
 

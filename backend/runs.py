@@ -103,6 +103,10 @@ AGENT_RULES = (
     "researcher names it. Ask the researcher with the ask tool only for a decision only they can make."
 )
 RETRIEVAL_ROUTES = ("literature", "memory_literature")
+# Why a continued turn's previous run ended, as its request tells the model (ticket 15; never after a revocation)
+_ENDED = {"agent_steps": "it reached its limit of steps", "tool_calls": "it reached its limit of tool calls",
+          "turn_minutes": "it reached its time limit", "chain_over_window": "its steps no longer fit the model's window",
+          "budget": "it reached its budget", "interrupted": "it was interrupted"}
 MAX_SELECTION = 50  # papers a message may select
 JUDGE_SECONDS = 60  # one support-judge call's total bound
 TITLE_RULES = (
@@ -633,16 +637,17 @@ class Harness:
         """Admit a new turn that continues an interrupted one, or one stopped at a limit or
         revoked by a change to its project, from the conversation as it is now. It is the
         conversation's latest turn; the new turn sends its message again and records
-        which run it continues. Its recorded steps are not reused."""
+        which run it continues, and its request tells the model why that run ended (not for a revoked one). Its
+        recorded steps are not reused (M2 audit area 3, item 3: carrying them is reported, not built)."""
         from backend import budgets  # it imports this module
         row, notes = await self._read(lambda conn: (conn.execute(
             "SELECT t.conversation_id, t.user_message, r.status, r.cancel_reason,"
-            " t.seq = (SELECT max(seq) FROM turns WHERE conversation_id = t.conversation_id)"
+            " t.seq = (SELECT max(seq) FROM turns WHERE conversation_id = t.conversation_id), t.reason_code"
             " FROM turns t JOIN runs r ON r.id = t.run_id WHERE t.run_id = ?", (run_id,)).fetchone(),
             budgets.read_notes(conn, run_id)))
         if row is None:
             raise AdmissionError(404, "not_found", "No such turn")
-        conversation_id, message, status, cancel_reason, latest = row
+        conversation_id, message, status, cancel_reason, latest, reason = row
         status = derived_status(status, run_id, self.registry)
         if not latest or not (status == "interrupted" or (status == "cancelled" and cancel_reason in ("limit", "revoked"))):
             raise AdmissionError(409, "not_continuable", "Only the latest interrupted or stopped turn can be continued")
@@ -650,8 +655,14 @@ class Harness:
         # S1-33: the notes its steps read are its researcher's words too; the stopped turn is not in later history
         # (together over the message limit, admit_turn refuses it as any message over it, writing nothing)
         text = "\n\n".join([message.get("text", ""), *notes])
-        return await self.admit_turn(conversation_id, text, model=model, provider=provider,
-                                     effort=effort, retry_of=run_id, material_ids=message.get("material_ids"))
+        claim = await self.admit_turn(conversation_id, text, model=model, provider=provider,
+                                      effort=effort, retry_of=run_id, material_ids=message.get("material_ids"))
+        # its request says why the previous run ended; a revoked run's ending is not carried (section 10)
+        ended = _ENDED.get("interrupted" if status == "interrupted" else reason if cancel_reason == "limit" else None)
+        if ended:
+            claim.context["continued"] = ("The researcher chose Continue: the previous run of this request stopped: "
+                                          f"{ended}. Its steps and tool results are not included here.")
+        return claim
 
     async def steer(self, run_id: str, text: str) -> dict:
         """S1-33 (F11, steer): a message sent while a turn runs becomes a steering note its next step reads
@@ -1472,7 +1483,8 @@ class Harness:
                 sections={"agents_md": [ctx["instructions"]] if ctx["instructions"] else [], "research_evidence": evidence,
                           "conflicts": [*citations.missing(read or held, mode=found["mode"], route=decision["route"],
                                                            **({} if beyond else {"index": index, "cut": cut})),
-                                        *ctx.get("memory_missing", ())],  # S1-21a: an earlier decision memory lacks
+                                        *ctx.get("memory_missing", ()),  # S1-21a: an earlier decision memory lacks
+                                        *([ctx["continued"]] if ctx.get("continued") else [])],
                           **ctx["skill_sections"], **ctx.get("memory_sections", {})},
                 history=history, tools=ctx["tools"], chain=chain, summary=summary and summary["text"])
         request = assemble(lines, numbered)
