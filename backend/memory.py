@@ -892,6 +892,15 @@ async def _embed_soon(state, project_id):
             logging.getLogger(__name__).warning("an index run for memory could not be requested (%s)", type(error).__name__)
 
 
+async def _to_end(awaitable):
+    """A write and its index run's request followed through even when the request goes away (see backend.app._to_end)."""
+    from backend.runs import _through
+    result, cancelled = await _through(awaitable)
+    if cancelled:
+        raise asyncio.CancelledError()
+    return result
+
+
 async def _forget(state, record, check=None):
     from backend.db import deletion
     # the runs it revokes are stopped on this loop, never in the deletion's thread
@@ -927,13 +936,16 @@ async def create_memory(body: NewRecord, request: Request):
             raise Refused(404, "not_found", "No such project")
         return write(conn, project_id=body.project_id, scope=body.scope, kind=body.type, content=content,
                      status="confirmed", sources=[("researcher", "views")], structured={"entered": True})
-    try:
+    async def written():  # the record, then its index run's request (_to_end)
         record = await asyncio.to_thread(state["db"].write, create)
+        await _embed_soon(state, body.project_id)
+        return record
+    try:
+        record = await _to_end(written())
     except Refused as error:
         return _refused(error)
     except sqlite3.IntegrityError as error:  # reading 4: never personal from a Private, Local only or locked project
         return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
-    await _embed_soon(state, body.project_id)
     return await asyncio.to_thread(state["db"].read, lambda conn: row(conn, record))
 
 
@@ -951,13 +963,22 @@ async def change_memory(record_id: str, body: Change, request: Request):
     def change(conn):
         return edit(conn, record_id, body.version, content=content, confirm=body.status == "confirmed")
     try:
-        record = await asyncio.to_thread(state["db"].write, change)
+        found = await _to_end(_written(state, change))
     except LookupError:
         return _refused(Refused(404, "not_found", "No such record"))
     except (ValueError, sqlite3.IntegrityError) as error:  # sqlite3: personal_from_strict (migration 0008)
         return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
-    if record is None:  # a proposal whose record changed: marked out of date, back in Things to confirm
+    if found is None:  # a proposal whose record changed: marked out of date, back in Things to confirm
         return _refused(Refused(*_CHANGE_ERRORS["out_of_date"]))
+    return found
+
+
+async def _written(state, change):
+    """change(conn) written; the record it gives back read, and its index run asked for (under _to_end); None when it
+    gives none (a proposal marked out of date)."""
+    record = await asyncio.to_thread(state["db"].write, change)
+    if record is None:
+        return None
     found = await asyncio.to_thread(state["db"].read, lambda conn: row(conn, record))
     await _embed_soon(state, found["project_id"])
     return found
@@ -1038,15 +1059,13 @@ async def answer_review(body: Review, request: Request):
             raise LookupError(body.id)
         return edit(conn, body.id, body.version, content=content)
     try:
-        record = await asyncio.to_thread(state["db"].write, answer)
+        found = await _to_end(_written(state, answer))
     except LookupError:
         return _refused(Refused(404, "not_found", "No such proposal"))
     except (ValueError, sqlite3.IntegrityError) as error:  # sqlite3: personal_from_strict (migration 0008)
         return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
-    if record is None:  # marked out of date in that commit: back in Things to confirm
+    if found is None:  # marked out of date in that commit: back in Things to confirm
         return _refused(Refused(*_CHANGE_ERRORS["out_of_date"]))
-    found = await asyncio.to_thread(state["db"].read, lambda conn: row(conn, record))
-    await _embed_soon(state, found["project_id"])
     return found
 
 

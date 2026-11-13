@@ -552,6 +552,46 @@ async def test_the_installs_requests_go_on_after_one_fails(tmp_path, monkeypatch
         assert asked == [first, second]
 
 
+@pytest.mark.parametrize("site", ["create", "edit", "keep", "move"])
+async def test_a_memory_write_whose_request_goes_away_after_its_commit_still_asks_for_its_run(tmp_path, monkeypatch,
+                                                                                              site):
+    # batch 2, rider R1: "write, then ask" is followed through (as app._to_end), so a cancellation between the two
+    # leaves the record's run asked for
+    from cited import cited
+    from test_search import runs_of
+    async with cited(tmp_path) as client:
+        project, other = await project_of(client, "First"), await project_of(client, "Second")
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Remember: wage floors raise the earnings of low-paid workers")
+        [(moved,)] = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+        await background_idle(client, timeout=20)
+        proposal = await write(client, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We sample thirty nurses",
+            status="proposed", sources=[("researcher", "views")]))
+        before = len(await runs_of(client, "index"))
+        real, outer = memory._embed_soon, {}
+
+        async def going_away(state, project_id):
+            outer["task"].cancel()  # the request goes away as its run is asked for
+            await asyncio.sleep(0)
+            await real(state, project_id)
+        monkeypatch.setattr(memory, "_embed_soon", going_away)
+        call = {"create": lambda: client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                                    "content": "We dropped the pilot"}),
+                "edit": lambda: client.patch(f"/api/memory/{moved}", json={"version": 1, "content": "Wage floors, revised"}),
+                "keep": lambda: client.post("/api/memory/review", json={"id": proposal, "action": "keep", "version": 1}),
+                "move": lambda: client.post(f"/api/conversations/{conversation}/move", json={"project_id": other})}[site]
+        outer["task"] = asyncio.ensure_future(call())
+        with pytest.raises(asyncio.CancelledError):
+            await outer["task"]
+        await asyncio.sleep(0.2)
+        await background_idle(client, timeout=20)
+        assert len(await runs_of(client, "index")) == before + 1
+        records = [r for (r,) in await rows(client, "SELECT id FROM memory_records WHERE status IN ('confirmed', 'inferred')"
+                                                    " AND type = 'decision'")]
+        assert await _vectors(client, records) == set(records)
+
+
 async def test_a_whole_rebuild_while_the_app_runs_asks_for_the_runs_of_memory_it_dropped(tmp_path):
     # M2 audit area 2: the rebuilt file's runs (index.rebuilt) take the projects whose memory lacks vectors too
     from test_search import app
