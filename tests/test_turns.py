@@ -543,17 +543,17 @@ async def test_a_response_that_fails_before_it_starts_leaves_no_claim(tmp_path):
 
 
 async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tmp_path, monkeypatch):
-    import time
     from backend import providers as providers_module
     real = providers_module.gate_inputs
     checking = asyncio.Event()
+    stopped = threading.Event()  # PR 52 rule 1 recheck A-F2: held until Stop was asked for, never a fixed wait
     loop = asyncio.get_running_loop()
 
     def slow_inputs(data_root):
         turn = client.state["harness"].registry.turns.get(conversation)
         if turn is not None and turn.call is not None:  # the turn's own call, reserved, is at the gate
             loop.call_soon_threadsafe(checking.set)
-        time.sleep(0.3)  # the gate is still checking when Stop arrives
+            assert stopped.wait(10)  # the gate is still checking when Stop arrives
         return real(data_root)
 
     async with started(tmp_path / "data") as client:
@@ -567,6 +567,7 @@ async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tm
         await asyncio.wait_for(checking.wait(), 5)
         run_id = active_turn(client, conversation).run_id
         await client.post(f"/api/runs/{run_id}/cancel")
+        stopped.set()
         assert (await stream)[-1]["status"] == "cancelled"
         assert len(client.provider.chats) == 2  # the first conversation's turn and its extraction only
         assert await rows(client, "SELECT status, settled_usd FROM budget_reservations WHERE run_id = ?",
@@ -576,11 +577,11 @@ async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tm
 async def test_a_receipt_is_recorded_even_if_stop_comes_while_the_client_closes(tmp_path, monkeypatch):
     import httpx
     real_exit = httpx.AsyncClient.__aexit__
-    closing = asyncio.Event()
+    closing, stopped = asyncio.Event(), asyncio.Event()  # held until Stop was asked for, never a fixed wait (A-F2)
 
     async def slow_exit(self, *exc):
         closing.set()
-        await asyncio.sleep(0.3)
+        await asyncio.wait_for(stopped.wait(), 10)
         await real_exit(self, *exc)
 
     async with started(tmp_path / "data") as client:
@@ -592,6 +593,7 @@ async def test_a_receipt_is_recorded_even_if_stop_comes_while_the_client_closes(
         await asyncio.wait_for(closing.wait(), 5)
         run_id = active_turn(client, conversation).run_id
         await client.post(f"/api/runs/{run_id}/cancel")
+        stopped.set()
         assert (await stream)[-1]["status"] == "cancelled"
         assert await rows(client, "SELECT status, settled_usd, basis FROM budget_reservations WHERE run_id = ?",
                           run_id) == [("settled", 0.002, "reported")]
@@ -1575,6 +1577,35 @@ async def test_a_stop_while_the_gate_decides_on_a_retry_records_it_unsent_and_ke
         assert await attempts_of(client, run_id) == [(0, "request", True, "reported", 0.2, True),
                                                      (1, "cancelled", False, "unknown", None, False)]
         assert await rows(client, "SELECT attempt FROM run_bodies WHERE run_id = ?", run_id) == [(0,)]
+
+
+@pytest.mark.parametrize("cost", [1_000_000.0, 1.7e308])
+async def test_a_retried_call_reporting_up_to_the_most_an_amount_can_be_keeps_it_as_reported_and_more_is_estimated(
+        tmp_path, monkeypatch, cost):
+    # PR 52 cycle 5 A-F2 (SPEC:425), design review V's Option 1: the rejected attempt and its retry each reported
+    # $1,000,000, the most an amount can be: their sum is held there (one call's record, spending.combined), settled as
+    # reported, and the turn's record and stream carry it. Each reporting 1.7e308, no amount: an invalid report, so each
+    # attempt is charged from its reported tokens at the step's rates, marked estimated, as any invalid report is.
+    rejected = (400, {"error": {}, "usage": {"prompt_tokens": 10, "completion_tokens": 0, "cost": cost}})
+    answered = (200, {"choices": [{"message": {"role": "assistant", "content": "Hi."}}],
+                      "usage": {"prompt_tokens": 12, "completion_tokens": 5, "cost": cost}})
+    async with started(tmp_path / "data", MockProvider(rejected, answered)) as client:
+        conversation = await lab(client, monkeypatch)
+        stream = await send(client, conversation, provider="lab", model="m")
+        assert stream[-1]["status"] == "succeeded"
+        run_id = stream[0]["run_id"]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        _, status, settled, basis = await reservation(client, run_id)
+        if cost == 1_000_000.0:
+            assert (status, settled, basis) == ("settled", 1_000_000.0, "reported")
+            assert await attempts_of(client, run_id) == [(0, "request", True, "reported", cost, True),
+                                                         (1, "ok", True, "reported", cost, True)]
+            assert (stream[-1]["cost_usd"], stream[-1]["accounting"]["reported_usd"], turn["cost_usd"]) == (cost,) * 3
+        else:
+            assert (status, basis) == ("settled", "estimated") and 0 < settled < 1
+            assert [a[3] for a in await attempts_of(client, run_id)] == ["estimated", "estimated"]
+            assert stream[-1]["accounting"] == {**stream[-1]["accounting"], "reported_usd": 0, "estimated_usd": settled}
+            assert turn["cost_usd"] == settled
 
 
 async def test_a_stop_while_a_retry_is_in_flight_keeps_both_attempts_and_charges_at_least_the_reported_one(

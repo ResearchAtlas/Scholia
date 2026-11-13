@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from backend import governance
 from backend.db import new_id
-from backend.runs import _budget_unread, _event
+from backend.runs import _budget_unread, _event, derived_status
 from backend.settings import load_settings, visible
 
 log = logging.getLogger(__name__)
@@ -104,7 +104,10 @@ def answer(conn, run_id, ask_id, option=None, text=None, registry=None, data_dir
     if ask is None or ask["ask_id"] != ask_id:
         raise AskRefused(404, "not_found", "No such question")
     active = registry.runs.get(run_id) if registry is not None else None
-    if answered is not None or run[0] != "running" or run[1] is not None or run[2] != "ask" \
+    # a running run no process here holds reads interrupted (SPEC:672), and its ask is closed with it, though the write
+    # that would close it failed (PR 52 cycle 5 B2)
+    status = run[0] if registry is None else derived_status(run[0], run_id, registry)
+    if answered is not None or status != "running" or run[1] is not None or run[2] != "ask" \
             or (active is not None and active.cancel_requested.is_set()):
         raise AskRefused(409, "ask_closed", "This question can no longer be answered")
     if _current_policy(conn, ask["project_id"]) != ask["policy"]:
@@ -187,8 +190,9 @@ NO_TEXT.add("memory_forget")
 SHOWN.update(memory_save=_memory_candidates, memory_update=_memory_candidates, memory_forget=_memory_candidates)
 
 
-def open_asks(conn, project_id=None, conversation_id=None, run_id=None):
-    """The asks that can be answered now: of running runs waiting on them, under the policy they were
+def open_asks(conn, project_id=None, conversation_id=None, run_id=None, registry=None):
+    """The asks that can be answered now: of running runs waiting on them (given registry, only runs this process holds:
+    another reads interrupted, SPEC:672), under the policy they were
     asked under; for a project, a conversation they were raised from, or a run. Each names its
     project (project_name, project_kind), wherever it is shown. A turn's asks (the agent's, S1-19c) are shown only
     where their work started, in their conversation (section 6.2): a project's listing (the Library panel) leaves
@@ -201,6 +205,8 @@ def open_asks(conn, project_id=None, conversation_id=None, run_id=None):
         " ORDER BY r.started_at", (project_id, run_id, conversation_id)).fetchall()
     found = []
     for run, workflow, project_name, project_kind in rows:
+        if registry is not None and derived_status("running", run, registry) != "running":
+            continue
         ask, answered = asked(conn, run)
         if ask is None or answered is not None or _current_policy(conn, ask["project_id"]) != ask["policy"]:
             continue
@@ -217,11 +223,13 @@ def open_asks(conn, project_id=None, conversation_id=None, run_id=None):
 async def list_asks(request: Request, project_id: str | None = None, conversation_id: str | None = None):
     """The open asks; for a conversation, also how many runs started from it still run (`working`),
     so the conversation knows to look again."""
-    def listing(conn):
-        working = conn.execute(
-            "SELECT count(*) FROM runs WHERE status = 'running' AND json_extract(inputs, '$.origin.conversation_id') = ?",
-            (conversation_id,)).fetchone()[0] if conversation_id else 0
-        return {"asks": open_asks(conn, project_id, conversation_id), "working": working}
+    registry = request.app.state.scholia["harness"].registry
+
+    def listing(conn):  # a run no process here holds reads interrupted (SPEC:672), so it is not working either
+        working = sum(derived_status("running", run, registry) == "running" for (run,) in conn.execute(
+            "SELECT id FROM runs WHERE status = 'running' AND json_extract(inputs, '$.origin.conversation_id') = ?",
+            (conversation_id,))) if conversation_id else 0
+        return {"asks": open_asks(conn, project_id, conversation_id, registry=registry), "working": working}
 
     return await asyncio.to_thread(request.app.state.scholia["db"].read, listing)
 
@@ -290,7 +298,7 @@ def _save_project_budget(data_dir, decided):
         return False
     if _budget_unread(loaded):  # an unreadable file, or this value, gives the default, never what it holds: unknown,
         return False  # so not saved
-    return abs(loaded.values["project"]["budget_usd"] - decided["to_usd"]) <= 1e-9
+    return round(loaded.values["project"]["budget_usd"], 9) == round(decided["to_usd"], 9)  # as amounts are kept
 
 
 def _budget_saved(conn, run_id, decided, saved):

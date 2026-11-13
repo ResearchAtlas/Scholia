@@ -347,3 +347,406 @@ async def test_a_forget_answered_after_its_record_moved_to_another_project_leave
         assert {"type": "memory", "action": "forgotten", "count": 1} in await sending
         assert await rows(client, "SELECT content, project_id FROM memory_records WHERE type != 'progress'") == [
             ("we exclude studies before 2000", private)]
+
+
+async def test_a_forget_stopped_once_its_deletion_committed_still_records_and_says_what_it_forgot(tmp_path, monkeypatch):
+    # PR 52's follow-up, item 9 (design review P's separate finding): Stop landed while the forget's deletion ran in its
+    # worker. The deletion committed, but the loop was cut there: no memory_proposed event and no stream event, the turn
+    # read cancelled with nothing said of the record it deleted. The deletions and their record run to their end, as a
+    # tool's result does (Harness._tool's keeping), and then the Stop is honored.
+    import time
+    from backend.db import deletion
+    real = deletion.delete
+    async with started(tmp_path / "data") as client:
+        harness, loop = client.state["harness"], asyncio.get_running_loop()
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Remember: the pilot used a survey")
+        await background_idle(client)
+        [(record,)] = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+
+        def deleting(*args, **kwargs):
+            found = real(*args, **kwargs)  # committed: the Stop lands while its worker is still to return
+            loop.call_soon_threadsafe(harness._request_cancel, harness.registry.turns[conversation], "researcher")
+            time.sleep(0.2)
+            return found
+        monkeypatch.setattr(deletion, "delete", deleting)
+        stream = await send(client, conversation, "Forget: the pilot used a survey")
+        assert stream[-1]["status"] == "cancelled"
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE id = ?", record) == [(0,)]
+        [(data,)] = await rows(client, "SELECT data FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                               stream[0]["run_id"])
+        assert (json.loads(data)["action"], json.loads(data)["count"]) == ("forgotten", 1)
+        assert {"type": "memory", "action": "forgotten", "count": 1} in stream
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1:]
+        assert [(m["action"], m["count"]) for m in turn["memory"]] == [("forgotten", 1)]
+
+
+
+async def test_a_stop_during_a_forget_of_several_records_deletes_none_after_it_and_says_what_it_forgot(tmp_path,
+                                                                                                     monkeypatch):
+    # The internal review's F4: Stop is immediate (SPEC:412). The deletion it landed on commits, and the forget records
+    # and says that one; the records still to be deleted are kept, as they were before the follow-up.
+    import time
+    from backend import memory
+    from backend.db import deletion
+    real = deletion.delete
+    async with started(tmp_path / "data") as client:
+        harness, loop = client.state["harness"], asyncio.get_running_loop()
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        first = await send(client, conversation, "What do I study?")
+        await background_idle(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: [memory.save_command(
+            conn, project_id=project, run_id=first[0]["run_id"], action="save", text=text)
+            for text in ("the pilot used a survey", "the cohort is 40 nurses", "interviews ran in May")])
+        made = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+        assert len(made) == 3
+        deleted = []
+
+        def deleting(*args, **kwargs):
+            found = real(*args, **kwargs)
+            deleted.append(args[3])
+            if len(deleted) == 1:  # committed: the Stop lands while its worker is still to return
+                loop.call_soon_threadsafe(harness._request_cancel, harness.registry.turns[conversation], "researcher")
+                time.sleep(0.2)
+            return found
+        monkeypatch.setattr(deletion, "delete", deleting)
+        sending = asyncio.create_task(send(client, conversation, "forget this"))
+        ask = await open_ask(client, conversation)
+        assert len(ask["params"]["records"]) == 3
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "forget"})
+        stream = await sending
+        assert stream[-1]["status"] == "cancelled" and len(deleted) == 1
+        assert len(await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")) == 2
+        [(data,)] = await rows(client, "SELECT data FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                               stream[0]["run_id"])
+        assert (json.loads(data)["action"], json.loads(data)["count"]) == ("forgotten", 1)
+        assert {"type": "memory", "action": "forgotten", "count": 1} in stream
+
+
+# Fix batch 1, B-F2 (item 9; SPEC:650, run events before the final state): once a forget's deletion committed, the turn's
+# record and its `memory` event say what it forgot, also when a later deletion fails (the count recorded, then the turn
+# fails) and when the run is revoked after a deletion committed. No deletion starts after Stop or a revocation (SPEC:412).
+
+
+async def _three_to_forget(client, monkeypatch, deleting):
+    """A conversation with three saved records and deletion.delete replaced by deleting(real, *args, **kwargs); its
+    forget sent ("forget this") and answered Forget: (the send's task, the project, the conversation)."""
+    from backend import memory
+    from backend.db import deletion
+    real = deletion.delete
+    project = await project_of(client)
+    conversation = await conversation_in(client, project)
+    first = await send(client, conversation, "What do I study?")
+    await background_idle(client)
+    await asyncio.to_thread(client.state["db"].write, lambda conn: [memory.save_command(
+        conn, project_id=project, run_id=first[0]["run_id"], action="save", text=text)
+        for text in ("the pilot used a survey", "the cohort is 40 nurses", "interviews ran in May")])
+    monkeypatch.setattr(deletion, "delete", lambda *args, **kwargs: deleting(real, *args, **kwargs))
+    sending = asyncio.create_task(send(client, conversation, "forget this"))
+    ask = await open_ask(client, conversation)
+    assert len(ask["params"]["records"]) == 3
+    await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "forget"})
+    return sending, project, conversation
+
+
+async def _forgotten(client, stream, count):
+    found = await rows(client, "SELECT data FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                       stream[0]["run_id"])  # one event for each deletion, in its commit (design review M's Option 2)
+    assert [(json.loads(d)["action"], json.loads(d)["count"]) for (d,) in found] == [("forgotten", 1)] * count
+    assert {"type": "memory", "action": "forgotten", "count": count} in stream
+
+
+@pytest.mark.parametrize("after_commit", [False, True])
+async def test_a_forget_whose_later_deletion_fails_records_what_it_forgot_and_then_fails(tmp_path, monkeypatch,
+                                                                                        after_commit):
+    # The first review's B-F2, first probe: the second deletion fails before its transaction (or after its commit, so
+    # its record is gone too); nothing was recorded or said of the one already forgotten, and the turn failed
+    calls = []
+
+    def deleting(real, *args, **kwargs):
+        calls.append(args[3])
+        if len(calls) == 2:
+            if after_commit:
+                real(*args, **kwargs)
+            raise RuntimeError("the deletion failed")
+        return real(*args, **kwargs)
+    async with started(tmp_path / "data") as client:
+        sending, _, _ = await _three_to_forget(client, monkeypatch, deleting)
+        stream = await sending
+        assert stream[-1]["status"] == "failed" and len(calls) == 2
+        left = 1 if after_commit else 2
+        assert len(await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")) == left
+        await _forgotten(client, stream, 3 - left)
+
+
+async def test_a_forget_revoked_once_its_deletion_committed_records_what_it_forgot_and_deletes_no_more(tmp_path,
+                                                                                                    monkeypatch):
+    # The first review's B-F2, second probe: the project is made Private through its endpoint while the first deletion's
+    # worker is still to return; the run ends revoked, and its record said memory: []
+    import threading
+    reached, go, calls = threading.Event(), threading.Event(), []
+
+    def deleting(real, *args, **kwargs):
+        found = real(*args, **kwargs)
+        calls.append(args[3])
+        if len(calls) == 1:  # committed: the project changes while its worker is still to return
+            reached.set()
+            go.wait(10)
+        return found
+    async with started(tmp_path / "data") as client:
+        sending, project, conversation = await _three_to_forget(client, monkeypatch, deleting)
+        assert await asyncio.to_thread(reached.wait, 10)
+        assert (await client.post(f"/api/projects/{project}/sensitivity", json={"level": "private"})).status_code == 200
+        go.set()
+        stream = await sending
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked") and len(calls) == 1
+        assert len(await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")) == 2
+        await _forgotten(client, stream, 1)
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1:]
+        assert [(m["action"], m["count"]) for m in turn["memory"]] == [("forgotten", 1)]
+
+
+@pytest.mark.parametrize("change", ["private", "review lock", "ended"])
+async def test_a_forget_revoked_in_the_record_before_the_turn_hears_of_it_deletes_no_more(tmp_path, monkeypatch, change):
+    # Cycle 2's B-R2-F1: the policy change commits the run's revocation, and the harness is told only after its write
+    # returns. In that moment the loop saw no cancellation and the deletion's own transaction did not read the run, so
+    # every record left was deleted. Now each deletion reads its run there: one revoked (or ended in the record, here
+    # written directly) deletes nothing more.
+    import threading
+    reached, go, calls, held = threading.Event(), threading.Event(), [], []
+
+    def deleting(real, *args, **kwargs):
+        found = real(*args, **kwargs)
+        calls.append(args[3])  # committed
+        if len(calls) == 1:  # the project changes (or the conversation goes) while its worker is still to return
+            reached.set()
+            go.wait(10)
+        return found
+    async with started(tmp_path / "data") as client:
+        harness = client.state["harness"]
+        real_revoke = harness.revoke
+
+        def revoke(run_ids):  # the policy change's notification held: committed, not yet told to the harness
+            if run_ids and not go.is_set():
+                held.append(list(run_ids))
+                return
+            real_revoke(run_ids)
+        monkeypatch.setattr(harness, "revoke", revoke)
+        sending, project, conversation = await _three_to_forget(client, monkeypatch, deleting)
+        assert await asyncio.to_thread(reached.wait, 10)
+        if change == "ended":
+            run_id = harness.registry.turns[conversation].run_id
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                "UPDATE runs SET status = 'cancelled', cancel_reason = 'researcher' WHERE id = ?", (run_id,)))
+            ids = []
+        else:
+            path, body = ((f"/api/projects/{project}/review-lock", {"locked": True}) if change == "review lock" else
+                          (f"/api/projects/{project}/sensitivity", {"level": "private"}))
+            assert (await client.post(path, json=body)).status_code == 200
+            [ids] = held
+            assert await rows(client, "SELECT cancel_reason FROM runs WHERE id IN (%s)" % ",".join("?" * len(ids)),
+                              *ids) == [("revoked",)] * len(ids)
+        go.set()
+        try:
+            stream = await asyncio.wait_for(sending, 20)
+        finally:
+            real_revoke(ids)
+        assert len(calls) == 1
+        assert len(await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")) == 2
+        if change == "ended":  # the deletion made while it ran is recorded with it; nothing after its end
+            assert await rows(client, "SELECT json_extract(data, '$.count') FROM run_events"
+                              " WHERE type = 'memory_proposed' AND run_id = ?", stream[0]["run_id"]) == [(1,)]
+            return
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")
+        await _forgotten(client, stream, 1)
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1:]
+        assert [(m["action"], m["count"]) for m in turn["memory"]] == [("forgotten", 1)]
+
+
+@pytest.mark.parametrize("message", ["Remember: the cohort is 40 nurses", "Correct: the cohort is 40 nurses"])
+async def test_a_save_or_update_command_on_a_run_revoked_in_the_record_before_the_turn_hears_of_it_writes_nothing(
+        tmp_path, monkeypatch, message):
+    # Fix batch 2's sweep of B-R2-F1: a save or update writes through _record, which reads the run in the transaction
+    # that writes, so a revocation committed before the harness hears of it (the flag still unset) keeps it out
+    async with started(tmp_path / "data") as client:
+        harness = client.state["harness"]
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Remember: the cohort is 30 nurses")
+        await background_idle(client)
+        before = await rows(client, "SELECT id, version, status FROM memory_records ORDER BY id")
+        real, calls = harness.memory_on, []
+
+        async def memory_on(project_id):  # its second read is the one just before the command's write
+            calls.append(project_id)
+            if len(calls) == 2:
+                run_id = harness.registry.turns[conversation].run_id
+                await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                    "UPDATE runs SET cancel_reason = 'revoked' WHERE id = ?", (run_id,)))
+            return await real(project_id)
+        monkeypatch.setattr(harness, "memory_on", memory_on)
+        stream = await send(client, conversation, message)
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")
+        assert await rows(client, "SELECT id, version, status FROM memory_records ORDER BY id") == before
+        assert await rows(client, "SELECT 1 FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                          stream[0]["run_id"]) == []
+
+
+@pytest.mark.parametrize("by", ["command", "memory page"])
+async def test_a_forget_stops_another_run_holding_the_record_on_the_event_loop_never_in_the_deletions_thread(
+        tmp_path, monkeypatch, by):
+    # Fix batch 2's "Not fixed" (pre-existing): the deletion runs in a worker thread and tells the harness from there
+    # once it commits, so another run's revocation (an asyncio.Event set, a task cancelled) ran off the loop. It is
+    # handed to the loop now, as the conversation and project deletions do (app.revoke_soon)
+    import threading
+    from backend.db import new_id
+    async with started(tmp_path / "data") as client:
+        harness, loop_thread, told = client.state["harness"], threading.get_ident(), []
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Remember: the pilot used a survey")
+        await background_idle(client)
+        [(record,)] = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+        other = new_id()  # another run, still running, whose request was shown the record
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', 'memory', json(?))",
+            (other, project, json.dumps({"memory_ids": [record]}))))
+        real = harness.revoke
+
+        def revoke(run_ids):
+            told.append((list(run_ids), threading.get_ident()))
+            real(run_ids)
+        monkeypatch.setattr(harness, "revoke", revoke)
+        if by == "command":
+            stream = await send(client, conversation, "Forget: the pilot used a survey")
+            assert {"type": "memory", "action": "forgotten", "count": 1} in stream
+        else:
+            from test_memory import forget
+            assert (await forget(client, record)).json() == {"ok": True}
+        await asyncio.sleep(0.05)
+        assert await rows(client, "SELECT cancel_reason FROM runs WHERE id = ?", other) == [("revoked",)]
+        assert [(ids, thread == loop_thread) for ids, thread in told if other in ids] == [([other], True)]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'cancelled', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            (other,)))
+
+
+# Cycle 3's B-R3-F1 (design review M's Option 2): each deletion a forget makes commits together with the turn's record of
+# it (a `memory_proposed` event, count 1, written in the deletion's own transaction after its checks), so no later read,
+# write or failure can leave a committed deletion unrecorded. The conversation reads a forget's events as one item.
+
+
+async def _forgotten_now(client, stream):
+    """What the turn's record says it forgot (its `forgotten` events summed), and the counts its stream said."""
+    found = await rows(client, "SELECT data FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                       stream[0]["run_id"])
+    recorded = sum(json.loads(d).get("count", 0) for (d,) in found if json.loads(d)["action"] == "forgotten")
+    return recorded, [e["count"] for e in stream if e.get("type") == "memory"]
+
+
+async def _read_back(client, conversation):
+    [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1:]
+    return [(m["action"], m["count"]) for m in turn["memory"]]
+
+
+@pytest.mark.parametrize("after_commit", [False, True])
+async def test_a_forget_whose_later_deletion_and_the_next_read_both_fail_records_what_it_forgot(tmp_path, monkeypatch,
+                                                                                               after_commit):
+    # B-R3-F1: the second of three deletions fails (before its transaction, or after its commit) and the read after it
+    # fails too: the recovery read escaped before the record, so nothing was recorded or said of what was forgotten
+    import sqlite3
+    calls, armed = [], []
+
+    def deleting(real, *args, **kwargs):
+        calls.append(args[3])
+        if len(calls) == 2:
+            if after_commit:
+                real(*args, **kwargs)
+            armed.append(True)  # the next read fails, once
+            raise RuntimeError("the deletion failed")
+        return real(*args, **kwargs)
+    async with started(tmp_path / "data") as client:
+        harness = client.state["harness"]
+        real_read = harness._read
+
+        async def read(fn):
+            if armed:
+                armed.clear()
+                raise sqlite3.OperationalError("disk I/O error")
+            return await real_read(fn)
+        monkeypatch.setattr(harness, "_read", read)
+        sending, _, conversation = await _three_to_forget(client, monkeypatch, deleting)
+        stream = await asyncio.wait_for(sending, 20)
+        forgot = 2 if after_commit else 1
+        assert stream[-1]["status"] == "failed" and len(calls) == 2
+        assert len(await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")) == 3 - forgot
+        recorded, said = await _forgotten_now(client, stream)
+        assert (recorded, said) == (forgot, [forgot])
+        assert await _read_back(client, conversation) == [("forgotten", forgot)]
+
+
+async def test_a_forget_whose_record_write_fails_once_its_deletions_began_still_records_each_one(tmp_path, monkeypatch):
+    # Design review M's one-failure case: all three deletions commit, then the turn's record writes fail; the record of
+    # what was forgotten was the first of them, so the three deletions went unrecorded. Each is now in its own commit.
+    import sqlite3
+    calls = []
+
+    def deleting(real, *args, **kwargs):
+        calls.append(args[3])
+        return real(*args, **kwargs)
+    async with started(tmp_path / "data") as client:
+        harness = client.state["harness"]
+        real_record = harness._record
+
+        async def record(*args, **kwargs):
+            if calls:  # every record write once the deletions began
+                raise sqlite3.OperationalError("disk I/O error")
+            return await real_record(*args, **kwargs)
+        monkeypatch.setattr(harness, "_record", record)
+        sending, _, conversation = await _three_to_forget(client, monkeypatch, deleting)
+        stream = await asyncio.wait_for(sending, 20)
+        assert len(calls) == 3
+        assert await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'") == []
+        recorded, _ = await _forgotten_now(client, stream)
+        assert recorded == 3
+        assert await _read_back(client, conversation) == [("forgotten", 3)]
+
+
+async def test_after_each_deletion_of_a_forget_its_record_says_as_many_as_were_deleted(tmp_path, monkeypatch):
+    # The construction itself: read directly once each deletion returns, the turn's `forgotten` events are as many as
+    # the memory deletions audited, never fewer
+    seen = []
+
+    async def start(client):
+        harness = client.state["harness"]
+
+        def deleting(real, *args, **kwargs):
+            found = real(*args, **kwargs)
+            [run_id] = [a.run_id for a in harness.registry.runs.values() if a.kind == "turn"]
+            seen.append(client.state["db"].read(lambda conn: (
+                conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'memory_proposed'"
+                             " AND json_extract(data, '$.action') = 'forgotten'", (run_id,)).fetchone()[0],
+                conn.execute("SELECT count(*) FROM audit_log WHERE event = 'deletion'"
+                             " AND json_extract(data, '$.kind') = 'memory'").fetchone()[0])))
+            return found
+        return await _three_to_forget(client, monkeypatch, deleting)
+    async with started(tmp_path / "data") as client:
+        sending, _, _ = await start(client)
+        assert (await asyncio.wait_for(sending, 20))[-1]["status"] == "succeeded"
+        assert seen == [(1, 1), (2, 2), (3, 3)]
+
+
+async def test_a_forget_of_three_is_read_back_and_said_as_one_item(tmp_path, monkeypatch):
+    # Three events, one per deletion, read back as one "Forgot 3 memory records" and said as one memory event
+    async with started(tmp_path / "data") as client:
+        sending, _, conversation = await _three_to_forget(client, monkeypatch,
+                                                          lambda real, *args, **kwargs: real(*args, **kwargs))
+        stream = await asyncio.wait_for(sending, 20)
+        assert stream[-1]["status"] == "succeeded"
+        found = await rows(client, "SELECT data FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                           stream[0]["run_id"])
+        assert [json.loads(d)["count"] for (d,) in found] == [1, 1, 1]
+        assert [e for e in stream if e.get("type") == "memory"] == [{"type": "memory", "action": "forgotten", "count": 3}]
+        assert await _read_back(client, conversation) == [("forgotten", 3)]

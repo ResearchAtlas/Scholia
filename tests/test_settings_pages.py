@@ -380,3 +380,39 @@ async def test_an_unreadable_instruction_file_is_reported_not_an_error(tmp_path)
             assert read.status_code == 200 and read.json()["unreadable"] is True and read.json()["text"] == ""
         finally:
             os.chmod(path, 0o600)
+
+
+# PR 52's follow-up, item 8's personal file (Harold, 2026-11-13, Option 1): on a personal config.toml written by hand
+# with root dotted keys, the Providers page's save adding a provider, or a model's window, would move the keys after the
+# first one under the new table (OpenRouter losing its URL, the follow-up mode falling back to steer). It is refused, 400
+# invalid_setting ("A setting is not valid."), nothing written, and no provider changes, so the providers a save is
+# checked against (_providers_changed, read from the request) are the only ones a written save can change.
+_HAND_DOTTED = ('providers.openrouter.kind = "openrouter"\nproviders.openrouter.base_url = "https://openrouter.ai/api/v1"\n'
+                'ui.follow_up = "queue"\n')
+
+
+@pytest.mark.parametrize("updates", [
+    {"providers.lab.kind": "openai-compatible", "providers.lab.base_url": "http://127.0.0.1:11434/v1"},
+    {"providers.openrouter.windows.m": 32768}])
+async def test_a_providers_page_save_that_would_move_keys_in_a_hand_written_file_is_refused(tmp_path, updates):
+    async with started(tmp_path / "data") as client:
+        config = tmp_path / "data" / "config.toml"
+        config.write_text(_HAND_DOTTED)
+        listed = (await client.get("/api/providers")).json()["providers"]
+        response = await save(client, updates)
+        assert (response.status_code, response.json()["code"]) == (400, "invalid_setting")
+        assert config.read_text() == _HAND_DOTTED
+        assert (await client.get("/api/providers")).json()["providers"] == listed
+        assert (await client.get("/api/settings")).json()["values"]["ui"]["follow_up"] == "queue"
+
+
+async def test_the_first_runs_save_that_would_move_keys_in_a_hand_written_file_is_refused(tmp_path):
+    # The first run's own OpenRouter table: refused the same way, before the key is stored
+    async with started(tmp_path / "data", setup=False) as client:
+        config = tmp_path / "data" / "config.toml"
+        raw = 'providers.lab.kind = "openai-compatible"\nproviders.lab.base_url = "http://127.0.0.1:11434/v1"\n' \
+              'ui.follow_up = "queue"\n'
+        config.write_text(raw)
+        response = await client.post("/api/setup", json={"openrouter_key": "sk-or-test-key"})
+        assert (response.status_code, response.json()["code"]) == (400, "invalid_setting")
+        assert config.read_text() == raw and (await client.get("/api/setup")).json() == {"needed": True}

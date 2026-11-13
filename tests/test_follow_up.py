@@ -630,8 +630,8 @@ async def test_a_note_of_a_turn_whose_terminal_write_failed_is_not_said_to_be_qu
 
 async def test_each_way_a_message_joins_the_queue_is_streamed_as_queued(tmp_path):
     # D11 (F4, SPEC:641): queued by the researcher while the turn runs, by a steer the turn has no step left to read,
-    # and by a note left unread at the turn's end: each streamed as `queued` on the running turn's stream, before its
-    # end, once its row has committed. The event carries no text.
+    # and by a note left unread at the turn's end: each streamed as `queued` on the running turn's stream once its row
+    # has committed, here before its end (a live label: design review P2's Option 1, below). The event carries no text.
     gate = Gate(0)
     provider = Scripted(None)
     provider.script.append(gate.wrap(provider, "The answer."))
@@ -666,6 +666,121 @@ async def test_each_way_a_message_joins_the_queue_is_streamed_as_queued(tmp_path
         assert "queued" in (await steer(client, run_id, "Shorter, please")).json()
         release.set()
         assert [e["type"] for e in await sending].count("queued") == 1
+
+
+# PR 52's follow-up, design review P2's Option 1 (Harold's decision, 2026-11-13): `budget` and `steering_note` are sent
+# before `run_finished`; `queued` and the other stream events are live labels. The reply to the request that queued a
+# message says its row, and the record read at the turn's end holds every message queued before that end. Each case is
+# the first review's B-F1 schedule: none asserts where `queued` falls on the stream.
+
+
+def _held_write(client, monkeypatch, name, before=False):
+    """Hold the database write whose function's qualified name ends with name in its worker thread, once it committed
+    (or, with before, before it begins): (reached, go), threading events: reached is set when it gets there, and it goes
+    on once go is set."""
+    import threading
+    db, real, reached, go = client.state["db"], client.state["db"].write, threading.Event(), threading.Event()
+
+    def write(fn, *args, **kwargs):
+        if not getattr(fn, "__qualname__", "").endswith(name):
+            return real(fn, *args, **kwargs)
+        if before:
+            reached.set()
+            go.wait(10)
+        result = real(fn, *args, **kwargs)
+        if not before:
+            reached.set()
+            go.wait(10)
+        return result
+    monkeypatch.setattr(db, "write", write)
+    return reached, go
+
+
+async def _slow_turn(client, provider, conversation):
+    """A turn whose one model call waits: (its sending task, its run's ActiveRun, the event that lets the call answer)."""
+    release = asyncio.Event()
+
+    async def held(body):
+        await release.wait()
+        return provider.answer("Slow.")
+    provider.replies.append(held)
+    sending = asyncio.create_task(send(client, conversation, "Slow one?"))
+    run_id = await running_run(client, conversation)
+    while not provider.answers:
+        await asyncio.sleep(0.01)
+    return sending, client.state["harness"].registry.runs[run_id], release
+
+
+async def test_a_message_queued_while_its_turn_ends_is_in_the_read_at_that_end_and_in_its_reply(tmp_path, monkeypatch):
+    # B-F1, the queue endpoint: its row commits while the turn runs, its request returns only after the turn ended
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending, _, release = await _slow_turn(client, provider, conversation)
+        reached, go = _held_write(client, monkeypatch, "queue_message.<locals>.add")
+        queueing = asyncio.create_task(client.post(f"/api/conversations/{conversation}/queue", json={"content": "Next?"}))
+        assert await asyncio.to_thread(reached.wait, 10)
+        release.set()
+        assert [(e["type"], e.get("status")) for e in await sending][-1] == ("run_finished", "succeeded")
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["Next?"]
+        go.set()
+        response = await queueing
+        assert (response.status_code, response.json()["text"]) == (201, "Next?")
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["Next?"]
+
+
+async def test_a_steer_queued_on_a_route_without_tools_while_its_turn_ends_is_in_the_read_and_in_its_reply(
+        tmp_path, monkeypatch):
+    # B-F1, a steer the turn has no step to read: its row commits while the turn runs, its reply comes after the end,
+    # and nothing is put on the ended stream
+    provider = MockProvider()
+    provider.parameters = ["max_tokens", "temperature"]  # no endpoint takes tools: the turn has no next step
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending, active, release = await _slow_turn(client, provider, conversation)
+        reached, go = _held_write(client, monkeypatch, "steer.<locals>.write")
+        steering = asyncio.create_task(steer(client, active.run_id, "Shorter, please"))
+        assert await asyncio.to_thread(reached.wait, 10)
+        release.set()
+        assert [(e["type"], e.get("status")) for e in await sending][-1] == ("run_finished", "succeeded")
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["Shorter, please"]
+        go.set()
+        response = await steering
+        assert response.status_code == 200 and response.json()["queued"]["text"] == "Shorter, please"
+        assert "ended" not in response.json() and active.events.empty()
+
+
+async def test_a_steer_written_after_its_turn_ended_says_ended_with_its_row_which_the_read_holds(tmp_path, monkeypatch):
+    # B-F1, a steer answered `ended`: sent while the turn ran, its write begins only once the turn has ended
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending, active, release = await _slow_turn(client, provider, conversation)
+        reached, go = _held_write(client, monkeypatch, "steer.<locals>.write", before=True)
+        steering = asyncio.create_task(steer(client, active.run_id, "And another thing"))
+        assert await asyncio.to_thread(reached.wait, 10)
+        release.set()
+        assert [(e["type"], e.get("status")) for e in await sending][-1] == ("run_finished", "succeeded")
+        go.set()
+        response = await steering
+        assert response.status_code == 200 and response.json()["ended"] is True
+        assert response.json()["queued"]["text"] == "And another thing"
+        assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["And another thing"]
+
+
+async def test_a_steer_written_after_its_turn_ended_puts_nothing_on_the_ended_stream(tmp_path, monkeypatch):
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending, active, release = await _slow_turn(client, provider, conversation)
+        reached, go = _held_write(client, monkeypatch, "steer.<locals>.write", before=True)
+        steering = asyncio.create_task(steer(client, active.run_id, "And another thing"))
+        assert await asyncio.to_thread(reached.wait, 10)
+        release.set()
+        await sending
+        go.set()
+        assert (await steering).json()["ended"] is True
+        assert active.events.empty()
 
 
 # S1-33 fix batch 3 (PR 52 cycle 3): lifecycle first (charter section 10)
@@ -943,7 +1058,7 @@ async def test_a_note_read_by_a_step_that_went_out_is_said_read_when_stop_lands_
 async def test_a_note_queued_by_the_answers_commit_is_said_queued_when_stop_lands_during_that_commit(tmp_path,
                                                                                                     monkeypatch):
     # A note sent while the last step ran is queued by the answer's commit (L7, F6); Stop lands while that write runs.
-    # Once it commits, the stream says a message was queued, before the turn's end.
+    # Once it commits, the read holds the queued message, and the stream says the answer (`queued` there a live label).
     import time
     from backend import runs
     gate = Gate(0)
@@ -968,3 +1083,173 @@ async def test_a_note_queued_by_the_answers_commit_is_said_queued_when_stop_land
         stream = await sending
         assert [q["text"] for q in (await conversation_read(client, conversation))["queued"]] == ["Also say how many"]
         assert [e["type"] for e in stream][-3:] == ["queued", "chat_response", "run_finished"]  # and the answer (item 3)
+
+
+# PR 52's follow-up (the rule 1 recheck's B6-1 and C1; Harold: "Oldest check, follow-up"; S-2): a start of the queue's own
+# (after) takes only the oldest waiting message, checked in the admission's transaction. A later one was admitted, ahead of
+# the earlier, which then waited behind it.
+
+
+async def test_a_start_after_a_turn_takes_only_the_oldest_waiting_message(tmp_path):
+    async with started(tmp_path / "data") as client:
+        conversation = await named(client)
+        first = await send(client, conversation, "First?")
+        assert first[-1]["status"] == "succeeded"
+        await background_idle(client)
+        older = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Older 中文一"})).json()
+        newer = (await client.post(f"/api/conversations/{conversation}/queue", json={"content": "Newer 中文二"})).json()
+        after = {"after": first[0]["run_id"]}
+        refused = await client.post(f"/api/conversations/{conversation}/queue/{newer['id']}/send", json=after)
+        assert refused.status_code == 409 and refused.json()["code"] == "not_oldest", (refused.status_code, refused.text)
+        read = await conversation_read(client, conversation)
+        assert [t["status"] for t in read["turns"]] == ["succeeded"]
+        assert [q["id"] for q in read["queued"]] == [older["id"], newer["id"]]  # both still waiting, in order
+        started_turn = await client.post(f"/api/conversations/{conversation}/queue/{older['id']}/send", json=after)
+        assert started_turn.status_code == 200 and events(started_turn)[-1]["status"] == "succeeded"
+        read = await conversation_read(client, conversation)
+        assert [q["id"] for q in read["queued"]] == [newer["id"]]
+        sent = await client.post(f"/api/conversations/{conversation}/queue/{newer['id']}/send", json={})  # Send: any
+        assert sent.status_code == 200 and events(sent)[-1]["status"] == "succeeded"
+        await background_idle(client)
+
+
+# PR 52's follow-up, item 3 (cycle 5 B3, the third cycle of committed bookkeeping and its stream publication, after
+# cycle 4's G5; design review P's Option B, pending Harold's word under rule 10): what a turn's record says it read and
+# noticed is said on its stream from the record itself, read in the receipt's and every terminal transaction (_owed),
+# once each (ActiveRun.said), before its run_finished. A note a cleanup recorded as read was never said read.
+
+
+def _two_steps(cost=None):
+    """A turn of two agent steps, each held at the provider until opened: (provider, first gate, second gate)."""
+    first, second = Gate(0), Gate(1)
+    provider = Scripted(None, None, **({"cost": cost} if cost is not None else {}))
+    provider.script[0] = first.wrap(provider, {"calls": [call("list_materials")]})
+    provider.script[1] = second.wrap(provider, "Done.")
+    return provider, first, second
+
+
+def _said_before_the_end(stream, event):
+    assert stream.count(event) == 1, stream
+    assert stream.index(event) < len(stream) - 1 and stream[-1]["type"] == "run_finished", stream
+
+
+async def test_a_note_carried_by_a_request_stop_cut_off_is_said_read_before_the_run_ends(tmp_path):
+    provider, first, second = _two_steps()
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await first.reached.wait()
+        run_id = await running_run(client, conversation)
+        seq = (await steer(client, run_id, "Only the ones from 2020")).json()["steering"]["seq"]
+        first.open.set()
+        await second.reached.wait()  # the request carrying the note is at the provider
+        await client.post(f"/api/runs/{run_id}/cancel")
+        second.open.set()
+        stream = await sending
+        assert stream[-1]["status"] == "cancelled"
+        assert [n["state"] for n in (await conversation_read(client, conversation))["turns"][-1]["steering"]] == ["read"]
+        _said_before_the_end(stream, {"type": "steering_note", "read": [seq]})
+
+
+async def test_a_note_and_notices_whose_receipt_failed_are_said_by_the_cleanup_that_recorded_them(tmp_path, monkeypatch):
+    # The second step's receipt fails once; the turn's cleanup records its call (the note read, the 50% notice reached)
+    from backend import runs
+    from backend.db import new_id, utc_now
+    provider, first, second = _two_steps(cost=0.01)
+    real, calls = runs._settle_attempts, []
+
+    def failing_once(*args):
+        calls.append(1)
+        if len(calls) == 2:  # the second step's receipt
+            raise RuntimeError("the receipt's write failed")
+        return real(*args)
+    monkeypatch.setattr(runs, "_settle_attempts", failing_once)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        project = (await conversation_read(client, conversation))["project_id"]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: (conn.execute(
+            "UPDATE conversations SET budget_usd = 1 WHERE id = ?", (conversation,)), conn.execute(
+            "INSERT INTO budget_reservations (id, step_seq, paying_conversation_id, project_id, estimate_usd, status,"
+            " settled_usd, basis, settled_at) VALUES (?, 0, ?, ?, 0.485, 'settled', 0.485, 'reported', ?)",
+            (new_id(), conversation, project, utc_now()))))
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await first.reached.wait()
+        run_id = await running_run(client, conversation)
+        seq = (await steer(client, run_id, "Only the ones from 2020")).json()["steering"]["seq"]
+        first.open.set()
+        second.open.set()
+        stream = await sending
+        assert stream[-1]["status"] == "failed" and len(calls) == 3
+        assert [n["state"] for n in (await conversation_read(client, conversation))["turns"][-1]["steering"]] == ["read"]
+        _said_before_the_end(stream, {"type": "steering_note", "read": [seq]})
+        [notice] = [e for e in stream if e["type"] == "budget"]  # 0.505 of $1: the conversation's 50%, said once
+        assert (notice["budget"], notice["percent"]) == ("conversation", 50)
+        _said_before_the_end(stream, notice)
+
+
+async def test_a_turns_reads_and_notices_are_said_once_each_though_every_later_transaction_reads_them_again(tmp_path):
+    provider, first, second = _two_steps(cost=0.3)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = 1 WHERE id = ?", (conversation,)))
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await first.reached.wait()
+        run_id = await running_run(client, conversation)
+        seq = (await steer(client, run_id, "Only the ones from 2020")).json()["steering"]["seq"]
+        first.open.set()
+        second.open.set()
+        stream = await sending
+        assert stream[-1]["status"] == "succeeded"
+        _said_before_the_end(stream, {"type": "steering_note", "read": [seq]})
+        shown = [(e["budget"], e["percent"]) for e in stream if e["type"] == "budget"]
+        assert shown == [("conversation", 50)]  # $0.60 of $1 after the second step, said by its receipt only
+        await background_idle(client)
+
+
+@pytest.mark.parametrize("ending", ["succeeded", "stopped", "not_now", "failed"])
+async def test_every_ending_says_what_its_record_owes_the_stream_before_its_run_finished(tmp_path, monkeypatch, ending):
+    # Each read of what the record owes (the receipt's, and the terminal write's) is said, and before run_finished:
+    # a marker is owed at each read here, whatever the turn's ending.
+    from backend import runs
+    real, reads = runs._owed, []
+
+    def owed(conn, active):
+        found = real(conn, active)
+        if active is not None and active.kind == "turn":
+            reads.append(len(reads))
+            found = [*found, ({"type": "owed", "read": reads[-1]}, {("owed", reads[-1])})]
+        return found
+    monkeypatch.setattr(runs, "_owed", owed)
+    provider = MockProvider((500, {"error": {"message": "down"}})) if ending == "failed" else MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await named(client)
+        if ending in ("stopped", "not_now"):  # waiting on a step ask: the conversation's budget is less than the step
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                "UPDATE conversations SET budget_usd = 0.001 WHERE id = ?", (conversation,)))
+            from test_agent_loop import asked
+            sending = asyncio.create_task(send(client, conversation, "Short?"))
+            ask = await asked(client, conversation)
+            if ending == "stopped":
+                await client.post(f"/api/runs/{ask['run_id']}/cancel")
+            else:
+                await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "not_now"})
+            stream = await sending
+        else:
+            stream = await send(client, conversation, "Short?")
+        assert stream[-1]["type"] == "run_finished"
+        assert {"succeeded": "succeeded", "stopped": "cancelled", "not_now": "cancelled", "failed": "failed"}[ending] == \
+            stream[-1]["status"]
+        said = [e["read"] for e in stream if e["type"] == "owed"]
+        assert reads and said == reads, (said, reads)  # every read said once, all before the run's end
+        await background_idle(client)
+
+
+async def test_a_turns_budget_and_steering_note_events_are_built_only_from_its_record():
+    # Design review P's static check: no other site says these, so none can say less than the record
+    import inspect
+    from backend import runs
+    source, owed = inspect.getsource(runs), inspect.getsource(runs._owed)
+    for kind in ('"type": "budget"', '"type": "steering_note"'):
+        assert source.count(kind) == owed.count(kind) == 1, kind
+    assert "notes" not in inspect.signature(runs.Harness._call).parameters

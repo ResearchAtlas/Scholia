@@ -6,11 +6,12 @@ import { errorText, money } from './text.js';
 import { LanguageContext, useT } from './i18n/index.js';
 
 // A failure's text; S1-33: a budget limit too low for its step says the least it needs, rounded up to the cent so
-// typing it fits (PR 52 cycle 2).
+// typing it fits (PR 52 cycle 2), unless it is too large for cents (PR 52's follow-up: never Infinity).
 export function problemText(t, error, language) {
   if (!(error instanceof ApiError)) return errorText(t, 'internal');
   if (error.neededUsd !== undefined) {
-    return t('errors.limitNeeded', { needed: money(Math.ceil(error.neededUsd * 100 - 1e-9) / 100, language) });
+    const cents = Math.ceil(error.neededUsd * 100 - 1e-9) / 100;
+    return t('errors.limitNeeded', { needed: money(Number.isFinite(cents) ? cents : error.neededUsd, language) });
   }
   return errorText(t, error.code);
 }

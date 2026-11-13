@@ -798,12 +798,15 @@ test('a steer whose turn had ended waits queued and starts only as any waiting m
   assert.match(followUp, /\n\s*if \(sent\.queued\) drain\(id\);/);
 });
 
-test('a budget ask whose project budget could not be read says so, never that the budget is $0 (E4), in both catalogs', () => {
+// PR 52's follow-up: E4's rule for the personal file too, whose default conversation budget the ask names instead.
+test('a budget ask whose budget could not be read says so, never that the budget is $0 (E4), in both catalogs', () => {
   const ask = readFileSync(fileURLToPath(new URL('../src/components/Ask.jsx', import.meta.url)), 'utf8');
-  assert.match(ask, /budget\?\.unread \? t\('ask\.budget\.unread'\)/);
+  assert.match(ask, /budget\?\.unread \? t\(budget\.budget === 'conversation' \? 'ask\.budget\.unreadConversation' : 'ask\.budget\.unread'\)/);
   for (const language of ['en', 'zh-CN']) {
     const catalog = JSON.parse(readFileSync(fileURLToPath(new URL(`../src/i18n/${language}.json`, import.meta.url)), 'utf8'));
-    assert.ok(catalog['ask.budget.unread'] && !/\{limit\}/.test(catalog['ask.budget.unread']), language);
+    for (const key of ['ask.budget.unread', 'ask.budget.unreadConversation']) {
+      assert.ok(catalog[key] && !/\{limit\}/.test(catalog[key]), `${language} ${key}`);
+    }
   }
 });
 
@@ -1000,4 +1003,120 @@ test('a seeded random matrix of sends, steers, Sends, edits, removals, refusals,
     found.push(...(await trial(seed, (fetch) => { current = fetch; })).map((problem) => `seed ${seed}: ${problem}`));
   }
   assert.deepEqual(found.slice(0, 10), []);
+});
+
+// PR 52's follow-up (cycle 5 A-F2, the first review's C-F3; design review V's Option 1, Harold's decision of
+// 2026-11-13): a budget's limit is at most $1,000,000 and at least a billionth of a dollar, so a share never overflows
+// and the bar names the budget with the higher share: $3,000,000 settled against $10 and $5 is the project's.
+test('the bar names the budget with the higher share at the largest spends and limits an amount can be (A-F2, C-F3)', () => {
+  const spend = (settled, conversation, project) => ({
+    conversation: { limit_usd: conversation, settled_usd: settled, open_usd: 0, own: true },
+    project: { limit_usd: project, settled_usd: settled, open_usd: 0 }, notice_percents: [50, 85, 90] });
+  const bar = budgetBar(spend(3e6, 10, 5));
+  assert.deepEqual([bar.budget, bar.limit, bar.meter], ['project', 5, 100]);
+  assert.ok(Number.isFinite(bar.percent), JSON.stringify(bar));
+  assert.equal(budgetBar(spend(59000, 1e6, 1e6)), null); // 5.9%: below the lowest notice percent
+  const near = budgetBar(spend(940000, 1e6, 1e6));
+  assert.ok(Math.abs(near.percent - 94) < 1e-9 && near.meter === 94, JSON.stringify(near));
+  assert.equal(budgetBar(spend(3e6, 1e-9, 1e6)).budget, 'conversation'); // the smallest limit, still a finite share
+});
+
+// PR 52's follow-up (cycle 5 C3; SPEC:415, F4): the view's conversation read, taken from its source and run with what it
+// closes over stood in for. An older read answering after a queue edit's or removal's newer one was shown over it,
+// putting the removed or old text back on screen; only the newest read asked is shown, as the asks' are.
+test('an older conversation read answering late never restores a waiting message edited or removed since (C3)', async () => {
+  const { newest, readGuard } = await import('../src/library.js');
+  const source = VIEW();
+  const start = source.indexOf('const load = useCallback(async () => {');
+  let end = source.indexOf('{', start);
+  for (let depth = 0; ; end += 1) {
+    depth += source[end] === '{' ? 1 : source[end] === '}' ? -1 : 0;
+    if (depth === 0) break;
+  }
+  const body = source.slice(source.indexOf('async () =>', start), end + 1);
+  for (const [label, after] of [['removed', []], ['edited', [{ id: 'q1', text: 'Edited 中文' }]]]) {
+    const reads = [];
+    const shown = { queued: null };
+    const env = { id: 'c-c3', guard: { current: readGuard() }, newestRead: newest(), markdownReady: async () => {},
+      get: () => new Promise((resolve) => reads.push(resolve)), setTurns: () => {},
+      setQueued: (queued) => { shown.queued = queued; }, setFailed: () => {}, setStale: () => {}, setReads: () => {} };
+    const load = new Function(...Object.keys(env), `return (${body});`)(...Object.values(env));
+    const older = load(); // asked before the edit or removal, held
+    const newer = load(); // the change's own read
+    await new Promise((resolve) => setImmediate(resolve));
+    reads[1]({ turns: [], queued: after });
+    await newer;
+    reads[0]({ turns: [], queued: [{ id: 'q1', text: 'Original 中文' }] });
+    await older;
+    assert.deepEqual(shown.queued, after, label);
+  }
+});
+
+// Fix batch 1, C-F1 (F7): the view's conversation read and its handoff effect, each taken from its source and run on a
+// clock of its own. A read was outstanding when the stream ended; the handoff's read began 50 ms into it, each read
+// answering 100 ms after it was asked. The older read, dropped as overtaken, still counted as a read done, which
+// started the handoff again, overtaking the read in flight: forty reads, none shown, the live turn never let go and
+// Send never shown. Only the newest read asked counts as done, so the handoff's read is shown and lets the turn go.
+test('a read dropped as older never starts the handoff again, so its newest read is shown and Send follows (C-F1)', async () => {
+  const { newest, readGuard } = await import('../src/library.js');
+  const source = VIEW();
+  const block = (from, opener) => { // the function source starting at `opener` after `from`, braces balanced
+    const start = source.indexOf(opener, source.indexOf(from));
+    let end = source.indexOf('{', start);
+    for (let depth = 0; ; end += 1) {
+      depth += source[end] === '{' ? 1 : source[end] === '}' ? -1 : 0;
+      if (depth === 0) break;
+    }
+    return source.slice(start, end + 1);
+  };
+  const loadBody = block('const load = useCallback(async () => {', 'async () =>');
+  const handoffBody = block('useEffect(() => {\n    if (!waiting) return undefined;', '() =>');
+  let now = 0;
+  const timers = new Map();
+  let next = 0;
+  const later = (fn, ms) => { next += 1; timers.set(next, { at: now + ms, fn }); return next; };
+  const shown = [];
+  let reads = 0;
+  let cleared = 0;
+  let asked = 0;
+  let cleanup = null;
+  const env = { id: 'c-cf1', guard: { current: readGuard() }, newestRead: newest(), markdownReady: async () => {},
+    get: () => { asked += 1; return new Promise((resolve) => later(() => resolve({ turns: [{ status: 'cancelled' }], queued: [{ id: 'q1', text: 'Next' }] }), 100)); },
+    setTurns: (turns) => shown.push(turns), setQueued: () => {}, setFailed: () => {}, setStale: () => {},
+    setReads: (f) => { const before = reads; reads = f(reads); if (reads !== before) rerun(); } };
+  const load = new Function(...Object.keys(env), `return (${loadBody});`)(...Object.values(env));
+  const handoff = new Function('waiting', 'handoff', 'failed', 'POLL_MS', 'load', 'clear', 'id', 'setTimeout', 'clearTimeout',
+    `return (${handoffBody});`);
+  function rerun() { // the effect's deps changed (reads): its cleanup, then the effect again, as React runs them
+    cleanup?.();
+    if (!cleared) cleanup = handoff(true, true, false, 2000, load, () => { cleared += 1; }, 'c-cf1', later, (t) => timers.delete(t))();
+  }
+  load(); // a read outstanding when the stream ends
+  later(rerun, 50); // the handoff begins 50 ms into it
+  while (!cleared && now < 5000 && timers.size) {
+    const [key, { at, fn }] = [...timers.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+    timers.delete(key);
+    now = at;
+    fn();
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.ok(cleared === 1 && shown.length >= 1, JSON.stringify({ asked, shown: shown.length, cleared, now }));
+  assert.ok(asked <= 3, `reads asked: ${asked}`);
+});
+
+// The internal review's F2 and the first review's C-F2 (design review V's Option 1, Harold's decision of 2026-11-13): a
+// needed limit is at most $1,000,000, so it is said rounded up to the cent, grouped, in both languages, and the backend
+// takes it typed back as said (tests/test_budgets.py).
+test('a limit too low for the step says the least it needs, rounded up to the cent, up to the most a limit can be (C-F2)', async () => {
+  const { ApiError } = await import('../src/api.js');
+  const { problemText } = await import('../src/action.js');
+  const { loadLanguage, makeT } = await import('../src/i18n/index.js');
+  await loadLanguage('zh-CN');
+  for (const [needed, en, zh] of [[999999.981, '$999,999.99', 'US$999,999.99'], [1e6, '$1,000,000.00', 'US$1,000,000.00'],
+    [1234.0500001, '$1,234.06', 'US$1,234.06'], [0.031, '$0.04', 'US$0.04']]) {
+    assert.ok(problemText(makeT('en'), new ApiError(400, 'limit_too_low', needed), 'en').includes(` ${en}.`), en);
+    assert.ok(problemText(makeT('zh-CN'), new ApiError(400, 'limit_too_low', needed), 'zh-CN').includes(` ${zh}。`), zh);
+  }
+  assert.equal(problemText(makeT('en'), new ApiError(400, 'limit_too_high'), 'en'), 'A budget can be at most $1,000,000.');
+  assert.equal(problemText(makeT('zh-CN'), new ApiError(400, 'limit_too_high'), 'zh-CN'), '预算最多为 US$1,000,000。');
 });

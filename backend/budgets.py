@@ -21,10 +21,10 @@ import re
 import unicodedata
 
 from backend import governance, openrouter, spending
-from backend.runs import _budget_unread, _budgets_now, _event
+from backend.runs import _budgets_now, _event, _limit_unread
 from backend.settings import PERSONAL, PROJECT, load_settings
 
-_EPSILON = 1e-9
+_EPSILON = 1e-9  # a tolerance for sums against a limit (as spending.reserve's), never whether an amount changed (_same)
 EVALUATION_ATTEMPTS = openrouter.MAX_ATTEMPTS  # the HTTP attempts one call may make, each charged if it goes out
 STOPS = ("stop", "not_now")
 
@@ -37,6 +37,11 @@ class Refused(Exception):
         self.code, self.message, self.needed_usd = code, message, needed_usd
 
 
+def _same(a, b):
+    """Whether two amounts are one as amounts are kept, to a billionth: $1e-9, the least limit, is a change from $0."""
+    return round(a, 9) == round(b, 9)
+
+
 def options(form):
     return ["continue", "stop"] if form == "cap" else ["go_ahead", "not_now"]
 
@@ -44,7 +49,7 @@ def options(form):
 def bound(conn, project_id, estimate):
     """A call's reservation: its estimate, or in the evaluation project the conservative bound, the estimate (the counted
     request and its whole output limit at the highest reachable rate) times the attempts one call may make."""
-    return round(estimate * EVALUATION_ATTEMPTS, 9) if evaluation(conn, project_id) else estimate
+    return spending.combined(estimate * EVALUATION_ATTEMPTS) if evaluation(conn, project_id) else estimate
 
 
 def evaluation(conn, project_id):
@@ -89,14 +94,16 @@ def spend(conn, data_dir, project_id, conversation_id=None):
         return None
     limits = _limits(conn, data_dir, project_id, conversation_id)
     settled, held = totals(conn, project_id=project_id)
-    unread = _budget_unread(load_settings(data_dir, project_id))  # no limit shown that its file does not give (E4)
+    unread = _limit_unread(conn, data_dir, "project", project_id)  # no limit shown that its file does not give (E4)
     found = {"project": {"limit_usd": None if unread else limits["project"][0], "settled_usd": settled, "open_usd": held,
                          **bases(conn, project_id=project_id)}, "conversation": None,
              "notice_percents": sorted(load_settings(data_dir).values["budget"]["notice_percents"])}
     if conversation_id is not None:
         settled, held = totals(conn, conversation_id=conversation_id)
         limit, own = limits["conversation"]
-        found["conversation"] = {"limit_usd": limit, "settled_usd": settled, "open_usd": held, "own": own,
+        unread = _limit_unread(conn, data_dir, "conversation", project_id, conversation_id)
+        found["conversation"] = {"limit_usd": None if unread else limit, "settled_usd": settled, "open_usd": held,
+                                 "own": own,
                                  **bases(conn, conversation_id=conversation_id)}
     return found
 
@@ -121,7 +128,7 @@ def notices(conn, run_id, data_dir):
         settled = totals(conn, **({"conversation_id": conversation_id} if budget == "conversation"
                                   else {"project_id": project_id}))[0]
         for percent in percents:
-            if settled * 100 < percent * limit - _EPSILON:
+            if 100 * (settled / limit) < percent - _EPSILON:  # a share, which no product of large amounts overflows
                 continue
             if budget == "project":
                 if [percent, limit] in noticed:
@@ -143,12 +150,20 @@ def notices(conn, run_id, data_dir):
 
 
 def _typed(text):
-    """A typed limit in dollars ("25", "$2.50", " 10 ", full-width digits too), or Refused."""
-    found = re.fullmatch(r"\s*(?:US\s*)?\$?\s*([0-9]+(?:\.[0-9]+)?)\s*", unicodedata.normalize("NFKC", text or ""))
-    value = float(found.group(1)) if found else math.nan
-    if not math.isfinite(value) or value <= 0:
+    """A typed limit in dollars ("25", "$2.50", " 10 ", full-width digits too, and grouped in thousands as the needed
+    text says it: "$1,234.05", "US$1,234.05"), or Refused."""
+    found = re.fullmatch(r"\s*(?:US\s*)?\$?\s*((?:[0-9]+|[1-9][0-9]{0,2}(?:,[0-9]{3})+)(?:\.[0-9]+)?)\s*",
+                         unicodedata.normalize("NFKC", text or ""))
+    value = round(float(found.group(1).replace(",", "")), 9) if found else math.nan  # digits past a float: inf
+    if math.isnan(value) or value <= 0:  # kept to a billionth, more than zero
         raise Refused("invalid_limit", "Type a budget in US dollars, more than zero")
-    return round(value, 9)
+    if value > spending.MAX_USD:
+        raise _too_high()
+    return value
+
+
+def _too_high():
+    return Refused("limit_too_high", f"A budget can be at most ${spending.MAX_USD:,.0f}")
 
 
 def _amount(conn, data_dir, budget, scope_id, current, default):
@@ -171,7 +186,7 @@ def _amount(conn, data_dir, budget, scope_id, current, default):
             " AND json_extract(e.data, '$.budget') = ? AND json_extract(e.data, '$.amount_usd') IS NOT NULL"
             " AND json_extract(e.data, '$.applied') = 1"
             " ORDER BY e.rowid DESC LIMIT 1", (scope_id, budget)).fetchone()
-    found = row[1] if row is not None and abs(row[0] - current) <= _EPSILON else current
+    found = row[1] if row is not None and _same(row[0], current) else current
     return found if found > 0 else default
 
 
@@ -196,6 +211,8 @@ def decide(conn, run_id, ask, option, text, data_dir):
                      default or PERSONAL[("budget", "conversation_usd")][0])
     if text is not None:
         typed = _typed(text)
+        if needed > spending.MAX_USD:  # no limit can cover this step (design review V): never a needed amount past it
+            raise _too_high()
         if typed + _EPSILON < needed:
             raise Refused("limit_too_low", f"This step needs a budget of at least ${needed:.2f}", needed)
         decision, wanted, amount = "set_limit", typed, typed
@@ -204,10 +221,12 @@ def decide(conn, run_id, ask, option, text, data_dir):
         wanted = {"continue": round(current + amount, 9), "go_ahead": max(current, needed)}.get(option, current)
     # An ask raised while the project's file did not give its budget (unread, PR 52 cycle 3, E4): only a typed limit
     # means anything; Continue and Go ahead have no amount to add to, so they apply nothing and the step is checked again
-    stale = abs(current - params["limit_usd"]) > _EPSILON or (bool(params.get("unread")) and text is None)
-    applied = not stale and decision not in STOPS and abs(wanted - current) > _EPSILON
+    stale = not _same(current, params["limit_usd"]) or (bool(params.get("unread")) and text is None)
+    applied = not stale and decision not in STOPS and not _same(wanted, current)
+    if applied and wanted > spending.MAX_USD:  # Continue or Go ahead past the most a limit can be: only Stop or Not now
+        raise _too_high()
     # what the records say the limit was: nothing when its file does not give it, never $0 (and no amount to add to)
-    known = None if budget == "project" and _budget_unread(load_settings(data_dir, project_id)) else current
+    known = None if _limit_unread(conn, data_dir, budget, project_id, conversation_id) else current
     amount = amount if known is not None or text is not None else None
     to = wanted if applied else known
     pending = applied and budget == "project"

@@ -19,6 +19,8 @@ import re
 import sys
 from dataclasses import asdict, dataclass
 
+from backend.spending import amount, combined
+
 AUTO = "auto"
 
 TASK_SIGNALS = {
@@ -106,15 +108,16 @@ def request_cost(rates, input_tokens: int, output_tokens: int) -> float:
     """A step's estimate (D3): its counted request and its whole output limit at the highest rates
     among the endpoints it can reach (backend/reach.py), plus any charge per request. The settled
     cost comes from the provider's reported usage."""
-    return round(input_tokens * rates["input"] + output_tokens * rates["output"] + rates["request"], 9)
+    return combined(input_tokens * rates["input"] + output_tokens * rates["output"] + rates["request"])
 
 
 def cost_from_usage(rates, usage: dict) -> float | None:
     """An estimate from reported token counts, at the step's rates, when the provider reported tokens
     but no cost; None when it reported neither, or a count no float can hold (as openrouter._count, so an attempt
-    whose record has no count is charged its estimate: PR 52 cycle 4)."""
+    whose record has no count is charged its estimate: PR 52 cycle 4), or counts that price it above what an amount
+    can be (design review V: no usable usage, so the call keeps its estimate)."""
     prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
     if not all(isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= sys.float_info.max
                for n in (prompt, completion)):
         return None
-    return request_cost(rates, prompt, completion)
+    return amount(prompt * rates["input"] + completion * rates["output"] + rates["request"])

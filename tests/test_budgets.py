@@ -567,6 +567,45 @@ async def test_set_a_new_limit_takes_a_typed_amount_that_fits_the_step(tmp_path)
         assert (decision["decision"], decision["to_usd"]) == ("set_limit", 2.5)
 
 
+@pytest.mark.parametrize("text, usd", [
+    ("$1,234.05", 1234.05), ("US$1,234.05", 1234.05), ("1,234", 1234.0), ("$999,999.99", 999999.99),
+    ("US$1,000,000.00", 1000000.0), ("＄１，２３４．０５", 1234.05), (" 25 ", 25.0), ("$2.50", 2.5)])
+def test_a_typed_limit_is_taken_as_the_needed_text_shows_amounts_grouped_in_thousands(text, usd):
+    # Design review V's adjacent finding: the needed text says amounts from $1,000 with grouping ("$1,234.05", in
+    # zh-CN "US$1,234.05"), and typing one exactly as shown was refused invalid_limit
+    from backend import budgets
+    assert budgets._typed(text) == usd
+
+
+@pytest.mark.parametrize("text", ["1,23", "12,3456", ",123", "1,,234", "1,234,5", "1.234,05", "1 234", "1,234.", "$,5",
+                                  "0,123", "00,123", "0.0000000001"])  # the internal review: never shown so, or $0
+def test_a_typed_limit_grouped_any_other_way_is_still_refused(text):
+    from backend import budgets
+    with pytest.raises(budgets.Refused) as refused:
+        budgets._typed(text)
+    assert refused.value.code == "invalid_limit"
+
+
+@pytest.mark.asyncio
+async def test_the_least_limit_a_step_needs_typed_back_as_the_interface_says_it_applies(tmp_path):
+    # The needed text's amount (frontend/src/action.js: rounded up to the cent, grouped in thousands, "$" in English and
+    # "US$" in Chinese), typed back exactly, applies; a cent less is refused with the same needed amount
+    import math
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client, budget=1000.0)
+        await _project_budget(client, project, 5000.0)
+        await _spent(client, project, 1234.0, conversation)
+        sending, ask = await _asking(client, conversation)
+        refused = await _answer(client, ask, text="1000.5")
+        assert (refused.status_code, refused.json()["code"]) == (400, "limit_too_low")
+        cents = math.ceil(refused.json()["needed_usd"] * 100 - 1e-9) / 100
+        less = await _answer(client, ask, text=f"${cents - 0.01:,.2f}")
+        assert (less.json()["code"], less.json()["needed_usd"]) == ("limit_too_low", refused.json()["needed_usd"])
+        answered = await _answer(client, ask, text=f"US${cents:,.2f}")
+        assert answered.json()["budget"] == {"applied": True, "budget": "conversation", "limit_usd": cents}
+        assert (await sending)[-1]["status"] == "succeeded"
+
+
 @pytest.mark.asyncio
 async def test_two_conversations_admitting_075_against_1_left_one_is_admitted_and_one_asks(tmp_path):
     # SPEC:1197 end to end: two turns, each a $0.75 step, against $1 left of the project's budget.
@@ -1985,3 +2024,653 @@ async def test_a_queued_message_admitted_after_a_tightening_is_built_under_the_n
         if sent.status_code == 200:  # admitted, and refused a route under the new policy
             from scholia_app import events
             assert events(sent)[-1]["status"] != "succeeded"
+
+
+# PR 52's follow-up, design review V's Option 1 (rule 2, very large values: the first review's A-F1, C-F2, C-F3 and the
+# cycles before): an amount is $0 to spending.MAX_USD, $1,000,000. A value from outside above it is not an amount, so a
+# single reported cost above it is an invalid report, counted at the estimate and marked estimated, and a limit above it
+# is refused where it enters (the settings files, a typed limit, an answer that would raise one past it). One computed
+# record (a step's estimate, a call's attempts) is held at the most; every sum of amounts stays far below what a float
+# holds, so its cents are exact.
+
+MAX = 1_000_000.0
+BIG = 1.7e308  # a float, and no amount
+
+
+def test_no_value_past_the_most_an_amount_can_be_is_one_and_one_computed_record_is_held_there(db):
+    # A-F1's values cannot enter: a spend at what a float holds, a limit just below it, an estimate of 1.7e308
+    import math
+    import sys
+    from backend import budget_router
+    assert spending.MAX_USD == MAX and spending.amount(MAX) == MAX
+    for value in (MAX + 0.01, 2e6, BIG, sys.float_info.max, math.nextafter(sys.float_info.max, 0)):
+        assert spending.amount(value) is None, value
+    project = add_project(db)
+    conversation, run = add_turn(db, project)
+    with pytest.raises(ValueError):
+        reserve(db, project, conversation, run, BIG, project_budget=None, conversation_budget=None)
+    assert spending.combined(BIG + BIG) == MAX and spending.combined(0.1 + 0.2) == 0.3
+    assert budget_router.request_cost({"input": BIG, "output": BIG, "request": 0.0}, 10, 10) == MAX
+    assert budget_router.cost_from_usage({"input": 1.0, "output": 0.0, "request": 0.0},
+                                         {"prompt_tokens": 10 ** 300, "completion_tokens": 0}) is None
+    assert budget_router.cost_from_usage({"input": 0.5, "output": 0.0, "request": 0.0},
+                                         {"prompt_tokens": 2_000_000, "completion_tokens": 0}) == MAX
+
+
+def test_sums_of_amounts_at_the_most_are_exact_and_a_spend_past_a_limit_fits_no_step(db):
+    from backend import budgets
+    from backend.runs import _accounting
+    project = add_project(db)
+    conversation, run = add_turn(db, project)
+    for step in (0, 1, 2):
+        reservation = reserve(db, project, conversation, run, 0.01, step=step, project_budget=None, conversation_budget=None)
+        db.write(lambda conn: spending.settle(conn, reservation, MAX))
+    reserve(db, project, None, add_turn(db, project)[1], MAX, project_budget=None)  # open, at its estimate
+    assert project_spent(db, project) == 4 * MAX
+    assert db.read(lambda conn: spending.spent(conn, conversation_id=conversation)) == 3 * MAX
+    assert db.read(lambda conn: spending.run_cost(conn, run)) == 3 * MAX
+    assert db.read(lambda conn: _accounting(conn, run))["reported_usd"] == 3 * MAX
+    assert db.read(lambda conn: budgets.totals(conn, project_id=project)) == (3 * MAX, MAX)
+    assert db.read(lambda conn: budgets.bases(conn, project_id=project))["reported_usd"] == 3 * MAX
+    with pytest.raises(spending.BudgetExceeded):
+        reserve(db, project, conversation, run, 0.01, step=3, project_budget=None, conversation_budget=MAX)
+
+
+@pytest.mark.parametrize("already, estimate", [(999999.5, 0.4), (123456.789123456, 0.75), (500000.0, 500000.0),
+                                               (999999.999999999, 0.000000001), (0.0, MAX)])
+def test_the_limit_go_ahead_sets_admits_its_step_at_any_spend_within_the_most(db, already, estimate):
+    # A6 (the internal review's F1): Go ahead sets the limit to what the step needs, summed as budgets.decide sums it;
+    # admission sums spend and estimate the same way, so that limit admits the step, never asks again
+    project = add_project(db)
+    conversation, run = add_turn(db, project)
+    if already:
+        reserve(db, project, conversation, run, already, project_budget=None, conversation_budget=None)
+    spent = db.read(lambda conn: spending.spent(conn, conversation_id=conversation))
+    needed = round(spent + spending.amount(estimate), 9)
+    assert needed <= MAX
+    assert reserve(db, project, conversation, run, estimate, step=1, project_budget=None, conversation_budget=needed)
+
+
+def test_the_limit_go_ahead_sets_admits_a_step_and_its_judges_share_reserved_together_within_the_most(db):
+    # The recheck's F1-residual (pre-existing at 87371d7): an answer step reserves its request and its judge's share in
+    # one transaction; Go ahead's limit is spent + (request + share), the rows sum as (spent + request) + share. Within
+    # the most a limit can be, the step is always admitted.
+    import random
+    rng = random.Random(7)
+    cases = [((333619.774470715,), 4.363519406, 7.995511916)] + [
+        (tuple(round(rng.uniform(0, 333333) / 10 ** rng.choice([0, 0, 1, 3]), 9) for _ in range(3)),
+         round(rng.uniform(0.000000001, 9), 9), round(rng.uniform(0.000000001, 9), 9)) for _ in range(500)]
+    for rows, request, share in cases:
+        project = add_project(db)
+        conversation, run = add_turn(db, project)
+        for step, usd in enumerate(rows):
+            reserve(db, project, conversation, run, usd, project_budget=None, conversation_budget=None, step=step)
+        spent = db.read(lambda conn: spending.spent(conn, conversation_id=conversation))
+        needed = round(spent + round(request + share, 9), 9)  # as budgets.decide sets it
+
+        def both(conn):
+            for usd in (request, share):
+                spending.reserve(conn, run_id=run, step_seq=9, project_id=project, paying_conversation_id=conversation,
+                                 estimate_usd=usd, project_budget_usd=None, conversation_budget_usd=needed)
+        db.write(both)  # never BudgetExceeded
+
+
+def test_a_calls_attempts_settle_as_reported_up_to_the_most_and_an_attempt_reporting_more_counts_its_estimate(db):
+    # SPEC:425: two attempts of $1,000,000 settle as reported at the most (one call's record); two that each reported
+    # 1.7e308 reported no amount, so the call settles at its estimate, marked estimated, as for any invalid report
+    from backend.openrouter import Attempt, ModelResult
+    from backend.runs import _settle_attempts
+    project = add_project(db)
+    conversation, run = add_turn(db, project)
+    free = {"input": 0, "output": 0, "request": 0}
+    reservation = reserve(db, project, conversation, run, 0.04, project_budget=None, conversation_budget=None)
+    attempts = [Attempt("request", 400, 5, {"cost": MAX}), Attempt("ok", 200, 5, {"cost": MAX})]
+    db.write(lambda conn: _settle_attempts(conn, reservation, free, attempts))
+    assert row(db, reservation)[2:] == ("settled", MAX, "reported")
+    assert ModelResult("Hi.", None, None, attempts).reported_cost == MAX
+    over = reserve(db, project, conversation, run, 0.04, step=1, project_budget=None, conversation_budget=None)
+    attempts = [Attempt("request", 400, 5, {"cost": BIG}), Attempt("ok", 200, 5, {"cost": BIG})]
+    db.write(lambda conn: _settle_attempts(conn, over, free, attempts))
+    assert row(db, over)[2:] == ("settled", 0.04, "estimated")
+    assert ModelResult("Hi.", None, None, attempts).reported_cost is None
+    counted = [Attempt("ok", 200, 5, {"prompt_tokens": 10 ** 300, "completion_tokens": 0})]  # tokens priced past it
+    other = reserve(db, project, conversation, run, 0.04, step=2, project_budget=None, conversation_budget=None)
+    db.write(lambda conn: _settle_attempts(conn, other, {"input": 1e10, "output": 0, "request": 0}, counted))
+    assert row(db, other)[2:] == ("settled", 0.04, "estimated")
+
+
+@pytest.mark.asyncio
+async def test_spend_answers_with_exact_totals_when_its_settled_calls_sum_past_the_most_one_can_be(tmp_path):
+    # N3 (two settled calls of 1.7e308 made GET /spend answer 500): three of $1,000,000 give $3,000,000, and the limits
+    # it gives are those an amount can be
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client, budget=10.0)
+        await _project_budget(client, project, 5.0)
+        for _ in range(3):
+            await _spent(client, project, MAX, conversation)
+        response = await client.get(f"/api/projects/{project}/spend", params={"conversation_id": conversation})
+        assert response.status_code == 200, response.text
+        for budget, limit in (("project", 5.0), ("conversation", 10.0)):
+            assert {k: response.json()[budget][k] for k in ("limit_usd", "settled_usd", "reported_usd")} == {
+                "limit_usd": limit, "settled_usd": 3 * MAX, "reported_usd": 3 * MAX}
+
+
+@pytest.mark.parametrize("schema, key", [("project", "project.budget_usd"), ("personal", "budget.conversation_usd")])
+def test_a_settings_budget_outside_a_billionth_to_the_most_is_refused_and_one_written_by_hand_is_unread(
+        tmp_path, schema, key):
+    # C-F3's limits cannot enter from a settings file: the Settings page's "A setting is not valid." (400)
+    from backend.runs import _budget_unread
+    from backend.settings import load_settings
+    project_id = "p" if schema == "project" else None
+    table, name = key.split(".")
+    for bad in (MAX + 0.01, 1e9, BIG, 1e-10):
+        with pytest.raises(ValueError):
+            load_settings(tmp_path, project_id).save({key: bad})
+    for good in (MAX, 1e-9, 25):
+        load_settings(tmp_path, project_id).save({key: good})
+    path = tmp_path / ("projects/p/config.toml" if project_id else "config.toml")
+    path.write_text(f"[{table}]\n{name} = 2000000.0\n")
+    assert _budget_unread(load_settings(tmp_path, project_id), table, name)  # E4's: no room, the ask says so
+
+
+@pytest.mark.asyncio
+async def test_notices_follow_the_share_of_a_limit_at_the_most(tmp_path):
+    # N2, SPEC:421: 59,000 of $1,000,000 is 5.9%: no notice; 940,000 is 94%: each budget's three, once
+    from scholia_app import MockProvider, background_idle, send
+    async with await _app(tmp_path, MockProvider(cost=0.002)) as client:
+        conversation, project = await _conversation(client, budget=MAX)
+        await _project_budget(client, project, MAX)
+        await _spent(client, project, 59000.0, conversation)
+        stream = await send(client, conversation, "Short?")
+        assert stream[-1]["status"] == "succeeded"
+        await background_idle(client)  # its memory extraction settles against the project too
+        assert [e for e in stream if e["type"] == "budget"] == []
+        assert await _rows(client, "SELECT count(*) FROM run_events WHERE type = 'budget_notice'") == [(0,)]
+        await _spent(client, project, 881000.0, conversation)
+        stream = await send(client, conversation, "Again?")
+        assert sorted((e["budget"], e["percent"]) for e in stream if e["type"] == "budget") == [
+            (budget, percent) for budget in ("conversation", "project") for percent in (50, 85, 90)]
+
+
+@pytest.mark.asyncio
+async def test_at_the_most_a_limit_can_be_only_stop_ends_the_cap_ask_and_nothing_raises_a_limit_past_it(tmp_path):
+    # A5, A7 at the bound: the project at $1,000,000 past its cap. Continue would add $1,000,000 again, and any limit
+    # that covers the step is past the most: each is refused with the new text and no needed amount, nothing changes,
+    # and Stop ends the turn at its limit
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, MAX)
+        await _spent(client, project, MAX, conversation)
+        sending, ask = await _asking(client, conversation)
+        assert (ask["params"]["form"], ask["params"]["budget"]) == ("cap", "project")
+        for body in ({"option": "continue"}, {"text": "1000000.01"}, {"text": "2000000"}, {"text": "1000000"},
+                     {"text": "US$1,000,000.00"}, {"text": "1" * 400}):  # the internal review: digits past a float too
+            refused = await _answer(client, ask, **body)
+            assert (refused.status_code, refused.json()["code"]) == (400, "limit_too_high"), body
+            assert "needed_usd" not in refused.json()
+        assert await _project_budget(client, project) == MAX and await _decisions(client, ask["run_id"]) == []
+        assert (await _answer(client, ask, option="stop")).status_code == 200
+        assert [(e["type"], e.get("status")) for e in await sending][-1] == ("run_finished", "cancelled")
+        assert await _project_budget(client, project) == MAX
+
+
+@pytest.mark.asyncio
+async def test_a_step_needing_more_than_the_most_says_no_needed_amount_and_go_ahead_is_refused(tmp_path):
+    # C-F2: a step needing 46847608461976.055 had its needed text say a cent too little, so the amount typed as said was
+    # refused again. Such a spend is stored only from before the bound (stored values are not checked again on read):
+    # no limit can cover the step, so a typed limit is refused with no needed amount. And a step ask whose Go ahead
+    # would set a limit past the most is refused too; Not now ends it.
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, MAX)
+        await _spent(client, project, 46847608461976.05, conversation)
+        sending, ask = await _asking(client, conversation)
+        for text in ("46847608461976.06", "999999"):
+            refused = await _answer(client, ask, text=text)
+            assert (refused.status_code, refused.json()["code"], "needed_usd" in refused.json()) == (
+                400, "limit_too_high", False), text
+        assert (await _answer(client, ask, option="stop")).status_code == 200
+        await sending
+    (tmp_path / "step").mkdir()
+    async with await _app(tmp_path / "step") as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, MAX)
+        await _spent(client, project, MAX - 0.01, conversation)
+        sending, ask = await _asking(client, conversation)
+        assert (ask["params"]["form"], ask["params"]["budget"]) == ("step", "project")
+        for body in ({"option": "go_ahead"}, {"text": "999999.99"}):
+            refused = await _answer(client, ask, **body)
+            assert (refused.status_code, refused.json()["code"], "needed_usd" in refused.json()) == (
+                400, "limit_too_high", False), body
+        assert (await _answer(client, ask, option="not_now")).status_code == 200
+        assert [(e["type"], e.get("status")) for e in await sending][-1] == ("run_finished", "cancelled")
+
+
+@pytest.mark.asyncio
+async def test_the_least_limit_a_step_needs_just_under_the_most_typed_back_as_said_applies_and_a_cent_less_does_not(
+        tmp_path):
+    # C-F2 in range: the needed amount, as the interface says it in English and in Chinese (rounded up to the cent and
+    # grouped), typed back applies; a cent less is refused with the same needed amount
+    import math
+    async with await _app(tmp_path) as client:
+        for shown in ("${:,.2f}", "US${:,.2f}"):
+            conversation, project = await _conversation(client, budget=999990.0)
+            await _project_budget(client, project, MAX)
+            await _spent(client, project, 999998.5, conversation)
+            sending, ask = await _asking(client, conversation)
+            refused = await _answer(client, ask, text="999990.5")
+            needed = refused.json()["needed_usd"]
+            assert refused.json()["code"] == "limit_too_low" and needed <= MAX
+            cents = math.ceil(needed * 100 - 1e-9) / 100
+            less = await _answer(client, ask, text=shown.format(cents - 0.01))
+            assert (less.json()["code"], less.json()["needed_usd"]) == ("limit_too_low", needed)
+            answered = await _answer(client, ask, text=shown.format(cents))
+            assert answered.json()["budget"]["limit_usd"] == cents, answered.text
+            assert (await sending)[-1]["status"] == "succeeded"
+            await _project_budget(client, project, 50.0)  # back to the General project's own room for the next pass
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                "DELETE FROM budget_reservations WHERE project_id = ?", (project,)))
+
+
+# PR 52's follow-up (cycle 5 B2; SPEC:672, SPEC:732, A9, G9): a run whose terminal write failed is no longer held by this
+# process, though its row still says running and waiting on its ask: it reads interrupted, and so does its ask, which no
+# answer can apply. Continue applied ($0 to $10 for a conversation, $1 to $2 for a project).
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending, budget", [("stop", "conversation"), ("stop", "project"), ("closed", "conversation")])
+async def test_a_budget_ask_whose_run_ended_without_its_terminal_write_is_closed_and_changes_no_limit(
+        tmp_path, monkeypatch, ending, budget):
+    import contextlib
+    from backend import runs
+    from test_agent_loop import asked
+    async with await _app(tmp_path) as client:
+        harness = client.state["harness"]
+        conversation, project = await _conversation(client, budget=0 if budget == "conversation" else None)
+        if budget == "project":
+            await _project_budget(client, project, 1.0)
+            await _spent(client, project, 1.0)
+        claim = await harness.admit_turn(conversation, "Short?")
+
+        async def read():
+            return [event async for event in harness.events(claim)]
+        reader = asyncio.create_task(read())
+        ask = await asked(client, conversation)
+        assert (ask["params"]["form"], ask["params"]["budget"]) == ("cap", budget)
+        real = runs._close_asks
+
+        def failing(conn, run_id):
+            raise RuntimeError("the terminal write failed")
+        monkeypatch.setattr(runs, "_close_asks", failing)
+        if ending == "stop":
+            await client.post(f"/api/runs/{claim.run_id}/cancel")
+        else:
+            reader.cancel()  # its window went: the closed stream stops the turn
+        await asyncio.wait({claim.task, reader})
+        with contextlib.suppress(BaseException):
+            claim.task.result()
+        monkeypatch.setattr(runs, "_close_asks", real)  # restored once its run is let go
+        assert claim.run_id not in harness.registry.runs
+        assert await _rows(client, "SELECT status, waiting FROM runs WHERE id = ?", claim.run_id) == [("running", "ask")]
+        turn = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1]
+        assert turn["status"] == "interrupted"
+        answered = await _answer(client, ask, option="continue")
+        assert await _own_budget(client, conversation) == (0 if budget == "conversation" else None)
+        assert await _project_budget(client, project) == (1.0 if budget == "project" else 50)
+        assert (answered.status_code, answered.json()["code"]) == (409, "ask_closed")
+        assert await _decisions(client, claim.run_id) == []
+        assert (await client.get("/api/asks", params={"conversation_id": conversation})).json()["asks"] == []
+
+
+# Fix batch 1, A-F3 (Harold, 2026-10-21: nothing is admitted against a budget its file does not give, so each step asks;
+# 2026-11-12 (3) for the personal default): such a budget is read as $0, and a step whose route publishes zero prices
+# fitted it, so it went out with no ask. A budget of $0 (one used up already, G2, or one not read) admits nothing.
+
+_FREE = {"tag": "free", "context_length": 128000, "pricing": {"prompt": "0", "completion": "0"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["conversation", "project", "own zero"])
+async def test_a_step_that_costs_nothing_asks_while_its_budget_cannot_be_read_or_is_zero(tmp_path, budget):
+    from scholia_app import MockProvider
+    async with await _app(tmp_path, MockProvider(endpoints={budget_router_model(): [_FREE]})) as client:
+        conversation, project = await _conversation(client, budget=0 if budget == "own zero" else None)
+        if budget == "conversation":
+            personal = tmp_path / "data" / "config.toml"
+            personal.write_bytes(b'[budget]\nconversation_usd = "broken"\n' + personal.read_bytes())
+        elif budget == "project":
+            await _project_budget(client, project, 50.0)
+            _hand_set(tmp_path, project, '"broken"')
+        sending, ask = await _asking(client, conversation)
+        params = ask["params"]
+        assert (params["budget"], params["form"], params["estimate_usd"], params.get("unread")) == (
+            "project" if budget == "project" else "conversation", "cap", 0, None if budget == "own zero" else True)
+        assert client.provider.answers == []  # it never went out
+        assert (await _answer(client, ask, option="stop")).status_code == 200
+        assert [(e["type"], e.get("cancel_reason")) for e in await sending][-1] == ("run_finished", "limit")
+        assert client.provider.answers == []
+
+
+def test_a_background_call_that_costs_nothing_is_not_admitted_against_a_budget_of_zero(db):
+    # A10: a background run never asks; under a project budget its file does not give (read as $0) its call is refused
+    # as any other is, so a title ends failed and an extraction is skipped, whatever its route costs
+    project = add_project(db)
+    with pytest.raises(spending.BudgetExceeded):
+        reserve(db, project, None, add_turn(db, project)[1], 0.0, project_budget=0.0, conversation_budget=None)
+    assert reserve(db, project, None, add_turn(db, project)[1], 0.0, project_budget=1e-9, conversation_budget=None)
+
+
+# Cycle 2's A2-F1 and B-R2-F2 (Harold, 2026-11-13: an ordinary fix): whether an answer changes a limit is read as amounts
+# are kept, to a billionth, apart from the tolerance a sum is admitted with, so $1e-9 (the least limit, design review V)
+# is a change: a typed $0.000000001 on a step that costs nothing applies, and Continue on a limit of $1e-9 (or with a
+# default of $1e-9) adds it. The stale check, the amount Continue adds and the saved read-back compare the same way.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["conversation", "project", "own zero"])
+async def test_the_least_typed_limit_applies_to_a_step_that_costs_nothing(tmp_path, budget):
+    from scholia_app import MockProvider
+    async with await _app(tmp_path, MockProvider(endpoints={budget_router_model(): [_FREE]})) as client:
+        conversation, project = await _conversation(client, budget=0 if budget == "own zero" else None)
+        if budget == "conversation":  # the personal file gives no conversation budget (unread)
+            personal = tmp_path / "data" / "config.toml"
+            personal.write_bytes(b'[budget]\nconversation_usd = "broken"\n' + personal.read_bytes())
+        elif budget == "project":  # the project's file gives no budget (unread)
+            await _project_budget(client, project, 50.0)
+            _hand_set(tmp_path, project, '"broken"')
+        sending, ask = await _asking(client, conversation)
+        assert client.provider.answers == []
+        answered = (await _answer(client, ask, text="0.000000001")).json()["budget"]
+        assert (answered["applied"], answered["limit_usd"]) == (True, 1e-9)
+        stream = await asyncio.wait_for(sending, 20)
+        assert stream[-1]["status"] == "succeeded" and len(client.provider.answers) == 1
+        assert (await _project_budget(client, project) if budget == "project" else
+                await _own_budget(client, conversation)) == 1e-9
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["conversation", "project", "default"])
+async def test_continue_adds_the_least_amount_a_limit_can_be(tmp_path, budget):
+    from scholia_app import MockProvider
+    async with await _app(tmp_path, MockProvider(endpoints={budget_router_model(): [_FREE]})) as client:
+        conversation, project = await _conversation(client, budget={"conversation": 1e-9, "default": 0}.get(budget))
+        if budget == "default":  # the conversation's own $0, the personal default $1e-9: Continue adds the default
+            personal = tmp_path / "data" / "config.toml"
+            personal.write_bytes(b"[budget]\nconversation_usd = 1e-9\n" + personal.read_bytes())
+        else:  # a limit of $1e-9 with $3e-9 spent against it
+            if budget == "project":
+                await _project_budget(client, project, 1e-9)
+            await _spent(client, project, 3e-9, conversation if budget == "conversation" else None)
+        sending, ask = await _asking(client, conversation)
+        assert (ask["params"]["budget"], ask["params"]["form"]) == (
+            "project" if budget == "project" else "conversation", "cap")
+        answered = (await _answer(client, ask, option="continue")).json()["budget"]
+        wanted = 1e-9 if budget == "default" else 2e-9
+        assert (answered["applied"], answered["limit_usd"]) == (True, wanted)
+        stream = await asyncio.wait_for(sending, 20)
+        assert stream[-1]["status"] == "succeeded" and len(client.provider.answers) == 1
+        assert (await _project_budget(client, project) if budget == "project" else
+                await _own_budget(client, conversation)) == wanted
+
+
+@pytest.mark.asyncio
+async def test_whether_an_answer_changes_a_limit_is_read_to_a_billionth(tmp_path):
+    from scholia_app import MockProvider, background_idle, send
+    from backend import budgets
+    from backend.runs import _event
+    data = tmp_path / "data"
+    async with await _app(tmp_path, MockProvider(endpoints={budget_router_model(): [_FREE]})) as client:
+        conversation, project = await _conversation(client)
+        run_id = (await send(client, conversation, "Short?"))[0]["run_id"]
+        await background_idle(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "DELETE FROM budget_reservations WHERE paying_conversation_id = ?", (conversation,)))  # nothing spent
+
+        def decide(own, option=None, text=None, limit=None, estimate=0.0, earlier=None):
+            def go(conn):
+                conn.execute("UPDATE conversations SET budget_usd = ? WHERE id = ?", (own, conversation))
+                if earlier is not None:  # the conversation's last applied decision: (the limit it left, its amount)
+                    _event(conn, run_id, "budget_decision", {"budget": "conversation", "to_usd": earlier[0],
+                                                             "amount_usd": earlier[1], "applied": True})
+                ask = {"ask_id": new_id(), "project_id": project, "params": {
+                    "form": "cap", "budget": "conversation", "conversation_id": conversation,
+                    "limit_usd": own if limit is None else limit, "estimate_usd": estimate}}
+                found = budgets.decide(conn, run_id, ask, option, text, data)[0]
+                return found["applied"], found["limit_usd"]
+            return asyncio.to_thread(client.state["db"].write, go)
+        # an unchanged answer applies nothing, a float's last place included
+        assert await decide(0.1 + 0.2, text="0.3") == (False, 0.1 + 0.2)
+        assert await decide(1e-9, text="0.000000001") == (False, 1e-9)
+        assert await decide(5.0, option="go_ahead", estimate=1.0) == (False, 5.0)
+        # the limit changed by $1e-9 since the ask: stale, nothing applied (never Continue on the new limit)
+        assert await decide(2e-9, option="continue", limit=1e-9) == (False, 2e-9)
+        # the last decision left $1e-9 and the limit is $2e-9 now: Continue adds the limit itself, not that amount
+        assert await decide(2e-9, option="continue", earlier=(1e-9, 7e-9)) == (True, 4e-9)
+        assert await decide(1e-9, option="continue", earlier=(1e-9, 7e-9)) == (True, 8e-9)  # still what it left
+
+
+@pytest.mark.asyncio
+async def test_a_project_budget_not_saved_is_not_read_back_as_saved_when_it_differs_by_the_least_amount(
+        tmp_path, monkeypatch):
+    from backend import asks, settings
+    async with await _app(tmp_path) as client:
+        _, project = await _conversation(client)
+        await _project_budget(client, project, 1e-9)
+
+        def failing(self, updates, answer=False):
+            raise OSError("the disk is full")
+        monkeypatch.setattr(settings.Settings, "save", failing)
+        decided = {"project_id": project, "to_usd": 2e-9, "amount_usd": 1e-9}
+        assert asks._save_project_budget(tmp_path / "data", decided) is False
+        assert asks._save_project_budget(tmp_path / "data", {**decided, "to_usd": 1e-9}) is True  # what the file holds
+
+
+@pytest.mark.asyncio
+async def test_nothing_spent_of_the_least_limit_asks_about_the_step_not_the_cap(tmp_path):
+    # the cap is the settled spend and open reservations reaching the limit: $0 of $1e-9 has not
+    async with await _app(tmp_path) as client:
+        conversation, _ = await _conversation(client, budget=1e-9)
+        sending, ask = await _asking(client, conversation)
+        assert (ask["params"]["form"], ask["options"]) == ("step", ["go_ahead", "not_now"])
+        assert (await _answer(client, ask, option="not_now")).status_code == 200
+        await asyncio.wait_for(sending, 20)
+
+
+# PR 52's follow-up (Harold, 2026-11-12, the batch 3 readings' (3)): E4's rule for the personal config.toml. While it gives
+# no valid conversation budget, its loader's shipped $10 says nothing of what it holds: a conversation without a limit of
+# its own has no room, so each step asks and the ask says the budget could not be read (never that it is $0); Continue
+# and Go ahead apply nothing; a typed limit applies, the conversation's own from then on. One with its own limit is read
+# from the record, as before.
+
+PERSONAL_UNREAD = [b'budget = "broken"\n', b"[[budget]]\nconversation_usd = 2\n", b"[budget.conversation_usd]\ntoken = 1\n",
+                   b'[budget]\nconversation_usd = "ten"\n']  # a file not valid TOML gives no provider either: no turn runs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left", PERSONAL_UNREAD)
+async def test_while_the_personal_file_gives_no_conversation_budget_each_step_asks_and_only_a_typed_limit_applies(
+        tmp_path, left):
+    from scholia_app import send
+    from test_agent_loop import asked
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        own, _ = await _conversation(client, budget=2.0, title="Own")
+        personal = tmp_path / "data" / "config.toml"
+        personal.write_bytes(left + personal.read_bytes())  # before its providers table, which stays as it was
+        sending, ask = await _asking(client, conversation)
+        params = ask["params"]
+        assert (params["budget"], params["form"], params["limit_usd"], params.get("unread")) == (
+            "conversation", "cap", 0, True)
+        assert client.provider.answers == []  # the step never went out at the shipped default
+        spend = (await client.get(f"/api/projects/{project}/spend", params={"conversation_id": conversation})).json()
+        assert (spend["conversation"]["limit_usd"], spend["conversation"]["own"]) == (None, False)
+        assert (await _answer(client, ask, option="continue")).json()["budget"]["applied"] is False
+        [decided] = await _decisions(client, ask["run_id"])
+        assert (decided["from_usd"], decided["to_usd"], decided["amount_usd"], decided["applied"]) == (
+            None, None, None, False)  # unknown, never $0, and nothing to add to
+        again = await asked(client, conversation)
+        while again["ask_id"] == ask["ask_id"]:
+            assert not sending.done(), (await sending)[-1]
+            await asyncio.sleep(0.02)
+            again = await asked(client, conversation)
+        assert again["params"].get("unread") is True and client.provider.answers == []
+        answered = await _answer(client, again, text="3")
+        assert answered.json()["budget"] == {"applied": True, "budget": "conversation", "limit_usd": 3.0}
+        assert (await sending)[-1]["status"] == "succeeded"
+        assert await _own_budget(client, conversation) == 3.0
+        decided = (await _decisions(client, again["run_id"]))[-1]
+        assert (decided["decision"], decided["from_usd"], decided["to_usd"], decided["amount_usd"]) == (
+            "set_limit", None, 3.0, 3.0)
+        assert (await send(client, own, "Own?"))[-1]["status"] == "succeeded"  # its own limit, from the record
+        from backend import runs
+        assert (await asyncio.to_thread(runs._budgets_now, tmp_path / "data", project))[1] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_personal_file_not_valid_toml_gives_no_room_and_one_giving_its_budget_or_none_is_read_as_before(
+        tmp_path):
+    # The rule's edges: a file not valid TOML gives no room; one without the key, or with a problem elsewhere, gives the
+    # default as it always did
+    from backend import runs
+    async with await _app(tmp_path) as client:
+        _, project = await _conversation(client)
+        for raw, default in ((b"[budget\nconversation_usd = ", 0.0), (b"", 10), (b'[budget]\nnotice_percents = "x"\n', 10),
+                             (b"[budget]\nconversation_usd = 4\n", 4), (b'[ui]\nfollow_up = 7\n', 10)):
+            (tmp_path / "data" / "config.toml").write_bytes(raw)
+            assert (await asyncio.to_thread(runs._budgets_now, tmp_path / "data", project))[1] == default, raw
+
+
+# PR 52's follow-up (batch 7's residual; design review C3's "Outside this class"): in a project file whose keys are root
+# dotted keys, a save adding a table under `project` makes tomlkit write its header after the first of them, so every key
+# after it moves under the new table. With the limit not first, the limit moved too and read as reset to the shipped $50
+# (200). A project file's save writes nothing unless every key it does not name reads back as it was (Settings.save).
+
+
+@pytest.mark.asyncio
+async def test_a_settings_save_that_would_move_the_limit_in_a_hand_written_layout_is_refused_and_writes_nothing(tmp_path):
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 25.0)
+        _config(tmp_path, project).write_text('project.template = "imrad"\nproject.budget_usd = 25.0\n')
+        assert await _continue_at_cap(client, conversation, project, 25.0, "Short?") == 50.0
+        before = _config(tmp_path, project).read_bytes()
+        response = await _saved(client, project, {"project.unused": {}})
+        assert (response.status_code, response.json().get("code")) == (400, "invalid_setting")
+        assert _config(tmp_path, project).read_bytes() == before
+        assert await _project_budget(client, project) == 50.0
+        assert await _continue_at_cap(client, conversation, project, 50.0) == 75.0
+
+
+@pytest.mark.asyncio
+async def test_a_save_removing_a_child_of_the_limit_beside_a_table_that_would_move_it_is_refused(tmp_path):
+    # Fix batch 1, A-F2: the first review's probe. Removing a child of a number (`project.budget_usd.x`) changes nothing,
+    # but it exempted the number from the check, so the table moved it with the pair: 200, and Continue then added
+    # $50 (to $100), not the $25 it was given (to $75).
+    async with await _app(tmp_path) as client:
+        conversation, project = await _conversation(client)
+        await _project_budget(client, project, 25.0)
+        assert await _continue_at_cap(client, conversation, project, 25.0, "Short?") == 50.0
+        _config(tmp_path, project).write_text(
+            'project.template = "imrad"\nproject.budget_continue_usd = 25.0\nproject.budget_continue_at_usd = 50.0\n'
+            'project.budget_usd = 50.0\n')
+        before = _config(tmp_path, project).read_bytes()
+        response = await _saved(client, project, {"project.unused": {}, "project.budget_usd.x": None})
+        assert (response.status_code, response.json().get("code")) == (400, "invalid_setting")
+        assert _config(tmp_path, project).read_bytes() == before
+        assert await _continue_at_cap(client, conversation, project, 50.0) == 75.0
+
+
+_MOVING = b'project.template = "imrad"\nproject.budget_usd = 25.0\n'
+
+
+@pytest.mark.parametrize("raw, updates", [
+    (b'project.template = "imrad"\nproject.budget_usd = 80.0\n', {"project.unused": {}}),  # the limit would move
+    (b'project.budget_usd = 80.0\nproject.template = "imrad"\n', {"project.unused": {}}),  # another key would
+    (b'project.citation_style = "apa"\nproject.template = "imrad"\n', {"project.extra": {"x": 1}}),
+    # the internal review's F3: an empty table of its own names none of the keys under it
+    (_MOVING, {"project.unused": {}, "project": {}}),
+    (_MOVING, {"project": {"unused": {}}}),
+    # Fix batch 1, A-F2: a save naming a child of a value it would move (a removal that changes nothing), for each kind
+    # of key the first review moved, and a save naming a value it would move rather than set
+    (_MOVING, {"project.unused": {}, "project.budget_usd.x": None}),
+    (b'project.citation_style = "apa"\nproject.template = "imrad"\n', {"project.unused": {}, "project.template.x": None}),
+    (b'project.template = "imrad"\nmemory.enabled = false\n', {"project.unused": {}, "memory.enabled.x": None}),
+    (b'project.template = "imrad"\ntools.deny = ["write"]\n', {"project.unused": {}, "tools.deny.x": None}),
+    (b'project.template = "imrad"\nlimits.turn_minutes = 5\n', {"project.unused": {}, "limits.turn_minutes.x": None}),
+    (b'project.template = "imrad"\nmodels.default = "m"\n', {"project.unused": {}, "models.default.x": None}),
+    (b'project.template = "imrad"\nui.panel = "library"\n', {"project.unused": {}, "ui.panel.x": None}),
+    (b'project.template = "imrad"\nmcp.servers = [{ name = "a" }]\n', {"project.unused": {}, "mcp.servers.x": None}),
+    (_MOVING, {"project.unused": {}, "project.budget_usd": 30.0}),  # the limit it sets would read as the shipped $50
+    (_MOVING, {"project.budget_usd": 30.0, "project.unused": {}}),
+    (b'project.template = "imrad"\nmemory.enabled = false\n', {"project.unused": {}, "memory.enabled": False}),
+])
+def test_a_project_files_save_moving_a_key_it_does_not_name_raises_and_writes_nothing(tmp_path, monkeypatch, raw, updates):
+    from backend.settings import load_settings
+    written = _project_file(tmp_path, monkeypatch, raw)
+    with pytest.raises(ValueError):
+        load_settings(tmp_path, "p").save(updates)
+    assert written == [] and (tmp_path / "projects" / "p" / "config.toml").read_bytes() == raw
+
+
+_LAYOUTS = [b'project.template = "imrad"\nproject.budget_usd = 80.0\nmemory.enabled = true\n',
+            b'memory.enabled = true\nproject.budget_usd = 80.0\nproject.citation_style = "apa"\n',
+            b'project.budget_usd = 80.0\nproject.budget_continue_usd = 25.0\nproject.budget_continue_at_usd = 80.0\n'
+            b'limits.turn_minutes = 12\n',
+            b'[project]\ntemplate = "imrad"\nbudget_usd = 80.0\n[memory]\nenabled = true\n',
+            b"[project]\n", b"[project]\n[memory]\n",  # empty tables, as a reset leaves them, which a save writes into
+            b"project.budget_usd = 80.0\n"]  # a reset of its only key leaves no table
+
+
+@pytest.mark.parametrize("raw", _LAYOUTS)
+@pytest.mark.parametrize("updates, answer", [
+    ({"project.citation_style": "vancouver"}, False), ({"memory.enabled": False}, False),
+    ({"project.budget_usd": 60}, False), ({"project.budget_usd": None}, False), ({"limits.turn_minutes": 9}, False),
+    ({"project.budget_usd": 90.0, "project.budget_continue_usd": 10.0, "project.budget_continue_at_usd": 90.0}, True)])
+def test_the_apps_own_project_saves_move_no_key_in_any_layout_and_are_written(tmp_path, monkeypatch, raw, updates, answer):
+    # The rule refuses only a save that would move what it does not name: the Settings page's saves and a budget
+    # answer's, on hand-written layouts too, are written as before (a probe over 207 layouts found none refused)
+    from backend.settings import load_settings
+    written = _project_file(tmp_path, monkeypatch, raw)
+    load_settings(tmp_path, "p").save(updates, answer=answer)
+    assert len(written) == 1
+
+
+# Cycle 3's A3-F1: a limit Settings keeps past a billionth (it takes what the researcher types) is read by admission as
+# amounts are kept, as an answer is compared with it (runs._budgets_now), so a typed limit that admits the step is
+# never read as no change: saved $0.00000000151 is $0.000000002 for admission and asks alike.
+
+_TWO_BILLIONTHS = {"tag": "tiny", "context_length": 128000, "pricing": {"prompt": "0", "completion": "0.00000000000025"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["conversation", "project"])
+@pytest.mark.parametrize("saved, spent, typed, asks", [
+    (1.51e-9, 1e-9, "0.000000002", False), (1.00000000051, 1.0, "1.000000001", False),
+    (1.49e-9, 1e-9, "0.000000002", True), (1.00000000049, 1.0, "1.000000001", True)])  # controls: kept as one less
+async def test_a_limit_saved_past_a_billionth_admits_a_step_as_the_typed_limit_it_is_kept_as(
+        tmp_path, budget, saved, spent, typed, asks):
+    # the reviewer's four cases, through the Settings save and the ask: the step's $2e-9 fits the typed limit, so it
+    # goes out once, with no ask or with one whose typed answer applies; never an answer applying nothing and asking again.
+    # Saved as a billionth less, the step asks and the typed limit applies, before this fix and after
+    from scholia_app import MockProvider, send
+    async with await _app(tmp_path, MockProvider(endpoints={budget_router_model(): [_TWO_BILLIONTHS]})) as client:
+        conversation, project = await _conversation(client)
+        if budget == "project":
+            await _project_budget(client, project, saved)
+        else:
+            read = (await client.get("/api/settings")).json()
+            response = await client.put("/api/settings", json={"hash": read["hash"],
+                                                               "updates": {"budget.conversation_usd": saved}})
+            assert response.status_code == 200, response.text
+        await _spent(client, project, spent, conversation if budget == "conversation" else None)
+        sending, answers = asyncio.create_task(send(client, conversation, "Short?")), []
+        while not sending.done():
+            found = (await client.get(f"/api/asks?conversation_id={conversation}")).json()["asks"]
+            if found:
+                assert (found[0]["params"]["budget"], found[0]["params"]["estimate_usd"]) == (budget, 2e-9)
+                assert not answers, "the step asked again after its typed limit"
+                answers.append((await _answer(client, found[0], text=typed)).json()["budget"])
+                assert answers[-1]["applied"], answers[-1]
+            await asyncio.sleep(0.05)
+        assert (await sending)[-1]["status"] == "succeeded" and len(client.provider.answers) == 1
+        assert bool(answers) == asks

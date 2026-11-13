@@ -20,6 +20,10 @@ from pathlib import Path
 
 import tomlkit
 
+# The most an amount or a budget can be, in dollars (design review V's Option 1, Harold's decision of 2026-11-13); kept
+# here, which imports nothing of the app, so the reading child loads no database with it (backend/spending.py uses it)
+MAX_USD = 1_000_000.0
+
 
 _INT64 = range(-2**63, 2**63)  # TOML integers are 64-bit; tomlkit reads larger ones too
 
@@ -31,6 +35,11 @@ def _int(low, high=None):
 def _number(above, below=None):
     return lambda v: (((type(v) is int and v in _INT64) or (type(v) is float and math.isfinite(v)))
                       and v > above and (below is None or v < below))
+
+
+def _budget(v):
+    """A budget in dollars, from a billionth of a dollar to the most an amount can be (design review V)."""
+    return _number(0)(v) and 1e-9 <= v <= MAX_USD
 
 
 def _choice(*options):
@@ -139,7 +148,7 @@ PERSONAL = {
     ("subagents", "at_once"): (3, _int(1)),
     ("subagents", "tool_calls"): (30, _int(1)),
     ("subagents", "effort_cap"): (None, _text),
-    ("budget", "conversation_usd"): (10, _number(0)),
+    ("budget", "conversation_usd"): (10, _budget),
     ("budget", "notice_percents"): ([50, 85, 90], lambda v: type(v) is list and all(_int(1, 100)(x) for x in v)),
     ("privacy", "trim_bodies_after_days"): (0, _int(0)),
     # The local model helper (backend/local_helper.py; section 13's lifecycle values).
@@ -162,11 +171,11 @@ PERSONAL = {
 
 PROJECT = {
     **{("project", k): (None, _text) for k in ("target_venue", "citation_style", "citation_style_zh", "template")},
-    ("project", "budget_usd"): (50, _number(0)),
+    ("project", "budget_usd"): (50, _budget),
     # S1-33 (Harold, 2026-11-12, design review C's Option 2): written by the program beside the limit, never by the
     # Settings page: what Continue adds, and the limit it was written for (budgets._amount). No default, so a file
     # without them gives none, and a backup keeps them (known_only).
-    **{("project", k): (None, _number(0)) for k in ("budget_continue_usd", "budget_continue_at_usd")},
+    **{("project", k): (None, _budget) for k in ("budget_continue_usd", "budget_continue_at_usd")},
     ("ui", "panel"): (None, _choice("none", "library", "manuscript")),
     ("models", "default"): (None, _text),
     **{("limits", k): (None, check) for k, (_, check) in _LIMITS.items()},  # overrides
@@ -244,7 +253,8 @@ class Settings:
 
         Re-reads the file first and raises SettingsChanged if it changed since it
         was loaded. Raises ValueError, writing nothing, for an invalid value, a
-        secret, a personal setting in a project file, or a file that is not valid TOML.
+        secret, a personal setting in a project file, a file that is not valid TOML, or
+        a save that would move or change a key it does not name.
 
         In a project file, what Continue adds to the budget is written only by a budget
         answer (answer=True). Any other save that changes the limit takes it out in the
@@ -298,6 +308,15 @@ class Settings:
                     expected = (after[0], None, None)
                 if _continue_keys(data) != expected:
                     raise ValueError(f"{self.label}: what Continue adds is written only by a budget answer")
+            # PR 52's follow-up (item 8; Harold, 2026-11-13, Option 1 for the personal file): the bytes must read back
+            # as the document the save changed, so no key moves or changes that the save does not name, and each it
+            # names reads as set. A table added among root dotted keys gets its header after the first of them, moving
+            # the keys after it under it. Only an empty table the save left may be missing: removing a dotted table's
+            # last key leaves none.
+            again, built = _values(_reread(data)), _values(doc.unwrap())
+            if any(built.get(path) != value for path, value in again.items()) or any(
+                    again.get(path) != value for path, value in built.items() if value != "{}"):
+                raise ValueError(f"{self.label}: this save would move or change keys it does not name")
             write_private(self.path, data)
             _parse(self, data)
 
@@ -305,11 +324,25 @@ class Settings:
 _CONTINUE_KEYS = ("budget_usd", "budget_continue_usd", "budget_continue_at_usd")
 
 
+def _values(data):
+    """Every value and empty table by its key path, as repr."""
+    return {path: repr(value) for path, value in _leaves(data)}
+
+
+def _reread(data):
+    """The bytes a save is about to write, read as the loader reads them; ValueError for bytes that would not read at
+    all (a table added among root dotted keys whose name a key moved under it already holds)."""
+    try:
+        return tomlkit.parse(data.decode("utf-8")).unwrap()
+    except tomlkit.exceptions.TOMLKitError as error:
+        raise ValueError(f"the save would not read back ({type(error).__name__})") from None
+
+
 def _continue_keys(raw):
     """S1-33: a project file's limit and what Continue adds for it, read from its bytes: each a valid number as the
     loader keeps it (compared by value, so 50 is 50.0), None when absent, or "invalid" when present but not valid (true
     included), so a limit made invalid by hand and then set or reset counts as changed."""
-    own = tomlkit.parse(raw.decode("utf-8")).unwrap().get("project") if raw else None
+    own = _reread(raw).get("project") if raw else None
     own = own if isinstance(own, dict) else {}
     return tuple((own[key] if _check(PROJECT, ("project", key), own[key])[1] is None else "invalid") if key in own
                  else None for key in _CONTINUE_KEYS)

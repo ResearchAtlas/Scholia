@@ -182,6 +182,7 @@ class ActiveRun:
     progress: dict | None = None  # local work's progress, live only: {"done", "total"}
     follows: list = field(default_factory=list)  # runs its terminal transaction records (record_in), held till it commits
     answered: asyncio.Event = field(default_factory=asyncio.Event)  # one of its asks was answered (asks.answer_ask)
+    said: set = field(default_factory=set)  # S1-33: what of its record a turn's stream has said (_owed, _say)
 
 
 class Registry:
@@ -681,8 +682,10 @@ class Harness:
                 _event(conn, run_id, "steering_note", {"text": text})
                 return {"steering": {"run_id": run_id, "seq": seq}}
             return {"queued": budgets.queue(conn, row[0], text), **({} if under_way else {"ended": True})}
-        done, cancelled = await self._write_through(write)  # once it commits, said on the stream even if cancelled then
-        if "queued" in done and active is not None:  # the turn's stream says so too (SPEC:641)
+        done, cancelled = await self._write_through(write)  # once it commits, its reply says it even if cancelled then
+        # A live label on the turn's stream while it is open (SPEC:641); it may come after the end, or not at all once
+        # the stream has ended: the reply says the row, and the read at the turn's end holds it (Harold, 2026-11-13).
+        if "queued" in done and active is not None and self.registry.runs.get(run_id) is active:
             active.events.put_nowait({"type": "queued"})
         if cancelled:
             raise asyncio.CancelledError()
@@ -1047,15 +1050,11 @@ class Harness:
         except _LimitReached as hit:  # a turn limit (section 13), before any further dispatch: Continue is offered
             call = claim.call  # usually None (a call refused at dispatch is recorded first); any other is closed once
 
-            noticed = []
-
             def limited(conn):
-                noticed[:] = _close_call(conn, call, self.data_dir)
+                _close_call(conn, call, self.data_dir)  # said from the record (_owed), before the end
                 return self._finish_turn(conn, claim.run_id, "cancelled", "limit", hit.code,
                                          limit={hit.code: ctx["limits"].get(hit.code, True)}, claim=claim)
             final = await self._end_turn(claim, limited)
-            for notice in noticed:  # S1-33: streamed once recorded, as _call's are
-                emit({"type": "budget", **notice})
             if final.get("cancel_reason") == "limit":  # not a Stop that came first
                 emit({"type": "limit_reached", "limit": hit.code})
             emit({"type": "run_finished", **final})
@@ -1088,16 +1087,13 @@ class Harness:
         if status is None:
             status = "interrupted" if claim.cancel_reason == "shutdown" else "cancelled"
         cancel_reason = None if status != "cancelled" else ("revoked" if claim.cancel_reason == "revoked" else "researcher")
-        call, noticed = claim.call, []
+        call = claim.call
 
         def stop(conn):
-            noticed[:] = _close_call(conn, call, self.data_dir)
+            _close_call(conn, call, self.data_dir)  # what it records is said from the record (_owed), before the end
             return self._finish_turn(conn, claim.run_id, status, cancel_reason, reason or status, claim=claim)
 
-        final = await self._ended(claim, stop)
-        for notice in noticed:  # S1-33: streamed once recorded, as _call's are, before the run's end
-            claim.events.put_nowait({"type": "budget", **notice})
-        return final
+        return await self._ended(claim, stop)
 
     def _finish_turn(self, conn, run_id, status, cancel_reason, reason_code, limit=None, claim=None):
         """Write a terminal status for a turn that has no answer, if it is still running.
@@ -1134,8 +1130,10 @@ class Harness:
                            (run_id,)).fetchone()
         if row is None:
             return {"run_id": run_id, "status": "deleted"}
+        owed = _owed(conn, claim)  # S1-33: what its record owes the turn's stream, said before its end (_ended)
         return {"run_id": run_id, "status": row[0], **({"cancel_reason": row[1]} if row[1] else {}),
-                "cost_usd": row[2], "accounting": _accounting(conn, run_id), **({"queued": queued} if queued else {})}
+                "cost_usd": row[2], "accounting": _accounting(conn, run_id), **({"queued": queued} if queued else {}),
+                **({"owed": owed} if owed else {})}
 
     def _commit_answer(self, conn, claim, answer, ctx):
         """The primary commit. Refused if cancellation was requested, so no answer is
@@ -1197,8 +1195,10 @@ class Harness:
                     "conversation_id": claim.conversation_id, "provider": ctx["route"].provider.name,
                     "model": ctx.get("extractor") or ctx["route"].model, "inherited": not ctx.get("extractor")})))
             conn.execute("UPDATE turns SET memory_status = 'pending' WHERE run_id = ?", (claim.run_id,))
+        owed = _owed(conn, claim)  # S1-33: what its record owes the turn's stream, said before its end (_ended)
         return {"run_id": claim.run_id, "status": "succeeded", "cost_usd": cost,
-                "accounting": _accounting(conn, claim.run_id), **({"queued": queued} if queued else {})}
+                "accounting": _accounting(conn, claim.run_id), **({"queued": queued} if queued else {}),
+                **({"owed": owed} if owed else {})}
 
     # Model calls
 
@@ -1327,10 +1327,11 @@ class Harness:
         conversation_id = paying_conversation_id if refused.budget == "conversation" else None
         spent = await self._read(lambda conn: spending.spent(
             conn, **({"conversation_id": conversation_id} if conversation_id else {"project_id": project_id})))
-        form = "cap" if spent + 1e-9 >= refused.limit_usd else "step"
-        # a project budget its file does not give: the ask says so, never that the budget is $0 (PR 52 cycle 3, E4)
-        unread = refused.budget == "project" and await asyncio.to_thread(
-            lambda: _budget_unread(load_settings(self.data_dir, project_id)))
+        # the cap is reached as amounts are kept, to a billionth: $0 spent of a $1e-9 limit is not
+        form = "cap" if spent >= round(refused.limit_usd, 9) else "step"
+        # a budget its file does not give: the ask says so, never that the budget is $0 (PR 52 cycle 3, E4)
+        unread = await self._read(lambda conn: _limit_unread(conn, self.data_dir, refused.budget, project_id,
+                                                             paying_conversation_id))
         turn = agent.Turn(self, active, agent.Evidence({}), active.events.put_nowait)
         return await self._ask(turn, "budget", budget_rules.options(form), {
             "form": form, "budget": refused.budget, "limit_usd": refused.limit_usd, "spent_usd": spent,
@@ -1547,8 +1548,9 @@ class Harness:
         this", "update this" or "forget this", or a forget naming no record clearly, asks first on the shared
         confirmation, and only the researcher's answer saves or forgets (section 8, Words that count). With memory
         off nothing is written. Each outcome is a content-free `memory_proposed` event (`command`; `applied` 1 when
-        something changed), a `memory` stream event, and a line in USER MEMORY telling the model what was done, so
-        its answer confirms it; the conversation shows it read back from the record."""
+        something changed; a forget's, one for each record it deleted, in that deletion's commit), a `memory` stream
+        event, and a line in USER MEMORY telling the model what was done, so its answer confirms it; the conversation
+        shows it read back from the record."""
         ctx["memory_notes"] = []
         asked = ctx.get("command")
         if asked is None:
@@ -1556,8 +1558,9 @@ class Harness:
         ctx["memory_on"] = await self.memory_on(ctx["project_id"])  # the switch as it is now, not at admission
         action, text, project_id = asked["action"], asked["text"], ctx["project_id"]
 
-        async def done(what, data=None, count=0, line=None, change=None):
-            # change(conn) -> (what it did, ids) or ids: the outcome is what the record says, never what was asked
+        async def done(what, data=None, count=0, line=None, change=None, recorded=False):
+            # change(conn) -> (what it did, ids) or ids: the outcome is what the record says, never what was asked;
+            # recorded: a forget's deletions, each recorded in its own commit (as_seen), so nothing is written here
             outcome = {"what": what, "ids": []}
             if change is not None and not await self.memory_on(project_id):  # switched off while its ask waited
                 what, change, line = "memory_off", None, "Memory is off in this project: nothing was saved, changed or forgotten."
@@ -1573,7 +1576,8 @@ class Harness:
                     "command": action, "applied": int(bool(outcome["ids"] or count)), "action": outcome["what"],
                     **({"records": outcome["ids"]} if outcome["ids"] else {}), **({"count": count} if count else {}),
                     **(data or {})})
-            await self._record(claim, None, None, also=apply)
+            if not recorded:
+                await self._record(claim, None, None, also=apply)
             if outcome["ids"]:
                 await self._index_memory(project_id)
             turn.emit({"type": "memory", "action": outcome["what"], "count": count or len(outcome["ids"])})
@@ -1606,27 +1610,62 @@ class Harness:
                     return await done("declined", line="Nothing was forgotten: the researcher chose not now.")
             if not await self.memory_on(project_id):
                 return await done("memory_off", line="Memory is off in this project: nothing was saved, changed or forgotten.")
-            count = changed = 0
-            for record in ids:
-                def as_seen(conn, record=record):  # in the deletion's own transaction (MB9): edited, kept or replaced
-                    found = memory.row(conn, record)  # since, it is not what the researcher chose to forget
-                    if found is None:
-                        raise LookupError(record)
-                    if (found["version"], found["status"]) != seen[record] or (
-                            found["scope"] == "project" and found["project_id"] != project_id):
-                        raise ValueError("changed")  # (or moved to another project with its conversation since)
-                try:
-                    await asyncio.to_thread(deletion.delete, self.db, self.content, "memory", record,
-                                            on_committed=self.revoke, check=as_seen)
-                    count += 1
-                except LookupError:  # forgotten meanwhile
-                    pass
-                except ValueError:
-                    changed += 1
-            return await done("forgotten", count=count, line=f"Forgotten at the researcher's request: {count} memory "
-                                                             f"record{'s' if count != 1 else ''}. Do not use it."
-                              + (f" {changed} record{'s' if changed != 1 else ''} changed since the researcher chose and "
-                                 f"{'were' if changed != 1 else 'was'} not forgotten." if changed else ""))
+
+            loop = asyncio.get_running_loop()  # the runs a deletion revokes are stopped on it, never in its thread
+
+            async def forgetting():  # each deletion and its record to their end, whatever cancellation comes meanwhile
+                forgot, changed = [], 0
+
+                def committed(revoked):  # the deletion and its record committed: counted first, then the runs it
+                    forgot.append(1)  # revoked are stopped on the loop, never in the deletion's thread
+                    loop.call_soon_threadsafe(self.revoke, revoked)
+
+                def say():
+                    count = len(forgot)
+                    return done("forgotten", count=count, recorded=bool(count),
+                                line=f"Forgotten at the researcher's request: {count} memory record"
+                                     f"{'s' if count != 1 else ''}. Do not use it."
+                                + (f" {changed} record{'s' if changed != 1 else ''} changed since the researcher chose and "
+                                   f"{'were' if changed != 1 else 'was'} not forgotten." if changed else ""))
+                for record in ids:
+                    if claim.cancel_requested.is_set():  # Stop or a revocation: no deletion starts after it (SPEC:412)
+                        break
+                    def as_seen(conn, record=record):  # in the deletion's own transaction (MB9): edited, kept or
+                        # replaced since, it is not what the researcher chose to forget; and nothing more is deleted
+                        # for a run stopped, ended or revoked in the record, before the turn hears of it (B-R2-F1)
+                        if claim.cancel_requested.is_set() or not _running(conn, claim.run_id) \
+                                or _revoked(conn, claim.run_id):
+                            raise _Cancelled()
+                        found = memory.row(conn, record)
+                        if found is None:
+                            raise LookupError(record)
+                        if (found["version"], found["status"]) != seen[record] or (
+                                found["scope"] == "project" and found["project_id"] != project_id):
+                            raise ValueError("changed")  # (or moved to another project with its conversation since)
+                        # its record commits with it or not at all (cycle 3's B-R3-F1, design review M's Option 2)
+                        _event(conn, claim.run_id, "memory_proposed", {"command": action, "applied": 1,
+                                                                       "action": "forgotten", "count": 1})
+                    try:
+                        await asyncio.to_thread(deletion.delete, self.db, self.content, "memory", record,
+                                                check=as_seen, on_committed=committed)
+                    except _Cancelled:
+                        break
+                    except LookupError:  # forgotten meanwhile
+                        pass
+                    except ValueError:
+                        changed += 1
+                    except BaseException:  # a later deletion failing: what committed is said, then the turn fails (B-F2)
+                        if forgot:
+                            await say()
+                        raise
+                await say()
+            # PR 52's follow-up (design review P): a Stop once a deletion committed is honored after that deletion and the
+            # record of what was forgotten, as a tool's result is (_tool's keeping): never a record deleted with nothing
+            # said of it
+            _, cancelled = await _through(forgetting())
+            if cancelled:
+                raise asyncio.CancelledError()
+            return
         if action == "save":
             if previous is None:
                 return await done("no_candidate", line="The researcher asked to save something, but there is no "
@@ -1893,7 +1932,7 @@ class Harness:
             await handed({"type": "step", "seq": call.step, "phase": "answer"})
             result = await self._call(claim, call, ctx["route"], ctx["key"], request, ctx["facts"],
                                       zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
-                                      rehold=ctx if judge_estimate else None, notes=[seq for seq, _ in notes])
+                                      rehold=ctx if judge_estimate else None)
             turn.step = call.step
             if result.dispatched and ctx.get("summary_info") and not request.cuts.get("summary"):
                 # its dependencies stay registered from here (context_materials and summary_memory are never taken back
@@ -2323,7 +2362,7 @@ class Harness:
                       "endpoints": list(found.tags), "row": row, "output": found.output, "tools": found.tools}
 
     async def _call(self, active, call, route, key, request, facts, *, output=None, zero_retention=False, timeout=None,
-                    materials=(), rehold=None, hold=False, notes=()):
+                    materials=(), rehold=None, hold=False):
         """The dispatch path: every model call goes through here, and nowhere else calls the provider
         adapter (tests/test_dispatch_path.py). It sends the request the context assembler built, for
         an admitted call (its reservation), through the gate with the dispatch check, and records it,
@@ -2337,8 +2376,9 @@ class Harness:
         deleting one of them deletes it (backend/db/deletion.py). A body of a paper deleted before it is
         recorded is not kept. hold (S1-21a): the output is model text that may quote a paper, so it is kept in the run's
         inputs (`held.output`, taken out at its terminal record and by a deletion of one of its papers,
-        provenance.forget) and the finished step names it only ("output": "held"). notes (S1-33): the steering notes the
-        request carries, said read on the turn's stream once it went out."""
+        provenance.forget) and the finished step names it only ("output": "held"). S1-33: what its record then owes a
+        turn's stream (its budget notices, the steering notes it carried once it went out) is read in the receipt's
+        transaction and said once that commits (_owed, _say)."""
         if not isinstance(request, context.Request):
             raise TypeError("a model request is built by the context assembler")
         if context.serialized_tokens(request.messages, request.tools) + request.max_tokens > request.window:
@@ -2387,7 +2427,7 @@ class Harness:
             # S1-19c: an agent step's reply is kept whole as it arrives (model-route rule 5: each assistant step stored
             # whole), beside its request body and under the same deletion links, whatever the turn does next.
             kept_reply = {"ref": None}  # stored in the shielded recording below, so a Stop cannot skip the record
-            noticed = []
+            owed = []
             if output is not None and result.ok:
                 finished["output"] = output(result)
 
@@ -2400,7 +2440,7 @@ class Harness:
                                                                        kept_reply["ref"]) if answered else None)
                 if call.dispatched:
                     if exists:  # S1-33: the bar's notices this settlement reached
-                        noticed.extend(_notices(conn, active.run_id, self.data_dir))
+                        _notices(conn, active.run_id, self.data_dir)
                     if rehold is not None and exists:  # the answer's unspent, held again for its judge (_reserve)
                         held = _hold_unspent(conn, call, rehold, self.data_dir)
                         if held:
@@ -2415,6 +2455,7 @@ class Harness:
                     finished["output"] = "held"
                 if exists:
                     _event(conn, active.run_id, "step_finished", finished)
+                    owed[:] = _owed(conn, active)  # read last, after all this transaction wrote
 
             async def recording():
                 # The reply is held from collection until the record that links it commits (as request bodies are).
@@ -2429,13 +2470,10 @@ class Harness:
                     async with self.settings_lock:
                         return await self._write(record)
 
-            # Recorded before the client closes, and to its end even if cancelled meanwhile.
+            # Recorded before the client closes, and to its end even if cancelled meanwhile; what it owes the stream is
+            # said once recorded, with no await between, so a Stop as the client closes cannot skip it (PR 52 cycle 4, G5)
             _, cancelled = await _through(recording())
-            if active.kind == "turn":  # streamed once recorded, with no await between, so a Stop as the client closes
-                for notice in noticed:  # cannot skip them (PR 52 cycle 4, G5): the bar reads its figures again
-                    active.events.put_nowait({"type": "budget", **notice})
-                if notes and call.dispatched:  # said only once the request that carried them went out
-                    active.events.put_nowait({"type": "steering_note", "read": list(notes)})
+            _say(active, owed)
         active.call = None
         if cancelled:
             raise asyncio.CancelledError()
@@ -2485,10 +2523,14 @@ class Harness:
         the writer itself marks the run finished here (Registry.finished), so no cancellation of this await
         can separate the mark from the commit, and the run is known finished before it is released. A write
         that raises marks nothing. A turn's are awaited through _through (_end_turn, _stop_turn, the answer's commit),
-        so what one queued is streamed once it commits, whatever cancellation came (PR 52 cycle 4, G5's class)."""
+        so what its record owes the stream (_owed, read in that transaction) is said before the run's end, whatever
+        cancellation came (PR 52 cycle 4, G5's class); a note it queued is streamed then too, as a live label (Harold,
+        2026-11-13: the read at the turn's end holds it)."""
         final = await asyncio.to_thread(self.db.write, fn, committed=lambda: self.registry.finished.add(active.run_id))
-        if isinstance(final, dict) and final.pop("queued", None):  # S1-33: a note it queued, streamed once committed
-            active.events.put_nowait({"type": "queued"})
+        if isinstance(final, dict):
+            _say(active, final.pop("owed", ()))
+            if final.pop("queued", None):  # S1-33: a note it queued, streamed once committed
+                active.events.put_nowait({"type": "queued"})
         return final
 
     async def _background(self, active: ActiveRun) -> None:
@@ -2756,7 +2798,7 @@ class Harness:
         except context.OverWindow as over:
             raise RunOutcome("failed", over.code) from None
         estimate = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
-        bound = estimate * openrouter.MAX_ATTEMPTS
+        bound = spending.combined(estimate * openrouter.MAX_ATTEMPTS)
         remembered = [r[0] for r in related]
         versions = {r[0]: r[4] for r in related}  # as its request holds them: one edited since is refused at dispatch
 
@@ -3119,6 +3161,7 @@ def _settle_attempts(conn, reservation_id, rates, attempts):
                 continue
             basis = "estimated" if basis == "reported" else basis
         total += cost
+    total = spending.combined(total)  # one call's record: each attempt a valid amount, their sum held at MAX_USD
     if basis == "reported":
         spending.settle(conn, reservation_id, total)
     elif basis == "estimated":
@@ -3198,20 +3241,34 @@ def _kept_body(conn, call, number, dispatched):
 
 
 def _budgets_now(data_dir, project_id):
-    """The project's budget and the default conversation budget, as the settings files say now. A project budget its
+    """The project's budget and the default conversation budget, as the settings files say now. A budget its
     config.toml does not give (_budget_unread) is 0, never the loader's default, which says nothing of what the file
-    holds (PR 52 cycle 3, E4): nothing is admitted against it, so a step asks again (Harold, 2026-10-21)."""
+    holds (PR 52 cycle 3, E4): nothing is admitted against it, so a step asks again (Harold, 2026-10-21). The same for
+    the personal file's default (Harold, 2026-11-12): a conversation without a limit of its own then has no room. Each
+    is read as amounts are kept, to a billionth (a file may hold more places), so admission and an answer compared with
+    it (budgets.decide) read one amount (cycle 3's A3-F1)."""
     personal, project = load_settings(data_dir), load_settings(data_dir, project_id)
-    return (0.0 if _budget_unread(project) else project.values["project"]["budget_usd"],
-            personal.values["budget"]["conversation_usd"])
+    return (0.0 if _budget_unread(project) else round(project.values["project"]["budget_usd"], 9),
+            0.0 if _budget_unread(personal, "budget", "conversation_usd")
+            else round(personal.values["budget"]["conversation_usd"], 9))
 
 
-def _budget_unread(project):
-    """Whether a project's loaded settings do not give its budget: the file unreadable or not valid TOML, or a problem
-    with the [project] table itself (not a table: PR 52 cycle 4, G2), with the value, or with a key under it (a table
-    where the value belongs); any of these gives the loader's default."""
-    return any(problem["key"] in (None, "project") or (problem["key"] + ".").startswith("project.budget_usd.")
-               for problem in project.problems)
+def _budget_unread(loaded, table="project", key="budget_usd"):
+    """Whether loaded settings do not give a budget (a project's [project] budget_usd, or the personal [budget]
+    conversation_usd): the file unreadable or not valid TOML, or a problem with its table itself (not a table: PR 52
+    cycle 4, G2), with the value, or with a key under it (a table where the value belongs); any of these gives the
+    loader's default."""
+    return any(problem["key"] in (None, table) or (problem["key"] + ".").startswith(f"{table}.{key}.")
+               for problem in loaded.problems)
+
+
+def _limit_unread(conn, data_dir, budget, project_id, conversation_id=None):
+    """Whether a budget's limit is one its settings file does not give (_budget_unread), so no ask or record says it is
+    $0: the project's, or a conversation's without a limit of its own (the personal default)."""
+    if budget == "project":
+        return _budget_unread(load_settings(data_dir, project_id))
+    own = conn.execute("SELECT budget_usd FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+    return own is not None and own[0] is None and _budget_unread(load_settings(data_dir), "budget", "conversation_usd")
 
 
 def _notices(conn, run_id, data_dir):
@@ -3270,13 +3327,18 @@ def _take_queued(conn, conversation_id, text, queued_id, after, stopped=()):
     """S1-33: a queued message taken from the queue by the admission of its turn, in its transaction (Harness._admit).
     One started on its own (after) follows only the latest turn, succeeded, and not stopped (stopped: the runs Stop was
     pressed for or cancelled, Harness.stopped), so a Stop pressed in another window after the answer committed starts
-    nothing, nor does a turn whose stream closed before its end was recorded (it waits with Send)."""
+    nothing, nor does a turn whose stream closed before its end was recorded (it waits with Send). And it is only the
+    oldest waiting message (Harold's S-2; PR 52's rule 1 recheck B6-1): Send may start any."""
     if after is not None:
         latest = conn.execute("SELECT t.run_id, r.status FROM turns t JOIN runs r ON r.id = t.run_id"
                               " WHERE t.conversation_id = ? ORDER BY t.seq DESC LIMIT 1", (conversation_id,)).fetchone()
         if latest is None or tuple(latest) != (after, "succeeded") or after in stopped:
             raise AdmissionError(409, "not_after_success",
                                  "The turn before it did not succeed or was stopped; send it yourself")
+        oldest = conn.execute("SELECT id FROM queued_messages WHERE conversation_id = ? ORDER BY rowid LIMIT 1",
+                              (conversation_id,)).fetchone()
+        if oldest is not None and oldest[0] != queued_id:
+            raise AdmissionError(409, "not_oldest", "An earlier message waits before this one")
     if conn.execute("DELETE FROM queued_messages WHERE id = ? AND conversation_id = ? AND text = ?",
                     (queued_id, conversation_id, text)).rowcount != 1:
         raise AdmissionError(409, "not_queued", "This message is no longer waiting")
@@ -3384,13 +3446,40 @@ def _close_call(conn, call, data_dir):
     """Close a call cut off before it was recorded (Stop, a turn limit, shutdown, a failed receipt) as what its attempts
     did (_record_attempts): a reported charge is kept, an attempt cut off after the gate let it out counts at the
     estimate, and one that never left is released. Once: a call whose reservation is no longer open was recorded, and is
-    left as it is. Returns the budget notices its settlement reached (S1-33), recorded with it as with any settlement
-    (data_dir's settings)."""
+    left as it is. The budget notices its settlement reaches are recorded with it (S1-33), as with any settlement
+    (data_dir's settings); a turn's stream says them, and the notes it carried, from the record (_owed)."""
     if call is None or conn.execute("SELECT 1 FROM budget_reservations WHERE id = ? AND status = 'open'",
                                     (call.reservation_id,)).fetchone() is None:
-        return []
+        return
     _record_attempts(conn, call, _running(conn, call.run_id))
-    return _notices(conn, call.run_id, data_dir) if call.dispatched else []
+    if call.dispatched:
+        _notices(conn, call.run_id, data_dir)
+
+
+def _owed(conn, active):
+    """S1-33 (PR 52's follow-up, design review P's Option B): the events a turn's record owes its stream, read in the
+    transaction that wrote what they say (the receipt, and every terminal write): a `budget` event for each budget notice
+    recorded on the run, and a `steering_note` read event for the notes a request that went out carried
+    (budgets.carried_notes), each that the stream has not said yet. [(event, its keys)], for _say once it commits."""
+    from backend import budgets  # it imports this module
+    if active is None or active.kind != "turn":
+        return []
+    owed = [({"type": "budget", **json.loads(data)}, {("budget", seq)}) for seq, data in conn.execute(
+        "SELECT seq, data FROM run_events WHERE run_id = ? AND type = 'budget_notice' ORDER BY seq", (active.run_id,))
+        if ("budget", seq) not in active.said]
+    read = sorted(seq for seq in budgets.carried_notes(conn, active.run_id) if ("read", seq) not in active.said)
+    if read:
+        owed.append(({"type": "steering_note", "read": read}, {("read", seq) for seq in read}))
+    return owed
+
+
+def _say(active, owed):
+    """Put on a turn's stream each owed event (_owed) it has not said, marking it said: one synchronous step after the
+    transaction that read it committed, so no cancellation comes between them, and each said once."""
+    for event, keys in owed:
+        if not keys <= active.said:
+            active.said |= keys
+            active.events.put_nowait(event)
 
 
 def _accounting(conn, run_id, complete=True):
@@ -3403,7 +3492,7 @@ def _accounting(conn, run_id, complete=True):
     unknown = sum(1 for (data,) in conn.execute(
         "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'", (run_id,))
         if json.loads(data).get("charge") == "unknown" and json.loads(data).get("dispatched"))
-    return {"reported_usd": totals.get("reported", 0), "estimated_usd": totals.get("estimated", 0),
+    return {"reported_usd": round(totals.get("reported", 0), 9), "estimated_usd": round(totals.get("estimated", 0), 9),
             "unknown_attempts": unknown, "complete": complete}
 
 

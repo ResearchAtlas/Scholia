@@ -492,7 +492,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             refuse_if_busy({providers.OPENROUTER})
 
             async def set_up():
-                await asyncio.to_thread(_ensure_openrouter, data_dir)
+                try:
+                    await asyncio.to_thread(_ensure_openrouter, data_dir)
+                except ValueError:  # a settings file this save cannot change as it is (Settings.save): nothing written
+                    raise ApiError(400, "invalid_setting", "A setting is not valid") from None
                 return await _save_key(providers.OPENROUTER, body.openrouter_key)
 
             return {"ok": True, "warning": await _to_end(set_up())}
@@ -1124,9 +1127,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                     (conversation_id,)):
                 data = json.loads(data)
                 found = [memory.row(conn, i) for i in data.get("records", [])]
-                remembered.setdefault(owner, []).append({
-                    "action": data.get("action") or "noted", "count": data.get("count") or len(data.get("records", [])),
-                    "records": [{k: r[k] for k in ("id", "type", "status", "content", "scope")} for r in found if r]})
+                items = remembered.setdefault(owner, [])
+                item = {"action": data.get("action") or "noted", "count": data.get("count") or len(data.get("records", [])),
+                        "records": [{k: r[k] for k in ("id", "type", "status", "content", "scope")} for r in found if r]}
+                if item["action"] == "forgotten" and items and items[-1]["action"] == "forgotten":
+                    items[-1]["count"] += item["count"]  # a forget's deletions, each recorded in its own commit: one item
+                else:
+                    items.append(item)
             cited = {}  # S1-19: each answer's citations, as its chips show them
             for owner, cid, material, passage, quote, context, page, evidence, existence, support, retraction, title, \
                     ordinal in conn.execute(
@@ -1346,8 +1353,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             if conn.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone() is None:
                 raise ApiError(404, "not_found", "No such conversation")
             return budgets.queue(conn, conversation_id, text, body.material_ids)
-        added, cancelled = await _through(write(add))  # once its row commits, said on the stream even if cancelled then
-        if (running := harness().registry.turns.get(conversation_id)) is not None:  # its stream says so (SPEC:641)
+        added, cancelled = await _through(write(add))  # once its row commits, its reply says it even if cancelled then
+        # A live label on a running turn's stream (SPEC:641), which may come after that turn's end; the reply says the
+        # row, and the read at the turn's end holds every message queued before it (Harold, 2026-11-13).
+        if (running := harness().registry.turns.get(conversation_id)) is not None:
             running.events.put_nowait({"type": "queued"})
         if cancelled:
             raise asyncio.CancelledError()
