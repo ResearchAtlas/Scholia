@@ -28,7 +28,8 @@ under the earlier policy, is withdrawn and asked again under the current one. Th
 is applied with the run's terminal record, once: Merge fills the paper's missing fields from the
 record (`fills`; a paper whose details the researcher edited keeps the details form's fields as they
 are) and its evidence follows what it now holds (a file stays full text); Keep both makes the record
-its own paper, as at import, not looked up. Cancel leaves the record out. Merge first checks, in that
+its own paper, as at import, looked up as an import's paper is when no other paper of the project gives
+its identifier. Cancel leaves the record out. Merge first checks, in that
 transaction, that the paper still matches the record as a duplicate (`_matches`, Duplicates' rule): one
 whose DOI or title changed while the question waited takes nothing (the run fails no_longer_duplicate).
 A Merge that changes the identifier a reference file's paper is looked up by (a DOI where it had none,
@@ -349,8 +350,14 @@ def _answered(conn, project_id, material, record, option, harness, active, keep=
         if keep:
             keep(conn)
         else:
-            new_material(conn, project_id, record)
+            kept, _ = new_material(conn, project_id, record)
             conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
+            # M2 audit, area 1 (section 7.5): looked up as an import's paper is, when no other paper of the project gives
+            # its identifier (one kept by its DOI duplicates a paper looked up by it already)
+            given = reference_files.identifier(record)
+            if given is not None and all(reference_files.identifier(json.loads(csl)) != given for (csl,) in conn.execute(
+                    "SELECT csl FROM materials WHERE project_id = ? AND id != ? AND csl IS NOT NULL", (project_id, kept))):
+                _merged_lookup(conn, harness, active, project_id, kept)
         return
     row = conn.execute("SELECT csl, checked_by, evidence_type, title, source, lookup_filled, merge_filled FROM materials"
                        " WHERE id = ? AND project_id = ?", (material, project_id)).fetchone()
@@ -397,7 +404,7 @@ def _matches(paper, record):
 
 
 def _merged_lookup(conn, harness, active, project_id, material):
-    """The lookup of the identifier a merge gave a reference file's paper, as the import's lookup (a
+    """The lookup of the identifier a merge gave a reference file's paper, or of a kept duplicate's, as the import's lookup (a
     review-locked project never looks one up; a Local only project asks first, its question about this
     reference file's papers; the outbound gate and the lookup's own checks hold), recorded in the merge's
     terminal transaction and started once it commits (harness.record_in). The lookup reads the paper's
