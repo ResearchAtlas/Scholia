@@ -352,7 +352,7 @@
   "paper.replacing": "正在上传…",
   "paper.about": "关于这篇论文",
   "paper.deleteTitle": "删除“{title}”？",
-  "paper.deleteBody": "它的文件、各个版本和段落会从本项目中删除。引用它的地方会保留引文。",
+  "paper.deleteBody": "它的文件、各个版本和段落会从本项目中删除。用到它的回答会保留正文，但其中的引用不再保留引文。",
   "paper.details": "文献信息",
   "paper.field.title": "标题",
   "paper.field.authors": "作者，每行一位",

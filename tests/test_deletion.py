@@ -392,6 +392,17 @@ def test_deleting_a_material_removes_its_versions_and_marks_citations_elsewhere(
     assert store.read(x["body"]) == b"tool output p"  # still in a run's record
 
 
+def test_the_papers_delete_dialog_says_what_becomes_of_its_citations():
+    """M2 audit, area 1: the dialog shown before a paper's deletion says what it does (S1-19b, Harold 2026-10-21,
+    option A): answers that drew on the paper keep their text, and their citations keep no quote."""
+    from backend.db.deletion import _SOURCE_REMOVED
+    catalogs = {name: json.loads((Path(__file__).parent.parent / "frontend/src/i18n" / name).read_text())
+                for name in ("en.json", "zh-CN.json")}
+    assert "quote = NULL" in _SOURCE_REMOVED
+    assert catalogs["en.json"]["paper.deleteBody"].endswith("Answers that drew on it keep their text, but their citations keep no quotes.")
+    assert catalogs["zh-CN.json"]["paper.deleteBody"].endswith("用到它的回答会保留正文，但其中的引用不再保留引文。")
+
+
 def test_a_file_shared_with_another_material_keeps_its_extraction(db, store):
     paper = b"the same paper"
     x = populate(db, store, add_project(db, "Thesis"), "p", paper=paper)

@@ -359,7 +359,7 @@
   "paper.replacing": "Uploading…",
   "paper.about": "About this paper",
   "paper.deleteTitle": "Delete {title}?",
-  "paper.deleteBody": "Its file, its versions and its passages are deleted from this project. Citations of it keep their quotes.",
+  "paper.deleteBody": "Its file, its versions and its passages are deleted from this project. Answers that drew on it keep their text, but their citations keep no quotes.",
   "paper.details": "Details",
   "paper.field.title": "Title",
   "paper.field.authors": "Authors, one per line",
