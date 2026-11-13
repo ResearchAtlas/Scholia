@@ -79,3 +79,28 @@ async def test_a_turn_stops_past_its_time_limit(tmp_path, monkeypatch):
         monkeypatch.setattr(runs, "_clock", ticking)
         _, hit, _ = await stopped(client, conversation, "turn_minutes")
         assert hit == {"turn_minutes": 15} and len(provider.agent_steps) < 12
+
+
+async def test_a_continued_turn_is_told_why_the_previous_run_ended_and_a_revoked_one_is_not(tmp_path):
+    # M2 audit area 3, item 3 (ticket 15: Continue "tells the model why the previous run ended"; never after a
+    # revocation, section 10). The stopped turn's recorded steps are not carried (the audit fix's report says why).
+    import asyncio
+
+    from scholia_app import events
+    provider = Scripted(*looping(3), "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        await project_limits(client, project, agent_steps=3)
+        conversation = await conversation_in(client, project)
+        stream, _, _ = await stopped(client, conversation, "agent_steps")
+        continued = events(await client.post(f"/api/runs/{stream[0]['run_id']}/continue"))
+        assert continued[-1]["status"] == "succeeded"
+        system = provider.agent_steps[3]["messages"][0]["content"]
+        assert "previous run of this request stopped: it reached its limit of steps" in system
+        db = client.state["db"]
+        revoked = continued[0]["run_id"]
+        await asyncio.to_thread(db.write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'cancelled', cancel_reason = 'revoked' WHERE id = ?", (revoked,)))
+        again = events(await client.post(f"/api/runs/{revoked}/continue"))
+        assert again[-1]["status"] == "succeeded"
+        assert "previous run of this request" not in provider.agent_steps[-1]["messages"][0]["content"]

@@ -608,12 +608,15 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     def describe_model(provider, table, model, records, policy=None, key=None):
         """A catalog row with what the settings and the picker need: its window as reported
-        and in use, whether it is offered and recommended, and its effort steps; with a
-        project's policy, whether the project allows it."""
+        and in use, whether it is offered and recommended, and its effort steps (none where no
+        reasoning object is ever sent: another provider than OpenRouter, or a Private project's
+        zero-retention requests); with a project's policy, whether the project allows it."""
         capability = reasoning_capability.get_capability(records, model["id"], model)
         surface = capability.get("control_surface") or "unknown"
         steps = (capability.get("levels") or []) if surface == "levels" else \
             list(budget_router.EFFORT_LEVELS) if surface == "budget" else []
+        if not provider.is_openrouter or (policy is not None and policy.zero_retention):  # openrouter.resolve_model_reasoning
+            steps = []
         refusal = policy.problem(provider, model["id"], key) if policy is not None else None
         return {**model, "window": providers.window(table, model["id"], model.get("context_length")),
                 "offered": providers.offered(table, provider, model["id"], budget_router.RECOMMENDED),

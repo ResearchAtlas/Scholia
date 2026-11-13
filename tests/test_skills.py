@@ -214,6 +214,19 @@ def test_the_help_skill_says_exactly_what_each_protection_level_sends():
     assert lookup.SERVICES == {"doi": ("openalex", "crossref"), "arxiv": ("arxiv",)}  # what the text names
 
 
+def test_the_help_skill_says_how_a_budget_stops_a_turn_as_s1_33_built_it():
+    # M2 audit area 3, item 7 (F11 as S1-33 built it): a turn asks at the cap (Continue, Set a new limit, Stop) and
+    # before a step that alone costs more than is left (Go ahead, Set a new limit, Not now), in the asks' own words.
+    loaded = skills.load()[0]["help"]
+    english, chinese = loaded.body, loaded.zh["body"]
+    assert "A turn stops at the budget and Continue is offered once it is raised" not in english
+    for said in ("Continue", "Set a new limit", "Stop", "Go ahead", "Not now", "adds the budget's amount again"):
+        assert said in english, said
+    assert "提高预算后可以继续" not in chinese
+    for said in ("“继续”", "“设置新预算”", "“停止”", "“照常进行”", "“暂不”"):
+        assert said in chinese, said
+
+
 @pytest.mark.asyncio
 async def test_ct1_read_skill_file_reads_only_a_file_of_a_skill_active_in_the_conversation(tmp_path):
     provider = Scripted([call("read_skill_file", file_id="literature-review#1")], "Not yet.",
