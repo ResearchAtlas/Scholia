@@ -33,7 +33,8 @@ archiveID field when it is, whole, "arXiv:" and an ID (Harold, 2026-10-17); neve
 cancelled:
 - an item already imported into the project (keyed by library and item key, `source_key`
   "<library>/items/<KEY>") is updated: its details replaced by the record when they changed and the
-  researcher has not edited them, and a PDF that is none of its files becomes its next version;
+  researcher has not edited them (a Merge's fields kept where the record gives none), and a PDF other than
+  the one Zotero last gave (`zotero_file`) becomes its next version unless it is its current file;
 - a new item that duplicates a paper of the project (S1-14's `references.Duplicates`) is reported
   already there when it would add nothing, else asked about through S1-14's merge run (Keep both
   imports it as its own paper, through a one-item import of its own); a PDF that is already a paper's
@@ -78,6 +79,7 @@ from backend.settings import load_settings
 
 ORIGIN = _show(ZOTERO)
 MAX_ITEMS = 100  # per import (bounded work; the browser says so at the cap)
+UNKNOWN_FILE = "unknown"  # materials.zotero_file of a paper whose last Zotero PDF migration 0013 could not tell
 PAGE = 50  # items per page of the browser
 COLLECTION_PAGES = 50  # of 100 collections each, at most
 MAX_ANSWER = 8 * 1024 * 1024  # one answer's bytes
@@ -796,7 +798,8 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
 
 def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
     """An item imported before: its details replaced by its record when they changed (and the
-    researcher has not edited them), and its PDF, when it is none of its files, its next version.
+    researcher has not edited them), and its PDF, when it is not the one Zotero last gave nor its current file, its
+    next version.
     Returns (material, version, its record or {}, whether its current version has a file) to look up
     when its details were replaced or a file added, else None."""
     material, stored, checked_by, filled, title, evidence, merge_filled, given = found
@@ -828,18 +831,19 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
     current = conn.execute("SELECT id, file_sha256 FROM material_versions WHERE material_id = ? AND is_current = 1",
                            (material,)).fetchone()
     version = current[0] if current else None
-    # Files follow Zotero: its PDF becomes the paper's next version when Zotero changed it since it last gave one (back
-    # to an earlier file too), unless it is the current file already; while Zotero's is as it was, the researcher's own
-    # replacement stays. A paper whose Zotero file is not known (zotero_file NULL: migration 0013 found no import that
-    # gave it one): when it is none of its files; Zotero's file is kept from then on only once it is the current one.
+    # Files follow Zotero: its PDF becomes the paper's next version when it is not the one Zotero last gave
+    # (zotero_file: back to an earlier file too, and a first one where Zotero gave none), unless it is the current file
+    # already; while Zotero's is as it was, the researcher's own replacement stays. A paper migration 0013 could not
+    # tell (UNKNOWN_FILE: a file of the researcher's among its versions) goes by the earlier rule once: when the PDF is
+    # none of its files. The PDF read is recorded either way.
     if sha256 is not None:
-        moved_on = sha256 != given if given is not None else conn.execute(
+        moved_on = sha256 != given if given != UNKNOWN_FILE else conn.execute(
             "SELECT 1 FROM material_versions WHERE material_id = ? AND file_sha256 = ?", (material, sha256)).fetchone() is None
         if moved_on and (current is None or current[1] != sha256):
             version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF, None, recorded)
             step["version"] = True
             # what the old file's lookup gave it goes in add_version (materials._forget_file_lookup)
-        if given is not None or step["version"] or (current is not None and current[1] == sha256):
+        if sha256 != given:
             conn.execute("UPDATE materials SET zotero_file = ? WHERE id = ?", (sha256, material))
     elif step.get("pdf") and current is not None and current[1] is not None:
         step["kept"] = True  # its PDF could not be read this time: the paper keeps the file it had

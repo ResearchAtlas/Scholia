@@ -316,12 +316,13 @@ def test_artifact_versions_are_deleted_only_together_with_their_artifact(db):
     "INSERT INTO runs (id, project_id, kind, attempts) VALUES (:id, :general, 'background', 3)",
     "INSERT INTO memory_records (id, scope, type, content, status) VALUES (:id, 'personal', 'progress', 'x', 'confirmed')",
     "INSERT INTO materials (id, project_id, source, lookup_filled) VALUES (:id, :general, 'upload', '[\"page\",')",
+    "INSERT INTO materials (id, project_id, source, zotero_file) VALUES (:id, :general, 'zotero', 'not a hash')",
 ], ids=[
     "invalid-json", "invalid-json-csl", "id-not-uuid", "id-uppercase", "id-not-version-4",
     "id-only-hyphens", "id-hyphen-inside-a-group",
     "time-without-zone", "time-with-offset", "time-without-milliseconds",
     "unknown-enum", "strict-type", "missing-foreign-key", "background-attempts", "confirmed-progress",
-    "invalid-json-lookup-filled",
+    "invalid-json-lookup-filled", "zotero-file-state",
 ])
 def test_the_schema_refuses_invalid_values(db, sql):
     with pytest.raises(sqlite3.IntegrityError):
@@ -387,6 +388,42 @@ def test_migration_0013s_backfill_grows_with_the_library_not_its_square(tmp_path
         return counted[0]
 
     assert steps_for(2000) < 30 * steps_for(200)  # ten times the papers: about ten times the work, never a hundred
+
+
+@pytest.mark.parametrize("history, expected", [
+    ("a backward clock", "current"), ("a shared millisecond", "unknown"), ("no file", None), ("imports only", "current")])
+def test_migration_0013_knows_zoteros_last_file_by_count_never_by_time(tmp_path, history, expected):
+    """Design review G, option 1.2 (pending Harold; its tests 5 and 6): 0013 reads no time. Every file version an import
+    made (by count of the import steps that made one): Zotero's last file is the current one, whatever the clocks said
+    (A at :02, B at :01); a file of the researcher's among them, even in the same millisecond as an import: unknown;
+    no file: NULL (Zotero gave none)."""
+    import json
+    from backend.db.migrations import MIGRATIONS
+    data, material = tmp_path / "data", new_id()
+    files = {"a backward clock": [("a", "2026-01-01T00:00:02.000Z", True), ("b", "2026-01-01T00:00:01.000Z", True)],
+             "a shared millisecond": [("a", "2026-01-01T00:00:01.000Z", True), ("c", "2026-01-01T00:00:01.000Z", False)],
+             "no file": [], "imports only": [("a", "2026-01-01T00:00:01.000Z", True)]}[history]
+    with Database(data, migrations=MIGRATIONS[:12]) as old:
+        def seed(conn):
+            project, run = general_id(conn), new_id()
+            conn.execute("INSERT INTO materials (id, project_id, title, source) VALUES (?, ?, 'P', 'zotero')", (material, project))
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, status) VALUES (?, ?, 'background',"
+                         " 'zotero_import', 'succeeded')", (run, project))
+            if not files:
+                conn.execute("INSERT INTO material_versions (id, material_id, seq, is_current) VALUES (?, ?, 0, 1)",
+                             (new_id(), material))
+            for seq, (name, at, imported) in enumerate(files):
+                digest = name * 64
+                conn.execute("INSERT INTO content_files (sha256, size, media_type) VALUES (?, 1, 'application/pdf')", (digest,))
+                conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, created_at)"
+                             " VALUES (?, ?, ?, ?, ?, ?)", (new_id(), material, seq, digest, seq == len(files) - 1, at))
+                if imported:
+                    conn.execute("INSERT INTO run_events (run_id, seq, at, type, data) VALUES (?, ?, ?, 'step_finished', ?)",
+                                 (run, seq, at, json.dumps({"material_id": material, "outcome": "imported", "version": True})))
+        old.write(seed)
+    with Database(data) as db:
+        (found,) = db.read(lambda conn: conn.execute("SELECT zotero_file FROM materials WHERE id = ?", (material,)).fetchone())
+    assert found == (files[-1][0] * 64 if expected == "current" else expected)
 
 
 def test_the_schema_refuses_the_word_now_as_a_time(db):

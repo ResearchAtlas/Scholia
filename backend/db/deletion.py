@@ -379,16 +379,11 @@ def _delete(conn, kind, object_id, remove_all_trace):
                      " AND EXISTS (SELECT 1 FROM json_each(runs.inputs, '$.material_ids') j WHERE j.value = ?)",
                      (f'$.identifiers."{material}"', material))
         # A Zotero import's keys of the items that came to it: its own item's, in every import of its library, and any
-        # other item an earlier build's step named it for (merged into it, or already there by its PDF).
-        # (A running import names them in inputs.papers.)
+        # other item a running import names it for (inputs.papers: merged into it, or already there by its PDF).
         keys = {}
-        for run, item in conn.execute(
-                "SELECT e.run_id, json_extract(e.data, '$.key') FROM run_events e JOIN runs r ON r.id = e.run_id"
-                " WHERE r.project_id = ? AND r.workflow = 'zotero_import' AND e.type = 'step_finished'"
-                " AND json_extract(e.data, '$.material_id') = ? AND json_type(e.data, '$.key') = 'text'"
-                " UNION ALL SELECT r.id, j.value FROM runs r, json_each(r.inputs, ?) j"
-                " WHERE r.project_id = ? AND r.workflow = 'zotero_import'",
-                (project, material, f'$.papers."{material}"', project)):
+        for run, item in conn.execute("SELECT r.id, j.value FROM runs r, json_each(r.inputs, ?) j"
+                                      " WHERE r.project_id = ? AND r.workflow = 'zotero_import'",
+                                      (f'$.papers."{material}"', project)):
             keys.setdefault(run, set()).add(item)
         library, _, key = (source_key or "").rpartition("/items/")
         if source == "zotero" and library:
@@ -404,24 +399,6 @@ def _delete(conn, kind, object_id, remove_all_trace):
                 kept["papers"] = {paper: items for paper, items in inputs["papers"].items() if paper != material}
             if kept:
                 conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps({**inputs, **kept}), run))
-        # Events an earlier build wrote with them (a lookup step's identifier, its question's covers, a Zotero step's
-        # item key) lose them here: the deletion service's purge path is the one exception to the events' append-only
-        # rule (slice-1 spec section 4.2), so their trigger is lifted for this transaction only.
-        legacy = [rowid for (rowid,) in conn.execute(
-            "SELECT e.rowid FROM run_events e JOIN runs r ON r.id = e.run_id WHERE r.project_id = ?"
-            f" AND r.rowid NOT IN {_doomed('runs')} AND ((r.workflow IN ('lookup', 'zotero_import') AND e.type = 'step_finished'"
-            " AND json_extract(e.data, '$.material_id') = ? AND (json_type(e.data, '$.identifier') = 'text'"
-            " OR json_type(e.data, '$.key') = 'text')) OR (r.workflow = 'lookup' AND e.type = 'ask'"
-            " AND json_type(e.data, '$.covers') IS NOT NULL"
-            " AND EXISTS (SELECT 1 FROM json_each(r.inputs, '$.material_ids') j WHERE j.value = ?)))",
-            (project, material, material))]
-        if legacy:
-            (trigger,) = conn.execute("SELECT sql FROM sqlite_schema WHERE type = 'trigger'"
-                                      " AND name = 'run_events_no_update'").fetchone()
-            conn.execute("DROP TRIGGER run_events_no_update")
-            conn.execute("UPDATE run_events SET data = json_remove(data, '$.identifier', '$.covers', '$.key')"
-                         " WHERE rowid IN (SELECT value FROM json_each(?))", (json.dumps(legacy),))
-            conn.execute(trigger)
     # S1-21a: what's done, from AAB's own records: papers removed from a project that stays (no title is kept)
     from backend import memory
     for removed_from, count in conn.execute(
@@ -517,8 +494,11 @@ def _revoke(conn):
     )"""
     revoked = sorted(run_id for (run_id,) in conn.execute(
         f"{in_scope} SELECT id FROM runs WHERE status = 'running' AND id IN (SELECT id FROM scope)"))
+    # A revoked run applies no effect, so what it holds only while it runs (`held`: a Merge's record, an agent's
+    # question, an extraction's reply) goes now, in the deletion's transaction, not at its terminal record (design
+    # review F, option 1.1 rule (a)).
     conn.execute(
-        f"{in_scope} UPDATE runs SET cancel_reason = 'revoked'"
+        f"{in_scope} UPDATE runs SET cancel_reason = 'revoked', inputs = json_remove(inputs, '$.held')"
         f" WHERE status = 'running' AND id IN (SELECT id FROM scope) AND rowid NOT IN {_doomed('runs')}"
     )
     return revoked

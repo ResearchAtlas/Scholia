@@ -339,66 +339,221 @@ async def as_before_0013(data):
         conn.close()
 
 
+async def replaced(client, project, paper_id, data, name="mine.pdf"):
+    """The researcher's Replace file on a paper (its file as the interface sends it)."""
+    import base64
+    [(version,)] = await rows(client, "SELECT id FROM material_versions WHERE material_id = ? AND is_current = 1", paper_id)
+    response = await client.post(f"/api/projects/{project}/materials", json={
+        "files": [{"name": name, "data": base64.b64encode(data).decode()}], "material_id": paper_id, "replaces": version})
+    assert response.status_code == 201, response.text
+
+
+async def current_file(client, project, key=KEYS[1]):
+    """(the paper's current file's SHA-256, its zotero_file)."""
+    paper = (await papers(client, project))[f"users/0/items/{key}"]
+    [found] = await rows(client, "SELECT v.file_sha256, m.zotero_file FROM materials m JOIN material_versions v"
+                                 " ON v.material_id = m.id AND v.is_current = 1 WHERE m.id = ?", paper["id"])
+    return found
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def attach(mock, key, path):
+    """Zotero gives an item it gave no PDF a PDF attachment (its record otherwise as it was)."""
+    item = mock.items["users/0", key]
+    mock.item(key, item["data"]["title"], pdf=path, doi=item["csljson"].get("DOI"))
+
+
 async def test_an_attachment_changed_before_the_upgrade_and_back_after_it_becomes_current(tmp_path):
-    """Batch 1 (PR 61 recheck, item 7): Zotero's attachment went from A to B under a build before migration 0013, and back
-    to A after it: A becomes current at the next import (0013 takes B as Zotero's last file, from the import that gave it),
-    and an import of A again changes nothing."""
+    """Batch 1 (PR 61 recheck 1, item 7; design review G's test 3): Zotero's attachment went from A to B under a build
+    before migration 0013, every file from an import, so 0013 knows Zotero's last file (B, by count, reading no time);
+    back to A after the upgrade, A becomes current, and an import of A again changes nothing."""
     data, mock = tmp_path / "data", library(tmp_path)  # once: library() writes its PDFs anew
     async with started(data, provider(mock)) as client:
         project = await project_of(client)
         a = (tmp_path / "Zotero 文件 storage" / "two.pdf").read_bytes()
         await imported(client, project, KEYS[1:2])
-        pdf_file(tmp_path, "two.pdf", "The Second File", doi=None)
+        b = pdf_file(tmp_path, "two.pdf", "The Second File", doi=None).read_bytes()
         assert (await imported(client, project, KEYS[1:2]))["result"]["versions"] == 1
     await as_before_0013(data)
     (tmp_path / "Zotero 文件 storage" / "two.pdf").write_bytes(a)
     async with started(data, provider(mock), setup=False) as client:
+        assert await current_file(client, project) == (sha(b), sha(b))
         assert (await imported(client, project, KEYS[1:2]))["result"]["versions"] == 1
-        paper = (await papers(client, project))[f"users/0/items/{KEYS[1]}"]
-        [(current,)] = await rows(client, "SELECT file_sha256 FROM material_versions WHERE id = ?", paper["version"]["id"])
-        assert current == hashlib.sha256(a).hexdigest()
+        assert await current_file(client, project) == (sha(a), sha(a))
         assert (await imported(client, project, KEYS[1:2]))["result"]["unchanged"] == 1
 
 
 async def test_a_researchers_replacement_before_the_upgrade_stays_while_zoteros_file_is_as_it_was(tmp_path):
-    """Batch 1: migration 0013 takes Zotero's last file from the import that gave it, never a later replacement."""
-    import base64
+    """Batch 1 guard (design review G's test 4): a paper with a file of the researcher's is marked unknown by 0013; an
+    unchanged Zotero PDF, one of its files, leaves the researcher's file, and is recorded."""
     data, mock = tmp_path / "data", library(tmp_path)
+    async with started(data, provider(mock)) as client:
+        project = await project_of(client)
+        a = (tmp_path / "Zotero 文件 storage" / "two.pdf").read_bytes()
+        await imported(client, project, KEYS[1:2])
+        [paper] = (await papers(client, project)).values()
+        mine = synthetic.paper_pdf("The Researcher's Own File", doi=None)
+        await replaced(client, project, paper["id"], mine)
+    await as_before_0013(data)
+    async with started(data, provider(mock), setup=False) as client:
+        assert await current_file(client, project) == (sha(mine), "unknown")
+        row = await imported(client, project, KEYS[1:2])
+        assert (row["result"]["unchanged"], row["result"]["versions"]) == (1, 0)
+        assert await current_file(client, project) == (sha(mine), sha(a))
+
+
+async def test_r1_zoteros_unchanged_file_after_the_upgrade_never_replaces_the_researchers_later_one(tmp_path):
+    """Design review G's test 7 and 10 (round 2 R1): Zotero A, the researcher's B, Zotero B (unchanged: B is current), the
+    researcher's C; the upgrade; Zotero's B imported twice leaves C, and the unknown mark gives way to B's hash at the
+    first; then Zotero's D is followed."""
+    data, mock = tmp_path / "data", library(tmp_path)
+    storage = tmp_path / "Zotero 文件 storage" / "two.pdf"
+    b, c = (synthetic.paper_pdf(title, doi=None) for title in ("The Researcher's B", "The Researcher's C"))
     async with started(data, provider(mock)) as client:
         project = await project_of(client)
         await imported(client, project, KEYS[1:2])
         [paper] = (await papers(client, project)).values()
-        mine = synthetic.paper_pdf("The Researcher's Own File", doi=None)
-        assert (await client.post(f"/api/projects/{project}/materials", json={
-            "files": [{"name": "mine.pdf", "data": base64.b64encode(mine).decode()}], "material_id": paper["id"],
-            "replaces": paper["version"]["id"]})).status_code == 201
+        await replaced(client, project, paper["id"], b)
+        storage.write_bytes(b)
+        assert (await imported(client, project, KEYS[1:2]))["result"]["unchanged"] == 1
+        await replaced(client, project, paper["id"], c)
     await as_before_0013(data)
     async with started(data, provider(mock), setup=False) as client:
+        assert await current_file(client, project) == (sha(c), "unknown")
+        for _ in range(2):
+            assert (await imported(client, project, KEYS[1:2]))["result"]["unchanged"] == 1
+            assert await current_file(client, project) == (sha(c), sha(b))
+        d = pdf_file(tmp_path, "two.pdf", "Zotero's D", doi=None).read_bytes()
+        assert (await imported(client, project, KEYS[1:2]))["result"]["versions"] == 1
+        assert await current_file(client, project) == (sha(d), sha(d))
+
+
+async def test_r2_a_pdf_zotero_attaches_to_an_item_it_gave_none_is_followed_on_a_new_database(tmp_path):
+    """Design review G's test 8 (round 2 R2): an item imported with no PDF, the researcher's A then B, then Zotero
+    attaches A: Zotero gave none before, so its A is a change, made current (reported updated, one version); again,
+    unchanged."""
+    mock = library(tmp_path, pdfs=False)
+    a, b = (synthetic.paper_pdf(title, doi=None) for title in ("File A", "File B"))
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        await imported(client, project, KEYS[2:3])
+        [paper] = (await papers(client, project)).values()
+        await replaced(client, project, paper["id"], a)
+        await replaced(client, project, paper["id"], b)
+        path = tmp_path / "attached.pdf"
+        path.write_bytes(a)
+        attach(mock, KEYS[2], path)
+        row = await imported(client, project, KEYS[2:3])
+        assert (row["result"]["updated"], row["result"]["versions"]) == (1, 1)
+        assert await current_file(client, project, KEYS[2]) == (sha(a), sha(a))
+        assert (await imported(client, project, KEYS[2:3]))["result"]["unchanged"] == 1
+
+
+@pytest.mark.parametrize("history", ["zotero back to an earlier file", "zotero attaches the researchers earlier file"])
+async def test_the_limit_an_upgraded_paper_with_a_researchers_file_takes_an_earlier_file_as_unchanged_once(tmp_path, history):
+    """Design review G's test 9, the stated limit (pending Harold): a paper made before 0013 with a file of the
+    researcher's is unknown; at its first import after the upgrade, a Zotero PDF that is one of its earlier files and not
+    its current one is taken as unchanged, so the paper stays as it is; the PDF is recorded, and each later import is
+    exact."""
+    data = tmp_path / "data"
+    mock = library(tmp_path, pdfs=history == "zotero back to an earlier file")
+    m, a, b = (synthetic.paper_pdf(title, doi=None) for title in ("The Researcher's M", "File A", "File B"))
+    storage = tmp_path / "Zotero 文件 storage" / "two.pdf"
+    key = KEYS[1] if history == "zotero back to an earlier file" else KEYS[2]
+    async with started(data, provider(mock)) as client:
+        project = await project_of(client)
+        await imported(client, project, [key])
+        [paper] = (await papers(client, project)).values()
+        if history == "zotero back to an earlier file":  # Zotero A, the researcher's M, Zotero B
+            a = storage.read_bytes()
+            await replaced(client, project, paper["id"], m)
+            b = pdf_file(tmp_path, "two.pdf", "Zotero's B", doi=None).read_bytes()
+            assert (await imported(client, project, [key]))["result"]["versions"] == 1
+        else:  # no PDF from Zotero; the researcher's A, then B
+            await replaced(client, project, paper["id"], a)
+            await replaced(client, project, paper["id"], b)
+    await as_before_0013(data)
+    if history == "zotero back to an earlier file":
+        storage.write_bytes(a)
+    else:
+        path = tmp_path / "attached.pdf"
+        path.write_bytes(a)
+        attach(mock, key, path)
+    async with started(data, provider(mock), setup=False) as client:
+        assert await current_file(client, project, key) == (sha(b), "unknown")
+        assert (await imported(client, project, [key]))["result"]["unchanged"] == 1
+        assert await current_file(client, project, key) == (sha(b), sha(a))
+
+
+async def test_an_unreadable_pdf_leaves_zoteros_last_file_as_it_was(tmp_path):
+    """Design review G's test 11: an import whose PDF cannot be read records nothing of Zotero's file."""
+    mock = library(tmp_path)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        a = (tmp_path / "Zotero 文件 storage" / "two.pdf").read_bytes()
+        await imported(client, project, KEYS[1:2])
+        mock.files["users/0", KEYS[1][:7] + "Z"] = "file:///nowhere/gone.pdf"
         row = await imported(client, project, KEYS[1:2])
-        assert (row["result"]["unchanged"], row["result"]["versions"]) == (1, 0)
+        assert row["result"]["pdf_kept"] == {"pdf_missing": 1}
+        assert await current_file(client, project) == (sha(a), sha(a))
 
 
-async def test_a_merge_confirmed_before_the_upgrade_keeps_its_fields_through_a_reimport(tmp_path):
-    """Batch 1 (PR 61 recheck, item 6): a Merge confirmed under a build before migration 0013 recorded no fields; 0013
-    counts the paper's details (but a lookup's) as kept, so an unchanged re-import keeps the merged fields."""
+async def test_the_limit_a_merge_confirmed_before_the_upgrade_is_not_kept_by_a_reimport(tmp_path):
+    """Design review G, option 2.1 (pending Harold; its test 4): which fields a Merge confirmed before 0013 gave was never
+    recorded, so 0013 marks none, and the next re-import replaces the paper's details as before (reported updated, the
+    merged fields gone); a Merge confirmed after the upgrade is kept by the next import."""
     data, mock = tmp_path / "data", library(tmp_path, pdfs=False)
+    merged = ris(("Synthetic Wages in Small Towns", f"DO  - {DOI}\nAB  - The merged abstract.\nKW  - wages\n"))
     async with started(data, provider(mock)) as client:
         project = await project_of(client)
         await imported(client, project, KEYS[:1])
-        await imported_references(client, project, ris(("Synthetic Wages in Small Towns",
-                                                         f"DO  - {DOI}\nAB  - The merged abstract.\nKW  - wages\n")))
+        await imported_references(client, project, merged)
         [ask] = await merge_asks(client, project)
         assert (await answer(client, ask, "merge")).status_code == 200
         await run_finished(client, ask["run_id"])
         await background_idle(client, 30)
-        [paper] = (await papers(client, project)).values()
     await as_before_0013(data)
     async with started(data, provider(mock), setup=False) as client:
-        row = await imported(client, project, KEYS[:1])
-        assert row["result"]["unchanged"] == 1
-        [again] = (await papers(client, project)).values()
-        assert (again["csl"]["abstract"], again["csl"]["keyword"]) == ("The merged abstract.", "wages")
-        assert again["csl"] == paper["csl"]
+        [(filled,)] = await rows(client, "SELECT merge_filled FROM materials WHERE source = 'zotero'")
+        assert filled is None
+        assert (await imported(client, project, KEYS[:1]))["result"]["updated"] == 1
+        [paper] = (await papers(client, project)).values()
+        assert "abstract" not in paper["csl"] and "keyword" not in paper["csl"]
+        await imported_references(client, project, merged)  # asked again, since the record would add to it
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        assert (await imported(client, project, KEYS[:1]))["result"]["unchanged"] == 1
+        [kept] = (await papers(client, project)).values()
+        assert (kept["csl"]["abstract"], kept["csl"]["keyword"]) == ("The merged abstract.", "wages")
+
+
+async def test_r3_fields_zotero_removes_after_the_upgrade_go_however_a_merge_before_it_filled_others(tmp_path):
+    """Design review G's test 5 (round 2 R3): a keyword merged before 0013 into a Zotero paper with a DOI and a venue;
+    after the upgrade Zotero removes both: the re-import reports updated, the DOI and the venue go, and no lookup is made
+    for the removed DOI."""
+    data, mock = tmp_path / "data", library(tmp_path, pdfs=False)
+    mock.items["users/0", KEYS[0]]["csljson"]["container-title"] = "Journal of Synthetic Towns"
+    async with started(data, provider(mock)) as client:
+        project = await project_of(client)
+        await imported(client, project, KEYS[:1])
+        await imported_references(client, project, ris(("Synthetic Wages in Small Towns", f"DO  - {DOI}\nKW  - wages\n")))
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        await background_idle(client, 30)
+    await as_before_0013(data)
+    del mock.items["users/0", KEYS[0]]["csljson"]["DOI"], mock.items["users/0", KEYS[0]]["csljson"]["container-title"]
+    async with started(data, provider(mock), setup=False) as client:
+        lookups = await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'")
+        assert (await imported(client, project, KEYS[:1]))["result"]["updated"] == 1
+        await background_idle(client, 30)
+        [paper] = (await papers(client, project)).values()
+        assert "DOI" not in paper["csl"] and "container-title" not in paper["csl"]
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == lookups
 
 
 async def test_a_merged_field_zotero_then_gives_itself_is_zoteros_and_goes_when_zotero_drops_it(tmp_path):

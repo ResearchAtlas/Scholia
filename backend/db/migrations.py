@@ -728,40 +728,53 @@ ALTER TABLE queued_messages ADD COLUMN material_ids TEXT CHECK (material_ids IS 
 # triggers, as a STRICT table's CHECK cannot be added to a column in place; a paper written before keeps its value.
 # merge_filled: the fields a confirmed Merge gave the paper (a JSON list of CSL keys, or NULL), which a later record of
 # it (a Zotero re-import, a lookup tried again) keeps where that record gives none (backend/references.py _answered).
-# zotero_file: the SHA-256 of the PDF a Zotero paper's item gave when last imported with one (NULL: none known), so a
-# re-import adds Zotero's attachment when Zotero changed it, even back to an earlier file, and never undoes the
-# researcher's own replacement while Zotero's is as it was (backend/zotero.py _update). Both are filled for the papers
-# that exist from what the record holds (below).
+# Which fields a Merge confirmed before now gave was never recorded, so such a paper has none (design review G, option
+# 2.1, pending Harold): its next record replaces its details as before.
+# zotero_file: the PDF a Zotero paper's item gave when last imported, in one of three states: its SHA-256, NULL (Zotero
+# has given none), or 'unknown', which only this migration writes: a paper made before now whose file versions did not
+# all come from its imports (a researcher's file among them), so which one Zotero last gave is not known; its next
+# import that reads a PDF goes by the earlier rule once (backend/zotero.py _update) and records it (design review G,
+# option 1.2, pending Harold). No time is read: a paper whose every file version an import made is known by count.
+# Then, once (design review F, option 1.1 rule (b), pending Harold), the identifying fields earlier builds wrote into
+# lookup and Zotero events go (a lookup step's identifier, its question's covers, a Zotero step's item key; events name
+# papers by id only, backend/provenance.py), with the append-only trigger lifted for this transaction and recreated as
+# 0001 has it; an ended import keeps no item keys, and one under way keeps only the items it has not reached.
 _0013 = r"""
 ALTER TABLE materials ADD COLUMN merge_filled TEXT CHECK (merge_filled IS NULL OR json_valid(merge_filled));
-ALTER TABLE materials ADD COLUMN zotero_file TEXT;
+ALTER TABLE materials ADD COLUMN zotero_file TEXT
+    CHECK (zotero_file IS NULL OR zotero_file = 'unknown' OR length(zotero_file) = 64);
 
--- A paper a Merge was confirmed into before now (a merge run that succeeded with Merge): which fields it gave was not
--- recorded, so every field of its details but a lookup's counts as the researcher's choice; the paper's next record
--- (a re-import, a lookup) takes back each field it gives, so the list narrows to what that record lacks.
-UPDATE materials SET merge_filled = (
-    SELECT json_group_array(j.key) FROM json_each(materials.csl) j
-    WHERE j.key NOT IN (SELECT value FROM json_each(coalesce(materials.lookup_filled, '[]'))))
-WHERE csl IS NOT NULL AND id IN (
-    SELECT json_extract(inputs, '$.material_ids[0]') FROM runs
-    WHERE workflow = 'merge' AND status = 'succeeded' AND json_extract(summary, '$.option') = 'merge');
-
--- A Zotero paper's file as its imports last gave it: the newest of its versions with a file made by or before the last
--- import step that gave it one (the version is written in that step's own transaction, before its event), so a
--- researcher's later replacement is not taken for Zotero's. NULL when no import gave it a file. The steps are read once
--- into a table keyed by paper, so the work grows with the library, not with papers times steps.
-CREATE TEMP TABLE zotero_given (material TEXT PRIMARY KEY, at TEXT NOT NULL) WITHOUT ROWID;
+-- Read once into a table keyed by paper, so the work grows with the library, not with papers times steps.
+CREATE TEMP TABLE zotero_given (material TEXT PRIMARY KEY, files INTEGER NOT NULL) WITHOUT ROWID;
 INSERT INTO temp.zotero_given
-    SELECT json_extract(e.data, '$.material_id'), max(e.at) FROM run_events e JOIN runs r ON r.id = e.run_id
+    SELECT json_extract(e.data, '$.material_id'), count(*) FROM run_events e JOIN runs r ON r.id = e.run_id
     WHERE r.workflow = 'zotero_import' AND e.type = 'step_finished' AND json_extract(e.data, '$.version') = 1
     AND json_type(e.data, '$.material_id') = 'text'
     GROUP BY 1;
-UPDATE materials SET zotero_file = (
-    SELECT v.file_sha256 FROM material_versions v JOIN temp.zotero_given g ON g.material = v.material_id
-    WHERE v.material_id = materials.id AND v.file_sha256 IS NOT NULL AND v.created_at <= g.at
-    ORDER BY v.created_at DESC, v.seq DESC LIMIT 1)
+UPDATE materials SET zotero_file = CASE
+    WHEN (SELECT count(*) FROM material_versions v WHERE v.material_id = materials.id AND v.file_sha256 IS NOT NULL)
+        = coalesce((SELECT files FROM temp.zotero_given g WHERE g.material = materials.id), 0)
+    THEN (SELECT v.file_sha256 FROM material_versions v WHERE v.material_id = materials.id AND v.is_current = 1)
+    ELSE 'unknown' END
 WHERE source = 'zotero';
 DROP TABLE temp.zotero_given;
+
+DROP TRIGGER run_events_no_update;
+UPDATE run_events SET data = json_remove(data, '$.identifier', '$.covers', '$.key')
+WHERE type IN ('step_finished', 'ask')
+    AND run_id IN (SELECT id FROM runs WHERE workflow IN ('lookup', 'zotero_import'))
+    AND (json_type(data, '$.identifier') = 'text' OR json_type(data, '$.key') = 'text'
+         OR json_type(data, '$.covers') IS NOT NULL);
+CREATE TRIGGER run_events_no_update BEFORE UPDATE ON run_events
+BEGIN
+    SELECT RAISE(ABORT, 'run_events is append-only');
+END;
+UPDATE runs SET inputs = json_remove(inputs, '$.items', '$.done')
+WHERE workflow = 'zotero_import' AND status != 'running';
+UPDATE runs SET inputs = json_set(json_remove(inputs, '$.done'), '$.items', json((
+    SELECT json_group_array(j.value) FROM json_each(runs.inputs, '$.items') j
+    WHERE j.value NOT IN (SELECT value FROM json_each(runs.inputs, '$.done')))))
+WHERE workflow = 'zotero_import' AND status = 'running';
 
 CREATE TRIGGER materials_lookup_filled_valid BEFORE INSERT ON materials
 WHEN NEW.lookup_filled IS NOT NULL AND NOT json_valid(NEW.lookup_filled)

@@ -114,6 +114,10 @@ def kept_anywhere(data, text):
         for (table,) in conn.execute("SELECT name FROM sqlite_schema WHERE type = 'table'").fetchall():
             found += [f"{table}: {value}" for row in conn.execute(f'SELECT * FROM "{table}"')
                       for value in row if isinstance(value, str) and text in value]
+        # and no run that ended or was revoked holds anything (design review F's test 9)
+        found += [f"held: {run}" for (run,) in conn.execute(
+            "SELECT id FROM runs WHERE (status != 'running' OR cancel_reason = 'revoked')"
+            " AND json_type(inputs, '$.held') IS NOT NULL")]
     finally:
         conn.close()
     return found
@@ -670,6 +674,36 @@ async def test_a_merges_fields_survive_the_retry_of_the_uploads_lookup(tmp_path)
         retried = (await client.get(f"/api/materials/{paper}")).json()
         assert retried["csl"]["container-title"] == "Journal of Later Records"  # the lookup's details, replaced
         assert (retried["csl"]["abstract"], retried["csl"]["keyword"]) == ("The merged abstract.", "wages")
+
+
+async def test_r3_an_uploads_venue_its_lookup_no_longer_gives_goes_at_retry_after_the_upgrade(tmp_path):
+    """Design review G's test 6 (round 2 R3, the upload's variant; option 2.1, pending Harold): a Merge into an upload
+    confirmed before 0013 is not marked, so the lookup tried again after the upgrade writes its record afresh: a venue it
+    no longer gives goes, and so does the old Merge's field (the stated limit)."""
+    from test_reference_import import answer, imported as imported_references, merge_asks, ris
+    from test_zotero import as_before_0013
+    data, other = tmp_path / "data", "10.5555/never.answered"
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE, venue="Journal of Early Records")})
+    mock.answers = {"api.crossref.org": [503, 503, 503]}
+    async with started(data, MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()),
+                             ("second.md", f"# Second\n\ndoi:{other}\n".encode()))
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "failed"
+        await imported_references(client, project, ris((TITLE, f"DO  - {DOI}\nKW  - wages\n")))
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        paper = result["materials"][0]["id"]
+    await as_before_0013(data)
+    record = openalex_work(DOI, TITLE)
+    record["primary_location"] = {"source": None}  # no venue any more
+    mock = MockScholarly(openalex={DOI: record})
+    async with started(data, MockProvider(scholarly=mock), setup=False) as client:
+        again = await client.post(f"/api/runs/{result['lookup_run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        retried = (await client.get(f"/api/materials/{paper}")).json()
+        assert "container-title" not in retried["csl"] and "keyword" not in retried["csl"]
 
 
 async def test_a_failed_lookup_tried_again_twice_at_once_is_tried_again_once(tmp_path):
