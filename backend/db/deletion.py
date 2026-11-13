@@ -19,8 +19,10 @@ import contextlib
 import json
 import logging
 import weakref
+from datetime import UTC, datetime
 
 from backend import provenance
+from backend.db.content import referenced_sql
 from backend.extraction import EXTRACTORS, extractor_of
 
 log = logging.getLogger(__name__)
@@ -260,19 +262,22 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
     if kind not in KINDS:
         raise ValueError(f"cannot delete a {kind!r}")
     barrier = REVOKING.get(db)
+    started = datetime.now(UTC)
     with barrier(None) if barrier else contextlib.nullcontext():  # None: every project (see REVOKING)
         def run(conn):
             if check is not None:
                 check(conn)
-            return _delete(conn, kind, object_id, remove_all_trace)
-        revoked = db.write(run)
+            # the content referenced before: what of it the deletion leaves unreferenced is collected at once
+            referenced = [sha256 for (sha256,) in conn.execute(referenced_sql(conn))]
+            return _delete(conn, kind, object_id, remove_all_trace), referenced
+        revoked, referenced = db.write(run)
     if on_committed is not None:
         on_committed(revoked)
     # The deletion is committed. These finish removing its traces, and the next
     # deletion or collection retries them if they fail now. Collection goes first,
     # since the rows it removes would otherwise stay in the WAL.
     try:
-        content.collect_garbage()
+        content.collect_garbage(released=referenced, since=started)
     except Exception as error:
         log.warning("content collection after a deletion failed (%s)", type(error).__name__)
     try:

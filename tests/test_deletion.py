@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import signal
 import sqlite3
 import subprocess
@@ -266,11 +267,46 @@ def test_deleting_a_project_removes_everything_it_owned_and_nothing_else(db, sto
     assert not any(text in json.dumps(data) for text in ("Thesis", "Chat p", "Paper p", "Draft p", "fact p", "quote p"))
     assert (tmp_path / "data" / f"{DB_NAME}-wal").stat().st_size == 0  # no deleted page left in the WAL
 
-    store.collect_garbage(now=later())  # the deleted project's files were added just now
+    # its files, added just now, went with the deletion, and the other project's stay (M2 audit 1 F8)
     assert dump(db, skip=GOVERNANCE)["content_files"] == before["content_files"]
     assert store.read(other["paper"]) == b"paper q"
     with pytest.raises(FileNotFoundError):
         store.read(x["paper"])
+
+
+@pytest.mark.parametrize("kind", ["project", "conversation", "material"])
+def test_a_deletion_removes_at_once_the_files_only_it_referenced(db, store, kind):
+    # M2 audit 1 F8: a file added within the hour stayed in content/ until collection found it idle
+    other = populate(db, store, add_project(db, "Other"), "q")
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    loose = store.put(b"being added")  # its record is not committed yet: the idle rule keeps it
+    deleted = {"project": x["project"], "conversation": x["c1"], "material": x["m1"]}[kind]
+    gone = {"project": [x["paper"], x["body"]], "conversation": [x["body"]], "material": [x["paper"]]}[kind]
+
+    delete(db, store, kind, deleted)
+
+    for sha256 in gone:
+        with pytest.raises(FileNotFoundError):
+            store.read(sha256)
+        assert one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", sha256) == (0,)
+    assert store.read(other["paper"]) == b"paper q" and store.read(other["body"]) == b"tool output q"
+    assert store.read(loose) == b"being added"
+    for sha256 in {"project": [], "conversation": [x["paper"]], "material": [x["body"]]}[kind]:
+        assert store.read(sha256)  # still referenced (the body by its run's event)
+
+
+def test_a_file_added_again_while_a_deletion_runs_keeps_the_idle_rule(db, store, monkeypatch):
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    real = deletion_module._delete
+
+    def put_meanwhile(conn, *args):
+        result = real(conn, *args)
+        os.utime(store._path(x["paper"]))  # the same bytes, put again while the deletion's write runs
+        return result
+
+    monkeypatch.setattr(deletion_module, "_delete", put_meanwhile)
+    delete(db, store, "material", x["m1"])
+    assert store.read(x["paper"]) == b"paper p"
 
 
 def test_the_general_project_cannot_be_deleted(db, store):
@@ -677,7 +713,7 @@ KILLED_DELETION = r"""
 import os, signal, sqlite3, sys, time
 
 
-def crash(*args):
+def crash(*args, **kwargs):
     os.kill(os.getpid(), signal.SIGKILL)
     while True:  # the signal is delivered asynchronously; never return to the next statement
         time.sleep(1)

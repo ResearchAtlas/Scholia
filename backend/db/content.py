@@ -16,6 +16,7 @@ an export, a reading of a paper). The idle window is a second guard, for a put i
 import collections
 import contextlib
 import hashlib
+import json
 import os
 import re
 import threading
@@ -130,7 +131,7 @@ class ContentStore:
             raise ContentCorruptError(f"the stored content {sha256} does not match its hash")
         return data
 
-    def collect_garbage(self, now=None):
+    def collect_garbage(self, now=None, released=(), since=None):
         """Remove files and rows nothing references once idle. Returns the number of files removed.
 
         Content held (hold) is never removed. Otherwise a row is removed when no
@@ -140,28 +141,29 @@ class ContentStore:
         left by an interrupted put are removed the same way, never those of a put
         still in progress in this store. Names the store did not write
         are left alone. now, an aware UTC datetime, defaults to the current time.
+
+        released, with since (an aware UTC datetime): the hashes records referenced when a deletion started at
+        since. One nothing references now goes at once, not once idle (a deletion reaches every copy, slice 1
+        section 16; M2 audit 1 F8), unless its row or file was written since then: the same bytes put again
+        meanwhile keep the idle rule.
         """
         _refuse_event_loop()
         cutoff = (now or datetime.now(UTC)) - IDLE_AFTER
+        released = set(released) if since is not None else set()
+
+        def due(sha256):  # written before this, the file may go
+            return since if sha256 in released else cutoff
 
         def remove_rows(conn):
-            references = conn.execute(
-                "SELECT m.name, f.\"from\" FROM sqlite_schema m, pragma_foreign_key_list(m.name) f"
-                " WHERE m.type = 'table' AND f.\"table\" = 'content_files'"
-            ).fetchall()
-            # Every reference read once (a correlated check per row would scan an unindexed column, such as
-            # run_events.body_ref, once per stored file), NULLs left out so NOT IN compares only hashes.
-            referenced = " UNION ALL ".join(
-                f'SELECT "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL' for table, column in references
-            )
             candidates = [sha256 for (sha256,) in conn.execute(
-                "SELECT sha256 FROM content_files c"
-                f" WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', ?, 'unixepoch') AND sha256 NOT IN ({referenced})",
-                (cutoff.timestamp(),),
+                "SELECT sha256 FROM content_files c WHERE (created_at < strftime('%Y-%m-%dT%H:%M:%fZ', ?, 'unixepoch')"
+                " OR (created_at < strftime('%Y-%m-%dT%H:%M:%fZ', ?, 'unixepoch') AND sha256 IN"
+                f" (SELECT value FROM json_each(?)))) AND sha256 NOT IN ({referenced_sql(conn)})",
+                (cutoff.timestamp(), (since or cutoff).timestamp(), json.dumps(sorted(released))),
             )]
             # A held put that misses this check has its row put back by its own insert, which the one writer
             # runs after this transaction; its file, held, is kept below, under the lock.
-            idle = [sha256 for sha256 in candidates if sha256 not in self._held and _idle(self._path(sha256), cutoff)]
+            idle = [sha256 for sha256 in candidates if sha256 not in self._held and _idle(self._path(sha256), due(sha256))]
             conn.executemany("DELETE FROM content_files WHERE sha256 = ?", [(sha256,) for sha256 in idle])
 
         self.db.write(remove_rows)
@@ -175,7 +177,7 @@ class ContentStore:
             if path.name in kept:
                 continue
             with self._lock:
-                if path.name not in self._held and _idle(path, cutoff):
+                if path.name not in self._held and _idle(path, due(path.name)):
                     path.unlink(missing_ok=True)
                     removed += 1
         for path in self.root.glob(".put-*.tmp"):  # left by an interrupted put, not one still running
@@ -197,6 +199,17 @@ class ContentStore:
             for path in folder.iterdir():
                 if _HASH.fullmatch(path.name) and path.name.startswith(folder.name) and path.is_file():
                     yield path
+
+
+def referenced_sql(conn):
+    """A query of every hash a record refers to (each foreign key into content_files), NULLs left out so NOT IN
+    compares only hashes. Every reference read once: a correlated check per row would scan an unindexed column,
+    such as run_events.body_ref, once per stored file."""
+    references = conn.execute(
+        "SELECT m.name, f.\"from\" FROM sqlite_schema m, pragma_foreign_key_list(m.name) f"
+        " WHERE m.type = 'table' AND f.\"table\" = 'content_files'"
+    ).fetchall()
+    return " UNION ALL ".join(f'SELECT "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL' for table, column in references)
 
 
 class _Held(list):
