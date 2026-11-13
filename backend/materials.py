@@ -564,24 +564,27 @@ def _resolve(conn, sha256, extractor, extraction_id):
                          " support = CASE WHEN ? THEN support ELSE 'unchecked' END,"
                          " support_run_id = CASE WHEN ? THEN support_run_id END WHERE id = ?",
                          (found[0], found[1], *[found[2] == quote and len(quote) < QUOTE_CHARS] * 2, citation))
-    # M2 audit: a citation of a paper whose current file this is, still on a passage of the file it replaced, points at
-    # this reading's passage holding its quote (its old passage's text first, then its page), so its chip opens and
-    # highlights it; its verdict stands only when that passage's text is its old passage's (B18). One whose quote is
-    # not here keeps its passage, and reads as removed (answers.resolve_now).
+    # M2 audit: a citation of a paper whose current file this reading reads, still on a passage of another reading (its
+    # file replaced, or the same bytes read as another format), points at this reading's passage holding its quote,
+    # never a reference passage (section 7.1: not evidence), its old passage's text first, then its page, so its chip
+    # opens and highlights it there, at that passage's page (none for a file without pages). Its verdict stands only
+    # when that passage's text is its old passage's (B18). One stored removed while its quote was gone (an answer
+    # committed during a replacement) exists again. One whose quote is not here keeps its passage, and reads as
+    # removed (answers.resolve_now).
     for citation, quote, page, text, version, kind in conn.execute(
             f"SELECT d.id, d.quote, d.page, p.text, v.id, {_VERSION_TYPE} FROM citations d"
-            " JOIN passages p ON p.id = d.passage_id JOIN extractions e ON e.id = p.extraction_id"
+            " JOIN passages p ON p.id = d.passage_id"
             " JOIN material_versions v ON v.material_id = d.material_id AND v.is_current = 1"
             " LEFT JOIN content_files c ON c.sha256 = v.file_sha256"
-            " WHERE v.file_sha256 = ? AND e.file_sha256 != ? AND d.existence = 'ok' AND d.quote != ''",
-            (sha256, sha256)).fetchall():
+            " WHERE v.file_sha256 = ? AND p.extraction_id != ? AND d.existence IN ('ok', 'source_removed')"
+            " AND d.quote != ''", (sha256, extraction_id)).fetchall():
         if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
             continue
-        found = conn.execute("SELECT id, page, text FROM passages WHERE extraction_id = ? AND instr(text, ?) > 0"
-                             " ORDER BY text IS NOT ?, page IS NOT ?, ordinal LIMIT 1",
+        found = conn.execute("SELECT id, page, text FROM passages WHERE extraction_id = ? AND kind != 'reference'"
+                             " AND instr(text, ?) > 0 ORDER BY text IS NOT ?, page IS NOT ?, ordinal LIMIT 1",
                              (extraction_id, quote, text, page)).fetchone()
         if found is not None:
-            conn.execute("UPDATE citations SET passage_id = ?, material_version_id = ?, page = coalesce(?, page),"
+            conn.execute("UPDATE citations SET passage_id = ?, material_version_id = ?, page = ?, existence = 'ok',"
                          " support = CASE WHEN ? THEN support ELSE 'unchecked' END,"
                          " support_run_id = CASE WHEN ? THEN support_run_id END WHERE id = ?",
                          (found[0], version, found[1], *[found[2] == text] * 2, citation))
