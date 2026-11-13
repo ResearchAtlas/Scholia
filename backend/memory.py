@@ -881,11 +881,12 @@ def _on(state, project_id):
 
 
 async def _embed_soon(state, project_id):
-    """An index run for the project, when the search model is installed, so new records get their vectors."""
+    """The index runs that embed what memory written in the project lacks, when the search model is installed
+    (search.embed_memory_soon: the project's, and the General project's for personal records)."""
     from backend import search  # it imports backend.runs, which imports this module
-    if state.get("harness") is not None and search._installed(state):
+    if state.get("harness") is not None:
         try:
-            await search._request(state["harness"], project_id)
+            await search.embed_memory_soon(state, project_id)
         except Exception as error:  # the next index run embeds them
             import logging
             logging.getLogger(__name__).warning("an index run for memory could not be requested (%s)", type(error).__name__)

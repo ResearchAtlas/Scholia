@@ -10,8 +10,9 @@ thread makes every change, in order; searches read on connections of their own.
   registered on every connection; `project_id` and `passage_id` unindexed.
 - `vec_passages`: vec0, partitioned by project, each passage's embedding (1024 float32, cosine).
 - `vec_memory`: memory embeddings, partitioned by scope (`personal`, or `project:<id>`), S1-21a: each active recalled
-  record's content (backend/memory.py), keyed by `memory_rows` (its rowid, the record's id and scope; no text). Written by
-  index runs (backend/search.py), removed through the queue (target `memory`) with the deletion's or replacement's
+  record's content (backend/memory.py), keyed by `memory_rows` (its rowid, the record's id and scope; no text; a vector
+  counts for a record only under its current scope, memory_embedded). Written by index runs (a personal record's asked
+  for in the General project's, backend/search.py), removed through the queue (target `memory`) with the deletion's or replacement's
   commit, checked gone; at open, every row of a record the main database no longer holds active goes (_purge).
   `memory_refused`: a record whose content the helper refused, with the digest of that content (no text): not asked
   for again while its content and the model are unchanged; it goes with the record's row and the vectors.
@@ -1062,13 +1063,13 @@ class SearchIndex:
 
     # Memory (S1-21a)
 
-    def memory_embedded(self, memory_ids):
-        """The ones of memory_ids that have a vector."""
+    def memory_embedded(self, memory_ids, scopes=None):
+        """The ones of memory_ids that have a vector; with scopes ({memory id: scope}), only one under that scope."""
         if not self.vectors:
             return set()
-        return {m for (m,) in self._read(lambda conn: conn.execute(
-            "SELECT memory_id FROM memory_rows WHERE memory_id IN (SELECT value FROM json_each(?))",
-            (json.dumps(sorted(memory_ids)),)).fetchall())}
+        return {m for m, scope in self._read(lambda conn: conn.execute(
+            "SELECT memory_id, scope FROM memory_rows WHERE memory_id IN (SELECT value FROM json_each(?))",
+            (json.dumps(sorted(memory_ids)),)).fetchall()) if scopes is None or scopes.get(m) == scope}
 
     def memory_refused(self, marks):
         """The ones of marks ({memory id: digest of its content}) whose refusal is kept for that content."""

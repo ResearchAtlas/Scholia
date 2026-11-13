@@ -460,6 +460,98 @@ async def test_a_memory_record_the_helper_refuses_is_asked_for_again_only_once_i
         assert await marks() == []  # the refusal's digest goes with the record
 
 
+async def _general(client):
+    return (await rows(client, "SELECT id FROM projects WHERE kind = 'general'"))[0][0]
+
+
+@pytest.mark.parametrize("path", ["write", "install"])
+async def test_a_personal_record_keeps_its_run_when_the_project_it_was_written_from_is_deleted(tmp_path, path):
+    # batch 2 (PR 60 recheck round 2; design review E, Option 1): a personal record's run is the General project's,
+    # which cannot be deleted; the project it was written from is deleted while the record's embedding is held
+    from backend.local_helper import EMBEDDING
+    from test_local_helper import WEIGHTS
+    from test_search import app, runs_of
+    async with app(tmp_path, install=path == "write") as client:
+        client.remote.hold, client.remote.free = asyncio.Event(), 0
+        project = await project_of(client)
+        record = (await entered(client, project, "I prefer short answers", kind="preference", scope="personal"))["id"]
+        if path == "install":
+            helper = client.state["local_helper"].helpers[EMBEDDING]
+            helper.path.parent.mkdir(parents=True, exist_ok=True)
+            helper.path.write_bytes(WEIGHTS)
+            helper.model_installed()
+        await asyncio.wait_for(client.remote.reached.wait(), 10)  # its embedding asked for, and held
+        assert (await client.delete(f"/api/projects/{project}")).status_code == 200
+        client.remote.hold.set()
+        assert await _vectors(client, [record]) == {record}
+        assert [r["project_id"] for r in await runs_of(client, "index")] == [await _general(client)]
+
+
+async def test_a_personal_record_keeps_its_run_when_its_project_goes_before_the_request(tmp_path, monkeypatch):
+    # batch 2: the project it was written from is deleted between the derived question and the request (install path)
+    from backend.local_helper import EMBEDDING
+    from test_local_helper import WEIGHTS
+    from test_search import app
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        record = (await entered(client, project, "I prefer short answers", kind="preference", scope="personal"))["id"]
+        request, deleted = search._request, []
+
+        async def deleting_first(harness, project_id, rebuild=False):
+            if not deleted:
+                deleted.append(project_id)
+                assert (await client.delete(f"/api/projects/{project}")).status_code == 200
+            return await request(harness, project_id, rebuild)
+        monkeypatch.setattr(search, "_request", deleting_first)
+        helper = client.state["local_helper"].helpers[EMBEDDING]
+        helper.path.parent.mkdir(parents=True, exist_ok=True)
+        helper.path.write_bytes(WEIGHTS)
+        helper.model_installed()
+        assert await _vectors(client, [record]) == {record} and deleted
+
+
+async def test_a_vector_counts_as_done_only_under_the_records_scope(tmp_path):
+    # batch 2: a moved record keeps its vector under the old project's partition until a pass removes it
+    from test_search import app
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        record = await write(client, _unindexed(project, "Wage floors raise the earnings of low-paid workers"))
+        index = client.state["index"]
+        assert await asyncio.to_thread(index.store_memory, [(record, "project:another", [1.0] * 1024)]) == 1
+        assert await asyncio.to_thread(index.memory_embedded, [record]) == {record}  # recall's reading, by id
+        assert await asyncio.to_thread(index.memory_embedded, [record], {record: "project:another"}) == {record}
+        assert await asyncio.to_thread(index.memory_embedded, [record], {record: f"project:{project}"}) == set()
+        assert await asyncio.to_thread(search._memory_pending, index) == {project}
+
+
+async def test_a_write_that_leaves_nothing_to_embed_records_no_index_run(tmp_path):
+    # batch 2: the write path asks the same derived question as a launch; project state is not recalled by meaning
+    from test_search import app, runs_of
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await entered(client, project, "We use semi-structured interviews.", kind="project_state")
+        await background_idle(client)
+        assert await runs_of(client, "index") == []
+
+
+async def test_the_installs_requests_go_on_after_one_fails(tmp_path, monkeypatch):
+    # batch 2: each project's request on its own
+    from test_search import app
+    async with app(tmp_path, install=False) as client:
+        first, second = sorted([await project_of(client, "First"), await project_of(client, "Second")])
+        for project in (first, second):
+            await write(client, _unindexed(project, f"A decision of {project}"))
+        asked = []
+
+        async def failing_first(harness, project_id, rebuild=False):
+            asked.append(project_id)
+            if len(asked) == 1:
+                raise RuntimeError("a request that fails")
+        monkeypatch.setattr(search, "_request", failing_first)
+        await search._embed_all(client.state)
+        assert asked == [first, second]
+
+
 async def test_a_whole_rebuild_while_the_app_runs_asks_for_the_runs_of_memory_it_dropped(tmp_path):
     # M2 audit area 2: the rebuilt file's runs (index.rebuilt) take the projects whose memory lacks vectors too
     from test_search import app

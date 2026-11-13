@@ -277,34 +277,41 @@ def _downloading(state):
 
 
 def _memory_pending(index, read=True):
-    """The projects whose index runs embed the active recalled memory records without a vector (read from the index;
-    without read, or while it cannot be read, every one: its vectors dropped or being rebuilt). A project record's run is
-    its project's; a personal one, which any project's run embeds, the project it was written from, or, once that one
-    is deleted, the first project. The queue never embeds a memory addition (SearchIndex._apply_queue): only these runs
-    do (M2 audit, area 2)."""
+    """The projects whose index runs embed the active recalled memory records without a vector under their scope, nor a
+    refusal of their content (read from the index; without read, or while it cannot be read, every one: its vectors
+    dropped or being rebuilt). A project record's run is its project's, which it is deleted with; a personal one's is the
+    General project's, which cannot be deleted (every project's run embeds personal records, General's among them). The
+    queue never embeds a memory addition (SearchIndex._apply_queue): only these runs do (M2 audit, area 2; design
+    review E, Option 1)."""
     from backend import memory
     # Read: sqlite-vec did not load, so no vector can be made (the next launch where it loads asks). Unread, it tells
     # nothing: a file that failed at open did so before loading it, and the rebuild replacing it keeps no vector.
     if read and not index.vectors:
         return set()
-    found, first = index.db.read(lambda conn: (conn.execute(
-        "SELECT id, project_id, content FROM memory_records WHERE status IN (SELECT value FROM json_each(?))"
-        " AND type IN (SELECT value FROM json_each(?))", (json.dumps(memory.ACTIVE), json.dumps(memory.RECALLED))).fetchall(),
-        conn.execute("SELECT id FROM projects ORDER BY id LIMIT 1").fetchone()))
+    found, general = index.db.read(lambda conn: (conn.execute(
+        "SELECT id, CASE scope WHEN 'project' THEN project_id END, content FROM memory_records"
+        " WHERE status IN (SELECT value FROM json_each(?)) AND type IN (SELECT value FROM json_each(?))",
+        (json.dumps(memory.ACTIVE), json.dumps(memory.RECALLED))).fetchall(), _general(conn)))
     have = set()
     if read and found:
         try:
-            have = _memory_done(index, {m: content for m, _, content in found})
+            have = _memory_done(index, {m: (f"project:{project}" if project else "personal", content)
+                                        for m, project, content in found})
         except Exception as error:  # unreadable now (being replaced): every record is taken as pending
             log.warning("the search index's memory could not be read (%s)", type(error).__name__)
-    return {project or (first[0] if first else None) for m, project, _ in found if m not in have} - {None}
+    return {project or general for m, project, _ in found if m not in have}
 
 
-def _memory_done(index, contents):
-    """The ones of contents ({memory id: its content}) with a vector, or with the helper's refusal of that content kept
-    (asked for again only once the content, a new version, or the model changes, as a passage's refusal)."""
-    return index.memory_embedded(list(contents)) | index.memory_refused(
-        {m: digest(content) for m, content in contents.items()})
+def _general(conn):
+    return conn.execute("SELECT id FROM projects WHERE kind = 'general'").fetchone()[0]
+
+
+def _memory_done(index, records):
+    """The ones of records ({memory id: (its scope, its content)}) with a vector under that scope (a moved record's,
+    under the project it left, waits for its queued removal), or with the helper's refusal of that content kept (asked
+    for again only once the content, a new version, or the model changes, as a passage's refusal)."""
+    return index.memory_embedded(list(records), {m: scope for m, (scope, _) in records.items()}) | index.memory_refused(
+        {m: digest(content) for m, (_, content) in records.items()})
 
 
 async def _embed_all(state):
@@ -314,10 +321,28 @@ async def _embed_all(state):
     if index is None or harness is None:
         return
     try:
-        for project in sorted(await asyncio.to_thread(index.unembedded) | await asyncio.to_thread(_memory_pending, index)):
-            await _request(harness, project)
+        projects = await asyncio.to_thread(index.unembedded) | await asyncio.to_thread(_memory_pending, index)
     except Exception as error:
         log.warning("index runs after the model's install could not be requested (%s)", type(error).__name__)
+        return
+    for project in sorted(projects):  # each on its own: one that fails leaves the others asked for
+        try:
+            await _request(harness, project)
+        except Exception as error:
+            log.warning("an index run after the model's install could not be requested (%s)", type(error).__name__)
+
+
+async def embed_memory_soon(state, project_id):
+    """After a memory write in the project (a record created, edited or kept, a command, an extraction, a move), while
+    the search model is installed: a run for that project and the General project, those of the two whose memory lacks
+    vectors (_memory_pending). Never another project's: a run the researcher cancelled there stays so (reading R29)."""
+    index, harness = state.get("index"), state.get("harness")
+    if index is None or harness is None or not _installed(state):
+        return
+    pending = await asyncio.to_thread(_memory_pending, index)
+    general = await asyncio.to_thread(harness.db.read, _general)
+    for project in sorted(pending & {project_id, general}):
+        await _request(harness, project)
 
 
 async def after_deletion(state, project_id):
@@ -607,7 +632,9 @@ async def _counts(index, project_id):
 
 # S1-21a: memory embeddings (vec_memory). An index run embeds the active recalled records of its project and the
 # personal ones that lack a vector, each request carrying the run's dispatch check (the record still active); recall
-# asks for the nearest within `[retrieval] memory_ms` (backend/runs.py Harness._recall), else takes the newest.
+# asks for the nearest within `[retrieval] memory_ms` (backend/runs.py Harness._recall), else takes the newest. Which
+# runs are asked for is one derived question at every trigger (_memory_pending): a project record's own project, and
+# the General project for a personal one.
 
 
 def memory_scopes(project_id):
@@ -632,7 +659,8 @@ async def _embed_memory(state, harness, active, project_id, drained):
         return [(r["id"], "personal" if r["scope"] == "personal" else f"project:{project_id}", r["content"])
                 for r in memory.in_scope(conn, project_id, kinds=memory.RECALLED)]
     records = await asyncio.to_thread(db.read, wanted)
-    have = await asyncio.to_thread(_memory_done, index, {m: content for m, _, content in records}) if records else set()
+    have = await asyncio.to_thread(_memory_done, index, {m: (scope, content) for m, scope, content in records}) \
+        if records else set()
     stored = 0
     for memory_id, scope, content in (r for r in records if r[0] not in have):
         def admit(conn, memory_id=memory_id):
