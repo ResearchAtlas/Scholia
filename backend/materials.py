@@ -685,7 +685,9 @@ async def _look_up(harness, active, project_id, inputs, pace):
             return None
         found = _identifiers(conn, project_id, materials, versions)
         for material, (_, identifier, read) in found.items():
-            if identifier is None:
+            if identifier is None:  # and no identifier of an earlier pass of this run is kept beside it
+                conn.execute("UPDATE runs SET inputs = json_remove(inputs, ?) WHERE id = ?",
+                             (f'$.identifiers."{material}"', run_id))
                 _event(conn, run_id, "step_finished", {"material_id": material,
                                                        "outcome": "no_identifier" if read else "not_read"})
         return found

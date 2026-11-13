@@ -706,6 +706,30 @@ async def test_r3_an_uploads_venue_its_lookup_no_longer_gives_goes_at_retry_afte
         assert "container-title" not in retried["csl"] and "keyword" not in retried["csl"]
 
 
+async def test_a_resumed_lookup_that_finds_no_identifier_shows_none(tmp_path):
+    """Batch 3 (PR 61 recheck round 3, pass 1's probe): a lookup resolved a reference file's paper by its DOI, its run was
+    left running (its terminal write lost), and a re-import took the DOI away; resumed, the run finds no identifier, and
+    the paper's Details show none, not the earlier DOI its inputs kept."""
+    from test_reference_import import imported as imported_references, ris
+    data = tmp_path / "data"
+    async with started(data, scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client)
+        result = await imported_references(client, project, ris(("A Record With a DOI", f"DO  - {DOI}\nPY  - 2020\n")))
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        [paper] = result["imported"]
+        assert (await client.get(f"/api/materials/{paper}")).json()["lookup"]["identifier"] == f"doi:{DOI}"
+
+        def left_running(conn):  # as a crash before its terminal record, and a re-import that dropped the DOI
+            conn.execute("UPDATE runs SET status = 'running', finished_at = NULL, summary = NULL WHERE id = ?",
+                         (result["lookup_run_id"],))
+            conn.execute("UPDATE materials SET csl = json_remove(csl, '$.DOI') WHERE id = ?", (paper,))
+        await asyncio.to_thread(client.state["db"].write, left_running)
+    async with started(data, scholarly(openalex={DOI: openalex_work(DOI, TITLE)}), setup=False) as client:
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        lookup_shown = (await client.get(f"/api/materials/{paper}")).json()["lookup"]
+        assert (lookup_shown["outcome"], lookup_shown["identifier"]) == ("no_identifier", None)
+
+
 async def test_a_failed_lookup_tried_again_twice_at_once_is_tried_again_once(tmp_path):
     mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)})
     mock.answers = {"api.openalex.org": [503] * 3, "api.crossref.org": [503] * 3}
