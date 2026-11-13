@@ -269,3 +269,121 @@ async def test_a_confirmed_restatement_confirms_an_inferred_record(tmp_path):
                                             " AND type = 'project_state'")
         assert ("turn", stream[0]["run_id"]) in await rows(
             client, "SELECT source_kind, source_id FROM memory_sources WHERE memory_id = ?", confirmed)
+
+
+# Batch 1 (PR 62 recheck 1): what an extraction wrote is known from the record itself, and a researcher's change in
+# place since the extraction started is seen along the whole chain. Driven at the record (memory.apply_extraction), so
+# the order of starts, Keeps and finishes is exact.
+def _turn_and_extraction(conn, project, conversation, text, start=True):
+    """A succeeded turn saying text and, when start, its extraction run started now: (turn id, run id or None)."""
+    import time
+    from backend.db import new_id
+    turn = new_id()
+    time.sleep(0.005)  # each step after the last, by the clock the records keep
+    conn.execute("INSERT INTO runs (id, project_id, conversation_id, kind, workflow, status, inputs) VALUES"
+                 " (?, ?, ?, 'turn', 'agent', 'succeeded', '{}')", (turn, project, conversation))
+    (seq,) = conn.execute("SELECT count(*) FROM turns WHERE conversation_id = ?", (conversation,)).fetchone()
+    conn.execute("INSERT INTO turns (run_id, conversation_id, seq, author, user_message, answer) VALUES"
+                 " (?, ?, ?, 'researcher', ?, '{\"text\": \"ok\"}')",
+                 (turn, conversation, seq, json.dumps({"text": text})))
+    return turn, (_extraction(conn, project, turn) if start else None)
+
+
+def _extraction(conn, project, turn):
+    import time
+    from backend.db import new_id
+    run = new_id()
+    time.sleep(0.005)
+    conn.execute("INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, inputs) VALUES"
+                 " (?, ?, 'background', 'memory', ?, '{}')", (run, project, turn))
+    return run
+
+
+def _says(text, replaces=""):
+    return [{"type": "project_state", "content": text, "status": "confirmed", "span": text.lower(),
+             "replaces": replaces}]
+
+
+async def _in(client, fn):
+    return await asyncio.to_thread(client.state["db"].write, fn)
+
+
+@pytest.mark.parametrize("change", ["keep", "edit"])
+async def test_a_researchers_change_in_place_after_an_extraction_started_is_seen_through_a_later_replacement(
+        tmp_path, change):
+    # both astra passes: a proposal kept or edited by the researcher after E40 started, then replaced on its own by
+    # E35 (started after that change), was missed because the walk stopped at a version created before E40 started
+    import time
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+
+        def steps(conn):
+            pending = memory.write(conn, project_id=project, scope="project", kind="project_state",
+                                   content="The sample is 30 interviews", status="proposed",
+                                   sources=[("project", project)], structured={"extracted": True})
+            t35, _ = _turn_and_extraction(conn, project, conversation, "The sample is 35 interviews", start=False)
+            _, e40 = _turn_and_extraction(conn, project, conversation, "The sample is 40 interviews")
+            time.sleep(0.005)
+            if change == "keep":
+                memory.keep(conn, pending, None)
+            else:
+                memory.edit(conn, pending, 1, content="The sample is 31 interviews")
+            e35 = _extraction(conn, project, t35)
+            time.sleep(0.005)
+            memory.apply_extraction(conn, e35, _says("The sample is 35 interviews", pending))
+            time.sleep(0.005)
+            memory.apply_extraction(conn, e40, _says("The sample is 40 interviews", pending))
+        await _in(client, steps)
+        found = dict(await rows(client, "SELECT content, status FROM memory_records WHERE type = 'project_state'"))
+        assert (found["The sample is 35 interviews"], found["The sample is 40 interviews"]) == ("confirmed", "proposed")
+
+
+async def test_an_extractions_own_confirmation_of_a_proposal_does_not_block_the_later_statement(tmp_path):
+    # astra pass 2: E30's restatement confirms the pending proposal (keep), which added a source "from the researcher"
+    # and so read as the researcher's change; the later turn's 40 stayed proposed
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+
+        def steps(conn):
+            pending = memory.write(conn, project_id=project, scope="project", kind="project_state",
+                                   content="The sample is 30 interviews", status="proposed",
+                                   sources=[("project", project)], structured={"extracted": True})
+            _, e30 = _turn_and_extraction(conn, project, conversation, "The sample is 30 interviews")
+            _, e40 = _turn_and_extraction(conn, project, conversation, "The sample is 40 interviews")
+            memory.apply_extraction(conn, e30, _says("The sample is 30 interviews"))
+            memory.apply_extraction(conn, e40, _says("The sample is 40 interviews", pending))
+            return pending
+        pending = await _in(client, steps)
+        found = dict(await rows(client, "SELECT content, status FROM memory_records WHERE type = 'project_state'"))
+        assert found == {"The sample is 30 interviews": "superseded", "The sample is 40 interviews": "confirmed"}
+        assert ("researcher", "views") not in await rows(
+            client, "SELECT source_kind, source_id FROM memory_sources WHERE memory_id = ?", pending)
+
+
+async def test_an_extractions_replacement_stays_its_own_after_the_conversation_that_made_it_is_deleted(tmp_path):
+    # astra pass 2: deleting the conversation whose extraction wrote 35 cleared the record's run, so a running turn
+    # holding 30 was revoked at dispatch although nobody changed the record
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        first, second = await conversation_in(client, project), await conversation_in(client, project)
+
+        def steps(conn):
+            held = memory.write(conn, project_id=project, scope="project", kind="project_state",
+                                content="The sample is 30 interviews", status="confirmed",
+                                sources=[("project", project)])
+            _, e35 = _turn_and_extraction(conn, project, first, "The sample is 35 interviews")
+            memory.apply_extraction(conn, e35, _says("The sample is 35 interviews", held))
+            _, again = _turn_and_extraction(conn, project, second, "The sample is 35 interviews")
+            memory.apply_extraction(conn, again, _says("The sample is 35 interviews"))  # a source in `second` too
+            return held
+        held = await _in(client, steps)
+        assert (await client.delete(f"/api/conversations/{first}")).status_code == 200
+        assert await rows(client, "SELECT content, status FROM memory_records WHERE type = 'project_state'"
+                                  " ORDER BY version") == [("The sample is 30 interviews", "superseded"),
+                                                           ("The sample is 35 interviews", "confirmed")]
+        assert await asyncio.to_thread(client.state["db"].read, lambda conn: memory.allowed(conn, project, [held]))

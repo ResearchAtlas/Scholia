@@ -784,10 +784,11 @@ async def test_an_extractions_own_replacement_of_recalled_memory_leaves_the_turn
             if by == "extraction":
                 return memory.write(conn, project_id=held["project"], scope="project", kind="decision",
                                     content="We decided on 35 interviews", status="confirmed", run_id=extraction,
-                                    sources=[("run", extraction)], replaces=held["record"])
+                                    sources=[("run", extraction)], replaces=held["record"],
+                                    structured={"extracted": True})  # as apply_extraction marks its writes
             proposal = memory.write(conn, project_id=held["project"], scope="project", kind="decision",
                                     content="We decided on 35 interviews", status="proposed", run_id=extraction,
-                                    sources=[("run", extraction)])
+                                    sources=[("run", extraction)], structured={"extracted": True})
             conn.execute("UPDATE memory_records SET supersedes_id = ? WHERE id = ?", (held["record"], proposal))
             return memory.keep(conn, proposal, None)
         await asyncio.to_thread(held["client"].state["db"].write, replace)
