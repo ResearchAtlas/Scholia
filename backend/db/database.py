@@ -125,12 +125,10 @@ class Database:
 
     Opening checks an existing file read-only (a newer schema is refused and
     quick_check must pass), then migrates it on the writer thread, taking a
-    backup before its first migration unless the database is new and empty, or
-    backup is false: its state is in an automatic backup already (a restore of
-    one still in the folder that the next backup does not rotate out).
+    backup before its first migration unless the database is new and empty.
     """
 
-    def __init__(self, data_dir, *, migrations=MIGRATIONS, backup=True):
+    def __init__(self, data_dir, *, migrations=MIGRATIONS):
         _refuse_event_loop()
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / DB_NAME
@@ -162,7 +160,7 @@ class Database:
             close_connection(_open_checked(self.path, "quick_check", latest=len(migrations)))
         self._writer = ThreadPoolExecutor(1, thread_name_prefix="scholia-db-writer")
         try:
-            self._writer_ident = self._writer.submit(self._open_writer, migrations, backup).result()
+            self._writer_ident = self._writer.submit(self._open_writer, migrations).result()
         except BaseException:
             self._writer.shutdown()
             raise
@@ -419,13 +417,13 @@ class Database:
 
     # Writer thread
 
-    def _open_writer(self, migrations, backup=True):
+    def _open_writer(self, migrations):
         conn = _connect(self.path)
         try:
             if _switch_to_wal(conn) != "wal":
                 raise RuntimeError("the database could not switch to WAL mode")
             new = None  # whether this startup found a new, empty database
-            backed_up = not backup
+            backed_up = False
             while True:
                 # Decide under the write lock, so migrations another connection applied
                 # meanwhile are seen and not run again. The backup then copies exactly

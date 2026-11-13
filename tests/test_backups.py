@@ -477,8 +477,8 @@ async def test_a_restore_works_where_the_file_system_has_no_hard_links(tmp_path,
 
 @pytest.mark.parametrize("source", ["automatic", "file"])
 async def test_a_restore_of_an_older_schemas_backup_keeps_its_safety_copy(tmp_path, source):
-    # M2 audit 6 F1: the backups taken before the restored database's migrations rotated the safety copy out. From a
-    # file, its state at its own schema is then in one backup, taken before the migrations (PR 59 batch 2, item 4).
+    # M2 audit 6 F1: the backups taken before the restored database's migrations rotated the safety copy out. Its state
+    # at its own schema is then in one backup, taken before the migrations, as at a launch (design review H, R3).
     data = tmp_path / "data"
 
     def older():  # an M1 data folder (schema 3) and its backup
@@ -506,14 +506,14 @@ async def test_a_restore_of_an_older_schemas_backup_keeps_its_safety_copy(tmp_pa
         conn.close()
         assert old in listed  # and the backup restored from
         added = sorted(b["schema_version"] for i, b in listed.items() if i.split("/")[1] not in before)
-        assert added == ([len(MIGRATIONS)] if source == "automatic" else [3, len(MIGRATIONS)])
+        assert added == [3, len(MIGRATIONS)]
 
 
 @pytest.mark.parametrize("outcome", ["committed", "rolled back"])
-async def test_a_restore_of_an_older_automatic_backup_still_in_the_folder_takes_only_its_safety_copy(
+async def test_a_restore_of_an_older_automatic_backup_keeps_the_backup_before_its_migrations_only_when_committed(
         tmp_path, monkeypatch, outcome):
-    # PR 59 batch 1, item 5: the restored database's migrations also published a copy of the backup restored, kept
-    # when the restore was rolled back, so each failed attempt rotated out two of the week's backups
+    # PR 59 batch 1, item 5, and design review H, R3 and R4: committed, the restore adds its safety copy and the backup
+    # before its migrations; rolled back, only its safety copy
     data = tmp_path / "data"
 
     def older():  # an M1 data folder (schema 3) with its backup
@@ -531,15 +531,64 @@ async def test_a_restore_of_an_older_automatic_backup_still_in_the_folder_takes_
         response = await client.post("/api/backups/restore", json={"generation": old})
         assert response.status_code == (200 if outcome == "committed" else 500), response.text
         listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
-        [added] = set(listed) - before  # the safety copy, at the schema it was taken at
-        assert listed[added]["schema_version"] == len(MIGRATIONS) and old in listed
+    added = sorted(listed[i]["schema_version"] for i in set(listed) - before)
+    assert added == ([3, len(MIGRATIONS)] if outcome == "committed" else [len(MIGRATIONS)]) and old in listed
+
+
+async def test_a_rolled_back_restore_from_an_older_schema_file_leaves_only_its_safety_copy(tmp_path, monkeypatch):
+    # Design review H, B7 (Fable round 2's two failed file restores): the copy the migrations took held the file's
+    # records, records purged earlier included, in an automatic backup though nothing was changed
+    data = tmp_path / "data"
+
+    def older():
+        with Database(data, migrations=MIGRATIONS[:3]) as db:
+            generation = db.backup()
+        with zipfile.ZipFile(tmp_path / "m1.zip", "w") as archive:
+            for path in generation.iterdir():
+                archive.write(path, path.name)
+
+    await asyncio.to_thread(older)
+    async with started(data) as client:
+        before = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+
+        def failing(*args):
+            raise OSError("the journal cannot be written")
+        monkeypatch.setattr(backups_module, "_commit_journal", failing)
+        for _ in range(2):
+            response = await client.post("/api/backups/restore", json={"file": str(tmp_path / "m1.zip")})
+            assert (response.status_code, response.json()["code"]) == (500, "restore_failed")
+        listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
+    assert sorted(listed[i]["schema_version"] for i in set(listed) - before) == [len(MIGRATIONS)] * 2  # safety copies
+
+
+def fables_folder(data, now):
+    """Weekly backups 16 and 9 days old and daily ones 6 to 1 days old, at schema 3 (Fable's folder): the daily names."""
+    from datetime import timedelta
+    with Database(data, migrations=MIGRATIONS[:3]) as db:
+        return [db.backup(now=now - timedelta(days=days)).name for days in (16, 9, 6, 5, 4, 3, 2, 1)][2:]
+
+
+async def test_failed_restores_leave_the_weeks_backups(tmp_path, monkeypatch):
+    # Design review H, B2 (Fable's recheck probe C): each failed restore rotated one of the week's backups out with its
+    # safety copy, and on 74bf868 another with the backup before its migrations
+    from datetime import UTC, datetime
+    data = tmp_path / "data"
+    week = await asyncio.to_thread(fables_folder, data, datetime.now(UTC))
+    async with started(data) as client:
+        def failing(*args):
+            raise OSError("the journal cannot be written")
+        monkeypatch.setattr(backups_module, "_commit_journal", failing)
+        for _ in range(4):
+            response = await client.post("/api/backups/restore", json={"generation": f"daily/{week[1]}"})
+            assert response.status_code == 500, response.text
+        listed = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+    assert {f"daily/{name}" for name in week} <= listed
 
 
 @pytest.mark.parametrize("rotation", ["promoted", "deleted"])
-async def test_a_restore_of_a_backup_its_safety_copy_rotates_keeps_one_backup_of_it_before_migrating(tmp_path,
-                                                                                                  rotation):
-    # PR 59 batch 1, item 5: promoted to weekly, the backup restored is still the one; deleted, the copy the
-    # migrations take is the one backup of the state they start from
+async def test_a_restore_of_a_backup_over_a_week_old_its_safety_copy_rotates_keeps_a_backup_of_it(tmp_path, rotation):
+    # PR 59 batch 1, item 5, rewritten for design review H: a backup over a week old is still rotated by count; the
+    # restore's own backup before its migrations is then what keeps that state, promoted or deleted
     from datetime import UTC, datetime, timedelta
     data = tmp_path / "data"
     now = datetime.now(UTC)
@@ -547,71 +596,50 @@ async def test_a_restore_of_a_backup_its_safety_copy_rotates_keeps_one_backup_of
     def older():  # with "deleted", a weekly one two days older than it, so the rotation deletes it
         with Database(data, migrations=MIGRATIONS[:3]) as db:
             if rotation == "deleted":
-                db.backup(now=now - timedelta(days=8))
-            return db.backup(now=now - timedelta(days=6)).name
+                db.backup(now=now - timedelta(days=10))
+            name = db.backup(now=now - timedelta(days=8)).name
+            for days in range(5, 0, -1):
+                db.backup(now=now - timedelta(days=days))
+            return name
 
     name = await asyncio.to_thread(older)
-    async with started(data) as client:  # its upgrade's backup, then five more: the one restored the oldest daily
-        for _ in range(5):
-            assert (await client.post("/api/backups")).status_code == 200
+    async with started(data) as client:  # its upgrade's backup: seven daily, the one restored the oldest
         before = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
         assert f"daily/{name}" in before and len([b for b in before if b.startswith("daily/")]) == 7
         response = await client.post("/api/backups/restore", json={"generation": f"daily/{name}"})
         assert response.status_code == 200, response.text
         listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
     names = {i.split("/")[1] for i in before}  # by name: the rotation may move one to weekly
-    added = sorted(b["schema_version"] for i, b in listed.items() if i.split("/")[1] not in names)
-    if rotation == "promoted":
-        assert f"weekly/{name}" in listed and added == [len(MIGRATIONS)]  # the safety copy only
-    else:
-        assert not any(i.endswith(name) for i in listed) and added == [3, len(MIGRATIONS)]  # and the copy
+    assert sorted(b["schema_version"] for i, b in listed.items() if i.split("/")[1] not in names) == [3, len(MIGRATIONS)]
+    assert (f"weekly/{name}" in listed) == (rotation == "promoted") and f"daily/{name}" not in listed
 
 
-async def test_a_restored_backup_next_in_line_to_rotate_is_copied_before_the_migrations(tmp_path):
-    # PR 59 batch 2, item 3: kept by the safety copy as the oldest of a full daily set, the backup restored stood in for
-    # the backup before the migrations, and the next backup rotated it out: no copy of that state was left
-    from datetime import UTC, datetime, timedelta
+async def restored_from_fables_folder(tmp_path, more):
+    """Fable's folder, the 5-day backup restored, then more backups: (its name, the list, the names before)."""
+    from datetime import UTC, datetime
     data = tmp_path / "data"
-    now = datetime.now(UTC)
-
-    def older():  # weekly ones 16 and 9 days old, daily ones 6 to 1 days old (Fable's folder)
-        with Database(data, migrations=MIGRATIONS[:3]) as db:
-            return [db.backup(now=now - timedelta(days=days)).name for days in (16, 9, 6, 5, 4, 3, 2, 1)][3]
-
-    name = await asyncio.to_thread(older)  # the 5-day one
+    week = await asyncio.to_thread(fables_folder, data, datetime.now(UTC))
     async with started(data) as client:
         before = {b["id"].split("/")[1] for b in (await client.get("/api/backups")).json()["backups"]}
-        response = await client.post("/api/backups/restore", json={"generation": f"daily/{name}"})
+        response = await client.post("/api/backups/restore", json={"generation": f"daily/{week[1]}"})
         assert response.status_code == 200, response.text
-        assert (await client.post("/api/backups")).status_code == 200  # the next backup rotates the source out
-        listed = (await client.get("/api/backups")).json()["backups"]
-    assert not any(b["id"].endswith(name) for b in listed)
+        for _ in range(more):
+            assert (await client.post("/api/backups")).status_code == 200
+        return week[1], (await client.get("/api/backups")).json()["backups"], before
+
+
+async def test_a_restored_backup_under_a_week_old_outlives_the_next_backups(tmp_path):
+    # Design review H, B5 and B6 (Fable's round 2 trigger A): the restored backup, as the oldest daily one, went at the
+    # next backup
+    name, listed, _ = await restored_from_fables_folder(tmp_path, 3)
+    assert f"daily/{name}" in {b["id"] for b in listed}
+
+
+async def test_a_restored_backup_has_one_backup_of_its_state_after_two_more_backups(tmp_path):
+    # Design review H, B6: with the restore's own backup before its migrations, the restored state at its schema is in
+    # a backup of its own, which lasts a week whatever else is taken
+    _, listed, before = await restored_from_fables_folder(tmp_path, 2)
     assert [b["schema_version"] for b in listed if b["id"].split("/")[1] not in before].count(3) == 1
-
-
-async def test_which_backups_the_next_rotation_leaves_matches_the_rotation(tmp_path):
-    # PR 59 batch 2, item 3: _stays_through_a_backup against the rotation itself, for sets short, full and overfull
-    # (an earlier rotation that could not finish)
-    import datetime as dt
-    import backend.db.database as database_module
-    start = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
-    for kind, count in (("daily", 3), ("daily", 7), ("daily", 9), ("weekly", 4), ("weekly", 6)):
-        data = tmp_path / f"{kind}{count}"
-        folder = data / "backups" / kind
-        folder.mkdir(parents=True)
-        names = [(start + dt.timedelta(days=i)).strftime("%Y%m%dT%H%M%S%fZ") for i in range(count)]
-        for name in names:
-            (folder / name).mkdir()
-        predicted = {name: backups_module._stays_through_a_backup(data, name) for name in names}
-        if kind == "weekly":  # a promotion: the oldest daily moved to weekly, then weekly trimmed
-            (folder / (start + dt.timedelta(days=count + 30)).strftime("%Y%m%dT%H%M%S%fZ")).mkdir()
-            for old in database_module._generations(folder)[:-database_module.WEEKLY_KEPT]:
-                old.rmdir()
-        else:
-            new = data / "backups" / "daily" / (start + dt.timedelta(days=count)).strftime("%Y%m%dT%H%M%S%fZ")
-            new.mkdir()
-            database_module._rotate(data / "backups", new)
-        assert predicted == {name: (folder / name).is_dir() for name in names}, (kind, count)
 
 
 async def test_a_restore_stops_a_running_turn(tmp_path):
