@@ -871,3 +871,20 @@ def test_the_apps_own_personal_saves_on_hand_written_tables_are_written(tmp_path
     (tmp_path / "config.toml").write_text(raw)
     load_settings(tmp_path).save(updates)
     assert load_settings(tmp_path).values["ui"]["follow_up"] == "queue" or updates == {"ui.follow_up": "queue"}
+
+
+@pytest.mark.parametrize("project_id, raw, updates", [
+    # The internal review's F1: the table added holds a key of the name a key moved under it would take, so the bytes
+    # would not read at all (tomlkit's KeyAlreadyPresent, a 500 at the endpoint); refused as ValueError, as any move is
+    (None, 'providers.openrouter.kind = "openrouter"\nmodels.efforts.a = "low"\n', {"providers.lab.models": ["m"]}),
+    ("p", 'project.template = "x"\ntools.deny = ["a"]\n', {"project.extra.tools": ["b"]}),
+    # F2: an empty table the save does not name moves under the table it adds
+    (None, '"weird.key" = 1\nextensions.x.b.c = 2\nzotero = {}\n', {"extensions.y.n": 5}),
+])
+def test_a_save_whose_bytes_would_not_read_back_as_its_document_raises_and_writes_nothing(tmp_path, project_id, raw,
+                                                                                         updates):
+    path = tmp_path / "projects" / "p" / "config.toml" if project_id else tmp_path / "config.toml"
+    settings.write_private(path, raw.encode())
+    with pytest.raises(ValueError):
+        load_settings(tmp_path, project_id).save(updates)
+    assert path.read_text() == raw

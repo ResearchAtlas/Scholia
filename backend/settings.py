@@ -309,8 +309,11 @@ class Settings:
             # PR 52's follow-up (item 8; Harold, 2026-11-13, Option 1 for the personal file): the bytes must read back
             # as the document the save changed, so no key moves or changes that the save does not name, and each it
             # names reads as set. A table added among root dotted keys gets its header after the first of them, moving
-            # the keys after it under it.
-            if _values(tomlkit.parse(data.decode("utf-8")).unwrap()) != _values(doc.unwrap()):
+            # the keys after it under it. Only an empty table the save left may be missing: removing a dotted table's
+            # last key leaves none.
+            again, built = _values(_reread(data)), _values(doc.unwrap())
+            if any(built.get(path) != value for path, value in again.items()) or any(
+                    again.get(path) != value for path, value in built.items() if value != "{}"):
                 raise ValueError(f"{self.label}: this save would move or change keys it does not name")
             write_private(self.path, data)
             _parse(self, data)
@@ -320,15 +323,24 @@ _CONTINUE_KEYS = ("budget_usd", "budget_continue_usd", "budget_continue_at_usd")
 
 
 def _values(data):
-    """Every value by its key path, empty tables left out: removing a dotted table's last key leaves no table."""
-    return {path: repr(value) for path, value in _leaves(data) if value != {}}
+    """Every value and empty table by its key path, as repr."""
+    return {path: repr(value) for path, value in _leaves(data)}
+
+
+def _reread(data):
+    """The bytes a save is about to write, read as the loader reads them; ValueError for bytes that would not read at
+    all (a table added among root dotted keys whose name a key moved under it already holds)."""
+    try:
+        return tomlkit.parse(data.decode("utf-8")).unwrap()
+    except tomlkit.exceptions.TOMLKitError as error:
+        raise ValueError(f"the save would not read back ({type(error).__name__})") from None
 
 
 def _continue_keys(raw):
     """S1-33: a project file's limit and what Continue adds for it, read from its bytes: each a valid number as the
     loader keeps it (compared by value, so 50 is 50.0), None when absent, or "invalid" when present but not valid (true
     included), so a limit made invalid by hand and then set or reset counts as changed."""
-    own = tomlkit.parse(raw.decode("utf-8")).unwrap().get("project") if raw else None
+    own = _reread(raw).get("project") if raw else None
     own = own if isinstance(own, dict) else {}
     return tuple((own[key] if _check(PROJECT, ("project", key), own[key])[1] is None else "invalid") if key in own
                  else None for key in _CONTINUE_KEYS)
