@@ -275,11 +275,15 @@ def _unindexed(project, content, scope="project"):
 
 async def _vectors(client, ids, timeout=20.0):
     """The ones of ids that have a vector, once no index run runs and they all have one, or the timeout passes."""
+    from backend.search_index import Unavailable
     from test_search import runs_of
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         running = [r for r in await runs_of(client, "index") if r["status"] == "running"]
-        held = await asyncio.to_thread(client.state["index"].memory_embedded, ids)
+        try:
+            held = await asyncio.to_thread(client.state["index"].memory_embedded, ids)
+        except Unavailable:  # a launch's whole rebuild under way: no read is answered until it is done
+            held = set()
         if (held == set(ids) and not running) or asyncio.get_running_loop().time() > deadline:
             return held
         await asyncio.sleep(0.05)
