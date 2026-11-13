@@ -7,7 +7,7 @@ import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalSt
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError } from '../api.js';
 import { visible } from '../text.js';
-import { attempt, changeRecord, keepUnsaved, keptEvents, keptUnsaved, memoryChanged, readMemory, readsAgain,
+import { attempt, changeRecord, forgetRecord, keepUnsaved, keptEvents, keptUnsaved, memoryChanged, readMemory, readsAgain,
   recordText, review, settled } from '../memory.js';
 import { libraryEvents, readGuard } from '../library.js';
 import { LoadState, Section } from './fields.jsx';
@@ -157,7 +157,8 @@ function Row({ record, projectId, onFailed }) {
             {t('memory.forget')}</Button>
         </div>
       )}
-      <Forget record={record} open={forgetting} onClose={() => setForgetting(false)} />
+      <Forget record={record} open={forgetting} onClose={() => setForgetting(false)}
+        onDelete={(everywhere) => act(() => forgetRecord(record, everywhere), false, record.id)} />
     </li>
   );
 }
@@ -201,21 +202,21 @@ export function Proposal({ proposal, projectId, onFailed }) {
             {t('memory.forget')}</Button>
         </div>
       )}
-      <Forget record={proposal} open={forgetting} onClose={() => setForgetting(false)} />
+      <Forget record={proposal} open={forgetting} onClose={() => setForgetting(false)}
+        onDelete={(everywhere) => acted(() => forgetRecord(proposal, everywhere), false, proposal.id)} />
     </li>
   );
 }
 
 // Forget through the delete dialog (ticket 18, Retention; M2 audit area 4, item 6): its note that deleted data stays in
-// the automatic backups for about five weeks, and "Delete everywhere including backups", at the version shown. What it
-// could not do is said in the dialog; once forgotten, or closed after a failure (the record changed, or the outcome is
-// unknown), every view reads again, naming no project (MB12).
-function Forget({ record, open, onClose }) {
+// the automatic backups for about five weeks, and "Delete everywhere including backups", at the version shown. The
+// dialog only asks: onDelete is the row's own action (useMemoryAction), so what it could not do is kept outside the
+// views and every view reads again, even when a refresh has removed the row meanwhile (MB1, MB12; batch 1).
+function Forget({ record, open, onClose, onDelete }) {
   const t = useT();
   return (
-    <DeleteDialog target={open ? { kind: 'memory', id: record.id, version: record.version, title: t('memory.forgetTitle'),
+    <DeleteDialog target={open ? { kind: 'memory', id: record.id, title: t('memory.forgetTitle'),
       body: t('memory.forgetBody', { content: recordText(t, record) }) } : null}
-      onClose={(failed) => { onClose(); if (failed) memoryChanged(null); }}
-      onDone={() => { onClose(); memoryChanged(null); }} />
+      onClose={onClose} onDelete={onDelete} />
   );
 }

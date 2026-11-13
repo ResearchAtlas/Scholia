@@ -2,7 +2,8 @@
 // agent's note did, read back from the record (the conversation's turns carry it); project state's progress in words;
 // Where we left off's dismissal for this return; and the message box filled by its next-step button (nothing is sent
 // until Send).
-import { ApiError, get, patch, post } from './api.js';
+import { ApiError, del, get, patch, post } from './api.js';
+import { deletePath, deletionNotices } from './backups.js';
 import { libraryChanged } from './library.js';
 import { errorText } from './text.js';
 
@@ -57,6 +58,13 @@ export const readMemory = (projectId) => get(`/api/memory${projectId ? `?project
 export const changeRecord = (record, body, projectId) => patch(`/api/memory/${encodeURIComponent(record.id)}`,
   { version: record.version, project_id: projectId ?? null, ...body });
 export const review = (body) => post('/api/memory/review', body);
+// Forget at the version shown, with the delete dialog's choice (everywhere: also from the backups). A forget that could
+// not finish everything (older backups not replaced) throws what it must still say, so that is kept as a failure's
+// notice is, outside the views (MB1), and every view reads again (M2 audit area 4, batch 1).
+export async function forgetRecord(record, everywhere = false) {
+  const said = deletionNotices(await del(deletePath('memory', record.id, { version: record.version, everywhere })));
+  if (said.length) throw Object.assign(new Error('not wholly forgotten'), { notices: said });
+}
 
 // A memory action from the views: null once done, else what was not saved: the error in words and its code, whether it
 // was an edit (edit), and the record it was for (id). Never the text typed: that stays in its open editor (MB1, Q16).
@@ -65,6 +73,7 @@ export async function attempt(t, action, edit = false, id = null) {
     await action();
     return null;
   } catch (error) {
+    if (error?.notices) return { problem: error.notices.map((key) => t(key)).join(' '), code: 'forgotten', edit: false, id };
     const code = error instanceof ApiError ? error.code : 'internal';
     return { problem: errorText(t, code), code, edit: Boolean(edit), id };
   }

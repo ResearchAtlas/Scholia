@@ -11,9 +11,11 @@ import { useAction } from '../action.js';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 
-// target: { kind: "project", "conversation", "material" or "memory" (with the version shown), id, title, body }, or null
-// when closed. A memory record keeps no title in the record of its deletion, so it has no "Remove all trace".
-export function DeleteDialog({ target, onClose, onDone }) {
+// target: { kind: "project", "conversation", "material" or "memory", id, title, body }, or null when closed. A memory
+// record keeps no title in the record of its deletion, so it has no "Remove all trace". onDelete(everywhere), if given,
+// deletes in the dialog's place: the dialog closes at once and the caller owns the outcome, which outlives the dialog
+// (Forget in the memory views keeps it as their actions do, MB1).
+export function DeleteDialog({ target, onClose, onDone, onDelete }) {
   const t = useT();
   const traceId = useId();
   const [removeAllTrace, setRemoveAllTrace] = useState(false);
@@ -27,8 +29,12 @@ export function DeleteDialog({ target, onClose, onDone }) {
   }, [key]);
 
   async function remove(everywhere) {
-    const result = await run(() => api('DELETE', deletePath(target.kind, target.id,
-      { everywhere, removeAllTrace, version: target.version })));
+    if (onDelete) {
+      onClose();
+      onDelete(everywhere);
+      return;
+    }
+    const result = await run(() => api('DELETE', deletePath(target.kind, target.id, { everywhere, removeAllTrace })));
     if (!result) return;
     const said = deletionNotices(result);
     if (said.length) setNotices(said); // deleted, but not wholly: say so before it closes
@@ -39,7 +45,7 @@ export function DeleteDialog({ target, onClose, onDone }) {
     if (busy) return;
     reset();
     if (notices.length) onDone(target.id);
-    else onClose(Boolean(problem)); // whether a deletion was tried and failed: its outcome may be unknown
+    else onClose();
   }
 
   return (

@@ -260,6 +260,31 @@ test('an action on a memory record tells every project, once done or of unknown 
     const json = (status, body) => async () => new Response(JSON.stringify(body), { status });
     assert.deepEqual(await click('memory.keep', json(200, { project_id: 'p1' })), [null]);
     assert.deepEqual(await click('memory.keep', async () => { throw new TypeError('dropped'); }), [null]); // unknown outcome
+    // Forget's choice in its dialog (batch 1): the row's own action, so a lost answer or backups left are kept outside
+    // the views (onFailed) and every view reads again, the dialog and the row long gone
+    const forget = async (reply, everywhere) => {
+      let tree;
+      const failed = [];
+      renderToStaticMarkup(h(function Drawn() {
+        tree = Proposal({ proposal: { id: 'r1', version: 1, content: 'x', structured: {} }, onFailed: (f) => failed.push(f) });
+        return null;
+      }));
+      const dialog = tree.props.children.flat().at(-1);
+      const asked = [];
+      globalThis.fetch = async (url, init) => { asked.push([init?.method, String(url)]); return reply(); };
+      const heard = [];
+      const listen = (event) => heard.push(event.detail);
+      events.addEventListener('changed', listen);
+      try { await dialog.props.onDelete(everywhere); } finally { events.removeEventListener('changed', listen); }
+      return { heard, failed, asked };
+    };
+    const done = await forget(json(200, { ok: true }), true);
+    assert.deepEqual([done.heard, done.failed], [[null], [null]]); // a success clears an earlier notice for the record
+    assert.match(done.asked[0][1], /\/api\/memory\/r1\?version=1&purge_backups=true$/);
+    const lost = await forget(async () => { throw new TypeError('dropped'); }, false);
+    assert.deepEqual([lost.heard, lost.failed.map((f) => f.code)], [[null], ['unreachable']]);
+    const left = await forget(json(200, { ok: true, purge_failed: true }), true);
+    assert.deepEqual([left.heard, left.failed.map((f) => [f.code, f.problem])], [[null], [['forgotten', t('delete.purgeFailed')]]]);
     assert.deepEqual(await click('memory.keep', json(409, { code: 'version_changed' })), [null]); // the record changed
     assert.deepEqual(await click('memory.keep', json(400, { code: 'personal_from_strict' })), []); // refused: nothing changed
   } finally {
@@ -293,18 +318,16 @@ test('a memory change and a Things to confirm answer name the project they are m
 });
 
 // M2 audit area 4, item 6 (ticket 18, Retention): the views' and the card's Forget is the delete dialog, with its backup
-// note and "Delete everywhere including backups", at the version shown
-test('Forget in the views and the card opens the delete dialog for the record at the version shown', () => {
+// note and "Delete everywhere including backups", at the version shown; the dialog only asks, and the outcome is the
+// row's own action's (batch 1: kept outside the views, every view read again)
+test('Forget in the views and the card opens the delete dialog, whose choice is the row\'s own action', () => {
   const view = readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8');
   assert.equal((view.match(/onClick=\{\(\) => setForgetting\(true\)\}/g) ?? []).length, 2); // a record's row, a proposal
-  assert.equal((view.match(/<Forget record=\{(record|proposal)\} open=\{forgetting\}/g) ?? []).length, 2);
-  assert.match(view, /<DeleteDialog target=\{open \? \{ kind: 'memory', id: record\.id, version: record\.version,/);
+  assert.match(view, /onDelete=\{\(everywhere\) => act\(\(\) => forgetRecord\(record, everywhere\), false, record\.id\)\}/);
+  assert.match(view, /onDelete=\{\(everywhere\) => acted\(\(\) => forgetRecord\(proposal, everywhere\), false, proposal\.id\)\}/);
   assert.doesNotMatch(view, /action: 'forget'/);
-  // done, or closed after a failure, every view reads again (MB12)
-  assert.match(view, /onClose=\{\(failed\) => \{ onClose\(\); if \(failed\) memoryChanged\(null\); \}\}/);
-  assert.match(view, /onDone=\{\(\) => \{ onClose\(\); memoryChanged\(null\); \}\}/);
   const dialog = readFileSync(join(SRC, 'components', 'DeleteDialog.jsx'), 'utf8');
-  assert.match(dialog, /else onClose\(Boolean\(problem\)\);/);
+  assert.match(dialog, /if \(onDelete\) \{\n\s+onClose\(\);\n\s+onDelete\(everywhere\);/);
   assert.match(dialog, /shown\.current\?\.kind !== 'memory' && <details/); // a forgotten record keeps no title anyway
   assert.notEqual(t('memory.forgetTitle'), 'memory.forgetTitle');
   assert.match(t('memory.forgetBody', { content: 'We use interviews' }), /We use interviews/);
