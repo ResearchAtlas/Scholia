@@ -245,7 +245,8 @@ test('Details names each step\'s tool calls and outcomes and the skills used, ne
 });
 
 // M2 audit, area 1: a library change drops chosen papers deleted since and gives the others their titles now; a read
-// that fails drops them; one asked before a later change is not applied, and another project's change is not heard.
+// that fails keeps them (the message stays restricted to them); one asked before a later change is not applied, and
+// another project's change is not heard.
 test('a library change drops chosen papers deleted since and retitles the others', async () => {
   const original = globalThis.fetch;
   const asked = [];
@@ -273,7 +274,7 @@ test('a library change drops chosen papers deleted since and retitles the others
     answers = [async () => { throw new TypeError('dropped'); }];
     libraryChanged('p1');
     await settle();
-    assert.deepEqual(chosenPapers('p1'), []); // not known to exist: dropped
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'a', title: 'A again' }]); // kept: the backend refuses a deleted one
   } finally {
     globalThis.fetch = original;
     choosePapers('p1', []);

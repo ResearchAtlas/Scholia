@@ -155,18 +155,22 @@ export function watchChosen(listener) {
 export const MAX_CHOSEN = 50; // as the backend takes them (backend/app.py Message.material_ids)
 
 // M2 audit, area 1 (no client-held derived state): a change to the chosen papers' project drops those deleted since and
-// gives the others their titles now, from its papers read again; a read that fails drops the papers chosen when it was
-// asked. A read asked before a later change, or once another project's papers are chosen, is not applied.
+// gives the others their titles now, from its papers read again. A read that fails changes nothing: dropping them
+// would send the next message unrestricted (slice-1 spec: literature restricted to the selection), and the backend
+// refuses a deleted one (selection_invalid). A read asked before a later change, or once another project's papers
+// are chosen, is not applied.
 const reconciled = newest();
 libraryEvents.addEventListener('changed', async (event) => {
   const { projectId, papers } = chosen;
   if (!papers.length || (event.detail !== null && event.detail !== projectId)) return;
   const current = reconciled();
   const asked = new Set(papers.map((paper) => paper.id));
-  let titles = new Map();
+  let titles;
   try {
     titles = new Map((await get(`/api/projects/${encodeURIComponent(projectId)}/materials`)).materials.map((m) => [m.id, m.title]));
-  } catch { /* none kept: those asked about are dropped */ }
+  } catch {
+    return;
+  }
   if (!current() || chosen.projectId !== projectId) return;
   choosePapers(projectId, chosen.papers.filter((paper) => !asked.has(paper.id) || titles.has(paper.id))
     .map((paper) => (titles.has(paper.id) ? { ...paper, title: titles.get(paper.id) } : paper)));
