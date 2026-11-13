@@ -480,3 +480,26 @@ test('focus on the note goes to the view switch when the note goes, every page f
   assert.deepEqual(run(20_000, 20_000, false, 'body'), [[], false]); // focus was not on the note
   assert.deepEqual(run(15_836, 20_000, true, 'body'), [[], true]); // the note still there
 });
+
+// M2 audit, area 1 (no client-held derived state): every copy of a paper's text or title a view holds is dropped or read
+// again when the library changes. The Library's search drops its results and any search asked before the change, and
+// searches again; a listing read for a change that fails drops what was shown; the @-mention list drops its papers and a
+// read asked before; a paper's new file and its saved details are changes every view hears (the chosen papers: library.js,
+// tests/answers.test.mjs).
+test('the Library\'s search and listing, the @-mentions and a paper\'s own changes follow the one invalidation path', () => {
+  const library = source('Library.jsx');
+  const search = library.slice(library.indexOf('function useSearch('), library.indexOf('function SearchField('));
+  assert.match(search, /libraryEvents\.addEventListener\('changed', changed\)/);
+  assert.match(search, /const changed = \(event\) => \{\s*if \(event\.detail !== null && event\.detail !== projectId\) return;\s*asked\(\);\s*setShown\(null\);\s*if \(searched\.current\) again\.current\(searched\.current\);/);
+  const listing = library.slice(library.indexOf('export function useLibrary('), library.indexOf('export async function addTo('));
+  assert.match(listing, /event\.detail === projectId\) load\(true\)/);
+  assert.match(listing, /setProblem\([^;]*\);\s*if \(changed === true\) setListing\(null\);/);
+  const conversation = source('ConversationView.jsx');
+  const mention = conversation.slice(conversation.indexOf('function useMention('));
+  assert.match(mention, /libraryEvents\.addEventListener\('changed', changed\)/);
+  assert.match(mention, /setRead\(null\);\s*setGeneration\(\(n\) => n \+ 1\);/);
+  assert.match(mention, /\}, \[wanted, projectId, generation\]\);/); // a read asked before the change is let go
+  const paper = source('Paper.jsx');
+  assert.match(paper, /replaces: material\.version\?\.id \}\)\) libraryChanged\(project\.id\);/);
+  assert.match(paper, /<Details material=\{material\} onSaved=\{\(\) => libraryChanged\(project\.id\)\} \/>/);
+});

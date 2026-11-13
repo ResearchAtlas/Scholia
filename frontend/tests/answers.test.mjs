@@ -12,7 +12,7 @@ import { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import Answer, { Chip, backedSentences } from '../src/markdown.js';
 import { readTrace, summarize, turnRanges } from '../src/trace.js';
-import { MAX_CHOSEN, choosePapers, chosenPapers, openPaperAt, readGuard, takeOpening, watchChosen } from '../src/library.js';
+import { MAX_CHOSEN, choosePapers, chosenPapers, libraryChanged, openPaperAt, readGuard, takeOpening, watchChosen } from '../src/library.js';
 import { NOTICES } from '../src/live.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
@@ -242,6 +242,42 @@ test('Details names each step\'s tool calls and outcomes and the skills used, ne
   assert.deepEqual(found.steps.map((s) => s.phase), ['answer', 'answer_from_library']);
   assert.deepEqual(found.skills, ['help']); // once
   assert.equal(found.pairs.reused, 2);
+});
+
+// M2 audit, area 1: a library change drops chosen papers deleted since and gives the others their titles now; a read
+// that fails drops them; one asked before a later change is not applied, and another project's change is not heard.
+test('a library change drops chosen papers deleted since and retitles the others', async () => {
+  const original = globalThis.fetch;
+  const asked = [];
+  let answers = [];
+  globalThis.fetch = (path) => { asked.push(path); return answers.shift()(); };
+  const listed = (...materials) => async () => ({ ok: true, json: async () => ({ materials }) });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  try {
+    choosePapers('p1', [{ id: 'a', title: 'A' }, { id: 'gone', title: 'Deleted' }]);
+    libraryChanged('p2'); // another project's change
+    await settle();
+    assert.equal(asked.length, 0);
+    answers = [listed({ id: 'a', title: 'A, retitled' }, { id: 'c', title: 'C' })];
+    libraryChanged('p1');
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'a', title: 'A, retitled' }]);
+    let late;
+    answers = [() => new Promise((resolve) => { late = resolve; }), listed({ id: 'a', title: 'A again' })];
+    libraryChanged(null); // every project's
+    libraryChanged('p1'); // a later change: the read before it is not applied
+    await settle();
+    late({ ok: true, json: async () => ({ materials: [] }) });
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'a', title: 'A again' }]);
+    answers = [async () => { throw new TypeError('dropped'); }];
+    libraryChanged('p1');
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), []); // not known to exist: dropped
+  } finally {
+    globalThis.fetch = original;
+    choosePapers('p1', []);
+  }
 });
 
 test('papers chosen for the next message are one project\'s, kept once each, and a cited paper opens once', () => {

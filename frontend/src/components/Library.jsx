@@ -27,13 +27,14 @@ import { LocalOnlySearchNote } from './LocalHelper.jsx';
 const POLL_MS = 1500; // while a paper is read, a lookup runs or a question waits
 
 // Reads the project's papers, again while anything is under way and whenever they change. Only the
-// newest read's answer is kept: one asked for another project, or before a later read, is dropped.
+// newest read's answer is kept: one asked for another project, or before a later read, is dropped. A read
+// asked for a change that fails drops the papers shown (M2 audit, area 1: a deleted one is never shown again).
 export function useLibrary(projectId) {
   const [listing, setListing] = useState(null);
   const [problem, setProblem] = useState(null);
   const [reads, setReads] = useState(0);
   const [asked] = useState(newest);
-  const load = useCallback(async () => {
+  const load = useCallback(async (changed = false) => {
     const current = asked();
     if (!projectId) return;
     try {
@@ -42,14 +43,16 @@ export function useLibrary(projectId) {
       setListing(found);
       setProblem(null);
     } catch (error) {
-      if (current()) setProblem(error instanceof ApiError ? error.code : 'internal');
+      if (!current()) return;
+      setProblem(error instanceof ApiError ? error.code : 'internal');
+      if (changed === true) setListing(null);
     } finally {
       if (current()) setReads((n) => n + 1);
     }
   }, [projectId, asked]);
   useEffect(() => { setListing(null); load(); }, [load]);
   useEffect(() => {
-    const changed = (event) => { if (event.detail === null || event.detail === projectId) load(); };
+    const changed = (event) => { if (event.detail === null || event.detail === projectId) load(true); };
     libraryEvents.addEventListener('changed', changed);
     return () => libraryEvents.removeEventListener('changed', changed);
   }, [projectId, load]);
@@ -339,22 +342,42 @@ export function useIndex(projectId, listing) {
 }
 
 // The search field's text and the newest search's results; a search asked before a later one, or
-// for another project, is dropped.
+// for another project, is dropped. A change to the project's papers (one deleted, retitled or given another
+// file) drops the results shown and any search asked before it, and searches again (M2 audit, area 1: no
+// client-held copy of a paper's text or title outlives its change).
 function useSearch(projectId) {
   const [text, setText] = useState('');
   const [shown, setShown] = useState(null); // { query, found }
   const [asked] = useState(newest);
+  const searched = useRef(null); // the newest search's query, shown or asked
   const { busy, problem, run, reset } = useAction();
-  useEffect(() => { asked(); setText(''); setShown(null); reset(); }, [projectId]);
-  async function search() {
-    const query = queryOf(text);
-    if (!query || !projectId) return;
+  useEffect(() => { asked(); searched.current = null; setText(''); setShown(null); reset(); }, [projectId]);
+  async function find(query) {
     const current = asked();
+    searched.current = query;
     const found = await run(() => searchProject(projectId, query));
     if (found && current()) setShown({ query, found });
   }
+  const again = useRef(find);
+  again.current = find;
+  useEffect(() => {
+    const changed = (event) => {
+      if (event.detail !== null && event.detail !== projectId) return;
+      asked();
+      setShown(null);
+      if (searched.current) again.current(searched.current);
+    };
+    libraryEvents.addEventListener('changed', changed);
+    return () => libraryEvents.removeEventListener('changed', changed);
+  }, [projectId, asked]);
+  async function search() {
+    const query = queryOf(text);
+    if (!query || !projectId) return;
+    await find(query);
+  }
   function clear() {
     asked();
+    searched.current = null;
     setText('');
     setShown(null);
     reset();

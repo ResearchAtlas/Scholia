@@ -36,7 +36,8 @@ export function Paper({ material, project, index, target, onBack, onChanged }) {
     setNotice(null);
     return run(async () => {
       if (await addTo(project.id, [...files].slice(0, 1), t, setNotice, { materialId: material.id,
-        replaces: material.version?.id })) onChanged(); // the version shown when the file was chosen
+        replaces: material.version?.id })) libraryChanged(project.id); // the version shown when the file was chosen;
+      // every view showing the paper's text or title reads it again (the Library's listing among them)
     });
   }
 
@@ -67,7 +68,7 @@ export function Paper({ material, project, index, target, onBack, onChanged }) {
           {material.readable && <ReadAgain material={material} onDone={onChanged} />}
           {notice && <p role="status" className="rounded-md bg-muted px-3 py-2 text-sm">{notice}</p>}
         </header>
-        <Details material={material} onSaved={onChanged} />
+        <Details material={material} onSaved={() => libraryChanged(project.id)} />
         <section className="grid gap-2 text-sm">
           <h4 className="font-semibold">{t('paper.about')}</h4>
           <Facts material={material} project={project} index={index} />

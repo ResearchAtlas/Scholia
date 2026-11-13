@@ -594,11 +594,21 @@ const MENTION = /(^|\s)@([^\s@]*)$/u;
 
 function useMention(projectId, text) {
   const [read, setRead] = useState(null); // { projectId, papers }: the project's papers, read when an @ is first typed
+  const [generation, setGeneration] = useState(0); // M2 audit, area 1: a library change drops them, and a read asked before it
   const [picked, setPicked] = useState({ query: '', index: 0 }); // the highlighted paper, for the query it was moved at
   const [closed, setClosed] = useState(null); // the text an Escape closed the list at
   const typed = projectId && closed !== text ? MENTION.exec(text) : null;
   const papers = read?.projectId === projectId ? read.papers : null;
   const wanted = Boolean(typed) && !papers;
+  useEffect(() => {
+    const changed = (event) => {
+      if (event.detail !== null && event.detail !== projectId) return;
+      setRead(null);
+      setGeneration((n) => n + 1);
+    };
+    libraryEvents.addEventListener('changed', changed);
+    return () => libraryEvents.removeEventListener('changed', changed);
+  }, [projectId]);
   useEffect(() => {
     if (!wanted) return undefined;
     let live = true;
@@ -606,7 +616,7 @@ function useMention(projectId, text) {
       (found) => live && setRead({ projectId, papers: found.materials.map((m) => ({ id: m.id, title: m.title })) }),
       () => live && setRead({ projectId, papers: [] }));
     return () => { live = false; };
-  }, [wanted, projectId]);
+  }, [wanted, projectId, generation]);
   const query = typed?.[2].toLocaleLowerCase() ?? '';
   const matching = (papers ?? []).filter((paper) => (paper.title ?? '').toLocaleLowerCase().includes(query)).slice(0, 8);
   const open = Boolean(typed && papers);
