@@ -1196,6 +1196,7 @@
   "library.askAbout": "就这些提问",
   "library.chooseNone": "清除",
   "composer.chosen": "为这条消息选择的论文",
+  "composer.chosenPaper": "一篇已选的论文",
   "composer.papersWait": "现在发送的话，这条消息会作为下一轮等待，因为它指定了论文。",
   "composer.unchoose": "移除“{title}”",
   "composer.mentions": "这个项目中的论文",

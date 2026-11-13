@@ -11,7 +11,8 @@ import { useAction } from '../action.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
 import { ACCEPT, addFiles, authorNames, choosePapers, chosenPapers, detailsSource, latestLookup, libraryEvents, newest, ocrPages,
-  reasonKey, sortFiles, stateKey, takeOpening, typeKey, unsettled, uploadsWaiting, watchChosen, watchUploads, yearOf } from '../library.js';
+  readGuard, reasonKey, sortFiles, stateKey, takeOpening, typeKey, unsettled, uploadsWaiting, watchChosen, watchUploads,
+  yearOf } from '../library.js';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
 import { AddMenu } from './AddMenu.jsx'; // S1-14: Add offers a reference file
@@ -27,41 +28,51 @@ import { LocalOnlySearchNote } from './LocalHelper.jsx';
 const POLL_MS = 1500; // while a paper is read, a lookup runs or a question waits
 
 // Reads the project's papers, again while anything is under way and whenever they change. Only the
-// newest read's answer is kept: one asked for another project, or before a later read, is dropped. A read
-// asked for a change that fails drops the papers shown (M2 audit, area 1: a deleted one is never shown again).
+// newest read's answer is kept: one asked for another project, or before a later read, is dropped. After a
+// change (library.js readGuard), a read asked before it is never shown, and one that fails before a read asked
+// after it succeeds drops the papers shown (Harold, 2026-10-21: a failed reload never shows old text), whichever
+// read it was. forget(id) takes a deleted paper out of the papers shown at once.
 export function useLibrary(projectId) {
   const [listing, setListing] = useState(null);
   const [problem, setProblem] = useState(null);
   const [reads, setReads] = useState(0);
   const [asked] = useState(newest);
-  const load = useCallback(async (changed = false) => {
+  const [guard] = useState(readGuard);
+  const load = useCallback(async () => {
     const current = asked();
+    const settle = guard.ask();
     if (!projectId) return;
     try {
       const found = await get(`/api/projects/${encodeURIComponent(projectId)}/materials`);
-      if (!current()) return;
+      if (!current() || !settle(true)) return;
       setListing(found);
       setProblem(null);
     } catch (error) {
-      if (!current()) return;
+      if (!current() || !settle(false)) return;
       setProblem(error instanceof ApiError ? error.code : 'internal');
-      if (changed === true) setListing(null);
+      if (guard.changed()) setListing(null);
     } finally {
       if (current()) setReads((n) => n + 1);
     }
-  }, [projectId, asked]);
+  }, [projectId, asked, guard]);
   useEffect(() => { setListing(null); load(); }, [load]);
   useEffect(() => {
-    const changed = (event) => { if (event.detail === null || event.detail === projectId) load(true); };
+    const changed = (event) => {
+      if (event.detail !== null && event.detail !== projectId) return;
+      guard.libraryChanged();
+      load();
+    };
     libraryEvents.addEventListener('changed', changed);
     return () => libraryEvents.removeEventListener('changed', changed);
-  }, [projectId, load]);
+  }, [projectId, load, guard]);
   useEffect(() => {
     if (!unsettled(listing) && !problem) return undefined;
     const timer = setTimeout(load, POLL_MS);
     return () => clearTimeout(timer);
   }, [listing, problem, reads, load]);
-  return { listing, problem, load };
+  const forget = useCallback((id) => setListing((shown) => shown && { ...shown,
+    materials: shown.materials.filter((material) => material.id !== id) }), []);
+  return { listing, problem, load, forget };
 }
 
 // Adds files to the project, after leaving out those Scholia does not read: resolves to the
@@ -82,7 +93,7 @@ export async function addTo(projectId, fileList, t, notify, options) {
 
 export function Library({ project }) {
   const t = useT();
-  const { listing, problem, load } = useLibrary(project?.id);
+  const { listing, problem, load, forget } = useLibrary(project?.id);
   const [open, setOpen] = useState(null); // the paper whose page is shown: { id, target } (a result's passage)
   const index = useIndex(project?.id, listing);
   const search = useSearch(project?.id);
@@ -109,7 +120,8 @@ export function Library({ project }) {
   const paper = open && listing?.materials.find((m) => m.id === open.id);
   if (paper) {
     return <Paper material={paper} project={project} index={index} target={open.target}
-      onBack={() => { setOpen(null); load(); }} onChanged={load} />;
+      onBack={() => { setOpen(null); load(); }} onChanged={load}
+      onDeleted={() => { forget(paper.id); setOpen(null); }} />; // its listing read again with the change
   }
   const searching = Boolean(search.shown);
   const materials = listing?.materials ?? [];

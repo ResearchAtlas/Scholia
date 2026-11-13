@@ -244,9 +244,10 @@ test('Details names each step\'s tool calls and outcomes and the skills used, ne
   assert.equal(found.pairs.reused, 2);
 });
 
-// M2 audit, area 1: a library change drops chosen papers deleted since and gives the others their titles now; a read
-// that fails keeps them (the message stays restricted to them); one asked before a later change is not applied, and
-// another project's change is not heard.
+// M2 audit, area 1: a library change drops chosen papers' titles at once, then drops those deleted since and gives the
+// others their titles now; a read that fails keeps their ids, untitled (the message stays restricted to them, and no
+// title of a deleted paper stays); one asked before a later change is not applied, and another project's change is
+// not heard.
 test('a library change drops chosen papers deleted since and retitles the others', async () => {
   const original = globalThis.fetch;
   const asked = [];
@@ -261,6 +262,7 @@ test('a library change drops chosen papers deleted since and retitles the others
     assert.equal(asked.length, 0);
     answers = [listed({ id: 'a', title: 'A, retitled' }, { id: 'c', title: 'C' })];
     libraryChanged('p1');
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'a', title: null }, { id: 'gone', title: null }]); // at once
     await settle();
     assert.deepEqual(chosenPapers('p1'), [{ id: 'a', title: 'A, retitled' }]);
     let late;
@@ -274,7 +276,7 @@ test('a library change drops chosen papers deleted since and retitles the others
     answers = [async () => { throw new TypeError('dropped'); }];
     libraryChanged('p1');
     await settle();
-    assert.deepEqual(chosenPapers('p1'), [{ id: 'a', title: 'A again' }]); // kept: the backend refuses a deleted one
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'a', title: null }]); // kept, untitled: the backend refuses a deleted one
   } finally {
     globalThis.fetch = original;
     choosePapers('p1', []);

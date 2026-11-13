@@ -1237,6 +1237,7 @@
   "library.askAbout": "Ask about these",
   "library.chooseNone": "Clear",
   "composer.chosen": "Papers chosen for this message",
+  "composer.chosenPaper": "A chosen paper",
   "composer.papersWait": "Sent now, this message waits as the next turn, because it names papers.",
   "composer.unchoose": "Remove “{title}”",
   "composer.mentions": "Papers in this project",

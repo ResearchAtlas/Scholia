@@ -528,7 +528,8 @@ function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
           )}
           {chosen.length > 0 && (
             <ul className="flex flex-wrap gap-1 px-1 pb-1" aria-label={t('composer.chosen')}>
-              {chosen.map((paper) => (
+              {chosen.map((paper) => ({ ...paper, title: paper.title ?? t('composer.chosenPaper') })).map((paper) => ( // untitled while
+                // its title is read again after a library change (library.js)
                 <li key={paper.id} className="flex max-w-60 items-center gap-1 rounded-full bg-brand-soft py-0.5 pl-2 pr-1 text-xs text-brand">
                   <span className="truncate" title={paper.title}>{paper.title}</span>
                   <button type="button" aria-label={t('composer.unchoose', { title: paper.title })}
@@ -594,7 +595,10 @@ const MENTION = /(^|\s)@([^\s@]*)$/u;
 
 function useMention(projectId, text) {
   const [read, setRead] = useState(null); // { projectId, papers }: the project's papers, read when an @ is first typed
-  const [generation, setGeneration] = useState(0); // M2 audit, area 1: a library change drops them, and a read asked before it
+  // M2 audit, area 1: a library change drops them at once, and an answer to a read asked before it (readGuard), and
+  // they are read again
+  const [generation, setGeneration] = useState(0);
+  const [guard] = useState(readGuard);
   const [picked, setPicked] = useState({ query: '', index: 0 }); // the highlighted paper, for the query it was moved at
   const [closed, setClosed] = useState(null); // the text an Escape closed the list at
   const typed = projectId && closed !== text ? MENTION.exec(text) : null;
@@ -603,20 +607,22 @@ function useMention(projectId, text) {
   useEffect(() => {
     const changed = (event) => {
       if (event.detail !== null && event.detail !== projectId) return;
+      guard.libraryChanged();
       setRead(null);
       setGeneration((n) => n + 1);
     };
     libraryEvents.addEventListener('changed', changed);
     return () => libraryEvents.removeEventListener('changed', changed);
-  }, [projectId]);
+  }, [projectId, guard]);
   useEffect(() => {
     if (!wanted) return undefined;
     let live = true;
+    const settle = guard.ask();
     get(`/api/projects/${encodeURIComponent(projectId)}/materials`).then(
-      (found) => live && setRead({ projectId, papers: found.materials.map((m) => ({ id: m.id, title: m.title })) }),
-      () => live && setRead({ projectId, papers: [] }));
+      (found) => live && settle(true) && setRead({ projectId, papers: found.materials.map((m) => ({ id: m.id, title: m.title })) }),
+      () => live && settle(false) && setRead({ projectId, papers: [] }));
     return () => { live = false; };
-  }, [wanted, projectId, generation]);
+  }, [wanted, projectId, generation, guard]);
   const query = typed?.[2].toLocaleLowerCase() ?? '';
   const matching = (papers ?? []).filter((paper) => (paper.title ?? '').toLocaleLowerCase().includes(query)).slice(0, 8);
   const open = Boolean(typed && papers);

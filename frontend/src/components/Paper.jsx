@@ -24,7 +24,7 @@ import { cn } from '@/lib/utils';
 
 // index: the project's search index status, for Details (S1-17); target: a search result's passage
 // ({ id, ordinal }), which the text view opens at.
-export function Paper({ material, project, index, target, onBack, onChanged }) {
+export function Paper({ material, project, index, target, onBack, onChanged, onDeleted }) {
   const t = useT();
   const [deleting, setDeleting] = useState(false);
   const [notice, setNotice] = useState(null);
@@ -78,7 +78,7 @@ export function Paper({ material, project, index, target, onBack, onChanged }) {
       <DeleteDialog target={deleting ? { kind: 'material', id: material.id, title: t('paper.deleteTitle', { title: material.title }),
         body: t('paper.deleteBody') } : null}
         onClose={() => setDeleting(false)}
-        onDone={() => { setDeleting(false); libraryChanged(project.id); onBack(); }} />
+        onDone={() => { setDeleting(false); libraryChanged(project.id); onDeleted(); }} />
     </div>
   );
 }
