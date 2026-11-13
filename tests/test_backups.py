@@ -499,6 +499,54 @@ async def test_a_restore_of_an_older_schemas_backup_keeps_its_safety_copy(tmp_pa
         assert old in listed  # and the backup restored from
 
 
+@pytest.mark.parametrize("outcome", ["committed", "rolled back"])
+async def test_a_restore_of_an_older_automatic_backup_still_in_the_folder_takes_only_its_safety_copy(
+        tmp_path, monkeypatch, outcome):
+    # PR 59 batch 1, item 5: the restored database's migrations also published a copy of the backup restored, kept
+    # when the restore was rolled back, so each failed attempt rotated out two of the week's backups
+    data = tmp_path / "data"
+
+    def older():  # an M1 data folder (schema 3) with its backup
+        with Database(data, migrations=MIGRATIONS[:3]) as db:
+            return db.backup().name
+
+    name = await asyncio.to_thread(older)
+    async with started(data) as client:
+        [old] = [b["id"] for b in (await client.get("/api/backups")).json()["backups"] if b["id"].endswith(name)]
+        before = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+        if outcome == "rolled back":
+            def failing(*args):
+                raise OSError("the journal cannot be written")
+            monkeypatch.setattr(backups_module, "_commit_journal", failing)
+        response = await client.post("/api/backups/restore", json={"generation": old})
+        assert response.status_code == (200 if outcome == "committed" else 500), response.text
+        listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
+        [added] = set(listed) - before  # the safety copy, at the schema it was taken at
+        assert listed[added]["schema_version"] == len(MIGRATIONS) and old in listed
+
+
+async def test_a_restore_of_a_backup_its_safety_copy_rotated_away_keeps_a_copy_of_it_before_migrating(tmp_path):
+    # PR 59 batch 1, item 5: with the backup restored no longer where it was, the copy its migrations take is the one
+    # backup of the state they start from
+    from datetime import UTC, datetime, timedelta
+    data = tmp_path / "data"
+
+    def older():
+        with Database(data, migrations=MIGRATIONS[:3]) as db:
+            return db.backup(now=datetime.now(UTC) - timedelta(days=6)).name
+
+    name = await asyncio.to_thread(older)
+    async with started(data) as client:  # its upgrade's backup, then five more: seven daily, the oldest restored
+        for _ in range(5):
+            assert (await client.post("/api/backups")).status_code == 200
+        before = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+        response = await client.post("/api/backups/restore", json={"generation": f"daily/{name}"})
+        assert response.status_code == 200, response.text
+        listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
+        added = {listed[i]["schema_version"] for i in set(listed) - before if not i.endswith(name)}
+        assert added == {3, len(MIGRATIONS)} and f"daily/{name}" not in listed  # the copy and the safety copy
+
+
 async def test_a_restore_stops_a_running_turn(tmp_path):
     async with started(tmp_path / "data") as client:
         backup = (await client.post("/api/backups")).json()["id"]
