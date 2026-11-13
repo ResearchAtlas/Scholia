@@ -327,7 +327,8 @@ def _first_sent(conn, run_id):
     """Along the Continue chain from a turn back to the one the researcher sent: (that turn's message text, whether a
     turn of the chain applied its memory command, the records a forget of the chain chose and did not delete, still
     there and current). Each Continue sends the message again with the notes its steps read, so only the first message
-    holds the command's own words (M2 audit area 4, item 1); a forget cut short is asked again for the rest (batch 1)."""
+    holds the command's own words (M2 audit area 4, item 1); a forget cut short is asked again for the rest (batch
+    1)."""
     text, applied, chosen, seen = "", False, set(), set()
     while run_id is not None and run_id not in seen:
         seen.add(run_id)

@@ -345,7 +345,8 @@ async def test_a_forget_answered_after_its_record_moved_to_another_project_leave
         assert (await client.post(f"/api/conversations/{moving}/move", json={"project_id": private})).status_code == 200
         await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "forget"})
         assert {"type": "memory", "action": "forgotten", "count": 0} in await sending
-        assert sorted(await rows(client, "SELECT content, project_id FROM memory_records WHERE type != 'progress'")) == [
+        assert sorted(await rows(client, "SELECT content, project_id FROM memory_records"
+                                         " WHERE type != 'progress'")) == [
             ("we exclude studies after the pilot", project), ("we exclude studies before 2000", private)]
 
 
@@ -895,7 +896,8 @@ async def test_a_command_stopped_while_its_record_commits_still_asks_for_its_ind
 
 
 # PR 62 batch 1 (Fable's recheck, findings 1 and 2; both astra passes, the read-back)
-async def test_a_forget_closing_with_a_period_still_names_its_record_and_words_only_like_several_ask_about_one(tmp_path):
+async def test_a_forget_closing_with_a_period_names_its_record_and_words_only_like_several_ask_about_one(
+        tmp_path):
     from backend import memory
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
@@ -903,8 +905,10 @@ async def test_a_forget_closing_with_a_period_still_names_its_record_and_words_o
         ids = [await asyncio.to_thread(client.state["db"].write, lambda conn, text=text: memory.write(
             conn, project_id=project, scope="project", kind="project_state", content=text, status="confirmed",
             sources=[("project", project)]))
-            for text in ("The sample is 30 interviews", "The sample is 35 interviews with nurses", "The pilot sample was 12")]
-        stream = await asyncio.wait_for(send(client, conversation, "Forget that the sample is 35 interviews with nurses."), 10)
+            for text in ("The sample is 30 interviews", "The sample is 35 interviews with nurses",
+                         "The pilot sample was 12")]
+        stream = await asyncio.wait_for(
+            send(client, conversation, "Forget that the sample is 35 interviews with nurses."), 10)
         assert {"type": "memory", "action": "forgotten", "count": 1} in stream  # named: no ask
         sending = asyncio.create_task(send(client, conversation, "Forget that the sample was 30 interviews"))
         ask = await open_ask(client, conversation)
