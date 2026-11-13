@@ -728,8 +728,12 @@ ALTER TABLE queued_messages ADD COLUMN material_ids TEXT CHECK (material_ids IS 
 # triggers, as a STRICT table's CHECK cannot be added to a column in place; a paper written before keeps its value.
 # merge_filled: the fields a confirmed Merge gave the paper (a JSON list of CSL keys, or NULL), which a later record of
 # it (a Zotero re-import, a lookup tried again) keeps where that record gives none (backend/references.py _answered).
+# zotero_file: the SHA-256 of the PDF a Zotero paper's item gave when last imported with one (NULL: none yet, or a paper
+# imported before it was kept), so a re-import adds Zotero's attachment when Zotero changed it, even back to an earlier
+# file, and never undoes the researcher's own replacement while Zotero's is as it was (backend/zotero.py _update).
 _0013 = r"""
 ALTER TABLE materials ADD COLUMN merge_filled TEXT CHECK (merge_filled IS NULL OR json_valid(merge_filled));
+ALTER TABLE materials ADD COLUMN zotero_file TEXT;
 
 CREATE TRIGGER materials_lookup_filled_valid BEFORE INSERT ON materials
 WHEN NEW.lookup_filled IS NOT NULL AND NOT json_valid(NEW.lookup_filled)

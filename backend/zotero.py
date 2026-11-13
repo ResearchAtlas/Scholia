@@ -757,7 +757,8 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
     if fetched is not None:
         csl, dropped, sha256, why = fetched
         step.update(pdf=why, left_out=dropped)
-        found = conn.execute("SELECT id, csl, checked_by, lookup_filled, title, evidence_type, merge_filled FROM materials"
+        found = conn.execute("SELECT id, csl, checked_by, lookup_filled, title, evidence_type, merge_filled, zotero_file"
+                             " FROM materials"
                              " WHERE project_id = ? AND source = 'zotero' AND source_key = ?",
                              (project_id, source_key)).fetchone()
         if found is not None:
@@ -790,7 +791,7 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
     researcher has not edited them), and its PDF, when it is none of its files, its next version.
     Returns (material, version, its record or {}, whether its current version has a file) to look up
     when its details were replaced or a file added, else None."""
-    material, stored, checked_by, filled, title, evidence, merge_filled = found
+    material, stored, checked_by, filled, title, evidence, merge_filled, given = found
     step["material_id"] = material
     changed = False
     own = json.loads(stored or "{}")
@@ -816,12 +817,18 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
     current = conn.execute("SELECT id, file_sha256 FROM material_versions WHERE material_id = ? AND is_current = 1",
                            (material,)).fetchone()
     version = current[0] if current else None
-    if sha256 is not None and conn.execute("SELECT 1 FROM material_versions WHERE material_id = ? AND file_sha256 = ?",
-                                           (material, sha256)).fetchone() is None:  # one of its files already: none
-        version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF, None, recorded)
-        step["version"] = True
-        # what the old file's lookup gave it goes in add_version (materials._forget_file_lookup)
-    elif sha256 is None and step.get("pdf") and current is not None and current[1] is not None:
+    # Files follow Zotero: its PDF becomes the paper's next version when Zotero changed it since it last gave one (back
+    # to an earlier file too), unless it is the current file already; while Zotero's is as it was, the researcher's own
+    # replacement stays. A paper imported before Zotero's file was kept (zotero_file NULL): when it is none of its files.
+    if sha256 is not None:
+        moved_on = sha256 != given if given is not None else conn.execute(
+            "SELECT 1 FROM material_versions WHERE material_id = ? AND file_sha256 = ?", (material, sha256)).fetchone() is None
+        if moved_on and (current is None or current[1] != sha256):
+            version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF, None, recorded)
+            step["version"] = True
+            # what the old file's lookup gave it goes in add_version (materials._forget_file_lookup)
+        conn.execute("UPDATE materials SET zotero_file = ? WHERE id = ?", (sha256, material))
+    elif step.get("pdf") and current is not None and current[1] is not None:
         step["kept"] = True  # its PDF could not be read this time: the paper keeps the file it had
     step["outcome"] = "updated" if changed or step["version"] else "unchanged"
     if not (changed or step["version"]) or version is None:
@@ -860,10 +867,10 @@ def _new(conn, harness, project_id, inputs, key, source_key, csl, sha256, step, 
                                                        "server_id": inputs.get("server_id")}}})
             return None
     material = new_id()
-    conn.execute("INSERT INTO materials (id, project_id, title, csl, source, source_key, evidence_type, proposed_by)"
-                 " VALUES (?, ?, ?, ?, 'zotero', ?, ?, 'researcher')",
+    conn.execute("INSERT INTO materials (id, project_id, title, csl, source, source_key, evidence_type, proposed_by,"
+                 " zotero_file) VALUES (?, ?, ?, ?, 'zotero', ?, ?, 'researcher', ?)",
                  (material, project_id, csl["title"], json.dumps(csl), source_key,
-                  "full_text" if sha256 else references._evidence(csl)))
+                  "full_text" if sha256 else references._evidence(csl), sha256))
     version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF if sha256 else None, None,
                              recorded)
     step.update(outcome="imported", material_id=material, version=sha256 is not None)

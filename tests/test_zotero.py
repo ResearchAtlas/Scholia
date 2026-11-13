@@ -5,6 +5,7 @@ transport. Lifecycle cases first: cancellation and retries, deletion while the i
 level or lock, and a commit followed by a failure or a crash."""
 
 import asyncio
+import hashlib
 import json
 import re
 
@@ -669,6 +670,28 @@ async def test_a_zotero_pdf_matching_an_earlier_version_never_displaces_the_rese
         row = await imported(client, project, KEYS[1:2])
         assert (row["result"]["unchanged"], row["result"]["versions"]) == (1, 0)
         assert (await papers(client, project))[f"users/0/items/{KEYS[1]}"]["version"]["seq"] == 1
+
+
+async def test_an_attachment_zotero_changes_back_to_an_earlier_file_becomes_current_again(tmp_path):
+    """M2 audit, area 1 (S1-15: files follow Zotero): Zotero's attachment changed from A to B and back to A brings A
+    back as the paper's next version, reported updated; the researcher's own replacement is still never undone by an
+    attachment Zotero left as it was (the test above)."""
+    mock = library(tmp_path)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        a = (tmp_path / "Zotero 文件 storage" / "two.pdf").read_bytes()
+        await imported(client, project, KEYS[1:2])
+        pdf_file(tmp_path, "two.pdf", "The Second File", doi=None)  # Zotero's attachment changed: B
+        assert (await imported(client, project, KEYS[1:2]))["result"]["versions"] == 1
+        (tmp_path / "Zotero 文件 storage" / "two.pdf").write_bytes(a)  # and back to A
+        row = await imported(client, project, KEYS[1:2])
+        assert (row["result"]["updated"], row["result"]["versions"], row["result"]["unchanged"]) == (1, 1, 0)
+        await background_idle(client, 60)
+        paper = (await papers(client, project))[f"users/0/items/{KEYS[1]}"]
+        [(current,)] = await rows(client, "SELECT file_sha256 FROM material_versions WHERE id = ?", paper["version"]["id"])
+        assert paper["version"]["seq"] == 2 and current == hashlib.sha256(a).hexdigest()
+        row = await imported(client, project, KEYS[1:2])  # A again, as it was: nothing changed
+        assert (row["result"]["unchanged"], row["result"]["versions"]) == (1, 0)
 
 
 async def test_a_redirect_from_zotero_fails_as_unavailable_never_as_a_changed_project(tmp_path):
