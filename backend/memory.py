@@ -183,12 +183,12 @@ def allowed(conn, project_id, record_ids, versions=None):
 
 
 def _automatic(conn, record):
-    """Whether a record's version is an extraction's own write (section 8's automatic replacement, or its confirmation of
-    what was only inferred), never the researcher's: an edit, a Keep and a command each are written by no memory run, or
-    carry a source from the researcher."""
+    """Whether a record's version is an extraction's own write (section 8's automatic replacement, or its confirmation
+    of what was only inferred), never the researcher's: an edit, a Keep and a command each are written by no memory
+    run, or carry a source from the researcher."""
     return conn.execute(
-        "SELECT 1 FROM memory_records m JOIN runs r ON r.id = m.created_by_run_id WHERE m.id = ? AND r.workflow = 'memory'"
-        " AND NOT EXISTS (SELECT 1 FROM memory_sources s WHERE s.memory_id = m.id AND s.source_kind = 'researcher')",
+        "SELECT 1 FROM memory_records m JOIN runs r ON r.id = m.created_by_run_id WHERE m.id = ?"
+        " AND r.workflow = 'memory' AND NOT EXISTS (SELECT 1 FROM memory_sources s WHERE s.memory_id = m.id AND s.source_kind = 'researcher')",
         (record,)).fetchone() is not None
 
 
@@ -678,8 +678,9 @@ def apply_extraction(conn, run_id, candidates):
         if same is not None:
             counts["duplicates"] += 1
             late = late_anywhere if same["scope"] == "personal" else late_project
-            if own:  # the researcher said it again: this turn is a source of it too (M2 audit area 4, item 2)
-                restated(conn, same["id"], turn)
+            if own and (same["scope"] == "project" or personal):  # the researcher said it again: this turn is a
+                restated(conn, same["id"], turn)  # source of it too, a personal one's only from a Normal, unlocked
+                # project (item 2; Harold's decision of 2026-10-23, point 1)
             if status == "confirmed" and not late and (same["scope"] == "project" or personal):  # never a personal one
                 if same["status"] == "proposed" and not same["supersedes_id"]:  # from a stricter project
                     keep(conn, same["id"], None)  # the researcher's own words confirm what was only proposed

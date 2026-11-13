@@ -71,6 +71,9 @@ async def test_a_private_projects_restatement_never_confirms_a_personal_proposal
              "span": "i prefer tables about alice", "replaces": ""}]))
         assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", proposal) == [("proposed",)]
         assert await recalled(client, other) == []
+        # nor does its turn become a source that keeps the personal record (the internal review of M2 audit area 4)
+        assert await rows(client, "SELECT source_kind, source_id FROM memory_sources WHERE memory_id = ?", proposal) == [
+            ("project", normal)]
 
 
 async def test_a_late_extraction_never_undoes_a_forget_made_in_another_project(tmp_path):

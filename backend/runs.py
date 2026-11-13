@@ -1634,8 +1634,9 @@ class Harness:
         that count; M2 audit area 4, item 1). A command Continue sends again is applied once: when a turn it continues
         applied it, it is said, not applied again. With memory off nothing is written. Each outcome is a content-free
         `memory_proposed` event (`command`; `applied` 1 when something changed; a forget's, one for each record it
-        deleted, in that deletion's commit, `named` when its words named them), a `memory` stream event, and a line in USER MEMORY telling the model what was done, so its answer confirms it; the conversation
-        shows it read back from the record."""
+        deleted, in that deletion's commit, `named` when its words named them), a `memory` stream event, and a line
+        in USER MEMORY telling the model what was done, so its answer confirms it; the conversation shows it read back
+        from the record."""
         ctx["memory_notes"] = []
         asked = ctx.get("command")
         if asked is None:
@@ -1682,7 +1683,7 @@ class Harness:
                                                      "forgotten now.")
         if not ctx["memory_on"]:
             return await done("memory_off", line="Memory is off in this project: nothing was saved, changed or forgotten.")
-        previous =await self._read(lambda conn: memory.previous_answer(conn, claim.conversation_id, claim.run_id))
+        previous = await self._read(lambda conn: memory.previous_answer(conn, claim.conversation_id, claim.run_id))
         if text is not None and action != "forget":
             return await done("saved" if action == "save" else "updated", change=lambda conn: memory.save_command(
                 conn, project_id=project_id, run_id=claim.run_id, action=action, text=text),
