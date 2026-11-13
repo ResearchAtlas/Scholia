@@ -106,12 +106,12 @@ def run(scenario):
                     return asked
                 asked = write(admitted)
                 if asked and asked["action"] == "forget" and asked["text"] is not None:
-                    scored = db.read(lambda conn: memory.forget_candidates(conn, where, asked["text"]))
-                    if memory.clear(scored):
-                        deletion.delete(db, _Store(), "memory", scored[0][1]["id"])
-                        write(lambda conn, turn=turn: conn.execute(
-                            "INSERT INTO run_events (run_id, seq, type, data) VALUES (?, 0, 'memory_proposed', ?)",
-                            (turn, json.dumps({"command": "forget", "applied": 1, "count": 1}))))
+                    named = db.read(lambda conn: memory.named(conn, where, asked["text"]))  # else it asks first
+                    for seq, record in enumerate(named):
+                        deletion.delete(db, _Store(), "memory", record["id"])
+                        write(lambda conn, turn=turn, seq=seq: conn.execute(
+                            "INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, 'memory_proposed', ?)",
+                            (turn, seq, json.dumps({"command": "forget", "applied": 1, "count": 1, "named": 1}))))
             elif op == "start":
                 names[step["extraction"]] = new_id()
                 turn = names[step["turn"]]

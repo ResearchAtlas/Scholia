@@ -363,12 +363,14 @@ def save_command(conn, *, project_id, run_id, action, text, replaces=None):
         same = [r for r in in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"))
                 if normalized(r["content"]) == normalized(text) and (r["scope"] == "project" or personal_allowed(conn, project_id))]
         if same and same[0]["status"] == "confirmed":
+            restated(conn, same[0]["id"], run_id)
             return "saved", [same[0]["id"]]
         if same and same[0]["status"] == "proposed" and (same[0]["scope"] == "project" or _normal(
                 conn, same[0]["project_id"])):  # the researcher's own words keep a pending proposal (a personal one
             # only while its own project is Normal and unlocked: the database refuses the rest, migration 0008)
             kept = keep(conn, same[0]["id"], None)
             if kept is not None:
+                restated(conn, kept, run_id)
                 return "saved", [kept]
         if same and same[0]["status"] == "proposed":
             same = []  # out of date, or not to be kept from here: saved as its own record below
@@ -378,6 +380,14 @@ def save_command(conn, *, project_id, run_id, action, text, replaces=None):
     record = write(conn, project_id=project_id, scope=scope, kind=kind, content=text, status="confirmed",
                    sources=sources, run_id=run_id, replaces=replaces, structured={"command": action})
     return ("updated" if replaces and action != "save" else "saved"), [record]
+
+
+def restated(conn, record, turn):
+    """A turn whose researcher states a record again is one of its sources too (ticket 31: linked to its source turns),
+    so the record goes only with its last one (ticket 14), and the latest turn behind it is that one (section 8)."""
+    if turn is not None:
+        conn.execute("INSERT OR IGNORE INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'turn', ?)",
+                     (record, turn))
 
 
 def forget_candidates(conn, project_id, text=None, previous=None):
@@ -561,7 +571,8 @@ def _head(conn, record):
 
 def apply_extraction(conn, run_id, candidates):
     """An extraction's effect, in its terminal transaction (section 8): each candidate capped (cap), a duplicate of
-    an active or pending record dropped, and one that names a record it replaces (or, confirmed, conflicts with)
+    an active or pending record not stored again (the researcher's restatement is a source of it, and confirms it when
+    it was only proposed or inferred), and one that names a record it replaces (or, confirmed, conflicts with)
     replacing it only when it is at least as authoritative, its source turn came after the latest turn behind that
     record, and the researcher has not changed the record since the extraction started; else it waits as a proposal
     naming the record (older when its turn came first). After a later explicit command in the scope it stores
@@ -609,9 +620,18 @@ def apply_extraction(conn, run_id, candidates):
         # researcher's words are written here as their own record)
         if same is not None:
             counts["duplicates"] += 1
-            if same["status"] == "proposed" and status == "confirmed" and not late and not same["supersedes_id"] \
-                    and (same["scope"] == "project" or personal):  # never a personal one from a stricter project
-                keep(conn, same["id"], None)  # the researcher's own words confirm what was only proposed
+            late = late_anywhere if same["scope"] == "personal" else late_project
+            if own:  # the researcher said it again: this turn is a source of it too (M2 audit area 4, item 2)
+                restated(conn, same["id"], turn)
+            if status == "confirmed" and not late and (same["scope"] == "project" or personal):  # never a personal one
+                if same["status"] == "proposed" and not same["supersedes_id"]:  # from a stricter project
+                    keep(conn, same["id"], None)  # the researcher's own words confirm what was only proposed
+                elif same["status"] == "inferred":  # or what was only inferred, as its next version
+                    written.append(write(conn, project_id=project_id, scope=same["scope"], kind=same["type"],
+                                         content=same["content"], status="confirmed", run_id=run_id,
+                                         sources=[*sources_of(conn, same["id"]), ("turn", turn), ("run", run_id)],
+                                         replaces=same["id"], structured={"source": "researcher"}))
+                    counts["confirmed"] += 1
             continue
         head = _head(conn, candidate["replaces"]) if candidate["replaces"] else None  # as the record stands now
         target = next((r for r in pending if r["id"] == head and r["status"] in ACTIVE and (

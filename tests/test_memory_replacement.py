@@ -181,3 +181,66 @@ async def test_edit_and_forget_in_things_to_confirm(tmp_path):
         assert (await client.post("/api/memory/review", json={"id": pilot, "action": "forget", "version": 1})).json() == {"ok": True}
         assert await rows(client, "SELECT count(*) FROM memory_records WHERE id = ?", pilot) == [(0,)]
         assert (await client.get(f"/api/memory/review?project_id={project}")).json()["proposals"] == []
+
+
+# M2 audit area 4, item 2 (astra F1): a restatement is a source of the record it restates, so deleting the conversation
+# that first said it leaves the record while another turn says it; a confirmed restatement confirms an inferred record.
+async def test_a_save_said_again_in_another_conversation_outlives_the_first_ones_deletion(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        first, second = await conversation_in(client, project), await conversation_in(client, project)
+        await send(client, first, "Remember: the sample is 30 interviews")
+        stream = await send(client, second, "Remember: the sample is 30 interviews")
+        assert {"type": "memory", "action": "saved", "count": 1} in stream
+        [(record,)] = await rows(client, "SELECT id FROM memory_records WHERE type = 'project_state'")
+        assert (await client.delete(f"/api/conversations/{first}")).status_code == 200
+        assert await rows(client, "SELECT id, status FROM memory_records WHERE type = 'project_state'") == [
+            (record, "confirmed")]
+        assert await rows(client, "SELECT source_kind, source_id FROM memory_sources WHERE memory_id = ?", record) == [
+            ("turn", stream[0]["run_id"])]
+
+
+async def test_an_extractions_restatement_is_a_source_and_keeps_the_later_statement_newer(tmp_path):
+    # astra's second probe: an earlier turn's extraction (35) finishing after a later restatement of 30 does not make 35
+    # active: the restatement is the latest turn behind 30
+    provider = MockProvider()
+    release = asyncio.Event()
+    async with started(tmp_path / "data", provider) as client:
+        project, conversation, record = await setup(client)
+        reply(provider, says("The sample is 35 interviews", record), release=release)
+        reply(provider, candidate("The sample is 30 interviews", "confirmed", "project_state",
+                                  span="the sample is 30 interviews"))
+        await send(client, conversation, "The sample is 35 interviews")
+        await wait_for(lambda: provider.extractions)
+        restating = await send(client, conversation, "No, the sample is 30 interviews")
+        await wait_for(lambda: len(provider.extractions) == 2)
+        while not await rows(client, "SELECT 1 FROM runs WHERE workflow = 'memory' AND source_turn_id = ?"
+                                     " AND status = 'succeeded'", restating[0]["run_id"]):
+            await asyncio.sleep(0.02)  # the restatement's extraction finishes first
+        assert ("turn", restating[0]["run_id"]) in await rows(
+            client, "SELECT source_kind, source_id FROM memory_sources WHERE memory_id = ?", record)
+        release.set()
+        await background_idle(client)
+        assert await state(client) == {"the sample is 30 interviews": ("confirmed", False, False),
+                                       "The sample is 35 interviews": ("proposed", True, False)}
+
+
+async def test_a_confirmed_restatement_confirms_an_inferred_record(tmp_path):
+    from backend import memory
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="project_state", content="The sample is 30 interviews",
+            status="inferred", sources=[("project", project)]))
+        reply(provider, candidate("The sample is 30 interviews", "confirmed", "project_state",
+                                  span="the sample is 30 interviews"))
+        stream = await send(client, conversation, "The sample is 30 interviews")
+        await background_idle(client)
+        assert sorted(await rows(client, "SELECT status, version FROM memory_records WHERE type = 'project_state'")) == [
+            ("confirmed", 2), ("superseded", 1)]
+        [(confirmed,)] = await rows(client, "SELECT id FROM memory_records WHERE status = 'confirmed'"
+                                            " AND type = 'project_state'")
+        assert ("turn", stream[0]["run_id"]) in await rows(
+            client, "SELECT source_kind, source_id FROM memory_sources WHERE memory_id = ?", confirmed)
