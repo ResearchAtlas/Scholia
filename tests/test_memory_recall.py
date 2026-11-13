@@ -352,6 +352,50 @@ async def test_a_launch_without_sqlite_vec_asks_for_no_memory_runs_and_the_next_
         assert await _vectors(client, ids) == set(ids)
 
 
+@pytest.mark.parametrize("meanwhile", ["damaged_file", "model_installed"])
+async def test_the_opening_rebuild_asks_for_the_runs_of_what_lacks_vectors_once_it_is_ready(tmp_path, monkeypatch,
+                                                                                           meanwhile):
+    # batch 1 (PR 60 rechecks): a launch's whole rebuild, held until the launch has asked for its runs. A file damaged
+    # at open fails before sqlite-vec loads, so the launch cannot yet tell that vectors are wanted; a model installed
+    # while it runs finds the index unreadable. Its end asks for the runs of what then lacks vectors.
+    import threading
+    from backend.local_helper import EMBEDDING
+    from backend.search_index import FILE, SearchIndex
+    from test_local_helper import WEIGHTS
+    from test_search import app
+    installed = meanwhile == "damaged_file"
+    async with app(tmp_path, install=installed) as client:
+        project = await project_of(client)
+        ids = [(await entered(client, project, "Wage floors raise the earnings of low-paid workers"))["id"]]
+        await background_idle(client)
+        await asyncio.to_thread(client.state["index"].apply)  # its addition has left the queue
+        assert await asyncio.to_thread(client.state["index"].memory_embedded, ids) == (set(ids) if installed else set())
+    path = tmp_path / "data" / FILE
+    for found in path.parent.glob(path.name + "*"):
+        found.unlink()
+    if meanwhile == "damaged_file":
+        path.write_bytes(b"not a database " * 512)
+    gate, real = threading.Event(), SearchIndex._rebuild_all
+
+    def held(self):
+        gate.wait(20)
+        return real(self)
+    monkeypatch.setattr(SearchIndex, "_rebuild_all", held)
+    try:
+        async with app(tmp_path, install=installed) as client:  # the launch has asked for its runs
+            if meanwhile == "model_installed":
+                helper = client.state["local_helper"].helpers[EMBEDDING]
+                helper.path.parent.mkdir(parents=True, exist_ok=True)
+                helper.path.write_bytes(WEIGHTS)
+                helper.model_installed()
+            await asyncio.sleep(0.2)  # what the launch or the install asks for, asked while the rebuild is held
+            assert client.state["index"].building
+            gate.set()
+            assert await _vectors(client, ids) == set(ids)
+    finally:
+        gate.set()
+
+
 async def test_a_whole_rebuild_while_the_app_runs_asks_for_the_runs_of_memory_it_dropped(tmp_path):
     # M2 audit area 2: the rebuilt file's runs (index.rebuilt) take the projects whose memory lacks vectors too
     from test_search import app
