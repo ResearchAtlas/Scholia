@@ -682,9 +682,13 @@ def register(harness, content):
         return await _import(harness, active, project_id, inputs, content)
 
     harness.workflows["zotero_import"] = import_run
-    # Its lookup batch closes with its terminal record, however it ends, and is looked up then.
-    harness.endings["zotero_import"] = lambda conn, active, project_id: _close_batch(conn, harness, project_id,
-                                                                                      active.run_id)
+    # Its lookup batch closes with its terminal record, however it ends, and is looked up then; and its item keys,
+    # read only while it runs, go then (M2 audit, area 1: no ended run keeps an identifier of a paper deleted later).
+    def ending(conn, active, project_id):
+        _close_batch(conn, harness, project_id, active.run_id)
+        conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.items', '$.done') WHERE id = ?", (active.run_id,))
+
+    harness.endings["zotero_import"] = ending
 
 
 class _Ended(Exception):

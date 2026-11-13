@@ -272,7 +272,35 @@ async def test_a_deleted_zotero_paper_leaves_its_item_key_and_doi_in_no_run_and_
         await background_idle(client)
         assert kept_anywhere(tmp_path / "data", KEYS[0]) == [] and kept_anywhere(tmp_path / "data", DOI) == []
         [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE workflow = 'zotero_import'")
-        assert (json.loads(inputs)["items"], json.loads(inputs)["done"]) == ([KEYS[1]], [KEYS[1]])  # the other item's
+        assert not {"items", "done"} & set(json.loads(inputs))  # an ended import keeps no item key, of any paper
+
+
+@pytest.mark.parametrize("option", ["merge", "already"])
+async def test_a_deleted_paper_another_zotero_item_matched_leaves_that_items_key_in_no_run(tmp_path, option):
+    """M2 audit, area 1: a Zotero item merged into a reference file's paper, or reported already there by its PDF,
+    names no Scholia paper of its own; once that paper is deleted with Remove all trace, its key is kept nowhere."""
+    from test_identifier_lookup import kept_anywhere
+    import base64
+    async with started(tmp_path / "data", provider(library(tmp_path, pdfs=option == "already"))) as client:
+        project = await project_of(client)
+        if option == "merge":
+            await imported_references(client, project, ris(("Synthetic Wages in Small Towns", f"DO  - {DOI}\n")))
+            await imported(client, project, KEYS[:1])
+            [ask] = await merge_asks(client, project)
+            assert (await answer(client, ask, "merge")).status_code == 200
+            await run_finished(client, ask["run_id"])
+        else:  # the item's PDF is an upload of the project already
+            pdf = (tmp_path / "Zotero 文件 storage" / "one.pdf").read_bytes()
+            assert (await client.post(f"/api/projects/{project}/materials", json={"files": [
+                {"name": "one.pdf", "data": base64.b64encode(pdf).decode()}]})).status_code == 201
+            assert (await imported(client, project, KEYS[:1]))["result"]["already"] == 1
+        await background_idle(client, 30)
+        [paper] = (await listing(client, project))["materials"]
+        response = await client.delete(f"/api/materials/{paper['id']}", params={"remove_all_trace": "true",
+                                                                                 "purge_backups": "true"})
+        assert response.status_code == 200
+        await background_idle(client)
+        assert kept_anywhere(tmp_path / "data", KEYS[0]) == []
 
 
 async def test_a_restarted_import_whose_zotero_is_gone_fails(tmp_path):
@@ -909,8 +937,9 @@ async def test_a_failed_file_url_request_stops_the_import_and_never_loses_the_pd
         row = await run_finished(client, run)
         assert (row["status"], row["result"]["reason"]) == ("failed", "zotero_unavailable")
         assert await rows(client, "SELECT count(*) FROM materials") == [(0,)]
-        (inputs,) = (await rows(client, "SELECT inputs FROM runs WHERE id = ?", run))[0]
-        assert json.loads(inputs)["done"] == []  # read again by the next import
+        # not done (read again by the next import): no step of it, and its ended run keeps no item key
+        assert await rows(client, "SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_finished'", run) == [(0,)]
+        assert "done" not in json.loads((await rows(client, "SELECT inputs FROM runs WHERE id = ?", run))[0][0])
 
 
 @pytest.mark.parametrize("answer", [400, 404, "false", ""])  # "": getLocalFileURL's false, as Zotero's server sends it
