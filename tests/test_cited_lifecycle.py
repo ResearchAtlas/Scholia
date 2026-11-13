@@ -184,6 +184,25 @@ async def test_a_recheck_verdict_is_written_only_to_the_pair_it_was_given_for(tm
         assert await rows(client, "SELECT passage_id, support FROM citations") == [(other, "supported")]
 
 
+async def test_a_recheck_of_a_moved_conversations_answer_judges_its_citations_where_their_papers_are(tmp_path):
+    # M2 audit area 3, item 6: a move takes turns and runs, never papers; each pair is checked under the project that
+    # reads its paper, as the conversation read resolves it (answers.resolve_now).
+    from test_materials import project_of
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        await background_idle(client)  # S1-21a: its extraction runs keyed to its turn, which a move waits for
+        other = await project_of(client, "Other")
+        assert (await client.post(f"/api/conversations/{conversation}/move", json={"project_id": other})).status_code == 200
+        judged = len(client.provider.judged)
+        client.provider.verdicts = lambda body: "1: unsupported"
+        [check] = (await client.post("/api/citations/check", json={"run_id": run_id})).json()["run_ids"]
+        assert (await run_finished(client, check))["status"] == "succeeded"
+        assert len(client.provider.judged) == judged + 1
+        assert await rows(client, "SELECT support FROM citations") == [("unsupported",)]
+
+
 async def test_a_recheck_of_forty_one_pairs_runs_in_two_batches_and_judges_every_pair(tmp_path):
     # b1 (7): /check batches at judge_pairs (40) and never reports success with a pair unjudged.
     text = " ".join(f"Claim number {i} holds [S1.1]." for i in range(41))

@@ -380,12 +380,22 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None, revoke=None)
     # a paper whose text it carries is gone, or its project no longer allows this request (tightened, or review-locked)
     refused = refused or bool(held) and not provenance.sendable(conn, project_id, json.loads(held))
     refused = refused or not compaction.sendable(conn, run_id)  # S1-21b: a memory record a summary it carries follows is gone
-    refused = refused or bool(wanted) and still_read(conn, project_id, wanted) != wanted
+    refused = refused or bool(wanted) and _read_now(conn, wanted) != wanted
     if refused and revoke is not None:
         conn.execute("UPDATE runs SET cancel_reason = 'revoked' WHERE id = ? AND status = 'running'"
                      " AND cancel_reason IS NULL", (run_id,))
         revoke()
     return not refused
+
+
+def _read_now(conn, pairs):
+    """Of the (passage id, material id) pairs given, those each paper reads now in the project that holds it: a move
+    takes a conversation's turns and runs, never its papers, so a moved conversation's answer is checked where its
+    papers are (as answers.resolve_now reads them). Which projects may send them is provenance.sendable's check."""
+    projects = dict(conn.execute("SELECT id, project_id FROM materials WHERE id IN (SELECT value FROM json_each(?))",
+                                 (json.dumps(sorted({m for _, m in pairs})),)).fetchall())
+    return {pair for project in set(projects.values())
+            for pair in still_read(conn, project, {p for p in pairs if projects.get(p[1]) == project})}
 
 
 @dataclass
