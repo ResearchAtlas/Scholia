@@ -506,3 +506,58 @@ async def test_a_forget_revoked_once_its_deletion_committed_records_what_it_forg
         await _forgotten(client, stream, 1)
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1:]
         assert [(m["action"], m["count"]) for m in turn["memory"]] == [("forgotten", 1)]
+
+
+@pytest.mark.parametrize("change", ["private", "review lock", "ended"])
+async def test_a_forget_revoked_in_the_record_before_the_turn_hears_of_it_deletes_no_more(tmp_path, monkeypatch, change):
+    # Cycle 2's B-R2-F1: the policy change commits the run's revocation, and the harness is told only after its write
+    # returns. In that moment the loop saw no cancellation and the deletion's own transaction did not read the run, so
+    # every record left was deleted. Now each deletion reads its run there: one revoked (or ended in the record, here
+    # written directly) deletes nothing more.
+    import threading
+    reached, go, calls, held = threading.Event(), threading.Event(), [], []
+
+    def deleting(real, *args, **kwargs):
+        found = real(*args, **kwargs)
+        calls.append(args[3])  # committed
+        if len(calls) == 1:  # the project changes (or the conversation goes) while its worker is still to return
+            reached.set()
+            go.wait(10)
+        return found
+    async with started(tmp_path / "data") as client:
+        harness = client.state["harness"]
+        real_revoke = harness.revoke
+
+        def revoke(run_ids):  # the policy change's notification held: committed, not yet told to the harness
+            if run_ids and not go.is_set():
+                held.append(list(run_ids))
+                return
+            real_revoke(run_ids)
+        monkeypatch.setattr(harness, "revoke", revoke)
+        sending, project, conversation = await _three_to_forget(client, monkeypatch, deleting)
+        assert await asyncio.to_thread(reached.wait, 10)
+        if change == "ended":
+            run_id = harness.registry.turns[conversation].run_id
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                "UPDATE runs SET status = 'cancelled', cancel_reason = 'researcher' WHERE id = ?", (run_id,)))
+            ids = []
+        else:
+            path, body = ((f"/api/projects/{project}/review-lock", {"locked": True}) if change == "review lock" else
+                          (f"/api/projects/{project}/sensitivity", {"level": "private"}))
+            assert (await client.post(path, json=body)).status_code == 200
+            [ids] = held
+            assert await rows(client, "SELECT cancel_reason FROM runs WHERE id IN (%s)" % ",".join("?" * len(ids)),
+                              *ids) == [("revoked",)] * len(ids)
+        go.set()
+        try:
+            stream = await asyncio.wait_for(sending, 20)
+        finally:
+            real_revoke(ids)
+        assert len(calls) == 1
+        assert len(await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")) == 2
+        if change == "ended":  # nothing is recorded on a run that has ended
+            return
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")
+        await _forgotten(client, stream, 1)
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1:]
+        assert [(m["action"], m["count"]) for m in turn["memory"]] == [("forgotten", 1)]

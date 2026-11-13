@@ -1615,7 +1615,12 @@ class Harness:
                     if claim.cancel_requested.is_set():  # Stop or a revocation: no deletion starts after it (SPEC:412)
                         break
                     def as_seen(conn, record=record):  # in the deletion's own transaction (MB9): edited, kept or
-                        found = memory.row(conn, record)  # replaced since, it is not what the researcher chose to forget
+                        # replaced since, it is not what the researcher chose to forget; and nothing more is deleted
+                        # for a run stopped, ended or revoked in the record, before the turn hears of it (B-R2-F1)
+                        if claim.cancel_requested.is_set() or not _running(conn, claim.run_id) \
+                                or _revoked(conn, claim.run_id):
+                            raise _Cancelled()
+                        found = memory.row(conn, record)
                         if found is None:
                             raise LookupError(record)
                         if (found["version"], found["status"]) != seen[record] or (
@@ -1625,6 +1630,8 @@ class Harness:
                         await asyncio.to_thread(deletion.delete, self.db, self.content, "memory", record,
                                                 on_committed=self.revoke, check=as_seen)
                         count += 1
+                    except _Cancelled:
+                        break
                     except LookupError:  # forgotten meanwhile
                         pass
                     except ValueError:
