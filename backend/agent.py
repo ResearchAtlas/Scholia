@@ -45,6 +45,15 @@ MAX_SELECTED = 50  # papers a tool call may restrict itself to, as a message may
 ANSWERED_POLL_SECONDS = 2  # how often a waiting ask looks again without being woken
 
 _IDS = {"type": "array", "items": {"type": "string", "maxLength": 64}, "maxItems": MAX_SELECTED}
+# What a tool's search tells the model when it searched nothing, or by keyword only (F4 step 6, section 7.2)
+UNSEARCHED = ("The library's search index is being built or is unavailable, so the researcher's papers could not be "
+              "searched. Say so; do not say the library holds no evidence.")
+KEYWORD_ONLY = "(Meaning search was unavailable: this search used keyword search only.)\n\n"
+
+
+def unsearched(found):
+    """Whether a retrieval searched nothing: its index was being built or unavailable (search.retrieve fails closed)."""
+    return (found.get("trace") or {}).get("index") in ("building", "unavailable")
 
 
 class Evidence:
@@ -232,11 +241,11 @@ async def search_passages(call, turn):
                                     whole=lambda records: _preview_fits(citations.bundle(citations.sources(records))))
     await turn.harness._trace_retrieval(turn.claim, found, call.id)
     keys = list(dict.fromkeys(turn.evidence.add(found["records"], shown=False)))
+    head = KEYWORD_ONLY if found["mode"] == "keyword_only" else ""
     if not keys:
-        return ToolResult(id=call.id, ok=True, text="No passage matched.", meta={"passages": [], "mode": found["mode"]})
+        return ToolResult(id=call.id, ok=True, text=UNSEARCHED if unsearched(found) else head + "No passage matched.",
+                          meta={"passages": [], "mode": found["mode"]})
     # S1-21b: whole passages, best first; past the preview, kept and paged, each read once a page shows its marker
-    head = "(Meaning search was unavailable: these come from keyword search only.)\n\n" \
-        if found["mode"] == "keyword_only" else ""
     text, _, read = _paged(turn, call.id, _passage_items(turn, keys), "\n\n", head=head)
     return ToolResult(id=call.id, ok=True, text=text, meta={"passages": read, "mode": found["mode"]})
 

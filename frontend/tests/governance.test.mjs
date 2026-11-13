@@ -129,6 +129,12 @@ test('an audit entry\'s heading says no more than its record knows, in each inte
   assert.equal(auditDetail(en, { event: 'outbound', data: { decision: 'deny', reason: 'revoked',
     destination: 'https://openrouter.ai:443' } }, dates), 'Refused: the run was told to stop · https://openrouter.ai:443');
   assert.match(en('audit.hint'), /allowed or refused/);
+  // The M2 audit's Fable 5 F2: an answered budget ask, and the agent's own question, by name, not by their codes.
+  const budget = { event: 'ask_answered', data: { question: 'budget', answer: 'go_ahead' } };
+  assert.equal(auditDetail(en, budget, dates), 'question: spending past a budget · answer: go ahead');
+  assert.equal(auditDetail(zh, budget, dates), '问题：超出预算 · 回答：照常进行');
+  assert.equal(auditDetail(en, { event: 'ask_answered', data: { question: 'choice', answer: '2' } }, dates),
+    'question: a question during a turn · answer: the second option');
 });
 
 test('audit details are shown in the interface language, codes this version does not name as they are', () => {
