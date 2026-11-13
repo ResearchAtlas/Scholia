@@ -676,15 +676,22 @@ async def test_a_project_export_holds_its_citations_notes_asks_and_waiting_messa
         conversation = (await client.post("/api/conversations", json={"project_id": project,
                                                                       "title": "Sampling"})).json()["id"]
         run_id = (await send(client, conversation, "How large a sample do I need?"))[0]["run_id"]
-        await stored_material(client, project, b"%PDF-1.7 a paper", "application/pdf")
+        own_file = await stored_material(client, project, b"%PDF-1.7 a paper", "application/pdf")
         [(material, version)] = await rows(client, "SELECT m.id, v.id FROM materials m JOIN material_versions v"
                                                    " ON v.material_id = m.id WHERE m.project_id = ?", project)
         elsewhere = await new_project(client, "Elsewhere")  # a paper of the project a moved conversation came from
-        await stored_material(client, elsewhere, b"%PDF-1.7 another paper", "application/pdf")
+        foreign_file = await stored_material(client, elsewhere, b"%PDF-1.7 another paper", "application/pdf")
         [(foreign,)] = await rows(client, "SELECT id FROM materials WHERE project_id = ?", elsewhere)
-        ask, citation, memory = new_id(), new_id(), new_id()
+        ask, citation, memory, own_passage, foreign_passage = new_id(), new_id(), new_id(), new_id(), new_id()
 
         def record(conn):
+            from backend.extraction import PDF, extractor_of
+            for file, passage, ordinal in ((own_file, own_passage, 3), (foreign_file, foreign_passage, 5)):
+                extraction = new_id()  # each paper's reading, one passage each
+                conn.execute("INSERT INTO extractions (id, file_sha256, extractor, extractor_version, status)"
+                             " VALUES (?, ?, ?, ?, 'done')", (extraction, file, *extractor_of(PDF)))
+                conn.execute("INSERT INTO passages (id, extraction_id, ordinal, kind, text)"
+                             " VALUES (?, ?, ?, 'paragraph', 'the passage')", (passage, extraction, ordinal))
             (seq,) = conn.execute("SELECT max(seq) + 1 FROM run_events WHERE run_id = ?", (run_id,)).fetchone()
             events = [("steering_note", {"text": "Only recent ones"}), ("step_started", {"step": 7, "steering": [seq]}),
                       ("model_attempt", {"step": 7, "dispatched": True}), ("steering_note", {"text": "Never read"}),
@@ -693,16 +700,16 @@ async def test_a_project_export_holds_its_citations_notes_asks_and_waiting_messa
             for i, (kind, event) in enumerate(events):
                 conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, ?, ?)",
                              (run_id, seq + i, kind, json.dumps(event)))
-            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, material_version_id, quote,"
-                         " context, page, existence, support)"
-                         " VALUES (?, 'answer', ?, ?, ?, 'n = 40 sufficed', ?, 4, 'ok', 'supported')",
-                         (citation, run_id, material, version,
+            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, material_version_id,"
+                         " passage_id, quote, context, page, existence, support)"
+                         " VALUES (?, 'answer', ?, ?, ?, ?, 'n = 40 sufficed', ?, 4, 'ok', 'supported')",
+                         (citation, run_id, material, version, own_passage,
                           json.dumps({"marker": "[S1.1]", "offset": 3, "sentence": "Forty."})))
-            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, material_version_id, quote,"
-                         " context, page, evidence_type, existence) VALUES (?, 'answer', ?, ?,"
-                         " (SELECT id FROM material_versions WHERE material_id = ?), 'words of another project', ?, 9,"
-                         " 'rct', 'ok')", (new_id(), run_id, foreign, foreign,
-                                           json.dumps({"marker": "[S2.1]", "offset": 9, "sentence": "Also."})))
+            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, material_version_id,"
+                         " passage_id, quote, context, page, evidence_type, existence) VALUES (?, 'answer', ?, ?,"
+                         " (SELECT id FROM material_versions WHERE material_id = ?), ?, 'words of another project', ?,"
+                         " 9, 'rct', 'ok')", (new_id(), run_id, foreign, foreign, foreign_passage,
+                                              json.dumps({"marker": "[S2.1]", "offset": 9, "sentence": "Also."})))
             conn.execute("INSERT INTO citations (id, owner_kind, owner_id, context, page, evidence_type, existence)"
                          " VALUES (?, 'answer', ?, ?, 7, 'cohort', 'source_removed')",  # its paper deleted since
                          (new_id(), run_id, json.dumps({"marker": "[S3.1]", "offset": 12, "sentence": None})))
@@ -730,10 +737,11 @@ async def test_a_project_export_holds_its_citations_notes_asks_and_waiting_messa
     assert "- [S3.1] page 7" in markdown.splitlines()
     assert not any(b"words of another project" in read(path, name) for name in names(path))
     assert "- [S2.1]" in markdown.splitlines()
-    assert {k: cited[k] for k in ("id", "marker", "material_id", "material_version", "quote", "page", "existence",
-                                  "support")} == {"id": citation, "marker": "[S1.1]", "material_id": material,
-                                                  "material_version": 0, "quote": "n = 40 sufficed", "page": 4,
-                                                  "existence": "ok", "support": "supported"}
+    assert {k: cited[k] for k in ("id", "marker", "material_id", "material_version", "passage_id", "passage", "quote",
+                                  "page", "existence", "support")} == {
+        "id": citation, "marker": "[S1.1]", "material_id": material, "material_version": 0, "passage_id": own_passage,
+        "passage": 3, "quote": "n = 40 sufficed", "page": 4, "existence": "ok", "support": "supported"}
+    assert foreign_passage not in json.dumps(exported)
     assert material in {m["id"] for m in json.loads(read(path, "materials.json"))}
     assert [q["text"] for q in exported["queued"]] == ["And the power?"]
     [kept] = json.loads(read(path, "memory.json"))
