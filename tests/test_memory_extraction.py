@@ -430,3 +430,32 @@ async def test_a_confirmed_restatement_confirms_the_pending_proposal(tmp_path):
         await background_idle(client)
         assert await rows(client, "SELECT status FROM memory_records WHERE content = 'A survey of managers'") == [
             ("confirmed",)]
+
+
+# M2 audit area 4, item 8 (design review E's rider R1): the request for an index run follows the write that needs it,
+# so a cancellation landing while the write commits never drops it
+async def test_an_extraction_cancelled_while_its_records_commit_still_asks_for_their_index_run(tmp_path, monkeypatch):
+    import time
+    provider = MockProvider()
+    real = memory.apply_extraction
+    asked = []
+
+    async def index(self, project_id):
+        asked.append(project_id)
+    monkeypatch.setattr(runs.Harness, "_index_memory", index)
+    async with started(tmp_path / "data", provider) as client:
+        harness, loop = client.state["harness"], asyncio.get_running_loop()
+        project = await project_of(client)
+
+        def applying(conn, run_id, candidates):
+            found = real(conn, run_id, candidates)  # in the terminal write; the cancel lands before it returns
+            loop.call_soon_threadsafe(harness._request_cancel, harness.registry.runs[run_id], "researcher")
+            time.sleep(0.2)
+            return found
+        monkeypatch.setattr(memory, "apply_extraction", applying)
+        extracted(provider, candidate("We use interviews", "confirmed", span="we use interviews"))
+        await send(client, await conversation_in(client, project), "We use interviews")
+        await background_idle(client)
+        assert await rows(client, "SELECT content, status FROM memory_records WHERE type = 'decision'") == [
+            ("We use interviews", "confirmed")]
+        assert asked == [project]

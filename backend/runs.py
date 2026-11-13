@@ -1661,16 +1661,20 @@ class Harness:
                     "command": action, "applied": int(bool(outcome["ids"] or count)), "action": outcome["what"],
                     **({"records": outcome["ids"]} if outcome["ids"] else {}), **({"count": count} if count else {}),
                     **(data or {})})
-            if not recorded:
-                await self._record(claim, None, None, also=apply)
-            if outcome["ids"]:
-                await self._index_memory(project_id)
+            async def recording():  # the record, then its index run's request, to their end whatever cancellation
+                if not recorded:  # comes meanwhile (M2 audit area 4, item 8; design review E's rider R1)
+                    await self._record(claim, None, None, also=apply)
+                if outcome["ids"]:
+                    await self._index_memory(project_id)
+            _, cancelled = await _through(recording())
             turn.emit({"type": "memory", "action": outcome["what"], "count": count or len(outcome["ids"])})
             said = line(outcome["what"]) if callable(line) else line
             if outcome["what"] == "no_candidate" and change is not None:
                 said = "Nothing was saved: the earlier answer can no longer be kept."
             if said:
                 ctx["memory_notes"].append(said)
+            if cancelled:  # honored once the record and its request are done
+                raise asyncio.CancelledError()
 
         if asked.get("applied"):  # Continue: a turn it continues applied this command already (continue_turn)
             return await done("applied_before", line="The researcher's memory command in this message was carried out "
@@ -2669,10 +2673,12 @@ class Harness:
             if workflow == "memory" and output is not None and not memory.enabled(
                     (await asyncio.to_thread(load_settings, self.data_dir, project_id)).values):
                 raise RunOutcome("cancelled", "memory_off")  # switched off during its call, or before a restart
-            await self._ended(active, lambda conn: self._finish_background(
-                conn, active, "succeeded" if output is not None else "failed", output, inputs))
-            if workflow == "memory" and output:  # it had candidates: it may have written or confirmed records
-                await self._index_memory(project_id)
+            _, cancelled = await _through(self._ended(active, lambda conn: self._finish_background(
+                conn, active, "succeeded" if output is not None else "failed", output, inputs)))
+            if workflow == "memory" and output:  # it had candidates: it may have written or confirmed records; asked
+                await _through(self._index_memory(project_id))  # once that committed, whatever cancellation came
+            if cancelled:  # (M2 audit area 4, item 8; design review E's rider R1)
+                raise asyncio.CancelledError()
         except asyncio.CancelledError:
             call = active.call
 

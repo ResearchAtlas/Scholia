@@ -862,3 +862,32 @@ async def test_an_update_or_correction_says_which_record_it_replaced(tmp_path):
         assert item["action"] == "updated" and item["records"][0]["content"] == "the sample is 35 interviews"
         assert item["records"][0]["replaced"] == "the pilot sample is 30 interviews"
         assert "replaced" not in turns[0]["memory"][0]["records"][0]
+
+
+async def test_a_command_stopped_while_its_record_commits_still_asks_for_its_index_run(tmp_path, monkeypatch):
+    # M2 audit area 4, item 8 (design review E's rider R1): the record and its index run's request go together
+    import time
+    from backend import memory, runs
+    real = memory.save_command
+    asked = []
+
+    async def index(self, project_id):
+        asked.append(project_id)
+    monkeypatch.setattr(runs.Harness, "_index_memory", index)
+    async with started(tmp_path / "data") as client:
+        harness, loop = client.state["harness"], asyncio.get_running_loop()
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+
+        def saving(conn, **kwargs):
+            found = real(conn, **kwargs)  # in the record's write; the Stop lands before it returns
+            loop.call_soon_threadsafe(harness._request_cancel, harness.registry.turns[conversation], "researcher")
+            time.sleep(0.2)
+            return found
+        monkeypatch.setattr(memory, "save_command", saving)
+        stream = await send(client, conversation, "Remember: the pilot used a survey")
+        assert stream[-1]["status"] == "cancelled"
+        assert await rows(client, "SELECT content FROM memory_records WHERE type != 'progress'") == [
+            ("the pilot used a survey",)]
+        assert asked == [project]
+        assert {"type": "memory", "action": "saved", "count": 1} in stream
