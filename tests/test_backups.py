@@ -268,6 +268,38 @@ async def test_a_restored_full_backup_shows_its_own_run_as_it_ended(tmp_path):
     assert not [p for p in destination.iterdir() if p.suffix != ".zip"]  # nothing else left beside it
 
 
+@pytest.mark.parametrize("archive", ["full", "export"])
+async def test_a_paper_deleted_after_an_archive_listed_its_file_and_before_it_held_it_stays_in_the_archive(
+        tmp_path, monkeypatch, archive):
+    # PR 59 batch 1, item 2: the deletion's collection, which no longer waits for files to be idle, removed a file the
+    # archive's copy or read of the records listed, before the archive held it
+    from backend.db import ContentStore, delete
+    data, destination = tmp_path / "data", tmp_path / "chosen"
+    destination.mkdir()
+    async with started(data) as client:
+        project = await new_project(client)
+        sha256 = await stored_material(client, project, b"%PDF-1.7 a paper", "application/pdf")
+        [(material,)] = await rows(client, "SELECT id FROM materials WHERE project_id = ?", project)
+        real, deleted = ContentStore.hold, []
+
+        def deleted_first(self, hashes=()):  # the paper deleted in the interval, its deletion's collection run
+            if sha256 in hashes and not deleted:
+                deleted.append(delete(client.state["db"], self, "material", material))
+            return real(self, hashes)
+
+        monkeypatch.setattr(ContentStore, "hold", deleted_first)
+        path = "/api/backups/full" if archive == "full" else f"/api/projects/{project}/export"
+        run = await archived_run(client, path, {"destination": str(destination)})
+        assert run.status == "succeeded" and deleted, run
+    file = destination / run.result["file"].rsplit("/", 1)[1]
+    if archive == "full":
+        assert run.result["missing_files"] == 0
+        assert read(file, f"content/{sha256[:2]}/{sha256}") == b"%PDF-1.7 a paper"
+    else:
+        [listed] = json.loads(read(file, "materials.json"))
+        assert read(file, listed["versions"][0]["file"]) == b"%PDF-1.7 a paper"
+
+
 async def test_a_full_backup_is_recorded_before_anything_is_written_and_removed_if_it_fails(tmp_path, monkeypatch):
     import errno
     import backend.db.database as database_module

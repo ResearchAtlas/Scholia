@@ -47,6 +47,7 @@ class ContentStore:
         self._lock = threading.Lock()
         self._writing = set()  # temporary files of puts in progress, however long they take
         self._held = collections.Counter()  # hashes collection keeps, however old (hold)
+        self._listing = 0  # readers between listing content and holding it (listing)
 
     @contextlib.contextmanager
     def hold(self, hashes=()):
@@ -67,6 +68,19 @@ class ContentStore:
                     self._held[sha256] -= 1
                     if self._held[sha256] <= 0:
                         del self._held[sha256]
+
+    @contextlib.contextmanager
+    def listing(self):
+        """For a reader that lists content from a copy or a read of the records and holds it (hold) inside this block:
+        until the block ends, collection removes no file, since one listed may meanwhile be referenced no more and,
+        after a deletion, not idle-protected either (PR 59 batch 1). A file it skips goes at a later collection."""
+        with self._lock:
+            self._listing += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._listing -= 1
 
     def put(self, data, media_type=None, hold=None):
         """Store bytes, or a binary file object read to its end. Returns the SHA-256.
@@ -178,7 +192,7 @@ class ContentStore:
             if path.name in kept:
                 continue
             with self._lock:
-                if path.name not in self._held and _idle(path, due(path.name)):
+                if path.name not in self._held and not self._listing and _idle(path, due(path.name)):
                     path.unlink(missing_ok=True)
                     removed += 1
         for path in self.root.glob(".put-*.tmp"):  # left by an interrupted put, not one still running

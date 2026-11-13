@@ -603,16 +603,18 @@ def _write_full_backup(db, destination, passphrase, archive, stop=None, progress
     ended (_ended_in_copy)."""
     staging = _staging(db.data_dir)
     try:
-        with _backup_errors():
-            info = db.snapshot(staging / "copy")
-        with closing_connection(sqlite3.connect((staging / "copy" / DB_NAME).as_uri() + "?mode=ro", uri=True)) as copy:
-            sensitive, projects = copy.execute(
-                f"SELECT count(*) FILTER (WHERE sensitivity IN {SENSITIVE}), count(*) FROM projects").fetchone()
-            # Only the files the copy's records refer to: one of a project deleted moments ago, which
-            # collection keeps for a while, would leave without the encryption its project needed.
-            hashes = [sha256 for sha256, *_ in _referenced_content(copy)]
-        if store is not None and held is not None:  # read later: none is collected meanwhile
-            held.enter_context(store.hold(hashes))
+        with _listing(store, held):  # from the copy until its files are held, collection removes none
+            with _backup_errors():
+                info = db.snapshot(staging / "copy")
+            with closing_connection(sqlite3.connect((staging / "copy" / DB_NAME).as_uri() + "?mode=ro",
+                                                    uri=True)) as copy:
+                sensitive, projects = copy.execute(
+                    f"SELECT count(*) FILTER (WHERE sensitivity IN {SENSITIVE}), count(*) FROM projects").fetchone()
+                # Only the files the copy's records refer to: one of a project deleted moments ago, which
+                # collection keeps for a while, would leave without the encryption its project needed.
+                hashes = [sha256 for sha256, *_ in _referenced_content(copy)]
+            if store is not None and held is not None:  # read later: none is collected meanwhile
+                held.enter_context(store.hold(hashes))
         if sensitive and not passphrase:
             raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
         entries, left_out = [], []
@@ -647,6 +649,11 @@ def _write_full_backup(db, destination, passphrase, archive, stop=None, progress
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return {"ok": True, "file": str(path), **record, "size": path.stat().st_size}
+
+
+def _listing(store, held):
+    """ContentStore.listing for an archive that holds what it lists (store and held given); else nothing."""
+    return store.listing() if store is not None and held is not None else contextlib.nullcontext()
 
 
 def _ended_in_copy(path, run_id, summary):
@@ -1412,12 +1419,13 @@ def _write_export(db, project_id, destination, passphrase, language, archive, st
                   held=None, memory=True):
     """store and held: as for _write_full_backup. memory: the project's memory records go in memory.json (its personal
     records never do)."""
-    data = db.read(lambda conn: _project_records(conn, project_id, memory))
-    if data is None:
-        raise BackupError(404, "not_found", "No such project")
-    if store is not None and held is not None:  # the papers' files, read later: none is collected meanwhile
-        held.enter_context(store.hold([v["file_sha256"] for m in data["materials"] for v in m["versions"]
-                                         if v["file_sha256"]]))
+    with _listing(store, held):  # from the read until its files are held, collection removes none
+        data = db.read(lambda conn: _project_records(conn, project_id, memory))
+        if data is None:
+            raise BackupError(404, "not_found", "No such project")
+        if store is not None and held is not None:  # the papers' files, read later: none is collected meanwhile
+            held.enter_context(store.hold([v["file_sha256"] for m in data["materials"] for v in m["versions"]
+                                             if v["file_sha256"]]))
     if data["project"]["sensitivity"] in SENSITIVE and not passphrase:
         raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
     entries = [("project.json", _json({"format": "scholia-project-export", "version": 1, "app_version": APP_VERSION,
