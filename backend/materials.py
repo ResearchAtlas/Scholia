@@ -208,7 +208,7 @@ async def _added(project_id, body, files, content, harness, held, check):
                     added.append({"id": same[0], "existing": True})
                     continue
                 material = new_id()
-                title = name.rsplit(".", 1)[0].strip() or name
+                title = visible(name.rsplit(".", 1)[0]) or name  # a name with nothing visible before its extension: all of it
                 conn.execute("INSERT INTO materials (id, project_id, title, source, evidence_type, proposed_by)"
                              " VALUES (?, ?, ?, 'upload', 'full_text', 'researcher')", (material, project_id, title[:500]))
             version, run = add_version(conn, harness, project_id, material, sha256, kind, origin, recorded)

@@ -422,6 +422,16 @@ async def test_each_format_is_stored_once_and_read_into_passages(tmp_path, kept_
             p["id"] for p in passages)
 
 
+@pytest.mark.parametrize("stem", ["‮", "​​", " ​ "])
+async def test_a_file_name_with_nothing_visible_before_its_extension_gives_the_whole_name_as_the_title(tmp_path, stem):
+    """M2 audit, area 1: as the details form refuses a title with no visible character (title_needed), a paper
+    added as such a file is titled with its whole name, never an invisible one."""
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, (f"{stem}.md", b"# Notes\n\nSome text.\n")))["materials"]
+        assert (await client.get(f"/api/materials/{paper['id']}")).json()["title"] == f"{stem}.md".strip()  # as named
+
+
 async def test_the_same_file_is_one_paper_in_a_project_and_shares_its_reading_with_another(tmp_path, kept_queue):
     async with started(tmp_path / "data") as client:
         first, second = await project_of(client, "First"), await project_of(client, "Second")
