@@ -91,6 +91,53 @@ async def test_after_a_cited_papers_file_is_replaced_its_chip_reads_removed_not_
         assert [(c["existence"], c["support"]) for c in check["citations"]] == [("source_removed", "unchecked")]
 
 
+@pytest.mark.parametrize("kept, support", [
+    ("Minimum wages raise the earnings of low-paid workers in the synthetic panel.", "supported"),  # the same passage
+    ("Minimum wages raise the earnings of low-paid workers in the synthetic panel. Rents rose too.", "unchecked")])
+async def test_a_replacement_that_keeps_a_citations_quote_is_where_its_chip_points_once_read(tmp_path, kept, support):
+    # M2 audit area 3, item 2: once the replacement is read, the citation points at its passage holding the quote
+    # (the chip opens and highlights it there); its verdict stands only when that passage's text is unchanged (B18).
+    from test_materials import added
+    from test_search import idle
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        [before] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert (before["existence"], before["support"]) == ("ok", "supported") and before["quote"] in kept
+        await added(client, project, paper("Wage Floors", "A new opening paragraph.", kept), material_id=material)
+        await idle(client, project)
+        [chip] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        read_now = await asyncio.to_thread(client.state["db"].read, lambda conn: citations.readings(
+            conn, project, references=False))
+        assert chip["passage_id"] in read_now and chip["passage_id"] != before["passage_id"]
+        assert before["quote"] in read_now[chip["passage_id"]][4] and chip["ordinal"] == read_now[chip["passage_id"]][6]
+        assert (chip["existence"], chip["support"], chip["quote"]) == ("ok", support, before["quote"])
+        [check] = [e["data"] for e in (await client.get(f"/api/runs/{run_id}/trace")).json()["events"]
+                   if e["type"] == "citation_checks"]
+        assert [(c["existence"], c["support"]) for c in check["citations"]] == [("ok", support)]
+
+
+async def test_a_replacement_by_a_file_read_already_moves_the_citation_to_that_reading(tmp_path):
+    # Its sweep: a file whose reading is shared (read before, here the paper's first file) has no reading to commit,
+    # so its version's addition points the citations as a reading's commit does.
+    from test_materials import added
+    from test_search import idle
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        [first] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        await added(client, project, paper("Wage Floors", "A new opening paragraph.", first["quote"]), material_id=material)
+        await idle(client, project)
+        [moved] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert moved["passage_id"] != first["passage_id"]
+        await added(client, project, WAGES, material_id=material)  # its first file again: read already, shared
+        await idle(client, project)
+        [chip] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert (chip["passage_id"], chip["existence"], chip["support"]) == (first["passage_id"], "ok", "supported")
+
+
 async def test_a_paper_not_read_yet_keeps_its_chip_as_recorded_and_a_removed_one_is_not_found_again_by_a_read(tmp_path):
     # Internal review of T7: a paper whose current file has no reading yet (just replaced, or read again by a
     # newer extractor) is not removed; and the read only ever marks a found citation removed, never the reverse.
