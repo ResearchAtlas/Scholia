@@ -1609,6 +1609,8 @@ class Harness:
             if not await self.memory_on(project_id):
                 return await done("memory_off", line="Memory is off in this project: nothing was saved, changed or forgotten.")
 
+            loop = asyncio.get_running_loop()  # the runs a deletion revokes are stopped on it, never in its thread
+
             async def forgetting():  # each deletion and its record to their end, whatever cancellation comes meanwhile
                 count = changed = 0
                 failed = None
@@ -1629,7 +1631,8 @@ class Harness:
                             raise ValueError("changed")  # (or moved to another project with its conversation since)
                     try:
                         await asyncio.to_thread(deletion.delete, self.db, self.content, "memory", record,
-                                                on_committed=self.revoke, check=as_seen)
+                                                check=as_seen,
+                                                on_committed=lambda ids: loop.call_soon_threadsafe(self.revoke, ids))
                         count += 1
                     except _Cancelled:
                         break

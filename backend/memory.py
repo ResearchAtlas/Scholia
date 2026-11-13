@@ -893,8 +893,10 @@ async def _embed_soon(state, project_id):
 
 async def _forget(state, record, check=None):
     from backend.db import deletion
+    loop = asyncio.get_running_loop()  # the runs it revokes are stopped on this loop, never in the deletion's thread
     revoked = await asyncio.to_thread(deletion.delete, state["db"], state["content"], "memory", record,
-                                      on_committed=state["harness"].revoke, check=check)
+                                      on_committed=lambda ids: loop.call_soon_threadsafe(state["harness"].revoke, ids),
+                                      check=check)
     return revoked
 
 

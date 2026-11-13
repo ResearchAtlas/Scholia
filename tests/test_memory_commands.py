@@ -592,3 +592,42 @@ async def test_a_save_or_update_command_on_a_run_revoked_in_the_record_before_th
         assert await rows(client, "SELECT id, version, status FROM memory_records ORDER BY id") == before
         assert await rows(client, "SELECT 1 FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
                           stream[0]["run_id"]) == []
+
+
+@pytest.mark.parametrize("by", ["command", "memory page"])
+async def test_a_forget_stops_another_run_holding_the_record_on_the_event_loop_never_in_the_deletions_thread(
+        tmp_path, monkeypatch, by):
+    # Fix batch 2's "Not fixed" (pre-existing): the deletion runs in a worker thread and tells the harness from there
+    # once it commits, so another run's revocation (an asyncio.Event set, a task cancelled) ran off the loop. It is
+    # handed to the loop now, as the conversation and project deletions do (app.revoke_soon)
+    import threading
+    from backend.db import new_id
+    async with started(tmp_path / "data") as client:
+        harness, loop_thread, told = client.state["harness"], threading.get_ident(), []
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Remember: the pilot used a survey")
+        await background_idle(client)
+        [(record,)] = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+        other = new_id()  # another run, still running, whose request was shown the record
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', 'memory', json(?))",
+            (other, project, json.dumps({"memory_ids": [record]}))))
+        real = harness.revoke
+
+        def revoke(run_ids):
+            told.append((list(run_ids), threading.get_ident()))
+            real(run_ids)
+        monkeypatch.setattr(harness, "revoke", revoke)
+        if by == "command":
+            stream = await send(client, conversation, "Forget: the pilot used a survey")
+            assert {"type": "memory", "action": "forgotten", "count": 1} in stream
+        else:
+            from test_memory import forget
+            assert (await forget(client, record)).json() == {"ok": True}
+        await asyncio.sleep(0.05)
+        assert await rows(client, "SELECT cancel_reason FROM runs WHERE id = ?", other) == [("revoked",)]
+        assert [(ids, thread == loop_thread) for ids, thread in told if other in ids] == [([other], True)]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'cancelled', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            (other,)))
