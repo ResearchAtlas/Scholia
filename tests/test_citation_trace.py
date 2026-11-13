@@ -91,6 +91,115 @@ async def test_after_a_cited_papers_file_is_replaced_its_chip_reads_removed_not_
         assert [(c["existence"], c["support"]) for c in check["citations"]] == [("source_removed", "unchecked")]
 
 
+OLD = "Minimum wages raise the earnings of low-paid workers in the synthetic panel."
+
+
+@pytest.mark.parametrize("replacement, support, stored", [
+    (paper("Wage Floors", "A new opening paragraph.", OLD), "supported", "ok"),  # the same passage
+    (paper("Wage Floors", "A new opening paragraph.", OLD + " Rents rose too."), "unchecked", "ok"),
+    # batch 1 (1): a reference passage holding the old text is never the target (section 7.1); the body's is
+    (("Wage Floors.md", f"# Wage Floors\n\n## Findings\n\n{OLD} Rents rose too.\n\n## References\n\n{OLD}\n".encode()),
+     "unchecked", "ok"),
+    # batch 1 (4): a citation stored removed while the quote was gone (a commit during a replacement) is found again
+    (paper("Wage Floors", "A new opening paragraph.", OLD), "unchecked", "source_removed")])
+async def test_a_replacement_that_keeps_a_citations_quote_is_where_its_chip_points_once_read(tmp_path, replacement,
+                                                                                            support, stored):
+    # M2 audit area 3, item 2: once the replacement is read, the citation points at its passage holding the quote
+    # (the chip opens and highlights it there); its verdict stands only when that passage's text is unchanged (B18);
+    # its page is that passage's (batch 1 (5): none for a file without pages, never the old file's).
+    from test_materials import added
+    from test_search import idle
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        [before] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert (before["existence"], before["support"], before["quote"]) == ("ok", "supported", OLD)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # as if cited on a PDF's page 7
+            "UPDATE citations SET page = 7, existence = ?, support = CASE ? WHEN 'ok' THEN support ELSE 'unchecked' END",
+            (stored, stored)))
+        await added(client, project, replacement, material_id=material)
+        await idle(client, project)
+        [chip] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        read_now = await asyncio.to_thread(client.state["db"].read, lambda conn: citations.readings(
+            conn, project, references=False))
+        assert chip["passage_id"] in read_now and chip["passage_id"] != before["passage_id"]
+        assert OLD in read_now[chip["passage_id"]][4] and chip["ordinal"] == read_now[chip["passage_id"]][6]
+        assert (chip["existence"], chip["support"], chip["quote"]) == ("ok", support, OLD)
+        assert chip["page"] == read_now[chip["passage_id"]][5] is None
+        [check] = [e["data"] for e in (await client.get(f"/api/runs/{run_id}/trace")).json()["events"]
+                   if e["type"] == "citation_checks"]
+        assert [(c["existence"], c["support"]) for c in check["citations"]] == [("ok", support)]
+
+
+async def test_a_replacement_by_the_same_bytes_read_as_another_format_moves_the_citation_to_that_reading(tmp_path):
+    # Batch 1 (2): a reading is its file and its extractor (section 7.1), so the same bytes as LaTeX are another reading
+    from test_materials import added
+    from test_search import idle
+    text = f"{OLD}\n".encode()
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, ("wages.md", text))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        [before] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert before["existence"] == "ok" and before["quote"]
+        await added(client, project, ("wages.tex", text), material_id=material)
+        await idle(client, project)
+        [chip] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        read_now = await asyncio.to_thread(client.state["db"].read, lambda conn: citations.readings(
+            conn, project, references=False))
+        assert chip["passage_id"] in read_now and chip["passage_id"] != before["passage_id"]
+        assert chip["existence"] == "ok"
+
+
+async def test_a_citation_stored_removed_on_its_passage_exists_again_when_its_own_file_is_restored(tmp_path):
+    # Batch 2 (1): answered while its paper's file was replaced by one without the quote, the citation is stored
+    # removed on its old passage; the paper's first file restored (its reading shared, the same passages), the
+    # citation exists again there, and can be checked again.
+    from scholia_app import run_finished
+    from test_materials import added
+    from test_search import idle
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        [first] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        await added(client, project, paper("Wage Floors", "Rents rose in the synthetic city."), material_id=material)
+        await idle(client, project)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # what that answer's commit stores
+            "UPDATE citations SET existence = 'source_removed', support = 'unchecked'"))
+        await added(client, project, WAGES, material_id=material)  # its first file again: read already, shared
+        await idle(client, project)
+        [chip] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert (chip["passage_id"], chip["existence"], chip["quote"]) == (first["passage_id"], "ok", OLD)
+        assert await rows(client, "SELECT existence, passage_id FROM citations") == [("ok", first["passage_id"])]
+        client.provider.verdicts = lambda body: "1: supported"
+        response = await client.post("/api/citations/check", json={"run_id": run_id})
+        assert response.status_code == 202, response.text
+        [check] = response.json()["run_ids"]
+        assert (await run_finished(client, check))["status"] == "succeeded"
+
+
+async def test_a_replacement_by_a_file_read_already_moves_the_citation_to_that_reading(tmp_path):
+    # Its sweep: a file whose reading is shared (read before, here the paper's first file) has no reading to commit,
+    # so its version's addition points the citations as a reading's commit does.
+    from test_materials import added
+    from test_search import idle
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        [first] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        await added(client, project, paper("Wage Floors", "A new opening paragraph.", first["quote"]), material_id=material)
+        await idle(client, project)
+        [moved] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert moved["passage_id"] != first["passage_id"]
+        await added(client, project, WAGES, material_id=material)  # its first file again: read already, shared
+        await idle(client, project)
+        [chip] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert (chip["passage_id"], chip["existence"], chip["support"]) == (first["passage_id"], "ok", "supported")
+
+
 async def test_a_paper_not_read_yet_keeps_its_chip_as_recorded_and_a_removed_one_is_not_found_again_by_a_read(tmp_path):
     # Internal review of T7: a paper whose current file has no reading yet (just replaced, or read again by a
     # newer extractor) is not removed; and the read only ever marks a found citation removed, never the reverse.

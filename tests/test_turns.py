@@ -184,10 +184,13 @@ async def test_instructions_and_earlier_answers_go_into_the_request(tmp_path):
         await background_idle(client)
 
 
-async def test_a_turn_keeps_the_route_effort_and_request_admission_chose(tmp_path):
+async def test_a_turn_keeps_the_route_effort_and_request_admission_chose(tmp_path, monkeypatch):
     # Model-route rule 5: Auto picks the route and effort once per researcher request, and every step
     # records them; a catalog read between admission and the call changes nothing for the turn.
-    from backend import openrouter_client
+    from backend import openrouter, openrouter_client
+    # a model whose record allows a reasoning object, so the effort is sent and recorded (M2 audit area 3, item 5)
+    monkeypatch.setattr(openrouter, "resolve_model_reasoning",
+                        lambda route, effort, **kw: ({"effort": effort}, None) if effort else (None, None))
     provider = MockProvider()
     async with started(tmp_path / "data", provider) as client:
         conversation = await new_conversation(client)
@@ -1795,3 +1798,130 @@ async def test_a_stop_landing_while_a_turns_end_is_written_still_gets_that_end_o
         else:
             assert turn["status"] == "failed"
             assert stream[-2:] == [{"type": "error", "code": "malformed"}, {**stream[-1], "status": "failed"}]
+
+
+async def _until(check, what, timeout=10.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not check():
+        assert asyncio.get_running_loop().time() < deadline, what()
+        await asyncio.sleep(0.02)
+
+
+class _Blocked(asyncio.Event):
+    """The in-flight cap's wake-up (Harness._landed), counting the requests blocked on it: each has read the cap and
+    found no place (batch 2 (2): a test waits for them to be blocked, not for them to have called in)."""
+
+    def __init__(self):
+        super().__init__()
+        self.waiting = 0
+
+    async def wait(self):
+        self.waiting += 1
+        try:
+            return await super().wait()
+        finally:
+            self.waiting -= 1
+
+
+def _blocked(client):
+    blocked = client.state["harness"]._landed = _Blocked()
+    return blocked
+
+
+async def _save(client, updates):
+    current = (await client.get("/api/settings")).json()
+    saved = await client.put("/api/settings", json={"hash": current["hash"], "updates": updates})
+    assert saved.status_code == 200, saved.text
+
+
+async def test_model_requests_in_flight_app_wide_wait_for_the_cap_in_the_settings(tmp_path):
+    # M2 audit area 3, item 8 (section 13: 8 model requests in flight app-wide, limits.requests_in_flight): a request
+    # past the cap waits on the dispatch path for one to end, whichever conversation or background run sends it.
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        blocked = _blocked(client)
+        await _save(client, {"limits.requests_in_flight": 2})
+        conversations = [(await client.post("/api/conversations", json={})).json()["id"] for _ in range(3)]
+        await send(client, conversations[0])  # the catalog and endpoint listing read and kept, its title run made
+        await background_idle(client)
+        provider.hold, before = asyncio.Event(), len(provider.chats)
+        sending = [asyncio.create_task(send(client, c, "Another question?")) for c in conversations]
+        await _until(lambda: blocked.waiting == 1 and len(provider.chats) - before == 2,
+                     lambda: (blocked.waiting, len(provider.chats) - before))  # two let out, the third blocked at the cap
+        assert len(provider.chats) - before == 2 and client.state["harness"]._flying == 2
+        provider.hold.set()
+        streams = await asyncio.wait_for(asyncio.gather(*sending), 30)
+        assert [s[-1]["status"] for s in streams] == ["succeeded"] * 3
+        await background_idle(client)
+
+
+async def test_requests_waiting_for_a_place_read_a_raised_cap_when_one_ends(tmp_path):
+    # Internal review (P3): each waiter reads the cap again, so raising it lets every request it now allows go.
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        blocked = _blocked(client)
+        await _save(client, {"limits.requests_in_flight": 1})
+        conversations = [(await client.post("/api/conversations", json={})).json()["id"] for _ in range(3)]
+        await send(client, conversations[0])  # the catalog and endpoint listing read and kept, its title run made
+        await background_idle(client)
+        gates = [asyncio.Event() for _ in range(3)]
+
+        def waiting(gate):
+            async def reply(body):
+                await gate.wait()
+                return provider.answer("An answer.")
+            return lambda body: reply(body)
+        provider.replies, before = [waiting(g) for g in gates], len(provider.answers)
+        sending = [asyncio.create_task(send(client, c, "Another question?")) for c in conversations]
+        await _until(lambda: blocked.waiting == 2 and len(provider.answers) - before == 1,
+                     lambda: (blocked.waiting, len(provider.answers) - before))  # both waiters read cap 1 and blocked
+        assert client.state["harness"]._flying == 1
+        await _save(client, {"limits.requests_in_flight": 3})
+        gates[0].set()  # one ends: both waiters look again, under the raised cap
+        await _until(lambda: len(provider.answers) - before == 3, lambda: len(provider.answers) - before)
+        for gate in gates:
+            gate.set()
+        streams = await asyncio.wait_for(asyncio.gather(*sending), 30)
+        assert [s[-1]["status"] for s in streams] == ["succeeded"] * 3
+        await background_idle(client)
+
+
+async def test_a_router_request_waiting_for_a_place_falls_back_at_its_own_deadline(tmp_path):
+    # Batch 1 (3): section 7.3's router deadline counts the wait for a place under the cap; past it, the turn takes
+    # the fallback and the router request is never sent.
+    from backend import budget_router, router
+    provider = MockProvider()
+    routed = lambda: [b for b in provider.chats if b["messages"][0]["content"].startswith(router.ROUTER_RULES)]
+    async with started(tmp_path / "data", provider) as client:
+        await _save(client, {"limits.requests_in_flight": 1, "models.router": sorted(budget_router.RECOMMENDED)[0],
+                             "retrieval.router_ms": 100})
+        first, second = [(await client.post("/api/conversations", json={"title": "t"})).json()["id"] for _ in range(2)]
+        await send(client, first, "What does the panel show?")  # the catalog read and kept
+        await background_idle(client)
+        gate, holds = asyncio.Event(), asyncio.Event()
+
+        async def held(body):
+            holds.set()
+            await gate.wait()
+            return provider.answer("An answer.")
+        provider.replies = [lambda body: provider.answer("none"), lambda body: held(body)]  # the router, then its answer
+        holding = asyncio.create_task(send(client, first, "What does the panel show?"))
+        await asyncio.wait_for(holds.wait(), 10)  # its answer holds the one place
+        assert client.state["harness"]._flying == 1
+        sent_before = len(routed())
+        waiting = asyncio.create_task(send(client, second, "What does the panel show?"))
+
+        async def fallback():
+            return [json.loads(d) for (d,) in await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
+                "SELECT e.data FROM run_events e JOIN runs r ON r.id = e.run_id WHERE r.conversation_id = ?"
+                " AND e.type = 'route' AND json_extract(e.data, '$.retrieval.decided_by') = 'fallback'",
+                (second,)).fetchall())]
+        deadline = asyncio.get_running_loop().time() + 5
+        while not (found := await fallback()):
+            assert asyncio.get_running_loop().time() < deadline, "no fallback while the place was held"
+            await asyncio.sleep(0.02)
+        assert found[0]["retrieval"]["reason"] == "timeout" and len(routed()) == sent_before
+        gate.set()
+        streams = await asyncio.wait_for(asyncio.gather(holding, waiting), 30)
+        assert [s[-1]["status"] for s in streams] == ["succeeded"] * 2
+        await background_idle(client)

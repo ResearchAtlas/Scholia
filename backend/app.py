@@ -22,12 +22,13 @@ from pathlib import Path
 from typing import Literal
 
 import anyio
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.requests import ClientDisconnect
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend import backups
@@ -38,7 +39,7 @@ from backend import search  # S1-17: the search index, index runs and the search
 from backend import zotero  # S1-15: Zotero's library, read only
 from backend.db import (ContentStore, Database, DatabaseCloseError, DatabaseClosedError, close_failed, delete, new_id,
                         utc_now)
-from backend.local_guard import LocalRequestGuard
+from backend.local_guard import LocalRequestGuard, _is_api
 from backend.outbound_gate import OutboundGate, local_origin
 from backend import governance
 from backend.runs import MAX_MESSAGE_CHARS, AdmissionError, Harness, _through, derived_status
@@ -94,6 +95,31 @@ class ApiError(Exception):
 
 def _error(status, code, message):
     return JSONResponse({"code": code, "message": message}, status_code=status)
+
+
+async def _valid_text(request: Request):
+    """Every API request's JSON body holds only valid Unicode text: half a surrogate pair, which a JSON escape can give
+    (as "\\ud83d"), is refused as any invalid request is, in a string, a key or a list's item, whatever the route's model
+    says (the M2 audit's Fable 5 F1). Stored, the database could not read it back. FastAPI has parsed the body already
+    for a route that takes one, so this reads the same parse. Outside /api (the static pages) it reads nothing: the guard
+    bounds and authenticates only the API's bodies (PR 57's rechecks)."""
+    if not _is_api(request.scope["path"]):
+        return
+    try:  # an empty or absent body is not JSON either
+        stack = [await request.json()]
+    except (ValueError, RecursionError, ClientDisconnect):  # not JSON, nested past what Python parses, or the client
+        return  # left before it was read: the route answers as it would have (one that takes no body ignores it)
+    while stack:  # a loop, not recursion, over what was parsed
+        value = stack.pop()
+        if isinstance(value, str) and not value.isascii():  # ASCII (a file's base64) is valid, and says so at once
+            try:
+                value.encode()
+            except UnicodeEncodeError:
+                raise ApiError(400, "invalid_request", "The request is not valid") from None
+        elif isinstance(value, dict):
+            stack += [*value, *value.values()]
+        elif isinstance(value, list):
+            stack += value
 
 
 def _visible(text):
@@ -387,7 +413,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             if ended and not running and not close_failed():
                 state["closed"] = True
 
-    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    # Every route's, the included routers' too (see _valid_text)
+    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, dependencies=[Depends(_valid_text)])
     app.state.scholia = state  # the desktop entry reaches the harness through it at shutdown
     app.include_router(backups.router)  # backups, restore and project export, ahead of the catch-all routes
     app.include_router(materials.router)  # materials, passages, page images and retries (S1-13)
@@ -581,12 +608,15 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     def describe_model(provider, table, model, records, policy=None, key=None):
         """A catalog row with what the settings and the picker need: its window as reported
-        and in use, whether it is offered and recommended, and its effort steps; with a
-        project's policy, whether the project allows it."""
+        and in use, whether it is offered and recommended, and its effort steps (none where no
+        reasoning object is ever sent: another provider than OpenRouter, or a Private project's
+        zero-retention requests); with a project's policy, whether the project allows it."""
         capability = reasoning_capability.get_capability(records, model["id"], model)
         surface = capability.get("control_surface") or "unknown"
         steps = (capability.get("levels") or []) if surface == "levels" else \
             list(budget_router.EFFORT_LEVELS) if surface == "budget" else []
+        if not provider.is_openrouter or (policy is not None and policy.zero_retention):  # openrouter.resolve_model_reasoning
+            steps = []
         refusal = policy.problem(provider, model["id"], key) if policy is not None else None
         return {**model, "window": providers.window(table, model["id"], model.get("context_length")),
                 "offered": providers.offered(table, provider, model["id"], budget_router.RECOMMENDED),

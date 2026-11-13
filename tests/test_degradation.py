@@ -159,3 +159,69 @@ async def test_a_project_whose_index_is_being_rebuilt_says_its_papers_could_not_
         assert "No passage in the researcher's library matched" not in system
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert "index_unavailable" in turn["answer"]["notices"] and "keyword_only" not in turn["answer"]["notices"]
+
+
+# M2 audit area 3, item 1: the agent's own searches say when they searched nothing or searched by keyword only,
+# and the answer's notices cover every retrieval of the turn, not the pre-load alone.
+
+REWRITE = "Please rewrite this paragraph more clearly."  # the rewrite rule: no pre-load
+
+
+def _tool_turn(tool):
+    from agentic import Scripted, call
+    argument = {"query": "minimum wages earnings"} if tool == "search_passages" else {"question": QUESTION}
+    return Scripted([call(tool, call_id="t", **argument)], "Done.", inner=["Minimum wages raise earnings [S1.1]."])
+
+
+@pytest.mark.parametrize("tool", ["search_passages", "answer_from_library"])
+async def test_a_tool_search_while_the_index_is_rebuilt_says_the_papers_were_not_searched(tmp_path, tool):
+    from agentic import tool_messages
+    from cited import cited, conversation_in, with_papers
+    from scholia_app import send
+    provider = _tool_turn(tool)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        client.state["index"].building = True
+        try:
+            stream = await send(client, conversation, REWRITE)
+        finally:
+            client.state["index"].building = False
+        assert [e["route"] for e in stream if e["type"] == "route"] == ["none"]
+        assert stream[-1]["status"] == "succeeded"
+        [result] = tool_messages(provider.agent_steps[1])
+        assert "could not be searched" in result["content"] and "No passage" not in result["content"]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert "index_unavailable" in turn["answer"]["notices"] and "keyword_only" not in turn["answer"]["notices"]
+
+
+@pytest.mark.parametrize("tool", ["search_passages", "answer_from_library"])
+async def test_a_tool_search_by_keyword_only_tells_the_model_and_the_answer_says_so(tmp_path, tool):
+    from agentic import tool_messages
+    from cited import cited, conversation_in, with_papers
+    from scholia_app import send
+    provider = _tool_turn(tool)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        client.remote.failing = True  # the helper cannot embed the query: keyword search only
+        stream = await send(client, conversation, REWRITE)
+        assert stream[-1]["status"] == "succeeded"
+        [result] = tool_messages(provider.agent_steps[1])
+        assert "keyword search only" in result["content"]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert "keyword_only" in turn["answer"]["notices"] and "index_unavailable" not in turn["answer"]["notices"]
+
+
+async def test_a_tool_search_by_keyword_only_that_matches_nothing_says_how_it_searched(tmp_path):
+    from agentic import Scripted, call, tool_messages
+    from cited import cited, conversation_in, with_papers
+    from scholia_app import send
+    provider = Scripted([call("search_passages", call_id="t", query="quasars radio wavelengths")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        client.remote.failing = True
+        await send(client, conversation, REWRITE)
+        [result] = tool_messages(provider.agent_steps[1])
+        assert "No passage matched" in result["content"] and "keyword search only" in result["content"]
