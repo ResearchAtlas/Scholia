@@ -222,6 +222,35 @@ async def test_every_event_the_backend_writes_has_a_heading_in_each_interface_la
         assert {e for e in events if f"audit.event.{e}" not in catalog} == set(), name
 
 
+def raised_asks():
+    """Every ask kind the backend raises and every option it can be answered with, read from its source: each
+    raise_ask or Harness._ask call's kind, and its options, a literal list or one of the sets named here (a call
+    giving its options any other way fails this, so the set is named here first)."""
+    from backend import asks, budgets, references, search
+    named = {"list(OPTIONS)": references.OPTIONS, "OFFER_OPTIONS": search.OFFER_OPTIONS,
+             "budget_rules.options(form)": budgets.options("cap") + budgets.options("step"),
+             "options": [str(n) for n in range(1, asks.MAX_OPTIONS + 1)]}  # the agent's own, answered by number
+    kinds, options = set(), {"text"}  # a typed answer is audited as "text"
+    for path in (Path(__file__).resolve().parents[1] / "backend").rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        for kind, given in re.findall(r'(?:raise_ask\(conn, \w+|_ask\(turn), "(\w+)", (\[[^\]]*\]|[\w.()]+)', source):
+            kinds.add(kind)
+            options |= set(re.findall(r'"(\w+)"', given)) if given.startswith("[") else set(named[given])
+    return kinds, options
+
+
+async def test_every_ask_kind_and_answer_the_app_raises_is_named_in_the_audit_view_in_each_language():
+    # The M2 audit's Fable 5 F2: an answered budget ask showed "question: budget · answer: go_ahead" in both languages,
+    # as did the agent's questions, its approvals and tool-error asks, and the memory commands' asks.
+    kinds, options = raised_asks()
+    assert {"identifier_lookup", "merge", "model_download", "choice", "budget", "memory_save", "memory_update",
+            "memory_forget"} <= kinds
+    assert {"go_ahead", "not_now", "continue", "stop", "allow", "decline", "save", "forget", "1", "3"} <= options
+    for name, catalog in catalogs().items():
+        assert {k for k in kinds if f"ask.kindName.{k}" not in catalog} == set(), name
+        assert {o for o in options if f"ask.answer.{o}" not in catalog} == set(), name
+
+
 async def test_backups_restores_exports_and_purges_are_logged_with_text_for_each_field(tmp_path):
     destination = tmp_path / "chosen"
     destination.mkdir()
