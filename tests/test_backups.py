@@ -589,6 +589,31 @@ async def test_a_restored_backup_next_in_line_to_rotate_is_copied_before_the_mig
     assert [b["schema_version"] for b in listed if b["id"].split("/")[1] not in before].count(3) == 1
 
 
+async def test_which_backups_the_next_rotation_leaves_matches_the_rotation(tmp_path):
+    # PR 59 batch 2, item 3: _stays_through_a_backup against the rotation itself, for sets short, full and overfull
+    # (an earlier rotation that could not finish)
+    import datetime as dt
+    import backend.db.database as database_module
+    start = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    for kind, count in (("daily", 3), ("daily", 7), ("daily", 9), ("weekly", 4), ("weekly", 6)):
+        data = tmp_path / f"{kind}{count}"
+        folder = data / "backups" / kind
+        folder.mkdir(parents=True)
+        names = [(start + dt.timedelta(days=i)).strftime("%Y%m%dT%H%M%S%fZ") for i in range(count)]
+        for name in names:
+            (folder / name).mkdir()
+        predicted = {name: backups_module._stays_through_a_backup(data, name) for name in names}
+        if kind == "weekly":  # a promotion: the oldest daily moved to weekly, then weekly trimmed
+            (folder / (start + dt.timedelta(days=count + 30)).strftime("%Y%m%dT%H%M%S%fZ")).mkdir()
+            for old in database_module._generations(folder)[:-database_module.WEEKLY_KEPT]:
+                old.rmdir()
+        else:
+            new = data / "backups" / "daily" / (start + dt.timedelta(days=count)).strftime("%Y%m%dT%H%M%S%fZ")
+            new.mkdir()
+            database_module._rotate(data / "backups", new)
+        assert predicted == {name: (folder / name).is_dir() for name in names}, (kind, count)
+
+
 async def test_a_restore_stops_a_running_turn(tmp_path):
     async with started(tmp_path / "data") as client:
         backup = (await client.post("/api/backups")).json()["id"]

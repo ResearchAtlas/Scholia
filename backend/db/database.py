@@ -127,7 +127,7 @@ class Database:
     quick_check must pass), then migrates it on the writer thread, taking a
     backup before its first migration unless the database is new and empty, or
     backup is false: its state is in an automatic backup already (a restore of
-    one still in the folder).
+    one still in the folder that the next backup does not rotate out).
     """
 
     def __init__(self, data_dir, *, migrations=MIGRATIONS, backup=True):

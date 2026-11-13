@@ -653,11 +653,12 @@ def _write_full_backup(db, destination, passphrase, archive, stop=None, progress
 
 def _stays_through_a_backup(data_dir, name):
     """Whether the automatic backup named name is in the folder and the next backup's rotation leaves it there: not
-    the oldest of a full set (database._rotate moves or removes the oldest daily, and a promotion the oldest weekly)."""
+    among the oldest it rotates (database._rotate moves or removes the daily ones past the newest kept - 1 and the new
+    one, and a promotion the weekly ones past kept; more than one when an earlier rotation could not finish)."""
     for kind, kept in (("daily", DAILY_KEPT), ("weekly", WEEKLY_KEPT)):
         generations = [generation.name for generation in _generations(data_dir / "backups" / kind)]
         if name in generations:
-            return len(generations) < kept or generations[0] != name
+            return generations.index(name) > len(generations) - kept
     return False
 
 
