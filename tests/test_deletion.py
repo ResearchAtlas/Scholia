@@ -295,6 +295,33 @@ def test_a_deletion_removes_at_once_the_files_only_it_referenced(db, store, kind
         assert store.read(sha256)  # still referenced (the body by its run's event)
 
 
+def test_a_file_put_again_and_named_by_a_new_record_while_the_deletion_collects_is_kept(db, store, monkeypatch):
+    # PR 59 batch 2, item 1: after collection read which hashes have rows, the same bytes were put again, a record
+    # named them and the hold ended; with the clock set back, the file looked older than the deletion and was removed
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    real, again = ContentStore._stored_files, []
+
+    def put_again_first(self):
+        if not again:
+            with self.hold() as held:
+                again.append(self.put(b"paper p", "application/pdf", held))
+                db.write(lambda conn: conn.execute(
+                    "INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current)"
+                    " VALUES (?, ?, 1, ?, 0)", (new_id(), other, again[0])))
+            past = time.time() - 60  # the clock set back a minute while it was put
+            os.utime(self._path(again[0]), (past, past))
+        yield from real(self)
+
+    other = new_id()
+    db.write(lambda conn: conn.execute(
+        "INSERT INTO materials (id, project_id, title, source) VALUES (?, ?, 'Same paper', 'upload')",
+        (other, x["project"])))
+    monkeypatch.setattr(ContentStore, "_stored_files", put_again_first)
+    delete(db, store, "material", x["m1"])
+    assert again == [x["paper"]] and store.read(x["paper"]) == b"paper p"
+    assert one(db, "SELECT count(*) FROM material_versions WHERE file_sha256 = ?", x["paper"]) == (1,)
+
+
 def test_a_file_whose_row_was_made_in_the_deletions_own_millisecond_goes_with_it(db, store, monkeypatch):
     # PR 59 batch 1, item 3: rows keep milliseconds, the deletion's start microseconds, so a row made in the same
     # millisecond, before the deletion started, was left for the idle rule

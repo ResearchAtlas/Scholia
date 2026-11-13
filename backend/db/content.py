@@ -48,6 +48,11 @@ class ContentStore:
         self._writing = set()  # temporary files of puts in progress, however long they take
         self._held = collections.Counter()  # hashes collection keeps, however old (hold)
         self._listing = 0  # readers between listing content and holding it (listing)
+        # Puts counted in this store, and the count at each hash's last put: a collection removes no file put since it
+        # began, whatever the clock says (PR 59 batch 2). shortcut: one entry per hash put while the app runs, never
+        # pruned (collections overlap); prune if a session ever puts millions.
+        self._puts = 0
+        self._put_at = {}
 
     @contextlib.contextmanager
     def hold(self, hashes=()):
@@ -116,6 +121,8 @@ class ContentStore:
                     # collection takes; a put that outlives its block (its caller cancelled) is not held
                     self._held[sha256] += 1
                     hold.append(sha256)
+                self._puts += 1
+                self._put_at[sha256] = self._puts
                 os.replace(tmp, folder / sha256)
                 _fsync(folder)
                 if created:
@@ -159,11 +166,14 @@ class ContentStore:
         released, with since (an aware UTC datetime): the hashes records referenced when a deletion started at
         since. One nothing references now goes at once, not once idle (a deletion reaches every copy, slice 1
         section 16; M2 audit 1 F8), unless its row or file was written since then: the same bytes put again
-        meanwhile keep the idle rule.
+        meanwhile keep the idle rule. Whatever the times say, no file put in this store since the collection
+        began is removed by it (a clock set back cannot make a new put look older than the deletion).
         """
         _refuse_event_loop()
         cutoff = (now or datetime.now(UTC)) - IDLE_AFTER
         released = set(released) if since is not None else set()
+        with self._lock:
+            began = self._puts
 
         def due(sha256):  # written before this, the file may go
             return since if sha256 in released else cutoff
@@ -194,7 +204,8 @@ class ContentStore:
             if path.name in kept:
                 continue
             with self._lock:
-                if path.name not in self._held and not self._listing and _idle(path, due(path.name)):
+                if (path.name not in self._held and not self._listing and self._put_at.get(path.name, 0) <= began
+                        and _idle(path, due(path.name))):
                     path.unlink(missing_ok=True)
                     removed += 1
         for path in self.root.glob(".put-*.tmp"):  # left by an interrupted put, not one still running
