@@ -748,16 +748,20 @@ WHERE csl IS NOT NULL AND id IN (
 
 -- A Zotero paper's file as its imports last gave it: the newest of its versions with a file made by or before the last
 -- import step that gave it one (the version is written in that step's own transaction, before its event), so a
--- researcher's later replacement is not taken for Zotero's. NULL when no import gave it a file.
-WITH given (material, at) AS MATERIALIZED (
+-- researcher's later replacement is not taken for Zotero's. NULL when no import gave it a file. The steps are read once
+-- into a table keyed by paper, so the work grows with the library, not with papers times steps.
+CREATE TEMP TABLE zotero_given (material TEXT PRIMARY KEY, at TEXT NOT NULL) WITHOUT ROWID;
+INSERT INTO temp.zotero_given
     SELECT json_extract(e.data, '$.material_id'), max(e.at) FROM run_events e JOIN runs r ON r.id = e.run_id
     WHERE r.workflow = 'zotero_import' AND e.type = 'step_finished' AND json_extract(e.data, '$.version') = 1
-    GROUP BY 1)
+    AND json_type(e.data, '$.material_id') = 'text'
+    GROUP BY 1;
 UPDATE materials SET zotero_file = (
-    SELECT v.file_sha256 FROM material_versions v JOIN given g ON g.material = v.material_id
+    SELECT v.file_sha256 FROM material_versions v JOIN temp.zotero_given g ON g.material = v.material_id
     WHERE v.material_id = materials.id AND v.file_sha256 IS NOT NULL AND v.created_at <= g.at
     ORDER BY v.created_at DESC, v.seq DESC LIMIT 1)
 WHERE source = 'zotero';
+DROP TABLE temp.zotero_given;
 
 CREATE TRIGGER materials_lookup_filled_valid BEFORE INSERT ON materials
 WHEN NEW.lookup_filled IS NOT NULL AND NOT json_valid(NEW.lookup_filled)

@@ -354,6 +354,41 @@ def test_lookup_filled_is_checked_with_json_valid_on_a_new_and_a_migrated_databa
         db.write(lambda conn: conn.execute("UPDATE materials SET lookup_filled = '[]' WHERE id = ?", (kept,)))
 
 
+def test_migration_0013s_backfill_grows_with_the_library_not_its_square(tmp_path):
+    """Batch 1 (review F1): 0013 fills Zotero papers' last file from their import steps in steps that grow with the
+    papers (a lookup by paper), not with papers times steps: it runs as the app opens."""
+    import json
+    from backend.db.migrations import MIGRATIONS
+
+    def steps_for(count):
+        data = tmp_path / str(count)
+        with Database(data, migrations=MIGRATIONS[:12]) as old:
+            def seed(conn):
+                project, run = general_id(conn), new_id()
+                conn.execute("INSERT INTO runs (id, project_id, kind, workflow, status) VALUES (?, ?, 'background',"
+                             " 'zotero_import', 'succeeded')", (run, project))
+                for i in range(count):
+                    material, sha = new_id(), f"{i:064x}"
+                    conn.execute("INSERT INTO content_files (sha256, size, media_type) VALUES (?, 1, 'application/pdf')", (sha,))
+                    conn.execute("INSERT INTO materials (id, project_id, title, source, source_key) VALUES"
+                                 " (?, ?, 'P', 'zotero', ?)", (material, project, f"users/0/items/K{i}"))
+                    conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current) VALUES"
+                                 " (?, ?, 0, ?, 1)", (new_id(), material, sha))
+                    conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, 'step_finished', ?)",
+                                 (run, i, json.dumps({"material_id": material, "outcome": "imported", "version": True})))
+            old.write(seed)
+        conn, counted = sqlite3.connect(data / "scholia.sqlite3"), [0]
+        try:
+            conn.set_progress_handler(lambda: counted.__setitem__(0, counted[0] + 1), 1000)
+            conn.executescript(MIGRATIONS[12])
+            assert conn.execute("SELECT count(*) FROM materials WHERE zotero_file IS NOT NULL").fetchone() == (count,)
+        finally:
+            conn.close()
+        return counted[0]
+
+    assert steps_for(2000) < 30 * steps_for(200)  # ten times the papers: about ten times the work, never a hundred
+
+
 def test_the_schema_refuses_the_word_now_as_a_time(db):
     with pytest.raises(sqlite3.OperationalError, match="non-deterministic"):
         db.write(lambda conn: conn.execute("INSERT INTO audit_log (event, at) VALUES ('e', 'now')"))
