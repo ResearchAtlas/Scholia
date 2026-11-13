@@ -570,7 +570,7 @@ def test_a_backup_whose_retention_fails_still_counts_and_retention_is_retried(tm
     data = tmp_path / "data"
     real_rotate = database_module._rotate
 
-    def failing_rotate(backups, keep):
+    def failing_rotate(backups, keep, now=None):
         raise OSError(13, "Permission denied", str(backups))
 
     with Database(data) as db:
@@ -599,7 +599,7 @@ def test_rotation_never_removes_the_generation_just_published(tmp_path):
         generation = db.backup(now=START + timedelta(days=32))
         assert (generation / DB_NAME).is_file()
     assert generation.name in generations(data, "daily")
-    assert len(generations(data, "daily")) == 7
+    assert len(generations(data, "daily")) == 8  # by the clock set back, day 33 is under a week old: kept (R1)
     assert len(generations(data, "weekly")) == 4
 
 
@@ -607,7 +607,7 @@ def test_a_migration_does_not_run_without_its_backup(tmp_path, monkeypatch):
     data = tmp_path / "data"
     Database(data).close()
 
-    def losing_rotate(backups, keep):  # as if retention had removed the new generation
+    def losing_rotate(backups, keep, now=None):  # as if retention had removed the new generation
         for generation in (backups / "daily").iterdir():
             shutil.rmtree(generation)
 
@@ -660,6 +660,45 @@ def test_rotation_keeps_seven_daily_and_four_weekly_generations(tmp_path):
 
     assert generations(data, "daily") == names(range(33, 40))
     assert generations(data, "weekly") == names([7, 14, 21, 28])
+
+
+def week_of_daily_backups(db, now):
+    """Six daily backups, 6 to 1 days before now: their names."""
+    return [db.backup(now=now - timedelta(days=days)).name for days in range(6, 0, -1)]
+
+
+def test_seven_backups_on_request_leave_the_weeks_backups(tmp_path):
+    # Design review H, B8 (option 1B, R1): backups taken on request, or before project deletions, rotated out the week
+    now = datetime.now(UTC)
+    with Database(tmp_path / "data") as db:
+        week = week_of_daily_backups(db, now)
+        for minutes in range(7):
+            db.backup(now=now + timedelta(minutes=minutes))
+    assert set(week) <= set(generations(tmp_path / "data")) and len(generations(tmp_path / "data")) == 13
+
+
+def test_a_safety_copy_taken_after_the_clock_was_set_back_survives_the_next_backups(tmp_path):
+    # Design review H, B4 (astra's recheck 2 probe): seven generations stamped ahead of a clock set back; the next
+    # backup after the safety copy deleted it
+    later = datetime.now(UTC) + timedelta(days=30)
+    with Database(tmp_path / "data") as db:
+        for days in range(7):
+            db.backup(now=later + timedelta(days=days))
+        safety = db.backup(now=later - timedelta(days=20))  # the clock set back
+        db.backup(now=later - timedelta(days=20) + timedelta(minutes=1))
+    assert safety.is_dir() and safety.name in generations(tmp_path / "data")
+
+
+def test_a_backup_stamped_ahead_of_the_clock_does_not_make_every_check_take_one(tmp_path):
+    # Design review H, B10: backup_if_due asked only the newest by name, so one stamped 30 days ahead was never less
+    # than a day old and every idle check took a backup
+    now = datetime.now(UTC)
+    with Database(tmp_path / "data") as db:
+        week = week_of_daily_backups(db, now)
+        db.backup(now=now + timedelta(days=30))
+        taken = [db.backup_if_due(now=now + timedelta(minutes=10 * check)) for check in range(8)]
+    assert len([t for t in taken if t is not None]) == 1
+    assert set(week) <= set(generations(tmp_path / "data"))
 
 
 def test_an_automatic_backup_runs_at_most_once_a_day(tmp_path):
