@@ -452,9 +452,9 @@ async def _three_to_forget(client, monkeypatch, deleting):
 
 
 async def _forgotten(client, stream, count):
-    [(data,)] = await rows(client, "SELECT data FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
-                           stream[0]["run_id"])
-    assert (json.loads(data)["action"], json.loads(data)["count"]) == ("forgotten", count)
+    found = await rows(client, "SELECT data FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                       stream[0]["run_id"])  # one event for each deletion, in its commit (design review M's Option 2)
+    assert [(json.loads(d)["action"], json.loads(d)["count"]) for (d,) in found] == [("forgotten", 1)] * count
     assert {"type": "memory", "action": "forgotten", "count": count} in stream
 
 
@@ -555,9 +555,9 @@ async def test_a_forget_revoked_in_the_record_before_the_turn_hears_of_it_delete
             real_revoke(ids)
         assert len(calls) == 1
         assert len(await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")) == 2
-        if change == "ended":  # nothing is recorded on a run that has ended
-            assert await rows(client, "SELECT 1 FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
-                              stream[0]["run_id"]) == []
+        if change == "ended":  # the deletion made while it ran is recorded with it; nothing after its end
+            assert await rows(client, "SELECT json_extract(data, '$.count') FROM run_events"
+                              " WHERE type = 'memory_proposed' AND run_id = ?", stream[0]["run_id"]) == [(1,)]
             return
         assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")
         await _forgotten(client, stream, 1)
@@ -631,3 +631,122 @@ async def test_a_forget_stops_another_run_holding_the_record_on_the_event_loop_n
         await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
             "UPDATE runs SET status = 'cancelled', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
             (other,)))
+
+
+# Cycle 3's B-R3-F1 (design review M's Option 2): each deletion a forget makes commits together with the turn's record of
+# it (a `memory_proposed` event, count 1, written in the deletion's own transaction after its checks), so no later read,
+# write or failure can leave a committed deletion unrecorded. The conversation reads a forget's events as one item.
+
+
+async def _forgotten_now(client, stream):
+    """What the turn's record says it forgot (its `forgotten` events summed), and the counts its stream said."""
+    found = await rows(client, "SELECT data FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                       stream[0]["run_id"])
+    recorded = sum(json.loads(d).get("count", 0) for (d,) in found if json.loads(d)["action"] == "forgotten")
+    return recorded, [e["count"] for e in stream if e.get("type") == "memory"]
+
+
+async def _read_back(client, conversation):
+    [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1:]
+    return [(m["action"], m["count"]) for m in turn["memory"]]
+
+
+@pytest.mark.parametrize("after_commit", [False, True])
+async def test_a_forget_whose_later_deletion_and_the_next_read_both_fail_records_what_it_forgot(tmp_path, monkeypatch,
+                                                                                               after_commit):
+    # B-R3-F1: the second of three deletions fails (before its transaction, or after its commit) and the read after it
+    # fails too: the recovery read escaped before the record, so nothing was recorded or said of what was forgotten
+    import sqlite3
+    calls, armed = [], []
+
+    def deleting(real, *args, **kwargs):
+        calls.append(args[3])
+        if len(calls) == 2:
+            if after_commit:
+                real(*args, **kwargs)
+            armed.append(True)  # the next read fails, once
+            raise RuntimeError("the deletion failed")
+        return real(*args, **kwargs)
+    async with started(tmp_path / "data") as client:
+        harness = client.state["harness"]
+        real_read = harness._read
+
+        async def read(fn):
+            if armed:
+                armed.clear()
+                raise sqlite3.OperationalError("disk I/O error")
+            return await real_read(fn)
+        monkeypatch.setattr(harness, "_read", read)
+        sending, _, conversation = await _three_to_forget(client, monkeypatch, deleting)
+        stream = await asyncio.wait_for(sending, 20)
+        forgot = 2 if after_commit else 1
+        assert stream[-1]["status"] == "failed" and len(calls) == 2
+        assert len(await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")) == 3 - forgot
+        recorded, said = await _forgotten_now(client, stream)
+        assert (recorded, said) == (forgot, [forgot])
+        assert await _read_back(client, conversation) == [("forgotten", forgot)]
+
+
+async def test_a_forget_whose_record_write_fails_once_its_deletions_began_still_records_each_one(tmp_path, monkeypatch):
+    # Design review M's one-failure case: all three deletions commit, then the turn's record writes fail; the record of
+    # what was forgotten was the first of them, so the three deletions went unrecorded. Each is now in its own commit.
+    import sqlite3
+    calls = []
+
+    def deleting(real, *args, **kwargs):
+        calls.append(args[3])
+        return real(*args, **kwargs)
+    async with started(tmp_path / "data") as client:
+        harness = client.state["harness"]
+        real_record = harness._record
+
+        async def record(*args, **kwargs):
+            if calls:  # every record write once the deletions began
+                raise sqlite3.OperationalError("disk I/O error")
+            return await real_record(*args, **kwargs)
+        monkeypatch.setattr(harness, "_record", record)
+        sending, _, conversation = await _three_to_forget(client, monkeypatch, deleting)
+        stream = await asyncio.wait_for(sending, 20)
+        assert len(calls) == 3
+        assert await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'") == []
+        recorded, _ = await _forgotten_now(client, stream)
+        assert recorded == 3
+        assert await _read_back(client, conversation) == [("forgotten", 3)]
+
+
+async def test_after_each_deletion_of_a_forget_its_record_says_as_many_as_were_deleted(tmp_path, monkeypatch):
+    # The construction itself: read directly once each deletion returns, the turn's `forgotten` events are as many as
+    # the memory deletions audited, never fewer
+    seen = []
+
+    async def start(client):
+        harness = client.state["harness"]
+
+        def deleting(real, *args, **kwargs):
+            found = real(*args, **kwargs)
+            [run_id] = [a.run_id for a in harness.registry.runs.values() if a.kind == "turn"]
+            seen.append(client.state["db"].read(lambda conn: (
+                conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'memory_proposed'"
+                             " AND json_extract(data, '$.action') = 'forgotten'", (run_id,)).fetchone()[0],
+                conn.execute("SELECT count(*) FROM audit_log WHERE event = 'deletion'"
+                             " AND json_extract(data, '$.kind') = 'memory'").fetchone()[0])))
+            return found
+        return await _three_to_forget(client, monkeypatch, deleting)
+    async with started(tmp_path / "data") as client:
+        sending, _, _ = await start(client)
+        assert (await asyncio.wait_for(sending, 20))[-1]["status"] == "succeeded"
+        assert seen == [(1, 1), (2, 2), (3, 3)]
+
+
+async def test_a_forget_of_three_is_read_back_and_said_as_one_item(tmp_path, monkeypatch):
+    # Three events, one per deletion, read back as one "Forgot 3 memory records" and said as one memory event
+    async with started(tmp_path / "data") as client:
+        sending, _, conversation = await _three_to_forget(client, monkeypatch,
+                                                          lambda real, *args, **kwargs: real(*args, **kwargs))
+        stream = await asyncio.wait_for(sending, 20)
+        assert stream[-1]["status"] == "succeeded"
+        found = await rows(client, "SELECT data FROM run_events WHERE type = 'memory_proposed' AND run_id = ?",
+                           stream[0]["run_id"])
+        assert [json.loads(d)["count"] for (d,) in found] == [1, 1, 1]
+        assert [e for e in stream if e.get("type") == "memory"] == [{"type": "memory", "action": "forgotten", "count": 3}]
+        assert await _read_back(client, conversation) == [("forgotten", 3)]

@@ -1430,12 +1430,11 @@ class Harness:
                                                     "tool_call_id": call_id}
         await self._record(claim, "retrieval_trace", {**trace, "mode": found["mode"], "reason": found["reason"]})
 
-    async def _record(self, claim, kind, data, also=None, kept=False):
+    async def _record(self, claim, kind, data, also=None):
         """One event of a running turn (none when kind is None), and also(conn), if given, in its transaction; a
-        run deleted, ended or revoked meanwhile is cancelled instead. kept: the record of an effect that has committed
-        already (a forget's deletions), written on a run revoked meanwhile too, before its end (SPEC:650)."""
+        run deleted, ended or revoked meanwhile is cancelled instead."""
         def record(conn):
-            if not _running(conn, claim.run_id) or (_revoked(conn, claim.run_id) and not kept):
+            if not _running(conn, claim.run_id) or _revoked(conn, claim.run_id):
                 raise _Cancelled()
             if kind is not None:
                 _event(conn, claim.run_id, kind, data)
@@ -1549,8 +1548,9 @@ class Harness:
         this", "update this" or "forget this", or a forget naming no record clearly, asks first on the shared
         confirmation, and only the researcher's answer saves or forgets (section 8, Words that count). With memory
         off nothing is written. Each outcome is a content-free `memory_proposed` event (`command`; `applied` 1 when
-        something changed), a `memory` stream event, and a line in USER MEMORY telling the model what was done, so
-        its answer confirms it; the conversation shows it read back from the record."""
+        something changed; a forget's, one for each record it deleted, in that deletion's commit), a `memory` stream
+        event, and a line in USER MEMORY telling the model what was done, so its answer confirms it; the conversation
+        shows it read back from the record."""
         ctx["memory_notes"] = []
         asked = ctx.get("command")
         if asked is None:
@@ -1558,8 +1558,9 @@ class Harness:
         ctx["memory_on"] = await self.memory_on(ctx["project_id"])  # the switch as it is now, not at admission
         action, text, project_id = asked["action"], asked["text"], ctx["project_id"]
 
-        async def done(what, data=None, count=0, line=None, change=None):
-            # change(conn) -> (what it did, ids) or ids: the outcome is what the record says, never what was asked
+        async def done(what, data=None, count=0, line=None, change=None, recorded=False):
+            # change(conn) -> (what it did, ids) or ids: the outcome is what the record says, never what was asked;
+            # recorded: a forget's deletions, each recorded in its own commit (as_seen), so nothing is written here
             outcome = {"what": what, "ids": []}
             if change is not None and not await self.memory_on(project_id):  # switched off while its ask waited
                 what, change, line = "memory_off", None, "Memory is off in this project: nothing was saved, changed or forgotten."
@@ -1575,7 +1576,8 @@ class Harness:
                     "command": action, "applied": int(bool(outcome["ids"] or count)), "action": outcome["what"],
                     **({"records": outcome["ids"]} if outcome["ids"] else {}), **({"count": count} if count else {}),
                     **(data or {})})
-            await self._record(claim, None, None, also=apply, kept=bool(count))
+            if not recorded:
+                await self._record(claim, None, None, also=apply)
             if outcome["ids"]:
                 await self._index_memory(project_id)
             turn.emit({"type": "memory", "action": outcome["what"], "count": count or len(outcome["ids"])})
@@ -1612,8 +1614,19 @@ class Harness:
             loop = asyncio.get_running_loop()  # the runs a deletion revokes are stopped on it, never in its thread
 
             async def forgetting():  # each deletion and its record to their end, whatever cancellation comes meanwhile
-                count = changed = 0
-                failed = None
+                forgot, changed = [], 0
+
+                def committed(revoked):  # the deletion and its record committed: counted first, then the runs it
+                    forgot.append(1)  # revoked are stopped on the loop, never in the deletion's thread
+                    loop.call_soon_threadsafe(self.revoke, revoked)
+
+                def say():
+                    count = len(forgot)
+                    return done("forgotten", count=count, recorded=bool(count),
+                                line=f"Forgotten at the researcher's request: {count} memory record"
+                                     f"{'s' if count != 1 else ''}. Do not use it."
+                                + (f" {changed} record{'s' if changed != 1 else ''} changed since the researcher chose and "
+                                   f"{'were' if changed != 1 else 'was'} not forgotten." if changed else ""))
                 for record in ids:
                     if claim.cancel_requested.is_set():  # Stop or a revocation: no deletion starts after it (SPEC:412)
                         break
@@ -1629,29 +1642,23 @@ class Harness:
                         if (found["version"], found["status"]) != seen[record] or (
                                 found["scope"] == "project" and found["project_id"] != project_id):
                             raise ValueError("changed")  # (or moved to another project with its conversation since)
+                        # its record commits with it or not at all (cycle 3's B-R3-F1, design review M's Option 2)
+                        _event(conn, claim.run_id, "memory_proposed", {"command": action, "applied": 1,
+                                                                       "action": "forgotten", "count": 1})
                     try:
                         await asyncio.to_thread(deletion.delete, self.db, self.content, "memory", record,
-                                                check=as_seen,
-                                                on_committed=lambda ids: loop.call_soon_threadsafe(self.revoke, ids))
-                        count += 1
+                                                check=as_seen, on_committed=committed)
                     except _Cancelled:
                         break
                     except LookupError:  # forgotten meanwhile
                         pass
                     except ValueError:
                         changed += 1
-                    except Exception as error:  # what the others forgot is recorded, then the turn fails (B-F2)
-                        failed = error  # one that failed after its commit forgot its record too
-                        count += await self._read(lambda conn, record=record: memory.row(conn, record) is None)
-                        break
-                if failed is not None and not count:
-                    raise failed
-                await done("forgotten", count=count, line=f"Forgotten at the researcher's request: {count} memory "
-                                                          f"record{'s' if count != 1 else ''}. Do not use it."
-                           + (f" {changed} record{'s' if changed != 1 else ''} changed since the researcher chose and "
-                              f"{'were' if changed != 1 else 'was'} not forgotten." if changed else ""))
-                if failed is not None:
-                    raise failed
+                    except BaseException:  # a later deletion failing: what committed is said, then the turn fails (B-F2)
+                        if forgot:
+                            await say()
+                        raise
+                await say()
             # PR 52's follow-up (design review P): a Stop once a deletion committed is honored after that deletion and the
             # record of what was forgotten, as a tool's result is (_tool's keeping): never a record deleted with nothing
             # said of it

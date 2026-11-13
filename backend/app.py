@@ -1127,9 +1127,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                     (conversation_id,)):
                 data = json.loads(data)
                 found = [memory.row(conn, i) for i in data.get("records", [])]
-                remembered.setdefault(owner, []).append({
-                    "action": data.get("action") or "noted", "count": data.get("count") or len(data.get("records", [])),
-                    "records": [{k: r[k] for k in ("id", "type", "status", "content", "scope")} for r in found if r]})
+                items = remembered.setdefault(owner, [])
+                item = {"action": data.get("action") or "noted", "count": data.get("count") or len(data.get("records", [])),
+                        "records": [{k: r[k] for k in ("id", "type", "status", "content", "scope")} for r in found if r]}
+                if item["action"] == "forgotten" and items and items[-1]["action"] == "forgotten":
+                    items[-1]["count"] += item["count"]  # a forget's deletions, each recorded in its own commit: one item
+                else:
+                    items.append(item)
             cited = {}  # S1-19: each answer's citations, as its chips show them
             for owner, cid, material, passage, quote, context, page, evidence, existence, support, retraction, title, \
                     ordinal in conn.execute(
