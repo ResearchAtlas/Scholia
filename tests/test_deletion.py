@@ -347,6 +347,7 @@ def test_a_paper_added_and_deleted_at_once_leaves_no_file(db, store, monkeypatch
         def now(cls, tz=None):
             return started  # the deletion's request started before the paper was added
 
+    # the base's condition (the deletion read its start from this clock); the deletion reads no clock now (2B)
     monkeypatch.setattr(deletion_module, "datetime", Clock, raising=False)
     x = populate(db, store, add_project(db, "Thesis"), "p")
     delete(db, store, "material", x["m1"])

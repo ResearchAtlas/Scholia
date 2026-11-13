@@ -585,8 +585,10 @@ async def test_failed_restores_leave_the_weeks_backups(tmp_path, monkeypatch):
     assert {f"daily/{name}" for name in week} <= listed
 
 
+@pytest.mark.parametrize("outcome", ["committed", "rolled back"])
 @pytest.mark.parametrize("rotation", ["promoted", "deleted"])
-async def test_a_restore_of_a_backup_over_a_week_old_its_safety_copy_rotates_keeps_a_backup_of_it(tmp_path, rotation):
+async def test_a_restore_of_a_backup_over_a_week_old_its_safety_copy_rotates_keeps_a_backup_of_it(
+        tmp_path, monkeypatch, rotation, outcome):
     # PR 59 batch 1, item 5, rewritten for design review H: a backup over a week old is still rotated by count; the
     # restore's own backup before its migrations is then what keeps that state, promoted or deleted
     from datetime import UTC, datetime, timedelta
@@ -606,26 +608,35 @@ async def test_a_restore_of_a_backup_over_a_week_old_its_safety_copy_rotates_kee
     async with started(data) as client:  # its upgrade's backup: seven daily, the one restored the oldest
         before = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
         assert f"daily/{name}" in before and len([b for b in before if b.startswith("daily/")]) == 7
+        if outcome == "rolled back":
+            def failing(*args):
+                raise OSError("the journal cannot be written")
+            monkeypatch.setattr(backups_module, "_commit_journal", failing)
         response = await client.post("/api/backups/restore", json={"generation": f"daily/{name}"})
-        assert response.status_code == 200, response.text
+        assert response.status_code == (200 if outcome == "committed" else 500), response.text
         listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
     names = {i.split("/")[1] for i in before}  # by name: the rotation may move one to weekly
-    assert sorted(b["schema_version"] for i, b in listed.items() if i.split("/")[1] not in names) == [3, len(MIGRATIONS)]
+    added = sorted(b["schema_version"] for i, b in listed.items() if i.split("/")[1] not in names)
+    # rolled back, the copy stays only when it is the one backup of that state: the source deleted (R4)
+    kept_copy = outcome == "committed" or rotation == "deleted"
+    assert added == ([3, len(MIGRATIONS)] if kept_copy else [len(MIGRATIONS)])
     assert (f"weekly/{name}" in listed) == (rotation == "promoted") and f"daily/{name}" not in listed
 
 
-async def restored_from_fables_folder(tmp_path, more):
-    """Fable's folder, the 5-day backup restored, then more backups: (its name, the list, the names before)."""
+async def restored_from_fables_folder(tmp_path, more, days=5):
+    """Fable's folder, its backup of days days ago restored, then more backups: (its name, the list, the names
+    before)."""
     from datetime import UTC, datetime
     data = tmp_path / "data"
     week = await asyncio.to_thread(fables_folder, data, datetime.now(UTC))
     async with started(data) as client:
         before = {b["id"].split("/")[1] for b in (await client.get("/api/backups")).json()["backups"]}
-        response = await client.post("/api/backups/restore", json={"generation": f"daily/{week[1]}"})
+        source = week[6 - days]
+        response = await client.post("/api/backups/restore", json={"generation": f"daily/{source}"})
         assert response.status_code == 200, response.text
         for _ in range(more):
             assert (await client.post("/api/backups")).status_code == 200
-        return week[1], (await client.get("/api/backups")).json()["backups"], before
+        return source, (await client.get("/api/backups")).json()["backups"], before
 
 
 async def test_a_restored_backup_under_a_week_old_outlives_the_next_backups(tmp_path):
@@ -638,7 +649,7 @@ async def test_a_restored_backup_under_a_week_old_outlives_the_next_backups(tmp_
 async def test_a_restored_backup_has_one_backup_of_its_state_after_two_more_backups(tmp_path):
     # Design review H, B6: with the restore's own backup before its migrations, the restored state at its schema is in
     # a backup of its own, which lasts a week whatever else is taken
-    _, listed, before = await restored_from_fables_folder(tmp_path, 2)
+    _, listed, before = await restored_from_fables_folder(tmp_path, 2, days=4)  # the design review's B6 probe
     assert [b["schema_version"] for b in listed if b["id"].split("/")[1] not in before].count(3) == 1
 
 
