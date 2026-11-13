@@ -1160,7 +1160,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 items = remembered.setdefault(owner, [])
                 item = {"action": data.get("action") or "noted", "count": data.get("count") or len(data.get("records", [])),
                         "records": [{k: r[k] for k in ("id", "type", "status", "content", "scope")}
-                                    | memory.replaced(conn, r) for r in found if r],
+                                    | (memory.replaced(conn, r) if data.get("action") == "updated"
+                                       and r["created_by_run_id"] == owner else {})  # only the update that replaced
+                                    for r in found if r],
                         **({"named": True} if data.get("named") else {})}  # forgotten: the records its words named
                 if item["action"] == "forgotten" and items and items[-1]["action"] == "forgotten":
                     items[-1]["count"] += item["count"]  # a forget's deletions, each recorded in its own commit: one item

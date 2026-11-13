@@ -18,7 +18,7 @@ export function actionLines(t, item) {
   const key = MEMORY_ACTIONS[item.action];
   if (!key) return [];
   if ((item.action === 'saved' || item.action === 'updated') && item.records?.length) {
-    return item.records.map((record) => (record.replaced != null
+    return item.records.map((record) => (item.action === 'updated' && record.replaced != null
       ? t('memory.updatedFrom', { content: record.content, replaced: record.replaced })
       : t(key, { content: record.content })));
   }

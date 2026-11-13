@@ -34,6 +34,9 @@ test('a forget by its words, what an update replaced and a command Continue sent
     records: [{ content: 'the sample is 35', replaced: 'the sample is 30' }] }),
     ['Updated in memory: the sample is 35 (it replaced: the sample is 30)']);
   assert.deepEqual(actionLines(t, { action: 'applied_before', count: 0 }), [t('memory.appliedBefore')]);
+  // batch 1: a save of a record an earlier correction wrote replaced nothing itself
+  assert.deepEqual(actionLines(t, { action: 'saved', records: [{ content: 'the sample is 35', replaced: 'the sample is 30' }] }),
+    ['Saved to memory: the sample is 35']);
   assert.notEqual(t('memory.appliedBefore'), 'memory.appliedBefore');
 });
 
