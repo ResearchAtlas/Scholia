@@ -686,7 +686,8 @@ def register(harness, content):
     # read only while it runs, go then (M2 audit, area 1: no ended run keeps an identifier of a paper deleted later).
     def ending(conn, active, project_id):
         _close_batch(conn, harness, project_id, active.run_id)
-        conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.items', '$.done') WHERE id = ?", (active.run_id,))
+        conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.items', '$.done', '$.papers') WHERE id = ?",
+                     (active.run_id,))
 
     harness.endings["zotero_import"] = ending
 
@@ -785,8 +786,11 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
     if step["outcome"] in ("imported", "updated"):  # the project changed: it comes first in the list, as other imports do
         conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
     _event(conn, run_id, "step_finished", step)
-    conn.execute("UPDATE runs SET inputs = json_set(json_insert(inputs, '$.done[#]', ?), '$.batch', ?) WHERE id = ?",
-                 (key, batch, run_id))
+    now = json.loads(conn.execute("SELECT inputs FROM runs WHERE id = ?", (run_id,)).fetchone()[0])
+    now.update(done=[*(now.get("done") or []), key], batch=batch)
+    if step["material_id"]:  # the paper each item came to (made, updated, or matched), so its deletion takes the key
+        now.setdefault("papers", {}).setdefault(step["material_id"], []).append(key)
+    conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps(now), run_id))
     return step, used
 
 
@@ -806,11 +810,14 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
         # record gives none, as a Merge fills only what the paper lacks; a field the record now gives is its own.
         merged = [key for key in json.loads(merge_filled or "[]") if key in own]
         record = {**{key: own[key] for key in merged}, **csl}
+        still = [key for key in merged if key not in csl]  # a field the record gives now is the record's from now on,
+        # even when it gives the Merge's own value, so a record that drops it later drops it from the paper too
+        if own == record and still != json.loads(merge_filled or "[]"):
+            conn.execute("UPDATE materials SET merge_filled = ? WHERE id = ?", (json.dumps(still) if still else None, material))
         if own != record:
             changed = True
             # its retraction check and resolution were about the identifier it had: a DOI or an arXiv ID changed or gone
             moved = reference_files.identifier(own) != reference_files.identifier(record)
-            still = [key for key in merged if key not in csl]
             conn.execute("UPDATE materials SET title = ?, csl = ?, evidence_type = ?, lookup_filled = NULL, merge_filled = ?,"
                          " updated_at = ?"
                          + (", resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL" if moved else "")
@@ -823,7 +830,8 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
     version = current[0] if current else None
     # Files follow Zotero: its PDF becomes the paper's next version when Zotero changed it since it last gave one (back
     # to an earlier file too), unless it is the current file already; while Zotero's is as it was, the researcher's own
-    # replacement stays. A paper imported before Zotero's file was kept (zotero_file NULL): when it is none of its files.
+    # replacement stays. A paper whose Zotero file is not known (zotero_file NULL: migration 0013 found no import that
+    # gave it one): when it is none of its files; Zotero's file is kept from then on only once it is the current one.
     if sha256 is not None:
         moved_on = sha256 != given if given is not None else conn.execute(
             "SELECT 1 FROM material_versions WHERE material_id = ? AND file_sha256 = ?", (material, sha256)).fetchone() is None
@@ -831,7 +839,8 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
             version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF, None, recorded)
             step["version"] = True
             # what the old file's lookup gave it goes in add_version (materials._forget_file_lookup)
-        conn.execute("UPDATE materials SET zotero_file = ? WHERE id = ?", (sha256, material))
+        if given is not None or step["version"] or (current is not None and current[1] == sha256):
+            conn.execute("UPDATE materials SET zotero_file = ? WHERE id = ?", (sha256, material))
     elif step.get("pdf") and current is not None and current[1] is not None:
         step["kept"] = True  # its PDF could not be read this time: the paper keeps the file it had
     step["outcome"] = "updated" if changed or step["version"] else "unchanged"

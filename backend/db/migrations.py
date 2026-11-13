@@ -728,12 +728,36 @@ ALTER TABLE queued_messages ADD COLUMN material_ids TEXT CHECK (material_ids IS 
 # triggers, as a STRICT table's CHECK cannot be added to a column in place; a paper written before keeps its value.
 # merge_filled: the fields a confirmed Merge gave the paper (a JSON list of CSL keys, or NULL), which a later record of
 # it (a Zotero re-import, a lookup tried again) keeps where that record gives none (backend/references.py _answered).
-# zotero_file: the SHA-256 of the PDF a Zotero paper's item gave when last imported with one (NULL: none yet, or a paper
-# imported before it was kept), so a re-import adds Zotero's attachment when Zotero changed it, even back to an earlier
-# file, and never undoes the researcher's own replacement while Zotero's is as it was (backend/zotero.py _update).
+# zotero_file: the SHA-256 of the PDF a Zotero paper's item gave when last imported with one (NULL: none known), so a
+# re-import adds Zotero's attachment when Zotero changed it, even back to an earlier file, and never undoes the
+# researcher's own replacement while Zotero's is as it was (backend/zotero.py _update). Both are filled for the papers
+# that exist from what the record holds (below).
 _0013 = r"""
 ALTER TABLE materials ADD COLUMN merge_filled TEXT CHECK (merge_filled IS NULL OR json_valid(merge_filled));
 ALTER TABLE materials ADD COLUMN zotero_file TEXT;
+
+-- A paper a Merge was confirmed into before now (a merge run that succeeded with Merge): which fields it gave was not
+-- recorded, so every field of its details but a lookup's counts as the researcher's choice; the paper's next record
+-- (a re-import, a lookup) takes back each field it gives, so the list narrows to what that record lacks.
+UPDATE materials SET merge_filled = (
+    SELECT json_group_array(j.key) FROM json_each(materials.csl) j
+    WHERE j.key NOT IN (SELECT value FROM json_each(coalesce(materials.lookup_filled, '[]'))))
+WHERE csl IS NOT NULL AND id IN (
+    SELECT json_extract(inputs, '$.material_ids[0]') FROM runs
+    WHERE workflow = 'merge' AND status = 'succeeded' AND json_extract(summary, '$.option') = 'merge');
+
+-- A Zotero paper's file as its imports last gave it: the newest of its versions with a file made by or before the last
+-- import step that gave it one (the version is written in that step's own transaction, before its event), so a
+-- researcher's later replacement is not taken for Zotero's. NULL when no import gave it a file.
+WITH given (material, at) AS MATERIALIZED (
+    SELECT json_extract(e.data, '$.material_id'), max(e.at) FROM run_events e JOIN runs r ON r.id = e.run_id
+    WHERE r.workflow = 'zotero_import' AND e.type = 'step_finished' AND json_extract(e.data, '$.version') = 1
+    GROUP BY 1)
+UPDATE materials SET zotero_file = (
+    SELECT v.file_sha256 FROM material_versions v JOIN given g ON g.material = v.material_id
+    WHERE v.material_id = materials.id AND v.file_sha256 IS NOT NULL AND v.created_at <= g.at
+    ORDER BY v.created_at DESC, v.seq DESC LIMIT 1)
+WHERE source = 'zotero';
 
 CREATE TRIGGER materials_lookup_filled_valid BEFORE INSERT ON materials
 WHEN NEW.lookup_filled IS NOT NULL AND NOT json_valid(NEW.lookup_filled)
