@@ -28,9 +28,9 @@ are exact, so sums are plain rounds to the kept precision.
 import math
 
 from backend.db import new_id, utc_now
+from backend.settings import MAX_USD  # the most an amount can be
 
 _DECIMALS = 9  # amounts are kept to a billionth of a dollar
-MAX_USD = 1_000_000.0  # the most an amount or a limit can be (design review V)
 
 
 class BudgetExceeded(Exception):

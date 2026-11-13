@@ -20,7 +20,9 @@ from pathlib import Path
 
 import tomlkit
 
-from backend.spending import MAX_USD
+# The most an amount or a budget can be, in dollars (design review V's Option 1, Harold's decision of 2026-11-13); kept
+# here, which imports nothing of the app, so the reading child loads no database with it (backend/spending.py uses it)
+MAX_USD = 1_000_000.0
 
 
 _INT64 = range(-2**63, 2**63)  # TOML integers are 64-bit; tomlkit reads larger ones too
