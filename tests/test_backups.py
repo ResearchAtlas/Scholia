@@ -666,10 +666,14 @@ async def test_a_project_export_holds_its_citations_notes_asks_and_waiting_messa
                          " VALUES (?, 'answer', ?, ?, ?, 'n = 40 sufficed', ?, 4, 'ok', 'supported')",
                          (citation, run_id, material, version,
                           json.dumps({"marker": "[S1.1]", "offset": 3, "sentence": "Forty."})))
-            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, quote, context, page, existence)"
-                         " VALUES (?, 'answer', ?, ?, 'words of another project', ?, 9, 'ok')",
-                         (new_id(), run_id, foreign,
-                          json.dumps({"marker": "[S2.1]", "offset": 9, "sentence": "Also."})))
+            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, material_version_id, quote,"
+                         " context, page, evidence_type, existence) VALUES (?, 'answer', ?, ?,"
+                         " (SELECT id FROM material_versions WHERE material_id = ?), 'words of another project', ?, 9,"
+                         " 'rct', 'ok')", (new_id(), run_id, foreign, foreign,
+                                           json.dumps({"marker": "[S2.1]", "offset": 9, "sentence": "Also."})))
+            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, context, page, evidence_type, existence)"
+                         " VALUES (?, 'answer', ?, ?, 7, 'cohort', 'source_removed')",  # its paper deleted since
+                         (new_id(), run_id, json.dumps({"marker": "[S3.1]", "offset": 12, "sentence": None})))
             conn.execute("INSERT INTO queued_messages (id, conversation_id, text) VALUES (?, ?, 'And the power?')",
                          (new_id(), conversation))
             conn.execute("INSERT INTO memory_records (id, scope, project_id, type, content, status) VALUES"
@@ -687,8 +691,11 @@ async def test_a_project_export_holds_its_citations_notes_asks_and_waiting_messa
     [asked] = turn["asks"]
     assert (asked["kind"], asked["options"], asked["answer"]["text"], asked["answer"]["by"]) == (
         "choice", ["1", "2"], "The 2019 one", "researcher")
-    cited, moved = turn["citations"]
-    assert (moved["marker"], moved["material_id"], moved["quote"], moved["page"]) == ("[S2.1]", foreign, None, None)
+    cited, moved, removed = turn["citations"]
+    assert (moved["marker"], moved["material_id"]) == ("[S2.1]", foreign)
+    assert [moved[k] for k in ("material_version", "passage_id", "passage", "quote", "page", "evidence_type")] == [None] * 6
+    assert (removed["page"], removed["evidence_type"], removed["existence"]) == (7, "cohort", "source_removed")
+    assert "- [S3.1] page 7" in markdown.splitlines()
     assert not any(b"words of another project" in read(path, name) for name in names(path))
     assert "- [S2.1]" in markdown.splitlines()
     assert {k: cited[k] for k in ("id", "marker", "material_id", "material_version", "quote", "page", "existence",
