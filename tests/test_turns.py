@@ -1824,3 +1824,45 @@ async def test_model_requests_in_flight_app_wide_wait_for_the_cap_in_the_setting
         streams = await asyncio.gather(*sending)
         assert [s[-1]["status"] for s in streams] == ["succeeded"] * 3
         await background_idle(client)
+
+
+async def test_requests_waiting_for_a_place_read_a_raised_cap_when_one_ends(tmp_path):
+    # Internal review (P3): each waiter reads the cap again, so raising it lets every request it now allows go.
+    provider = MockProvider()
+
+    async def save_cap(client, cap):
+        current = (await client.get("/api/settings")).json()
+        saved = await client.put("/api/settings", json={"hash": current["hash"],
+                                                        "updates": {"limits.requests_in_flight": cap}})
+        assert saved.status_code == 200, saved.text
+    async with started(tmp_path / "data", provider) as client:
+        await save_cap(client, 1)
+        conversations = [(await client.post("/api/conversations", json={})).json()["id"] for _ in range(3)]
+        await send(client, conversations[0])  # the catalog and endpoint listing read and kept, its title run made
+        await background_idle(client)
+        gates = [asyncio.Event() for _ in range(3)]
+
+        def waiting(gate):
+            async def reply(body):
+                await gate.wait()
+                return provider.answer("An answer.")
+            return lambda body: reply(body)
+        provider.replies, before = [waiting(g) for g in gates], len(provider.answers)
+        sending = [asyncio.create_task(send(client, c, "Another question?")) for c in conversations]
+
+        async def sent(n):
+            deadline = asyncio.get_running_loop().time() + 5
+            while len(provider.answers) - before < n:
+                assert asyncio.get_running_loop().time() < deadline, len(provider.answers) - before
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(0.3)  # and no more meanwhile
+            assert len(provider.answers) - before == n
+        await sent(1)
+        await save_cap(client, 3)
+        gates[0].set()  # one ends: both waiters look again, under the raised cap
+        await sent(3)
+        for gate in gates:
+            gate.set()
+        streams = await asyncio.gather(*sending)
+        assert [s[-1]["status"] for s in streams] == ["succeeded"] * 3
+        await background_idle(client)

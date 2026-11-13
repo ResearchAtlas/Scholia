@@ -463,8 +463,12 @@ class Harness:
         """A place under the app-wide cap on model requests in flight (section 13: limits.requests_in_flight, read for
         each request): one past it waits for another to end, so recovery's restarts and many background runs never
         all send at once. Taken on the dispatch path only (_call), around the provider adapter's request."""
-        limit = (await asyncio.to_thread(load_settings, self.data_dir)).values["limits"]["requests_in_flight"]
-        while self._flying >= limit:
+        def limit():
+            return load_settings(self.data_dir).values["limits"]["requests_in_flight"]
+        while True:  # the cap read again each time a waiter looks (a raised one applies at the next request's end)
+            cap = await asyncio.to_thread(limit)
+            if self._flying < cap:  # no await from here to the count, so two waiters never both take the last place
+                break
             self._landed.clear()
             await self._landed.wait()
         self._flying += 1
