@@ -388,8 +388,9 @@ async def test_the_opening_rebuild_asks_for_the_runs_of_what_lacks_vectors_once_
 
         async def rebuilt_first(self, *args, **kwargs):  # start() stores the harness only after this
             gate.set()
-            index = search._STATES[self]["index"]
-            while index.building:
+            index, deadline = search._STATES[self]["index"], asyncio.get_running_loop().time() + 20
+            while index.building:  # a failed rebuild leaves it set (its retry waiting): bounded, said
+                assert asyncio.get_running_loop().time() < deadline, "the opening rebuild did not finish"
                 await asyncio.sleep(0.01)
             return await recover(self, *args, **kwargs)
         monkeypatch.setattr(Harness, "recover", rebuilt_first)
