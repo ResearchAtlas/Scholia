@@ -8,8 +8,8 @@ import json
 
 import pytest
 
-from backend import memory
-from scholia_app import MockProvider, background_idle, send, started
+from backend import memory, search
+from scholia_app import MockProvider, background_idle, run_finished, send, started
 from test_materials import project_of
 from test_memory import conversation_in, forget, rows, write
 
@@ -265,6 +265,116 @@ async def test_a_proposal_an_extraction_confirms_gets_its_vector(tmp_path):
         await idle(client, project)
         assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", proposal) == [("confirmed",)]
         assert await asyncio.to_thread(client.state["index"].memory_embedded, [proposal]) == {proposal}
+
+
+def _unindexed(project, content, scope="project"):
+    """A record written as the queue alone knows of it (no index run asked for: a crash after the commit)."""
+    return lambda conn: memory.write(conn, project_id=project, scope=scope, kind="decision", content=content,
+                                     status="confirmed", sources=[("researcher", "views")])
+
+
+async def _vectors(client, ids, timeout=20.0):
+    """The ones of ids that have a vector, once no index run runs and they all have one, or the timeout passes."""
+    from test_search import runs_of
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        running = [r for r in await runs_of(client, "index") if r["status"] == "running"]
+        held = await asyncio.to_thread(client.state["index"].memory_embedded, ids)
+        if (held == set(ids) and not running) or asyncio.get_running_loop().time() > deadline:
+            return held
+        await asyncio.sleep(0.05)
+
+
+async def test_memory_in_a_project_without_papers_gets_its_vectors_once_the_model_is_installed(tmp_path):
+    # M2 audit area 2: the install asks for the runs of the projects whose memory lacks vectors, not only of passages
+    from backend.local_helper import EMBEDDING
+    from test_local_helper import WEIGHTS
+    from test_search import app
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        record = await entered(client, project, "Wage floors raise the earnings of low-paid workers")
+        personal = await entered(client, project, "I prefer short answers", kind="preference", scope="personal")
+        await background_idle(client)
+        ids = [record["id"], personal["id"]]
+        assert await asyncio.to_thread(client.state["index"].memory_embedded, ids) == set()
+        helper = client.state["local_helper"].helpers[EMBEDDING]
+        helper.path.parent.mkdir(parents=True, exist_ok=True)
+        helper.path.write_bytes(WEIGHTS)
+        helper.model_installed()  # what a download or an import calls
+        assert await _vectors(client, ids) == set(ids)
+
+
+@pytest.mark.parametrize("lost", ["run_request", "index_file", "model_identity"])
+async def test_a_launch_asks_for_the_runs_of_memory_the_index_lacks_vectors_for(tmp_path, monkeypatch, lost):
+    # M2 audit area 2: a record whose index run was never asked for (the queue never embeds a memory addition, and its
+    # opening pass prunes it), and every vector a whole rebuild or another model's identity drops, in a project with no
+    # papers; a personal record whose project is gone is embedded by another project's run
+    from test_search import app
+    async with app(tmp_path) as client:
+        project, other = await project_of(client, "First"), await project_of(client, "Other")
+        if lost == "run_request":
+            ids = [await write(client, _unindexed(project, "Wage floors raise the earnings of low-paid workers")),
+                   await write(client, _unindexed(other, "I prefer short answers", scope="personal"))]
+            await write(client, lambda conn: conn.execute(  # as a project's deletion leaves it
+                "UPDATE memory_records SET project_id = NULL WHERE id = ?", (ids[1],)))
+        else:
+            ids = [(await entered(client, project, "Wage floors raise the earnings of low-paid workers"))["id"],
+                   (await entered(client, other, "I prefer short answers", kind="preference", scope="personal"))["id"]]
+            assert await _vectors(client, ids) == set(ids)
+    if lost == "index_file":
+        for found in (tmp_path / "data" / "index").glob("search.sqlite3*"):
+            found.unlink()
+    if lost == "model_identity":
+        real = search.identity
+        monkeypatch.setattr(search, "identity", lambda config: {**real(config), "revision": "another"})
+    async with app(tmp_path) as client:
+        assert await _vectors(client, ids) == set(ids)
+
+
+async def test_a_whole_rebuild_while_the_app_runs_asks_for_the_runs_of_memory_it_dropped(tmp_path):
+    # M2 audit area 2: the rebuilt file's runs (index.rebuilt) take the projects whose memory lacks vectors too
+    from test_search import app
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        ids = [(await entered(client, project, "Wage floors raise the earnings of low-paid workers"))["id"]]
+        assert await _vectors(client, ids) == set(ids)
+        index = client.state["index"]
+        await asyncio.to_thread(index._damaged)  # as a read that finds the file damaged
+        deadline = asyncio.get_running_loop().time() + 10
+        while index.building:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.02)
+        assert await _vectors(client, ids) == set(ids)
+
+
+async def test_a_helper_that_fails_on_a_memory_record_fails_the_run_and_retry_embeds_it(tmp_path):
+    # M2 audit area 2: as with a passage, the run fails with the helper's reason, so Retry (or the next launch) embeds it
+    from test_search import app, runs_of
+    async with app(tmp_path) as client:
+        client.remote.fail_on = "Wage floors"
+        project = await project_of(client)
+        record = await entered(client, project, "Wage floors raise the earnings of low-paid workers")
+        await background_idle(client)
+        [run] = await runs_of(client, "index", project)
+        assert (run["status"], run["result"]["reason"], run["retryable"]) == ("failed", "request_failed", True)
+        client.remote.fail_on = None
+        again = await client.post(f"/api/runs/{run['run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        assert await _vectors(client, [record["id"]]) == {record["id"]}
+
+
+async def test_recall_with_no_record_embedded_yet_is_traced_as_the_newest(tmp_path):
+    # M2 audit area 2: the nearest are none of the records (none has a vector yet): memory.ranked takes the newest,
+    # and the trace says so
+    from cited import cited
+    async with cited(tmp_path) as client:
+        project = await project_of(client)
+        await write(client, _unindexed(project, "We dropped the pilot because of cost."))
+        stream = await send(client, await conversation_in(client, project), "What did we decide last time?")
+        [(trace,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'retrieval_trace'"
+                                        " AND json_extract(data, '$.memory') IS NOT NULL", stream[0]["run_id"])
+        trace = json.loads(trace)["memory"]
+        assert (trace["mode"], trace.get("reason")) == ("recency", "unembedded") and len(trace["records"]) == 1
 
 
 async def test_an_embedding_that_finishes_after_its_record_moved_never_writes_the_old_partition(tmp_path, monkeypatch):

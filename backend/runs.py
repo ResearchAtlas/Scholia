@@ -1714,8 +1714,10 @@ class Harness:
                     try:
                         nearest = await asyncio.wait_for(search.nearest_memory(state, ctx["project_id"], ctx["message"]),
                                                          ctx["personal"].values["retrieval"]["memory_ms"] / 1000)
+                        reason = "unavailable" if nearest is None else None
+                        if nearest is not None and not set(nearest) & {r["id"] for r in candidates}:
+                            nearest, reason = None, "unembedded"  # no candidate has a vector yet: the newest
                         mode = "similarity" if nearest is not None else "recency"
-                        reason = None if nearest is not None else "unavailable"
                     except TimeoutError:
                         reason = "deadline"
                     except Exception as error:  # the helper or the index failed: the newest, said
