@@ -263,8 +263,11 @@ async def test_a_proposal_an_extraction_confirms_gets_its_vector(tmp_path):
         await send(client, await conversation_in(client, project), "We sample thirty nurses")
         await background_idle(client, timeout=20)
         await idle(client, project)
-        assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", proposal) == [("confirmed",)]
-        assert await asyncio.to_thread(client.state["index"].memory_embedded, [proposal]) == {proposal}
+        # PR 62 batch 4 (design review N): the extraction confirms it as its next version, which gets the vector
+        [(confirmed,)] = await rows(client, "SELECT id FROM memory_records WHERE supersedes_id = ?"
+                                            " AND status = 'confirmed'", proposal)
+        assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", proposal) == [("superseded",)]
+        assert await asyncio.to_thread(client.state["index"].memory_embedded, [confirmed]) == {confirmed}
 
 
 async def test_an_embedding_that_finishes_after_its_record_moved_never_writes_the_old_partition(tmp_path, monkeypatch):

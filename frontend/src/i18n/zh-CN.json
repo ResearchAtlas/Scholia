@@ -1283,6 +1283,8 @@
   "memory.dismiss": "关闭",
   "memory.confirm": "确认",
   "memory.forget": "忘记",
+  "memory.forgetTitle": "忘记这条记忆？",
+  "memory.forgetBody": "“忘记”会删除它的内容：{content}",
   "memory.keep": "保留",
   "memory.contentLabel": "条目内容",
   "memory.older": "早于当前条目",
@@ -1297,9 +1299,15 @@
   "memory.savedLive": "已存入记忆",
   "memory.updated": "已更新记忆：{content}",
   "memory.updatedLive": "已更新记忆",
+  "memory.updatedFrom": "已更新记忆：{content}（替换了：{replaced}）",
   "memory.forgotten": {
     "other": "已忘记 {count} 条记忆"
   },
+  "memory.forgottenNamed": {
+    "other": "已忘记你的消息所指的 {count} 条记忆"
+  },
+  "memory.appliedBefore": "这条记忆指令已在消息首次发送时执行，因此没有再做改动。",
+  "memory.appliedBeforePart": "这条“忘记”指令已在消息首次发送时执行，在它选定的 {of} 条记忆中忘记了 {count} 条。“继续”不会再次忘记：要忘记其余的记忆，请在新消息中说明，或在“设置”的“高级”中操作。",
   "memory.memoryOff": "本项目的记忆已关闭，因此没有保存、更改或忘记任何内容。",
   "memory.noMatch": "没有匹配的记忆条目，因此没有改动。",
   "memory.noCandidate": "没有可以保存的先前回答。",
@@ -1329,7 +1337,7 @@
   "ask.memory_update.body": "输入新的文字：它会作为新版本替换下面的条目。",
   "ask.memory_update.option.not_now": "暂不",
   "ask.memory_forget.question": "忘记这些记忆条目？",
-  "ask.memory_forget.body": "“忘记”会删除它们的内容。",
+  "ask.memory_forget.body": "“忘记”会删除它们的内容。被删除的内容会保留在 Scholia 的自动备份中，直到这些备份被替换，约为五周；在“设置”的“高级”中忘记一条记录时，也可以将它从备份中删除。",
   "ask.memory_forget.option.forget": "忘记",
   "ask.memory_forget.option.not_now": "暂不",
   "ask.kindName.memory_save": "存入记忆",
@@ -1354,6 +1362,7 @@
   "errors.version_changed": "这条记录在显示后已更改，请重新查看。",
   "errors.out_of_date": "它要替换的条目已更改，因此已标为过时。",
   "errors.not_confirmable": "已完成事项和智能体的笔记永远不会被确认。",
+  "errors.not_editable": "已完成事项根据你的文献库自身的记录写成，因此不能编辑。可以忘记它。",
   "errors.invalid_scope": "只有个人资料和偏好条目属于个人记忆。",
   "errors.empty": "内容为空。",
   "audit.event.memory_allowance_notice": "记忆提取因额度被跳过（提示一次）",

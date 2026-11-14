@@ -3,22 +3,30 @@
 // Where we left off's dismissal for this return; and the message box filled by its next-step button (nothing is sent
 // until Send).
 import { ApiError, del, get, patch, post } from './api.js';
+import { deletePath, deletionNotices } from './backups.js';
 import { libraryChanged } from './library.js';
 import { errorText } from './text.js';
 
 // A turn's memory actions (backend/runs.py Harness._memory_command, update_progress), as catalog keys.
 export const MEMORY_ACTIONS = { saved: 'memory.saved', updated: 'memory.updated', forgotten: 'memory.forgotten',
   memory_off: 'memory.memoryOff', no_match: 'memory.noMatch', no_candidate: 'memory.noCandidate',
-  declined: 'memory.declined', noted: 'memory.noted' };
+  declined: 'memory.declined', noted: 'memory.noted', applied_before: 'memory.appliedBefore' };
 
-// One action's lines: a saved or updated record's own text, read back from it; else the action in words.
+// One action's lines: a saved or updated record's own text, read back from it (and what an update replaced, while that
+// version is kept); a forget of the records the message's words named, said so; else the action in words.
 export function actionLines(t, item) {
   const key = MEMORY_ACTIONS[item.action];
   if (!key) return [];
   if ((item.action === 'saved' || item.action === 'updated') && item.records?.length) {
-    return item.records.map((record) => t(key, { content: record.content }));
+    return item.records.map((record) => (item.action === 'updated' && record.replaced != null
+      ? t('memory.updatedFrom', { content: record.content, replaced: record.replaced })
+      : t(key, { content: record.content })));
   }
   if (item.action === 'saved' || item.action === 'updated') return [t(`${key}Live`)];
+  if (item.action === 'forgotten' && item.named) return [t('memory.forgottenNamed', { count: item.count ?? 0 })];
+  if (item.action === 'applied_before' && item.of) { // a forget cut short: how many of those chosen went
+    return [t('memory.appliedBeforePart', { count: item.count ?? 0, of: item.of })];
+  }
   return [t(key, { count: item.count ?? 0 })];
 }
 
@@ -49,9 +57,17 @@ export function fillComposer(text) {
 
 export const readLeftOff = (projectId) => get(`/api/projects/${encodeURIComponent(projectId)}/left-off`);
 export const readMemory = (projectId) => get(`/api/memory${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`);
-export const changeRecord = (record, body) => patch(`/api/memory/${encodeURIComponent(record.id)}`, { version: record.version, ...body });
-export const forgetRecord = (record) => del(`/api/memory/${encodeURIComponent(record.id)}?version=${record.version}`);
+// projectId: the project the change is made from (a personal record changes only from a Normal, unlocked one)
+export const changeRecord = (record, body, projectId) => patch(`/api/memory/${encodeURIComponent(record.id)}`,
+  { version: record.version, project_id: projectId ?? null, ...body });
 export const review = (body) => post('/api/memory/review', body);
+// Forget at the version shown, with the delete dialog's choice (everywhere: also from the backups). A forget that could
+// not finish everything (older backups not replaced) throws what it must still say, so that is kept as a failure's
+// notice is, outside the views (MB1), and every view reads again (M2 audit area 4, batch 1).
+export async function forgetRecord(record, everywhere = false) {
+  const said = deletionNotices(await del(deletePath('memory', record.id, { version: record.version, everywhere })));
+  if (said.length) throw Object.assign(new Error('not wholly forgotten'), { notices: said });
+}
 
 // A memory action from the views: null once done, else what was not saved: the error in words and its code, whether it
 // was an edit (edit), and the record it was for (id). Never the text typed: that stays in its open editor (MB1, Q16).
@@ -60,6 +76,7 @@ export async function attempt(t, action, edit = false, id = null) {
     await action();
     return null;
   } catch (error) {
+    if (error?.notices) return { problem: error.notices.map((key) => t(key)).join(' '), code: 'forgotten', edit: false, id };
     const code = error instanceof ApiError ? error.code : 'internal';
     return { problem: errorText(t, code), code, edit: Boolean(edit), id };
   }
@@ -68,7 +85,8 @@ export async function attempt(t, action, edit = false, id = null) {
 // Whether the views read again after an action: always, but for a failure the server gives only before any write
 // (nothing changed: the view, and its open editor, stay as they are). A record changed meanwhile, or an outcome unknown
 // (a dropped connection, an error after a commit), reads again, which closes the editor, with the notice.
-const REFUSED_BEFORE_WRITING = new Set(['personal_from_strict', 'invalid_request', 'empty', 'not_confirmable']);
+const REFUSED_BEFORE_WRITING = new Set(['personal_from_strict', 'invalid_request', 'empty', 'not_confirmable',
+  'not_editable']);
 export const readsAgain = (failed) => !failed || !REFUSED_BEFORE_WRITING.has(failed.code);
 
 // What an action could not save, kept by view and project (`settings:<project>`, `leftOff:<project>`) outside the

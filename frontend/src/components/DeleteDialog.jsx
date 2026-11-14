@@ -11,8 +11,11 @@ import { useAction } from '../action.js';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 
-// target: { kind: "project", "conversation" or "material", id, title, body }, or null when closed.
-export function DeleteDialog({ target, onClose, onDone }) {
+// target: { kind: "project", "conversation", "material" or "memory", id, title, body }, or null when closed. A memory
+// record keeps no title in the record of its deletion, so it has no "Remove all trace". onDelete(everywhere), if given,
+// deletes in the dialog's place: the dialog closes at once and the caller owns the outcome, which outlives the dialog
+// (Forget in the memory views keeps it as their actions do, MB1).
+export function DeleteDialog({ target, onClose, onDone, onDelete }) {
   const t = useT();
   const traceId = useId();
   const [removeAllTrace, setRemoveAllTrace] = useState(false);
@@ -26,6 +29,11 @@ export function DeleteDialog({ target, onClose, onDone }) {
   }, [key]);
 
   async function remove(everywhere) {
+    if (onDelete) {
+      onClose();
+      onDelete(everywhere);
+      return;
+    }
     const result = await run(() => api('DELETE', deletePath(target.kind, target.id, { everywhere, removeAllTrace })));
     if (!result) return;
     const said = deletionNotices(result);
@@ -57,7 +65,7 @@ export function DeleteDialog({ target, onClose, onDone }) {
         ) : (
           <>
             <p className="text-sm leading-relaxed text-muted-foreground">{t('delete.retention')}</p>
-            <details className="group rounded-md border px-3 py-2 text-sm">
+            {shown.current?.kind !== 'memory' && <details className="group rounded-md border px-3 py-2 text-sm">
               <summary className="cursor-pointer select-none font-medium">{t('delete.details')}</summary>
               <div className="mt-2 flex items-start gap-2.5">
                 <input id={traceId} type="checkbox" checked={removeAllTrace} disabled={busy}
@@ -68,7 +76,7 @@ export function DeleteDialog({ target, onClose, onDone }) {
                   <span className="text-xs text-muted-foreground">{t('delete.removeAllTraceHint')}</span>
                 </label>
               </div>
-            </details>
+            </details>}
             {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
             {busy && <p role="status" className="text-sm text-muted-foreground">{t('backups.working')}</p>}
             <DialogFooter className="gap-2 sm:gap-0">

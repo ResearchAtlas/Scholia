@@ -1327,6 +1327,8 @@
   "memory.dismiss": "Dismiss",
   "memory.confirm": "Confirm",
   "memory.forget": "Forget",
+  "memory.forgetTitle": "Forget this memory record?",
+  "memory.forgetBody": "Forget deletes its content: {content}",
   "memory.keep": "Keep",
   "memory.contentLabel": "The record's text",
   "memory.older": "Older than the current record",
@@ -1341,10 +1343,17 @@
   "memory.savedLive": "Saved to memory",
   "memory.updated": "Updated in memory: {content}",
   "memory.updatedLive": "Updated in memory",
+  "memory.updatedFrom": "Updated in memory: {content} (it replaced: {replaced})",
   "memory.forgotten": {
     "one": "Forgot {count} memory record",
     "other": "Forgot {count} memory records"
   },
+  "memory.forgottenNamed": {
+    "one": "Forgot the memory record your message names",
+    "other": "Forgot the {count} memory records your message names"
+  },
+  "memory.appliedBefore": "This memory command was carried out when the message was first sent, so nothing more changed.",
+  "memory.appliedBeforePart": "This forget ran when the message was first sent and forgot {count} of the {of} memory records it chose. Continue does not forget again: to forget the others, say so in a new message or use Settings, then Advanced.",
   "memory.memoryOff": "Memory is off in this project, so nothing was saved, changed or forgotten.",
   "memory.noMatch": "No memory record matched, so nothing changed.",
   "memory.noCandidate": "There was no earlier answer to save.",
@@ -1376,7 +1385,7 @@
   "ask.memory_update.body": "Type the new text: it replaces the record below as a new version.",
   "ask.memory_update.option.not_now": "Not now",
   "ask.memory_forget.question": "Forget these memory records?",
-  "ask.memory_forget.body": "Forget deletes their content.",
+  "ask.memory_forget.body": "Forget deletes their content. Deleted data stays in Scholia's automatic backups until they are replaced, about five weeks; forgetting a record under Settings, then Advanced, can also remove it from them.",
   "ask.memory_forget.option.forget": "Forget",
   "ask.memory_forget.option.not_now": "Not now",
   "ask.kindName.memory_save": "saving to memory",
@@ -1402,6 +1411,7 @@
   "errors.version_changed": "This record changed since it was shown. Look again.",
   "errors.out_of_date": "The record this would replace changed, so it is marked out of date.",
   "errors.not_confirmable": "What's done and the agent's notes are never confirmed.",
+  "errors.not_editable": "What's done is written from your library's own records, so it cannot be edited. You can forget it.",
   "errors.invalid_scope": "Only profile and preference records are personal.",
   "errors.empty": "The text is empty.",
   "audit.event.memory_allowance_notice": "Memory extraction skipped for its allowance (noticed once)",

@@ -168,15 +168,60 @@ def personal_allowed(conn, project_id):
 
 def allowed(conn, project_id, record_ids, versions=None):
     """Whether every one of these records may still be in a request of project_id (section 10, at dispatch): it exists,
-    is current (never superseded: an edit since it was assembled means its old text may not leave; a proposal's edit
-    takes its next version: versions, {id: version} as the request held them, names it), and is valid there now (its
-    scope, the request's project's lock, its papers)."""
+    is current (never superseded by the researcher: an edit, Keep or command since it was assembled means its old text
+    may not leave; a proposal's edit takes its next version: versions, {id: version} as the request held them, names
+    it), and is valid there now (its scope, the request's project's lock, its papers). A record an extraction replaced
+    on its own since stays allowed: the request keeps the version it read (M2 audit area 4, item 5). An extraction
+    never changes a record in place (it writes new versions only, apply_extraction), so a held version changed in place
+    since is always the researcher's change, and refused (design review N, Option 1)."""
     for record in record_ids:
         found = row(conn, record)
-        if found is None or found["status"] == "superseded" or not valid(conn, project_id, found):
+        if found is None or not valid(conn, project_id, found) or (
+                found["status"] == "superseded" and not _replaced_automatically(conn, record)):
             return False
         if versions and versions.get(record, found["version"]) != found["version"]:
             return False
+    return True
+
+
+def _automatic(record):
+    """Whether a record's version is an extraction's own (section 8's automatic replacement, its confirmation of what
+    was only proposed or inferred, each a new version): marked so in the record when the extraction writes it (a
+    deletion of its run or turn erases nothing of that), and changed in place by the researcher since at no time (a
+    Keep or an edit stamps `researcher_at`; only the researcher changes a record in place). An edit or a command writes
+    an unmarked version (M2 audit area 4, items 3 and 5; batch 1; design review N)."""
+    return bool(record["structured"].get("extracted")) and not record["structured"].get("researcher_at")
+
+
+def _replaced_automatically(conn, record):
+    """Whether every version that replaced a superseded record is an extraction's own (_automatic)."""
+    seen = set()
+    while record not in seen:
+        seen.add(record)
+        newer = conn.execute("SELECT id FROM memory_records WHERE supersedes_id = ? AND status != 'proposed'"
+                             " ORDER BY version DESC LIMIT 1", (record,)).fetchone()
+        found = row(conn, newer[0]) if newer else None
+        if found is None or not _automatic(found):
+            return False
+        if found["status"] != "superseded":
+            return True
+        record = found["id"]
+    return False
+
+
+def _left_alone(conn, target, since):
+    """Whether the researcher has not changed a record since an extraction started then (section 8's third condition):
+    no version of it, the current one or one it replaced, was written by the researcher since or changed by the
+    researcher in place since (a Keep, an edit of a proposal); an extraction's own write is no change of theirs (M2
+    audit area 4, item 3; batch 1). A version last changed before then holds nothing later, nor do those before it."""
+    current, seen = target, set()
+    while current is not None and current["updated_at"] > since and current["id"] not in seen:
+        seen.add(current["id"])
+        if current["created_at"] > since and not current["structured"].get("extracted"):
+            return False
+        if (current["structured"].get("researcher_at") or "") > since:
+            return False
+        current = row(conn, current["supersedes_id"]) if current["supersedes_id"] else None
     return True
 
 
@@ -250,15 +295,18 @@ def _dict(conn, found, with_sources=True):
 
 def listing(conn, project_id=None, statuses=None):
     """{"personal": [...], "project": [...]}: the records the memory views show, newest first; project records of
-    project_id only."""
+    project_id only; personal proposals only where they may be kept (personal_allowed)."""
     statuses = statuses or ("confirmed", "inferred", "proposed")
     rows = conn.execute(
         f"SELECT {_COLUMNS} FROM memory_records WHERE status IN (SELECT value FROM json_each(?))"
         " AND (scope = 'personal' OR project_id = ?) ORDER BY updated_at DESC, rowid DESC",
         (json.dumps(list(statuses)), project_id)).fetchall()
     found = {"personal": [], "project": []}
+    personal = personal_allowed(conn, project_id)
     for item in rows:
         record = _dict(conn, item)
+        if record["scope"] == "personal" and record["status"] == "proposed" and not personal:
+            continue
         found[record["scope"]].append(record)
     return found
 
@@ -266,9 +314,10 @@ def listing(conn, project_id=None, statuses=None):
 def edit(conn, record, version, *, content=None, confirm=False):
     """The researcher's change to a record at the version they saw (the memory views, Things to confirm). A pending
     proposal takes the new content and is kept (keep). An active record gets a new version that replaces it, with
-    content (or the same content), confirmed; progress and agent notes stay inferred (never confirmed). Raises
-    LookupError, or ValueError: "changed" when it is not at that version any more (or superseded), or "not_confirmable".
-    None when a proposal is out of date (keep)."""
+    content (or the same content), confirmed; progress and agent notes stay inferred (never confirmed). Progress takes
+    no new text: it is drawn and counted from AAB's own records, so an edit would be neither shown nor kept (M2 audit
+    area 4, item 7). Raises LookupError, or ValueError: "changed" when it is not at that version any more (or
+    superseded), "not_confirmable" or "not_editable". None when a proposal is out of date (keep)."""
     old = row(conn, record)
     if old is None:
         raise LookupError(record)
@@ -277,13 +326,21 @@ def edit(conn, record, version, *, content=None, confirm=False):
     code_written = old["type"] in ("progress", "agent_note")
     if code_written and confirm:
         raise ValueError("not_confirmable")
+    if old["type"] == "progress" and content is not None:
+        raise ValueError("not_editable")
     if old["status"] == "proposed":
         if content is not None and content != old["content"]:
             # its next version, under the same id (Forget, the late rule and revocation follow the id): a request that
             # held the old text names the version it held, and is refused at dispatch (allowed)
-            conn.execute("UPDATE memory_records SET content = ?, version = version + 1, updated_at = ? WHERE id = ?",
-                         (content, utc_now(), record))
-        return keep(conn, record, None)
+            now = utc_now()  # the researcher's change in place, stamped (_left_alone)
+            conn.execute("UPDATE memory_records SET content = ?, version = version + 1, updated_at = ?, structured ="
+                         " json_set(coalesce(structured, '{}'), '$.researcher_at', ?) WHERE id = ?",
+                         (content, now, now, record))
+        kept = keep(conn, record, None)
+        if kept is not None:  # kept in the views or on the card: the views are a source of it, past its conversations
+            conn.execute("INSERT OR IGNORE INTO memory_sources (memory_id, source_kind, source_id) VALUES (?,"
+                         " 'researcher', 'views')", (kept,))
+        return kept
     structured = {k: v for k, v in old["structured"].items() if k in ("kind", "event", "count", "date")}
     return write(conn, project_id=old["project_id"], scope=old["scope"], kind=old["type"],
                  content=content if content is not None else old["content"],
@@ -293,9 +350,13 @@ def edit(conn, record, version, *, content=None, confirm=False):
 
 
 def keep(conn, proposal, version, edited=False):
-    """Keep (confirm) a proposal: it replaces the record it names (supersedes_id) only if that record is still at
-    the version the proposal saw; else it stays proposed and is marked out of date (section 8), in this transaction, and
-    None is returned. Returns its id, or raises LookupError or ValueError("changed")."""
+    """The researcher's Keep (confirm) of a proposal, in place (the views, the card, a Save command): it replaces the
+    record it names (supersedes_id) only if that record is still at the version the proposal saw; else it stays
+    proposed and is marked out of date (section 8), in this transaction, and None is returned. Returns its id, or raises
+    LookupError or ValueError("changed"). Stamped `researcher_at` (the researcher's change, _left_alone and _automatic).
+    It writes no source: the caller that knows who acts does (edit, for the views; the command's turn, for a Save;
+    design review K, Option 2A). An extraction never calls it: it confirms a proposal as the proposal's next version
+    (apply_extraction; design review N, Option 1)."""
     found = row(conn, proposal)
     if found is None or found["status"] != "proposed":
         raise LookupError(proposal)
@@ -320,10 +381,9 @@ def keep(conn, proposal, version, edited=False):
     # its next version, past both its own and the replaced record's (PR 51: a view that showed it before is stale)
     version = max(found["version"], current[1] if target is not None else 0) + 1
     structured = {k: v for k, v in found["structured"].items() if k not in ("out_of_date", "older", "seen", "source")}
+    structured["researcher_at"] = now
     conn.execute("UPDATE memory_records SET status = 'confirmed', structured = ?, version = ?, updated_at = ? WHERE id = ?",
                  (json.dumps(structured) if structured else None, version, now, proposal))
-    conn.execute("INSERT OR IGNORE INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'researcher', 'views')",
-                 (proposal,))
     if found["type"] in RECALLED:
         conn.execute("INSERT INTO index_queue (target, target_id, project_id, op) VALUES ('memory', ?, ?, 'add')",
                      (proposal, found["project_id"]))
@@ -363,12 +423,14 @@ def save_command(conn, *, project_id, run_id, action, text, replaces=None):
         same = [r for r in in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"))
                 if normalized(r["content"]) == normalized(text) and (r["scope"] == "project" or personal_allowed(conn, project_id))]
         if same and same[0]["status"] == "confirmed":
+            restated(conn, same[0]["id"], run_id)
             return "saved", [same[0]["id"]]
         if same and same[0]["status"] == "proposed" and (same[0]["scope"] == "project" or _normal(
                 conn, same[0]["project_id"])):  # the researcher's own words keep a pending proposal (a personal one
             # only while its own project is Normal and unlocked: the database refuses the rest, migration 0008)
             kept = keep(conn, same[0]["id"], None)
             if kept is not None:
+                restated(conn, kept, run_id)
                 return "saved", [kept]
         if same and same[0]["status"] == "proposed":
             same = []  # out of date, or not to be kept from here: saved as its own record below
@@ -378,6 +440,14 @@ def save_command(conn, *, project_id, run_id, action, text, replaces=None):
     record = write(conn, project_id=project_id, scope=scope, kind=kind, content=text, status="confirmed",
                    sources=sources, run_id=run_id, replaces=replaces, structured={"command": action})
     return ("updated" if replaces and action != "save" else "saved"), [record]
+
+
+def restated(conn, record, turn):
+    """A turn whose researcher states a record again is one of its sources too (ticket 31: linked to its source turns),
+    so the record goes only with its last one (ticket 14), and the latest turn behind it is that one (section 8)."""
+    if turn is not None:
+        conn.execute("INSERT OR IGNORE INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'turn', ?)",
+                     (record, turn))
 
 
 def forget_candidates(conn, project_id, text=None, previous=None):
@@ -392,9 +462,23 @@ def forget_candidates(conn, project_id, text=None, previous=None):
     return [(1.0, r) for r in (made or in_scope(conn, project_id, kinds=TYPES)[:1])][:3]
 
 
-def clear(scored):
-    """Whether a forget with text names one record clearly: much like it, or the only one fairly like it."""
-    return bool(scored) and (scored[0][0] >= 0.6 or (len(scored) == 1 and scored[0][0] >= 0.4))
+def named(conn, project_id, text):
+    """The records a forget's words name exactly (normalized, as a save command matches its record, a closing period or
+    the like aside): only these are forgotten without an ask; a forget whose words are only like a record asks first
+    (M2 audit area 4, item 1)."""
+    def plain(words):  # a sentence's closing punctuation aside (batch 1)
+        return normalized(words).rstrip(" .。!！;；,，…")
+    return [r for r in in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"), kinds=TYPES)
+            if plain(r["content"]) == plain(text)]
+
+
+def replaced(conn, record):
+    """{"replaced": the text an update or correction command replaced}, while that version is kept, else {}: the
+    conversation shows which record the command's words chose (M2 audit area 4, item 1)."""
+    if record["structured"].get("command") not in ("update", "correct") or not record["supersedes_id"]:
+        return {}
+    found = conn.execute("SELECT content FROM memory_records WHERE id = ?", (record["supersedes_id"],)).fetchone()
+    return {"replaced": found[0]} if found else {}
 
 
 def previous_answer(conn, conversation_id, run_id):
@@ -432,10 +516,17 @@ def save_answer(conn, *, project_id, run_id, previous, text=None):
 # Extraction
 
 
+def _said(conn, turn, message):
+    """The researcher's words in a turn: its message, then the steering notes its steps read, which are their own words
+    too (Harold's decision of 2026-11-11, as assembly, compaction and Continue read them; M2 audit area 4, item 9)."""
+    from backend import budgets  # it imports backend.runs, which imports this module
+    return "\n\n".join([(json.loads(message) or {}).get("text", ""), *budgets.read_notes(conn, turn)])
+
+
 def extraction_input(conn, run_id):
-    """What an extraction run's request holds, read now: (the researcher's message, the delivered answer, the turn's
-    author, the related records [(id, type, status, content)], the papers they and the answer carry), or None when
-    the source turn is gone."""
+    """What an extraction run's request holds, read now: (the researcher's message and the notes its steps read, the
+    delivered answer, the turn's author, the related records [(id, type, status, content)], the papers they and the
+    answer carry), or None when the source turn is gone."""
     from backend import provenance
     found = conn.execute(
         "SELECT t.user_message, t.answer, t.author, r.project_id, t.run_id FROM runs r JOIN turns t"
@@ -443,12 +534,13 @@ def extraction_input(conn, run_id):
     if found is None:
         return None
     message, answer, author, project_id, turn = found
+    message = _said(conn, turn, message)
     related = [r for r in in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"))
                if valid(conn, project_id, r)][:RELATED]  # as recall: none it may not be shown
     held = set(provenance.dependencies(conn, turn))
     for record in related:
         held |= {i for k, i in sources_of(conn, record["id"]) if k == "material"}
-    return ((json.loads(message) or {}).get("text", ""), (json.loads(answer or "{}") or {}).get("text", ""), author,
+    return (message, (json.loads(answer or "{}") or {}).get("text", ""), author,
             [(r["id"], r["type"], r["status"], r["content"], r["version"]) for r in related], sorted(held))
 
 
@@ -549,12 +641,14 @@ def _head(conn, record):
 
 
 def apply_extraction(conn, run_id, candidates):
-    """An extraction's effect, in its terminal transaction (section 8): each candidate capped (cap), a duplicate of
-    an active or pending record dropped, and one that names a record it replaces (or, confirmed, conflicts with)
-    replacing it only when it is at least as authoritative, its source turn came after the latest turn behind that
-    record, and the researcher has not changed the record since the extraction started; else it waits as a proposal
-    naming the record (older when its turn came first). After a later explicit command in the scope it stores
-    proposals only. Nothing when its source turn is gone. Returns the counts, or None."""
+    """An extraction's effect, in its terminal transaction (section 8): each candidate capped (cap), a duplicate of an
+    active or pending record not stored again (the researcher's restatement is a source of it, and confirms it when it
+    was only proposed or inferred and that is eligible as a replacement is, as its next version: PR 62 batches 3 and 4),
+    and one that names a record it replaces (or, confirmed, conflicts with) replacing it only when it is at least as
+    authoritative, its source turn came after the latest turn behind that record, and the researcher has not changed the
+    record since the extraction started; else it waits as a proposal naming the record (older when its turn came first).
+    After a later explicit command in the scope it stores proposals only. Nothing when its source turn is gone. Returns
+    the counts, or None."""
     from backend import provenance
     found = conn.execute(
         "SELECT t.user_message, t.author, r.project_id, t.run_id, s.started_at, r.started_at FROM runs r"
@@ -563,7 +657,7 @@ def apply_extraction(conn, run_id, candidates):
     if found is None:
         return None
     message, author, project_id, turn, turn_started, run_started = found
-    message = (json.loads(message) or {}).get("text", "")
+    message = _said(conn, turn, message)
     late_project = _command_since(conn, project_id, turn_started)
     late_anywhere = _command_since(conn, project_id, turn_started, anywhere=True)
     # every paper its request carried text of (the answer's, and the related records' it was shown), registered as
@@ -598,14 +692,30 @@ def apply_extraction(conn, run_id, candidates):
         # researcher's words are written here as their own record)
         if same is not None:
             counts["duplicates"] += 1
-            if same["status"] == "proposed" and status == "confirmed" and not late and not same["supersedes_id"] \
-                    and (same["scope"] == "project" or personal):  # never a personal one from a stricter project
-                keep(conn, same["id"], None)  # the researcher's own words confirm what was only proposed
-            continue
+            late = late_anywhere if same["scope"] == "personal" else late_project
+            # raising its authority is an automatic replacement too, so it takes section 8's conditions as a replacement
+            # does: its source turn after the latest turn behind the record (read before this turn joins it), and no
+            # change of the researcher's since the extraction started (PR 62 batch 3); never a personal one from a
+            # stricter project
+            eligible = status == "confirmed" and not late and (same["scope"] == "project" or personal) \
+                and turn_started > _latest_turn(conn, same) and _left_alone(conn, same, run_started)
+            if own and (same["scope"] == "project" or personal):  # the researcher said it again: this turn is a
+                restated(conn, same["id"], turn)  # source of it too, a personal one's only from a Normal, unlocked
+                # project (item 2; Harold's decision of 2026-10-23, point 1)
+            # the researcher's own words confirm what was only inferred, or only proposed (and replaces nothing), as its
+            # next version: an extraction writes new versions only, never a record in place (design review N, Option 1)
+            if eligible and (same["status"] == "inferred"
+                             or same["status"] == "proposed" and not same["supersedes_id"]):
+                written.append(write(conn, project_id=project_id, scope=same["scope"], kind=same["type"],
+                                     content=same["content"], status="confirmed", run_id=run_id,
+                                     sources=[*sources_of(conn, same["id"]), ("turn", turn), ("run", run_id)],
+                                     replaces=same["id"], structured={"source": "researcher", "extracted": True}))
+                counts["confirmed"] += 1
+            continue  # else it is left as it is, its restatement a source of it
         head = _head(conn, candidate["replaces"]) if candidate["replaces"] else None  # as the record stands now
         target = next((r for r in pending if r["id"] == head and r["status"] in ACTIVE and (
             r["scope"] == "project" or (personal and own))), None)  # a personal one: the researcher's own words only
-        structured = {"source": "researcher" if own else "answer"}
+        structured = {"source": "researcher" if own else "answer", "extracted": True}  # an extraction's (_automatic)
         sources = [("turn", turn), ("run", run_id)]  # a personal record carries no paper (point 1)
         if target is not None:
             if target["scope"] == "project":  # the papers it may carry text of, and those it was written from
@@ -616,7 +726,7 @@ def apply_extraction(conn, run_id, candidates):
                     status = "proposed"
             authoritative = status == "confirmed" or (status == "inferred" and target["status"] in ("inferred", "proposed"))
             newer = turn_started > _latest_turn(conn, target)
-            untouched = target["updated_at"] <= run_started
+            untouched = _left_alone(conn, target, run_started)
             if authoritative and newer and untouched and not late:
                 written.append(write(conn, project_id=project_id, scope=target["scope"], kind=target["type"],
                                      content=candidate["content"], status=status, sources=sources, run_id=run_id,
@@ -770,9 +880,13 @@ def materials_removed(conn, project_id, count):
 
 def proposals(conn, project_id):
     """Things to confirm: the pending proposals of the project's scope, newest first, each with the record it would
-    replace (its current content, when it is still there)."""
+    replace (its current content, when it is still there); a personal one only in a Normal, unlocked project, the only
+    kind it may be kept from (M2 audit area 4, item 4)."""
     found = []
+    personal = personal_allowed(conn, project_id)
     for record in in_scope(conn, project_id, statuses=("proposed",)):
+        if record["scope"] == "personal" and not personal:
+            continue
         full = row(conn, record["id"])
         target = row(conn, full["supersedes_id"]) if full["supersedes_id"] else None
         full["replaces"] = {"id": target["id"], "content": target["content"], "status": target["status"],
@@ -843,6 +957,7 @@ class NewRecord(BaseModel):
 
 
 class Change(BaseModel):
+    project_id: str | None = Field(default=None, max_length=64)  # the project the change is made from
     version: int
     content: str | None = Field(default=None, max_length=MAX_CONTENT)
     status: Literal["confirmed"] | None = None
@@ -870,9 +985,19 @@ def _refused(error):
 _CHANGE_ERRORS = {"changed": (409, "version_changed", "This record changed since it was shown; look again"),
                   "out_of_date": (409, "out_of_date", "The record this would replace changed; look again"),
                   "not_confirmable": (400, "not_confirmable", "Progress and the agent's notes are never confirmed"),
+                  "not_editable": (400, "not_editable", "Progress is written from the library's own records"),
                   "personal_from_strict": (400, "personal_from_strict",
                                            "Personal memory is written and changed only from a Normal, unlocked"
                                            " project")}
+
+
+def _from(conn, record, project_id):
+    """A personal record is edited, confirmed or kept only from a Normal, unlocked project, the one the request is made
+    from (Harold's decision of 2026-10-23, point 1), never judged by the project it was written in (M2 audit area 4,
+    item 4). Forget is allowed from anywhere."""
+    found = row(conn, record)
+    if found is not None and found["scope"] == "personal" and not personal_allowed(conn, project_id):
+        raise ValueError("personal_from_strict")
 
 
 def _on(state, project_id):
@@ -948,6 +1073,7 @@ async def change_memory(record_id: str, body: Change, request: Request):
             return _refused(Refused(400, "empty", "The record is empty"))
 
     def change(conn):
+        _from(conn, record_id, body.project_id)
         return edit(conn, record_id, body.version, content=content, confirm=body.status == "confirmed")
     try:
         record = await asyncio.to_thread(state["db"].write, change)
@@ -963,14 +1089,19 @@ async def change_memory(record_id: str, body: Change, request: Request):
 
 
 @router.delete("/api/memory/{record_id}")
-async def delete_memory(record_id: str, request: Request, version: int | None = None):
+async def delete_memory(record_id: str, request: Request, version: int | None = None, purge_backups: bool = False):
     """Forget: the record's content is deleted (with the versions it replaced), its vector removed, its audit record
     written without content, and the runs whose request holds it revoked. version: the one the view showed; a record
     changed or replaced since is not forgotten (409, as an edit at a stale version; S1-21a follow-up MB10). Without
-    it nothing is forgotten (400): which version was shown cannot be told (PR 51 review 1)."""
+    it nothing is forgotten (400): which version was shown cannot be told (PR 51 review 1). purge_backups: the delete
+    dialog's "Delete everywhere including backups" (ticket 18, Retention), as for a project, conversation or paper:
+    after the forget, a fresh backup and no older one; a request that goes away still purges."""
+    from backend import backups
+    from backend.runs import _through  # it imports this module
     state = request.app.state.scholia
     if version is None:
         return _refused(Refused(400, "invalid_request", "Name the version shown"))
+    project = []
 
     def shown(conn):
         found = row(conn, record_id)
@@ -978,13 +1109,30 @@ async def delete_memory(record_id: str, request: Request, version: int | None = 
             raise LookupError(record_id)
         if found["version"] != version or found["status"] == "superseded":
             raise ValueError("changed")
-    try:
+        project.append(found["project_id"])
+
+    async def forgetting():
         await _forget(state, record_id, check=shown)
+        if not purge_backups:
+            return {"ok": True}
+        try:
+            async with state["backups_lock"]:
+                purged = await asyncio.to_thread(backups.purge, state["db"], project[-1],
+                                                 {"kind": "memory", "object_id": record_id})
+        except Exception as error:  # forgotten all the same; the older backups keep it until they are replaced
+            import logging
+            logging.getLogger(__name__).warning("purging the backups after a forget failed (%s)", type(error).__name__)
+            purged = {"purge_failed": True}
+        return {"ok": True, **purged}
+    try:
+        done, cancelled = await _through(forgetting())
+        if cancelled:
+            raise asyncio.CancelledError()
+        return done
     except LookupError:
         return _refused(Refused(404, "not_found", "No such record"))
     except ValueError as error:
         return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
-    return {"ok": True}
 
 
 @router.get("/api/memory/review")
@@ -1035,6 +1183,7 @@ async def answer_review(body: Review, request: Request):
         found = row(conn, body.id)
         if found is None or found["status"] != "proposed":
             raise LookupError(body.id)
+        _from(conn, body.id, body.project_id)
         return edit(conn, body.id, body.version, content=content)
     try:
         record = await asyncio.to_thread(state["db"].write, answer)
