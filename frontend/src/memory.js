@@ -24,6 +24,9 @@ export function actionLines(t, item) {
   }
   if (item.action === 'saved' || item.action === 'updated') return [t(`${key}Live`)];
   if (item.action === 'forgotten' && item.named) return [t('memory.forgottenNamed', { count: item.count ?? 0 })];
+  if (item.action === 'applied_before' && item.of) { // a forget cut short: how many of those chosen went
+    return [t('memory.appliedBeforePart', { count: item.count ?? 0, of: item.of })];
+  }
   return [t(key, { count: item.count ?? 0 })];
 }
 

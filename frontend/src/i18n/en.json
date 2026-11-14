@@ -1353,6 +1353,7 @@
     "other": "Forgot the {count} memory records your message names"
   },
   "memory.appliedBefore": "This memory command was carried out when the message was first sent, so nothing more changed.",
+  "memory.appliedBeforePart": "This forget ran when the message was first sent and forgot {count} of the {of} memory records it chose. Continue does not forget again: to forget the others, say so in a new message or use Settings, then Advanced.",
   "memory.memoryOff": "Memory is off in this project, so nothing was saved, changed or forgotten.",
   "memory.noMatch": "No memory record matched, so nothing changed.",
   "memory.noCandidate": "There was no earlier answer to save.",

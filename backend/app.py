@@ -1163,7 +1163,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                                     | (memory.replaced(conn, r) if data.get("action") == "updated"
                                        and r["created_by_run_id"] == owner else {})  # only the update that replaced
                                     for r in found if r],
-                        **({"named": True} if data.get("named") else {})}  # forgotten: the records its words named
+                        **({"named": True} if data.get("named") else {}),  # forgotten: the records its words named
+                        **({"of": data["of"]} if data.get("of") else {})}  # Continue after a forget cut short
                 if item["action"] == "forgotten" and items and items[-1]["action"] == "forgotten":
                     items[-1]["count"] += item["count"]  # a forget's deletions, each recorded in its own commit: one item
                 else:

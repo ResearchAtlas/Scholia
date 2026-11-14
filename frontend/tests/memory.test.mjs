@@ -34,6 +34,14 @@ test('a forget by its words, what an update replaced and a command Continue sent
     records: [{ content: 'the sample is 35', replaced: 'the sample is 30' }] }),
     ['Updated in memory: the sample is 35 (it replaced: the sample is 30)']);
   assert.deepEqual(actionLines(t, { action: 'applied_before', count: 0 }), [t('memory.appliedBefore')]);
+  // batch 2 (design review K, Option 1A): Continue after a forget cut short says how many of those chosen went
+  assert.deepEqual(actionLines(t, { action: 'applied_before', count: 1, of: 3 }), [t('memory.appliedBeforePart',
+    { count: 1, of: 3 })]);
+  assert.match(actionLines(t, { action: 'applied_before', count: 1, of: 3 })[0], /forgot 1 of the 3 memory records/);
+  const zh = JSON.parse(readFileSync(join(SRC, 'i18n', 'zh-CN.json'), 'utf8'))['memory.appliedBeforePart'];
+  assert.ok(zh.includes('{count}') && zh.includes('{of}'));
+  assert.deepEqual(apply({}, { type: 'memory', action: 'applied_before', count: 1, of: 3 }).memory,
+    [{ action: 'applied_before', count: 1, of: 3 }]);
   // batch 1: a save of a record an earlier correction wrote replaced nothing itself
   assert.deepEqual(actionLines(t, { action: 'saved',
     records: [{ content: 'the sample is 35', replaced: 'the sample is 30' }] }),

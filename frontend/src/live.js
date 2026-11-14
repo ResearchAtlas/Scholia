@@ -41,7 +41,8 @@ export function apply(turn, event) {
     case 'tool_call': return { ...turn, tool: event.name }; // S1-19c: the tool the agent is using now
     case 'step': { const { tool, ...rest } = turn; return rest; } // the next model call: no tool is in use (CT3)
     case 'skill': return { ...turn, skills: [...(turn.skills ?? []), event.name] };
-    case 'memory': return { ...turn, memory: [...(turn.memory ?? []), { action: event.action, count: event.count }] }; // S1-21a
+    case 'memory': return { ...turn, memory: [...(turn.memory ?? []), { action: event.action, count: event.count,
+      ...(event.of ? { of: event.of } : {}) }] }; // S1-21a; of: a forget cut short, said on Continue (design review K)
     // S1-33: a step carried steering notes, a message joined the queue, or a settlement reached a budget notice: the
     // view reads the record again
     case 'steering_note': return { ...turn, steered: (turn.steered ?? 0) + 1 };
