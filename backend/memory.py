@@ -640,13 +640,13 @@ def _head(conn, record):
 
 
 def apply_extraction(conn, run_id, candidates):
-    """An extraction's effect, in its terminal transaction (section 8): each candidate capped (cap), a duplicate of
-    an active or pending record not stored again (the researcher's restatement is a source of it, and confirms it when
-    it was only proposed or inferred), and one that names a record it replaces (or, confirmed, conflicts with)
-    replacing it only when it is at least as authoritative, its source turn came after the latest turn behind that
-    record, and the researcher has not changed the record since the extraction started; else it waits as a proposal
-    naming the record (older when its turn came first). After a later explicit command in the scope it stores
-    proposals only. Nothing when its source turn is gone. Returns the counts, or None."""
+    """An extraction's effect, in its terminal transaction (section 8): each candidate capped (cap), a duplicate of an
+    active or pending record not stored again (the researcher's restatement is a source of it, and confirms it when it
+    was only proposed or inferred and that is eligible as a replacement is, PR 62 batch 3), and one that names a record
+    it replaces (or, confirmed, conflicts with) replacing it only when it is at least as authoritative, its source turn
+    came after the latest turn behind that record, and the researcher has not changed the record since the extraction
+    started; else it waits as a proposal naming the record (older when its turn came first). After a later explicit
+    command in the scope it stores proposals only. Nothing when its source turn is gone. Returns the counts, or None."""
     from backend import provenance
     found = conn.execute(
         "SELECT t.user_message, t.author, r.project_id, t.run_id, s.started_at, r.started_at FROM runs r"
