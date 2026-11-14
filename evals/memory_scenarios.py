@@ -130,7 +130,11 @@ def run(scenario):
                     return memory.apply_extraction(conn, names[s["extraction"]], candidates)
                 write(finish)
             elif op == "keep":
-                write(lambda conn, s=step: memory.keep(conn, _by_content(conn, s["content"]), None))
+                def kept(conn, s=step):  # the views' Keep (memory.edit), which adds the views as a source
+                    record = _by_content(conn, s["content"])
+                    version = conn.execute("SELECT version FROM memory_records WHERE id = ?", (record,)).fetchone()[0]
+                    return memory.edit(conn, record, version)
+                write(kept)
             elif op == "edit":
                 def edit(conn, s=step):
                     record = _by_content(conn, s["content"])

@@ -177,7 +177,8 @@ def allowed(conn, project_id, record_ids, versions=None):
         if found is None or not valid(conn, project_id, found) or (
                 found["status"] == "superseded" and not _replaced_automatically(conn, record)):
             return False
-        if versions and versions.get(record, found["version"]) != found["version"]:
+        if versions and versions.get(record, found["version"]) != found["version"] and not (
+                _automatic(found) and found["status"] != "proposed"):  # an extraction's own Keep is no change (R3)
             return False
     return True
 
@@ -334,7 +335,11 @@ def edit(conn, record, version, *, content=None, confirm=False):
             conn.execute("UPDATE memory_records SET content = ?, version = version + 1, updated_at = ?, structured ="
                          " json_set(coalesce(structured, '{}'), '$.researcher_at', ?) WHERE id = ?",
                          (content, now, now, record))
-        return keep(conn, record, None)
+        kept = keep(conn, record, None)
+        if kept is not None:  # kept in the views or on the card: the views are a source of it, past its conversations
+            conn.execute("INSERT OR IGNORE INTO memory_sources (memory_id, source_kind, source_id) VALUES (?,"
+                         " 'researcher', 'views')", (kept,))
+        return kept
     structured = {k: v for k, v in old["structured"].items() if k in ("kind", "event", "count", "date")}
     return write(conn, project_id=old["project_id"], scope=old["scope"], kind=old["type"],
                  content=content if content is not None else old["content"],
@@ -347,8 +352,9 @@ def keep(conn, proposal, version, edited=False, researcher=True):
     """Keep (confirm) a proposal: it replaces the record it names (supersedes_id) only if that record is still at
     the version the proposal saw; else it stays proposed and is marked out of date (section 8), in this transaction, and
     None is returned. Returns its id, or raises LookupError or ValueError("changed"). researcher: the researcher's Keep
-    (the views, the card, a command), stamped `researcher_at` with a source from the researcher; else an extraction's
-    own confirmation, which is automatic (_automatic; M2 audit area 4, batch 1)."""
+    (the views, the card, a command), stamped `researcher_at`; else an extraction's own confirmation, which is automatic
+    (_automatic; M2 audit area 4, batch 1). It writes no source: the caller that knows who acts does (edit, for the
+    views; the command's turn, for a Save; design review K, Option 2A)."""
     found = row(conn, proposal)
     if found is None or found["status"] != "proposed":
         raise LookupError(proposal)
@@ -377,9 +383,6 @@ def keep(conn, proposal, version, edited=False, researcher=True):
         structured["researcher_at"] = now
     conn.execute("UPDATE memory_records SET status = 'confirmed', structured = ?, version = ?, updated_at = ? WHERE id = ?",
                  (json.dumps(structured) if structured else None, version, now, proposal))
-    if researcher:
-        conn.execute("INSERT OR IGNORE INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'researcher',"
-                     " 'views')", (proposal,))
     if found["type"] in RECALLED:
         conn.execute("INSERT INTO index_queue (target, target_id, project_id, op) VALUES ('memory', ?, ?, 'add')",
                      (proposal, found["project_id"]))

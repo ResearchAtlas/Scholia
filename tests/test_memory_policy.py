@@ -1128,3 +1128,20 @@ async def test_personal_memory_is_never_edited_confirmed_or_kept_from_a_stricter
         edited = await client.patch(f"/api/memory/{record}", json={"project_id": normal, "version": 1,
                                                                     "content": "I prefer brief answers"})
         assert edited.status_code == 200 and edited.json()["scope"] == "personal"
+
+
+@pytest.mark.parametrize("by", ["extraction", "researcher"])
+async def test_an_extractions_own_keep_of_a_shown_proposal_is_no_change_at_dispatch(tmp_path, by):
+    # design review K's rider R3 (PR 62 batch 2): a sibling extraction that held a proposal at an earlier version is
+    # refused at dispatch only for a change of the researcher's, never for another extraction's own Keep
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+
+        def steps(conn):
+            proposal = memory.write(conn, project_id=project, scope="project", kind="decision",
+                                    content="We use interviews", status="proposed", sources=[("project", project)],
+                                    structured={"extracted": True})
+            held = {proposal: 1}  # the version the sibling's request held
+            memory.keep(conn, proposal, None, researcher=by == "researcher")
+            return memory.allowed(conn, project, [proposal], held)
+        assert await asyncio.to_thread(client.state["db"].write, steps) is (by == "extraction")

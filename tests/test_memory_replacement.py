@@ -395,3 +395,50 @@ async def test_an_extractions_replacement_stays_its_own_after_the_conversation_t
                                   " ORDER BY version") == [("The sample is 30 interviews", "superseded"),
                                                            ("The sample is 35 interviews", "confirmed")]
         assert await asyncio.to_thread(client.state["db"].read, lambda conn: memory.allowed(conn, project, [held]))
+
+
+# Design review K, Option 2A (PR 62 batch 2): the views are a source only of what was kept in the views; a Save that
+# confirms a pending proposal is the researcher's change (stamped) but goes with its last conversation (round 2, astra
+# pass 1 F1; ticket 14, "deleted with its only source")
+async def test_a_proposal_a_save_confirmed_goes_with_its_last_conversation(tmp_path):
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        first, second = await conversation_in(client, project), await conversation_in(client, project)
+
+        def proposed(conn):
+            _, run = _turn_and_extraction(conn, project, first, "We might use thirty interviews")
+            memory.apply_extraction(conn, run, [{"type": "project_state", "content": "We use thirty interviews",
+                                                 "status": "proposed", "span": "", "replaces": ""}])
+        await _in(client, proposed)
+        stream = await send(client, second, "Remember: we use thirty interviews")
+        assert {"type": "memory", "action": "saved", "count": 1} in stream
+        [(record, structured)] = await rows(client, "SELECT id, structured FROM memory_records"
+                                                    " WHERE type = 'project_state'")
+        assert json.loads(structured).get("researcher_at")  # the researcher's change
+        assert ("researcher", "views") not in await rows(
+            client, "SELECT source_kind, source_id FROM memory_sources WHERE memory_id = ?", record)
+        for conversation in (first, second):
+            assert (await client.delete(f"/api/conversations/{conversation}")).status_code == 200
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE id = ?", record) == [(0,)]
+
+
+async def test_a_proposal_kept_in_the_views_outlives_its_conversation(tmp_path):
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+
+        def proposed(conn):
+            _, run = _turn_and_extraction(conn, project, conversation, "We might use thirty interviews")
+            memory.apply_extraction(conn, run, [{"type": "project_state", "content": "We use thirty interviews",
+                                                 "status": "proposed", "span": "", "replaces": ""}])
+        await _in(client, proposed)
+        [(record, version)] = await rows(client, "SELECT id, version FROM memory_records WHERE type = 'project_state'")
+        kept = await client.post("/api/memory/review", json={"project_id": project, "id": record, "action": "keep",
+                                                              "version": version})
+        assert kept.status_code == 200, kept.text
+        assert (await client.delete(f"/api/conversations/{conversation}")).status_code == 200
+        assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", record) == [("confirmed",)]
+        assert await rows(client, "SELECT source_kind, source_id FROM memory_sources WHERE memory_id = ?", record) == [
+            ("researcher", "views")]
