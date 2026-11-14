@@ -361,15 +361,17 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         db.on_damage = damaged
         # S1-17: the index, checked against this database (the one before closed), before the background
         # runs start, so the index runs it records start with them.
-        await search.open_index(state, db)
+        await search.open_index(state, db, harness)
         try:
-            await (harness.recover() if kick else harness.recover(kick=False))
+            await harness.recover(kick=False)
         except BaseException:
             await harness.shutdown()
             raise
         state.update(db=db, content=content, gate=gate, harness=harness)
         state.pop("damaged", None)
         state.pop("damaged_code", None)
+        if kick:  # published before it starts anything: no run it starts meets a state without its gate
+            await harness.kick_background()
 
     @contextlib.asynccontextmanager
     async def lifespan(app):

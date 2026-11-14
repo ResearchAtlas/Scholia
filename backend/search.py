@@ -112,9 +112,10 @@ def identity(config):
             else pin["file"], "runtime": runtime, "dimensions": DIMENSIONS}
 
 
-async def open_index(state, db):
+async def open_index(state, db, harness=None):
     """Open the index for db (at launch, and again on the database a restore puts in place), closing
-    the one before; the index closes with db (Database.closing). Index runs are requested (recorded
+    the one before; the index closes with db (Database.closing), and asks its runs of harness, db's own (None: nothing is
+    asked, as an index opened on its own in a test). Index runs are requested (recorded
     unstarted: the app's background runs start them, backups.start_background, never before) for every
     project with queue rows left to apply, and, while the model is installed, every project whose index
     has passages without embeddings, or every project with papers when the vectors are wanted again
@@ -139,14 +140,16 @@ async def open_index(state, db):
         return
     db.closing.append(index.close)  # a restore under way or abandoned, or shutdown: nothing outlives db
     state["index"] = index
-    state["model_installed"] = lambda: asyncio.ensure_future(_embed_all(state))
+    # The model's install (a download or an import) and a rebuild's end ask this index's runs of its own harness, never
+    # one looked up later (a restore replaces both)
+    state["model_installed"] = asked = lambda: asyncio.ensure_future(_embed_all(state, index, harness))
     loop = asyncio.get_running_loop()
 
     def rebuilt():  # rows made outside an index run (in the writer): a file rebuilt while the app runs, or the
         # queue applied after a failed pass; the projects whose passages lack embeddings get their runs
         if _installed(state):
             try:
-                loop.call_soon_threadsafe(state["model_installed"])
+                loop.call_soon_threadsafe(asked)
             except RuntimeError:  # the app stopped meanwhile: the next launch requests the runs
                 pass
     index.rebuilt = rebuilt
@@ -317,36 +320,34 @@ def _memory_done(index, records):
         {m: digest(content) for m, (_, content) in records.items()})
 
 
-async def _embed_all(state):
-    """The model was just installed, or rows were made outside an index run (index.rebuilt): a run is requested for
-    every project whose index has passages without embeddings, or whose memory records lack vectors. The harness is the
-    one published when this runs, and only once it is this index's database's, its background runs have started and it
-    admits: before (a launch, a restore before its commit, a restore that stopped its work and may not go ahead), the
-    runs are recorded unstarted in that database, as open_index records the launch's, and start with its background
-    runs (backups.start_background, or Harness.resume), never before."""
-    index, harness = state.get("index"), state.get("harness")
-    if index is None or index.closed:
+async def _embed_all(state, index, harness):
+    """The model was just installed, or rows were made outside an index run (index.rebuilt): a run is requested of the
+    index's own harness for every project whose index has passages without embeddings, or whose memory records lack
+    vectors. While that harness cannot start runs (its background runs not started yet: a launch, or a restore before its
+    commit; or stopped: a restore that may not go ahead), nothing is read or written: the ask waits on the harness, and
+    its kick asks again (Harness.kick_background). Decided in one step, with no await between the look and the wait; a
+    request refused because the harness stopped meanwhile waits the same way. No run is recorded here (design review L,
+    Option A)."""
+    if harness is None or index.closed:
+        return
+
+    def again():
+        return _embed_all(state, index, harness)
+    if not harness.kicked or harness.registry.closed:
+        harness.asks_after_kick["all"] = again
         return
     try:
         projects = await asyncio.to_thread(index.unembedded) | await asyncio.to_thread(_memory_pending, index)
-    except Exception as error:
+    except Exception as error:  # a whole rebuild: its end asks (index.rebuilt)
         log.warning("index runs after the model's install could not be requested (%s)", type(error).__name__)
-        return
-    if harness is None or harness.db is not index.db or not harness.kicked or harness.registry.closed:
-        def recorded(conn):
-            for project in sorted(projects):
-                if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project,)).fetchone():
-                    request_run(conn, project, lambda conn, project, inputs: _insert_run(conn, None, project, inputs))
-        try:
-            await asyncio.to_thread(index.db.write, recorded)
-        except Exception as error:  # its database closed meanwhile (a restore abandoned): its next start asks
-            log.warning("index runs for a database still starting could not be recorded (%s)", type(error).__name__)
         return
     for project in sorted(projects):  # each on its own: one that fails leaves the others asked for
         try:
             await _request(harness, project)
         except Exception as error:
             log.warning("an index run after the model's install could not be requested (%s)", type(error).__name__)
+            if harness.registry.closed:  # stopped meanwhile: asked again if it starts its runs again (Harness.resume)
+                harness.asks_after_kick["all"] = again
 
 
 async def embed_memory_soon(state, project_id):
