@@ -1172,10 +1172,10 @@ async def test_a_conversation_deleted_between_reservation_and_dispatch_sends_not
         cleaning, release = threading.Event(), threading.Event()
         real = ContentStore.collect_garbage
 
-        def slow_cleanup(self, *args):  # the deletion has committed; its cleanup is slow
+        def slow_cleanup(self, *args, **kwargs):  # the deletion has committed; its cleanup is slow
             cleaning.set()
             release.wait(5)
-            return real(self, *args)
+            return real(self, *args, **kwargs)
 
         monkeypatch.setattr(ContentStore, "collect_garbage", slow_cleanup)
         deletion = asyncio.create_task(client.delete(f"/api/conversations/{conversation}"))

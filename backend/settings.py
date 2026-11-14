@@ -163,6 +163,9 @@ PERSONAL = {
     **{("limits", k): spec for k, spec in _LIMITS.items()},
     **{("context", k): spec for k, spec in _CONTEXT.items()},
     **{("retrieval", k): spec for k, spec in _RETRIEVAL.items()},
+    # The Zotero switch (zotero.enabled: on unless false), which the Settings page saves: defined, so a full backup
+    # keeps it (known_only; M2 audit 6 F2). Matched before the open section below.
+    ("zotero", "enabled"): (None, _flag),
     # No defined shape yet: a table at the root, returned as given. "**" matches below it.
     ("zotero", "**"): (None, None),
     ("discovery", "**"): (None, None),

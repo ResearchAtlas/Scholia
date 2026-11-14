@@ -125,7 +125,7 @@ class Database:
 
     Opening checks an existing file read-only (a newer schema is refused and
     quick_check must pass), then migrates it on the writer thread, taking a
-    backup before each migration unless the database is new and empty.
+    backup before its first migration unless the database is new and empty.
     """
 
     def __init__(self, data_dir, *, migrations=MIGRATIONS):
@@ -265,17 +265,19 @@ class Database:
         return generation
 
     def backup_if_due(self, now=None):
-        """Back up unless the latest backup is less than a day old. Returns the folder or None.
+        """Back up unless a daily backup is stamped within the last day. Returns the folder or None.
 
-        Retention runs either way, so a rotation an earlier backup could not
-        finish is retried.
+        Any of them, not only the newest by name: one stamped ahead of the clock
+        is never less than a day old, and would make every check take a backup
+        (design review H, B10). Retention runs either way, so a rotation an
+        earlier backup could not finish is retried.
         """
         _refuse_event_loop()
         now = now or datetime.now(UTC)
         with self._backup_lock:
-            latest = _generations(self.backups_dir / "daily")[-1:]
-            if latest and timedelta(0) <= now - _stamp_of(latest[0]) < timedelta(days=1):
-                self._apply_retention()
+            if any(timedelta(0) <= now - _stamp_of(generation) < timedelta(days=1)
+                   for generation in _generations(self.backups_dir / "daily")):
+                self._apply_retention(now=now)
                 return None
             generation = self._backup(now)
         self._retry_truncation()
@@ -421,10 +423,11 @@ class Database:
             if _switch_to_wal(conn) != "wal":
                 raise RuntimeError("the database could not switch to WAL mode")
             new = None  # whether this startup found a new, empty database
+            backed_up = False
             while True:
                 # Decide under the write lock, so migrations another connection applied
                 # meanwhile are seen and not run again. The backup then copies exactly
-                # the state the migration starts from.
+                # the state the first migration starts from.
                 conn.execute("BEGIN IMMEDIATE")
                 version, has_schema = _usable_state(conn, len(migrations))
                 if new is None:
@@ -432,11 +435,15 @@ class Database:
                 if version == len(migrations):
                     conn.execute("ROLLBACK")
                     break
-                if not new:  # a database this startup created holds nothing to back up, before any migration
+                # A database this startup created holds nothing to back up. One backup, of the version the
+                # app last ran at, is what going back needs (section 16); one per migration would rotate
+                # out the daily backups and a restore's safety copy (M2 audit 6 F1).
+                if not new and not backed_up:
                     with self._backup_lock:
                         generation = self._backup(datetime.now(UTC))
                     if not (generation / DB_NAME).is_file():
                         raise RuntimeError("the backup taken before this migration is missing, so it did not run")
+                    backed_up = True
                 # One transaction: the script, then the user_version bump, then COMMIT.
                 conn.executescript(f"{migrations[version]}\nPRAGMA user_version = {version + 1};\nCOMMIT;")
         except BaseException:
@@ -604,11 +611,11 @@ class Database:
         except Exception as error:  # the next write retries it
             log.warning("retrying the WAL truncation after a backup failed (%s)", type(error).__name__)
 
-    def _apply_retention(self, keep=None):
+    def _apply_retention(self, keep=None, now=None):
         """Rotate old generations, never keep. A failure is logged, not raised: the
         backup itself is already published, and the next backup or check retries this."""
         try:
-            _rotate(self.backups_dir, keep)
+            _rotate(self.backups_dir, keep, now)
         except Exception as error:
             log.warning(
                 "backup retention failed (%s, errno %s); it is retried at the next backup check",
@@ -754,17 +761,24 @@ def _usable_state(conn, latest):
     return version, bool(has_schema)
 
 
-def _rotate(backups, keep):
-    """Keep the newest daily generations; promote one a week to weekly, keeping the newest of those.
+def _rotate(backups, keep, now=None):
+    """Keep the newest daily generations, and every one under DAILY_KEPT days old; promote one a week to
+    weekly, keeping the newest of those.
 
     keep, a generation just published (or None), is never moved or removed and
     counts as the newest daily one whatever its date, since the clock may have
-    moved back.
+    moved back. Age is told by keep's stamp, else now (default the current time):
+    nothing under a week old is rotated, however many backups were taken on
+    request, before deletions or by restores (design review H, R1). A clock set
+    back makes generations look younger, so it keeps more.
     """
     daily, weekly = backups / "daily", backups / "weekly"
+    now = _stamp_of(keep) if keep is not None else now or datetime.now(UTC)
     others = [generation for generation in _generations(daily) if generation != keep]
     kept_others = DAILY_KEPT - 1 if keep is not None else DAILY_KEPT
     for old in others[:max(0, len(others) - kept_others)]:
+        if now - _stamp_of(old) < timedelta(days=DAILY_KEPT):
+            continue
         kept = _generations(weekly)
         if not kept or _stamp_of(old) - _stamp_of(kept[-1]) >= timedelta(days=7):
             _mkdir_private(weekly)

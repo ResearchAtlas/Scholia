@@ -462,3 +462,45 @@ def test_a_put_while_collection_checks_a_row_keeps_the_row(store, db, monkeypatc
     assert store.read(sha256) == data
     store.put(data)  # the put's row insert, after collection committed
     assert [row[0] for row in rows(db)] == [sha256]
+
+
+def test_every_put_in_backend_passes_a_hold():
+    # Design review H, option 2B: a put holds its own content until its row commits; a caller that commits a record
+    # naming it later must hold it until then, or collection may remove the file first. Every put in backend/ (and
+    # every call of runs._stored, which puts) passes a hold; a new one without fails here, in the manner of
+    # test_no_bypass.py.
+    import ast
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "backend"
+
+    def is_put(node):  # content.put / self.content.put / store.put
+        return isinstance(node, ast.Attribute) and node.attr == "put" and (
+            (isinstance(node.value, ast.Name) and node.value.id in ("content", "store"))
+            or (isinstance(node.value, ast.Attribute) and node.value.attr == "content"))
+
+    def passes_a_hold(args, keywords, positional):
+        hold = [k.value for k in keywords if k.arg == "hold"] or args[positional:positional + 1]
+        return bool(hold) and not (isinstance(hold[0], ast.Constant) and hold[0].value is None)
+
+    found, missing = [], []
+    for path in sorted(root.rglob("*.py")):
+        if path.name in ("content.py", "self_test.py"):  # the store itself; the self-test's own file helper
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            where = f"{path.relative_to(root)}:{node.lineno}"
+            if is_put(node.func):  # content.put(data, media_type, hold)
+                found.append(where)
+                if not passes_a_hold(node.args, node.keywords, 2):
+                    missing.append(where)
+            elif isinstance(node.func, ast.Name) and node.func.id == "_stored":  # _stored(content, body, hold)
+                found.append(where)
+                if not passes_a_hold(node.args, node.keywords, 2):
+                    missing.append(where)
+            elif isinstance(node.func, ast.Attribute) and node.func.attr == "to_thread" and node.args and (
+                    is_put(node.args[0]) or (isinstance(node.args[0], ast.Name) and node.args[0].id == "_stored")):
+                found.append(where)  # asyncio.to_thread(content.put, data, kind, held) and of _stored
+                if not passes_a_hold(node.args[1:], node.keywords, 2):
+                    missing.append(where)
+    assert len(found) >= 8 and missing == [], missing
