@@ -12,9 +12,10 @@ import { ZoteroBrowser } from './Parts.jsx'; // S1-15
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 
 // children(importing): the trigger, a button, disabled while a reference file is imported. onFiles opens
-// the files' chooser; onStart and onDone(text) frame a reference file's import, text being its report or
-// why it failed.
-export function AddMenu({ project, onFiles, onStart, onDone, children }) {
+// the files' chooser; onStart() starts a reference file's import and gives that import's own done(text), text being
+// its report or why it failed: held by the import itself, so no other import's start changes where it reports (PR 61
+// recheck round 6: this menu is drawn again whenever a paper's page is left, while its import still runs).
+export function AddMenu({ project, onFiles, onStart, children }) {
   const t = useT();
   const language = useContext(LanguageContext);
   const chooser = useRef(null);
@@ -24,12 +25,12 @@ export function AddMenu({ project, onFiles, onStart, onDone, children }) {
   async function chosen(file) {
     if (!file || !project) return;
     setImporting(true);
-    onStart?.();
+    const done = onStart();
     try {
       const report = await importReferences(project.id, file);
-      onDone(reportParts(report).map(([key, params]) => t(key, params)).join(language.startsWith('zh') ? '' : ' '));
+      done(reportParts(report).map(([key, params]) => t(key, params)).join(language.startsWith('zh') ? '' : ' '));
     } catch (error) {
-      onDone(errorText(t, error instanceof ApiError ? error.code : 'internal'));
+      done(errorText(t, error instanceof ApiError ? error.code : 'internal'));
     } finally {
       setImporting(false);
     }

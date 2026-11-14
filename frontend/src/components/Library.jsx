@@ -91,7 +91,6 @@ export function Library({ project }) {
   // The Library's own Add notices (a drop, Add files, an import from the Add menu) are the newest Add's: an older Add
   // that answers late says nothing over a newer one (PR 61 recheck round 5's class).
   const adds = useRef(0);
-  const importing = useRef(null);
   function addNotice() {
     const mine = ++adds.current;
     setNotice(null);
@@ -117,7 +116,7 @@ export function Library({ project }) {
   if (paper) {
     return (
       <>
-        <Paper material={paper} project={project} index={index} target={open.target}
+        <Paper key={paper.id} material={paper} project={project} index={index} target={open.target}
           onBack={() => { openPaper(null); load(); }} onChanged={load}
           onDelete={() => setDeleting({ id: paper.id, title: paper.title })}
           notice={paperFeedback(feedback, paper.id, 'notice')} saved={paperFeedback(feedback, paper.id, 'saved')}
@@ -140,8 +139,8 @@ export function Library({ project }) {
         </p>
         <input ref={input} type="file" multiple accept={ACCEPT} className="hidden" aria-hidden="true" tabIndex={-1}
           data-testid="library-files" onChange={(event) => { add(event.target.files); event.target.value = ''; }} />
-        <AddMenu project={project} onFiles={() => input.current?.click()} onStart={() => { importing.current = addNotice(); }}
-          onDone={(text) => { importing.current?.(text); libraryChanged(project.id); }}>
+        <AddMenu project={project} onFiles={() => input.current?.click()}
+          onStart={() => { const report = addNotice(); return (text) => { report(text); libraryChanged(project.id); }; }}>
           {(importing) => (
             <Button size="sm" variant="outline" className="h-8" disabled={adding || !project || importing}>
               <FilePlus2 aria-hidden="true" />{t('library.add')}

@@ -400,25 +400,7 @@ test('a paper\'s feedback is changed only by the latest action of its kind on th
   saveA2(true);
   assert.equal(paperFeedback(held, 'a', 'saved'), true);
 
-  const library = readFileSync(fileURLToPath(new URL('../src/components/Library.jsx', import.meta.url)), 'utf8');
-  assert.match(library, /notice=\{paperFeedback\(feedback, paper\.id, 'notice'\)\}/);
-  assert.match(library, /onAction=\{\(kind\) => paperAction\(paper\.id, kind, setFeedback\)\}/);
-  const paper = readFileSync(fileURLToPath(new URL('../src/components/Paper.jsx', import.meta.url)), 'utf8');
-  assert.match(paper, /const report = onAction\('notice'\);[\s\S]{0,120}addTo\(project\.id, \[\.\.\.files\]\.slice\(0, 1\), t, report,/);
-  // a save's answer, Saved or its failure, is lifted with it (batch 5 review P3-1): an older save's success that redraws
-  // the page never wipes a newer save's failure
-  assert.match(paper, /const report = onAction\('saved'\);[\s\S]{0,300}report\(\{ problem: problemText\(t, error, language\) \}\);[\s\S]{0,80}report\(true\);\s*afterSave\(\);/);
-  assert.match(paper, /\{saved\?\.problem && <p role="alert"[^\n]*\{saved\.problem\}<\/p>\}/);
-  assert.match(library, /saved=\{paperFeedback\(feedback, paper\.id, 'saved'\)\}/);
-  assert.doesNotMatch(paper, /onNotice|onSaved/);
-});
-
-// The Library's own Add notices (a drop, Add files, a reference file's import from the Add menu): only the newest Add's.
-test('an older Add\'s late notice never replaces a newer one\'s', () => {
-  const library = readFileSync(fileURLToPath(new URL('../src/components/Library.jsx', import.meta.url)), 'utf8');
-  assert.match(library, /const report = addNotice\(\);\s*const result = await addTo\(project\.id, files, t, report\);/);
-  assert.match(library, /onStart=\{\(\) => \{ importing\.current = addNotice\(\); \}\}/);
-  assert.match(library, /onDone=\{\(text\) => \{ importing\.current\?\.\(text\); libraryChanged\(project\.id\); \}\}/);
+  // how the Library and the page use it, by behaviour: tests/library_scenarios.test.mjs (r4 to r5fail, redraw)
 });
 
 // Design review F's rider 2: a memory change is heard by the conversation side, and moves no papers' generation.
