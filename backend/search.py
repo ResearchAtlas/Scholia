@@ -58,13 +58,18 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from backend import asks, local_helper
-from backend.db import deletion, new_id, utc_now
+from backend.db import DatabaseClosedError, deletion, new_id, utc_now
 from backend.local_helper import EMBEDDING, HelperUnavailable, InputRefused, Refused
 from backend.runs import AdmissionError, RunOutcome, _event, _revoked, _running, derived_status
 from backend.search_index import DAMAGE, DIMENSIONS, SearchIndex, Unavailable, digest, index_text, readings
 from backend.settings import load_settings, visible
 
 log = logging.getLogger(__name__)
+# What a request for an index run (_request) raises when a stop refused it, and nothing else does: AdmissionError, the
+# harness stopped at the request's admission (Harness.record_background); DatabaseClosedError, under a request already
+# admitted, a restore holding the writes or the database closing or closed (Database.write), or the database closed
+# under the started run's look (Database.read, through _started and Harness.start_again). Design review P, Option 3.
+STOPPED = (AdmissionError, DatabaseClosedError)
 
 QUERY_CHARS = 1000
 MAX_LIMIT = 50
@@ -320,19 +325,21 @@ def _memory_done(index, records):
         {m: digest(content) for m, (_, content) in records.items()})
 
 
-async def _embed_all(state, index, harness):
+async def _embed_all(state, index, harness, retry=True):
     """The model was just installed, or rows were made outside an index run (index.rebuilt): a run is requested of the
     index's own harness for every project whose index has passages without embeddings, or whose memory records lack
     vectors. While that harness cannot start runs (its background runs not started yet: a launch, or a restore before its
     commit; or stopped: a restore that may not go ahead), nothing is read or written: the ask waits on the harness, and
-    its kick asks again (Harness.kick_background). Decided in one step, with no await between the look and the wait; a
-    request refused because the harness stopped meanwhile waits the same way. No run is recorded here (design review L,
-    Option A)."""
+    its kick asks again (Harness.kick_background). Decided in one step, with no await between the look and the wait. A
+    request refused by a stop (STOPPED: known by the error, never by the harness's state when it arrives) waits the same
+    way, unless the harness admits again by then (a restore refused meanwhile, its kick past): then the same ask is made
+    again at once, once (retry false: one refused again waits). No run is recorded here (design reviews L, Option A,
+    and P, Option 3)."""
     if harness is None or index.closed:
         return
 
-    def again():
-        return _embed_all(state, index, harness)
+    def again(retry=True):
+        return _embed_all(state, index, harness, retry)
     if not harness.kicked or harness.registry.closed:
         harness.asks_after_kick["all"] = again
         return
@@ -346,27 +353,33 @@ async def _embed_all(state, index, harness):
             await _request(harness, project)
         except Exception as error:
             log.warning("an index run after the model's install could not be requested (%s)", type(error).__name__)
-            if harness.registry.closed:  # stopped meanwhile: asked again if it starts its runs again (Harness.resume)
-                harness.asks_after_kick["all"] = again
+            if isinstance(error, STOPPED):  # refused by a stop, whatever the harness is by now
+                if retry and not harness.registry.closed:  # that stop has ended, its kick past: again now, once
+                    return await again(False)
+                harness.asks_after_kick["all"] = again  # else at its next kick (Harness.resume)
 
 
-async def embed_memory_soon(state, project_id):
+async def embed_memory_soon(state, project_id, retry=True):
     """After a memory write in the project (a record created, edited or kept, a command, an extraction, a move), while
     the search model is installed: the project's run, then the General project's, asked by name, each on its own. A
     project record is embedded by its project's run; a personal one by any project's, and General cannot be deleted. So
     nothing about the record or the index is consulted, which a deletion or a rebuild since the commit could have
     changed (design review E2, Option A). Never a third project's run: one the researcher cancelled there stays so
-    (reading R29); General's starts again at the next memory write."""
+    (reading R29); General's starts again at the next memory write. An ask refused by a stop (STOPPED) makes the same
+    two again at once, once, if the harness admits again by then, else waits on it for its kick (design review P)."""
     index, harness = state.get("index"), state.get("harness")
     if index is None or harness is None or not _installed(state):
         return
-    def again():
-        return embed_memory_soon(state, project_id)
+
+    def again(retry=True):
+        return embed_memory_soon(state, project_id, retry)
     try:  # the project's first: reading General's id cannot lose it
         await _request(harness, project_id)
     except Exception as error:
         log.warning("an index run for memory could not be requested (%s)", type(error).__name__)
-        if harness.registry.closed:  # refused as stopped (a restore that may not go ahead): the same two at its kick
+        if isinstance(error, STOPPED):  # refused by a stop (a restore that may not go ahead): the same two again,
+            if retry and not harness.registry.closed:  # now and once if it admits again by now, else at its kick
+                return await again(False)
             harness.asks_after_kick[project_id] = again
     try:
         general = await asyncio.to_thread(harness.db.read, _general)
@@ -374,7 +387,9 @@ async def embed_memory_soon(state, project_id):
             await _request(harness, general)
     except Exception as error:
         log.warning("the General project's index run for memory could not be requested (%s)", type(error).__name__)
-        if harness.registry.closed:
+        if isinstance(error, STOPPED):
+            if retry and not harness.registry.closed:
+                return await again(False)
             harness.asks_after_kick[project_id] = again
 
 

@@ -1175,12 +1175,12 @@ async def test_a_memory_write_refused_as_a_restore_stops_the_work_is_asked_again
             stopped.set()
             return await shutdown(self, *args, **kwargs)
 
-        async def stopped_first(state, project_id):
+        async def stopped_first(state, project_id, *more):  # more: the retry flag a taken ask passes (batch 6)
             if not restoring:
                 restoring.append(asyncio.ensure_future(client.post("/api/backups/restore", json={"generation": backup})))
                 await asyncio.wait_for(stopped.wait(), 15)
                 assert state["harness"].registry.closed
-            return await soon(state, project_id)
+            return await soon(state, project_id, *more)
 
         def busy():
             raise BackupBusyError("settings kept changing")
@@ -1249,6 +1249,150 @@ async def test_a_start_whose_kick_fails_shuts_its_harness_down(tmp_path, monkeyp
         response = await client.post("/api/backups/restore", json={"generation": backup})
         assert response.status_code >= 400, response.text
         assert kicked and all(h.registry.closed for h in kicked)
+
+
+class _Ordering:
+    """Round 6's ordering (batch 6, design review P), on the real restore: the first write after run() starts waits in
+    its worker thread, past the harness's admission and before the database's; the restore's safety copy (the step after
+    hold_writes) lets it go on, waits until the database has refused it, and is busy; the refusal is handed back only
+    once Harness.resume has returned (reopened and kicked). Every wait is a threading.Event, bounded only to fail."""
+
+    def __init__(self, client, monkeypatch, backup, skip=0):
+        import threading
+        from backend.db import BackupBusyError, DatabaseClosedError
+        from backend.runs import Harness
+        self.client, self.backup, self.skip = client, backup, [skip]  # skip: the writes after run() let through first
+        self.armed, self.reached, self.go, self.refused, self.resumed = (threading.Event() for _ in range(5))
+        self.seen = []
+        db, real_write, real_resume = client.state["db"], client.state["db"].write, Harness.resume
+        ordering = self
+
+        def held_write(fn, *args, **kwargs):
+            if not ordering.armed.is_set() or ordering.reached.is_set():
+                return real_write(fn, *args, **kwargs)
+            if ordering.skip[0]:
+                ordering.skip[0] -= 1
+                return real_write(fn, *args, **kwargs)
+            ordering.reached.set()
+            assert ordering.go.wait(15)
+            try:
+                return real_write(fn, *args, **kwargs)
+            except DatabaseClosedError:
+                ordering.seen.append("refused")
+                ordering.refused.set()
+                assert ordering.resumed.wait(15)  # the refusal reaches its handler only after the resume
+                raise
+
+        def busy():
+            assert db._held
+            ordering.go.set()
+            assert ordering.refused.wait(15)
+            raise BackupBusyError("settings kept changing")
+
+        async def resumed(harness):
+            await real_resume(harness)
+            ordering.seen.append("resumed")
+            ordering.resumed.set()
+        monkeypatch.setattr(db, "write", held_write)
+        monkeypatch.setattr(db, "backup", busy)
+        monkeypatch.setattr(Harness, "resume", resumed)
+
+    async def run(self, ask):
+        """ask() -> the request's future, made once armed; the restore is started once its write waits."""
+        self.armed.set()
+        asked = ask()
+        assert await asyncio.to_thread(self.reached.wait, 15)
+        response = await self.client.post("/api/backups/restore", json={"generation": self.backup})
+        assert (response.status_code, response.json()["code"]) == (409, "backup_busy")
+        await asyncio.wait_for(asked, 15)
+        assert self.seen == ["refused", "resumed"], self.seen
+        assert not self.client.state["harness"].registry.closed
+
+
+async def test_an_installs_request_refused_by_held_writes_after_the_harness_resumed_is_asked_again(tmp_path,
+                                                                                                    monkeypatch):
+    # S9 (recheck round 6, both passes; the install's hook, _embed_all's handler): the refusal is known by its error,
+    # and the harness admitting again by then, the same ask is made again at once
+    from test_search import app
+    async with app(tmp_path, install=False) as client:
+        first, second = sorted([await project_of(client, "First"), await project_of(client, "Second")])
+        ids = [(await entered(client, first, "Wage floors raise the earnings of low-paid workers"))["id"],
+               (await entered(client, second, "Minimum wages did not reduce employment"))["id"]]
+        await background_idle(client)
+        backup = (await client.post("/api/backups")).json()["id"]
+        ordering = _Ordering(client, monkeypatch, backup)
+        _install(client)
+        await ordering.run(lambda: client.state["model_installed"]())  # the first project's request is the one refused
+        held = await _vectors(client, ids, timeout=5)
+        assert held == set(ids), (held, await _index_runs(client), dict(client.state["harness"].asks_after_kick))
+        assert client.state["harness"].asks_after_kick == {}
+
+
+async def test_a_memory_writes_own_ask_refused_by_held_writes_after_the_harness_resumed_is_asked_again(
+        tmp_path, monkeypatch):
+    # S10 (rider W's first handler), at the handler: embed_memory_soon driven directly, as a future of its own. No route
+    # of the app was found that reaches this ordering (a request is inside the writers' barrier; a run's task is waited
+    # for by the stop)
+    from test_search import app
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await background_idle(client)
+        backup = (await client.post("/api/backups")).json()["id"]
+        record = await write(client, _unindexed(project, "Wage floors raise the earnings of low-paid workers"))
+        ordering = _Ordering(client, monkeypatch, backup)
+        await ordering.run(lambda: asyncio.ensure_future(search.embed_memory_soon(client.state, project)))
+        held = await _vectors(client, [record], timeout=5)
+        assert held == {record}, (held, await _index_runs(client), dict(client.state["harness"].asks_after_kick))
+
+
+async def test_a_memory_writes_general_ask_refused_by_held_writes_after_the_harness_resumed_is_asked_again(
+        tmp_path, monkeypatch):
+    # S11 (rider W's second handler), at the handler, driven directly as S10 (no route of the app found): the writing
+    # project is gone by the ask (its own ask answers None), so only the General project's run embeds the personal record
+    from test_search import app
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await background_idle(client)
+        record = await write(client, _unindexed(project, "I prefer short answers", scope="personal"))
+        assert (await client.delete(f"/api/projects/{project}")).status_code == 200
+        await background_idle(client)
+        backup = (await client.post("/api/backups")).json()["id"]
+        assert await asyncio.to_thread(client.state["index"].memory_embedded, [record]) == set()
+        ordering = _Ordering(client, monkeypatch, backup, skip=1)  # its own ask's write (the project is gone: None)
+        await ordering.run(lambda: asyncio.ensure_future(search.embed_memory_soon(client.state, project)))
+        held = await _vectors(client, [record], timeout=5)
+        assert held == {record}, (held, await _index_runs(client), dict(client.state["harness"].asks_after_kick))
+
+
+@pytest.mark.parametrize("ask", ["install", "write"])
+async def test_an_ask_refused_by_a_stop_is_made_again_once_and_never_more(tmp_path, monkeypatch, ask):
+    # batch 6 (design review P): writes held under a harness that has kicked and admits (a state no path of the app
+    # makes), so every request is refused by the database: the ask, made again once at once, is refused again and waits
+    # on the harness; no more asks are made, and its next kick, once the writes are released, embeds the record
+    from test_search import app
+    async with app(tmp_path, install=ask == "write") as client:
+        project = await project_of(client)
+        await background_idle(client)
+        record = await write(client, _unindexed(project, "Wage floors raise the earnings of low-paid workers"))
+        harness, db = client.state["harness"], client.state["db"]
+        name = "_embed_all" if ask == "install" else "embed_memory_soon"
+        real, calls = getattr(search, name), []
+
+        async def counted(*args):
+            calls.append(args)
+            return await real(*args)
+        monkeypatch.setattr(search, name, counted)
+        if ask == "install":
+            _install(client)
+        await asyncio.to_thread(db.hold_writes)
+        assert harness.kicked and not harness.registry.closed
+        await (client.state["model_installed"]() if ask == "install" else search.embed_memory_soon(client.state, project))
+        assert len(calls) == 2  # the ask, and once again (retry false); never more
+        assert set(harness.asks_after_kick) == {"all" if ask == "install" else project}
+        await asyncio.to_thread(db.release_writes)
+        await harness.kick_background()
+        assert await _vectors(client, [record], timeout=5) == {record}, await _index_runs(client)
+        assert harness.asks_after_kick == {}
 
 
 async def test_a_failed_restore_put_back_publishes_its_harness_before_it_starts_its_background_runs(tmp_path,
