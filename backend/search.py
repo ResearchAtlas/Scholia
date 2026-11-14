@@ -320,9 +320,10 @@ def _memory_done(index, records):
 async def _embed_all(state):
     """The model was just installed, or rows were made outside an index run (index.rebuilt): a run is requested for
     every project whose index has passages without embeddings, or whose memory records lack vectors. The harness is the
-    one published when this runs, and only if it is this index's database's: while that database's start has not
-    published its own (a launch, or a restore before its commit), the runs are recorded unstarted in it, as open_index
-    records the launch's, and start with its background runs (backups.start_background), never before."""
+    one published when this runs, and only once it is this index's database's, its background runs have started and it
+    admits: before (a launch, a restore before its commit, a restore that stopped its work and may not go ahead), the
+    runs are recorded unstarted in that database, as open_index records the launch's, and start with its background
+    runs (backups.start_background, or Harness.resume), never before."""
     index, harness = state.get("index"), state.get("harness")
     if index is None or index.closed:
         return
@@ -331,7 +332,7 @@ async def _embed_all(state):
     except Exception as error:
         log.warning("index runs after the model's install could not be requested (%s)", type(error).__name__)
         return
-    if harness is None or harness.db is not index.db:
+    if harness is None or harness.db is not index.db or not harness.kicked or harness.registry.closed:
         def recorded(conn):
             for project in sorted(projects):
                 if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project,)).fetchone():

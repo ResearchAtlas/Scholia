@@ -841,6 +841,109 @@ async def test_a_model_installed_as_a_restored_index_rebuilds_before_its_harness
         assert await _vectors(client, ids) == set(ids)
 
 
+async def test_runs_asked_for_after_a_restored_harness_is_published_start_only_once_the_restore_commits(
+        tmp_path, monkeypatch):
+    # batch 4, internal review F1: the download ends, and the restored index's rebuild with it, after start() has
+    # published the restored database's harness but before the restore commits: nothing starts before the commit
+    import threading
+    import time
+    from backend import backups
+    from backend.local_helper import EMBEDDING
+    from backend.search_index import SearchIndex, Unavailable
+    from test_local_helper import WEIGHTS
+    from test_search import app
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        ids = [(await entered(client, project, "Wage floors raise the earnings of low-paid workers"))["id"],
+               (await entered(client, project, "I prefer short answers", kind="preference", scope="personal"))["id"]]
+        await background_idle(client)
+        await asyncio.to_thread(client.state["index"].apply)
+        backup = (await client.post("/api/backups")).json()["id"]
+        gate, rebuild = threading.Event(), SearchIndex._rebuild_all
+        refused, unembedded = threading.Event(), SearchIndex.unembedded
+        loop, commit, seen = asyncio.get_running_loop(), backups._commit_journal, {}
+
+        def held(self):
+            gate.wait(20)
+            return rebuild(self)
+
+        def read(self):
+            try:
+                return unembedded(self)
+            except Unavailable:
+                refused.set()
+                raise
+
+        def installed_before_the_commit(*args):  # in a worker thread, as the restore is about to commit
+            helper = client.state["local_helper"].helpers[EMBEDDING]
+            helper.path.parent.mkdir(parents=True, exist_ok=True)
+            helper.path.write_bytes(WEIGHTS)
+            loop.call_soon_threadsafe(helper.model_installed)
+            assert refused.wait(10)
+            gate.set()
+            index, deadline = client.state["index"], time.monotonic() + 20
+            while index.building:
+                assert time.monotonic() < deadline, "the restored index's rebuild did not finish"
+                time.sleep(0.01)
+            time.sleep(0.5)  # the rebuild's end has asked for its runs
+            seen["held"] = [r for r in client.state["harness"].registry.runs]
+            seen["runs"] = client.state["db"].read(lambda conn: conn.execute(
+                "SELECT status FROM runs WHERE workflow = 'index'").fetchall())
+            return commit(*args)
+        monkeypatch.setattr(SearchIndex, "_rebuild_all", held)
+        monkeypatch.setattr(SearchIndex, "unembedded", read)
+        monkeypatch.setattr(backups, "_commit_journal", installed_before_the_commit)
+        try:
+            response = await client.post("/api/backups/restore", json={"generation": backup})
+        finally:
+            gate.set()
+        assert response.status_code == 200, response.text
+        assert seen["held"] == [] and seen["runs"] and {status for (status,) in seen["runs"]} == {"running"}
+        assert await _vectors(client, ids) == set(ids)
+
+
+async def test_runs_asked_for_while_a_refused_restore_has_stopped_the_work_start_when_it_resumes(tmp_path,
+                                                                                               monkeypatch):
+    # batch 4, internal review F2: the download ends after the restore has stopped the harness and before it holds the
+    # writes; the restore is then refused (the safety copy busy), and the harness admits again
+    import threading
+    from backend.db import BackupBusyError
+    from backend.local_helper import EMBEDDING
+    from test_local_helper import WEIGHTS
+    from test_search import app
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        ids = [(await entered(client, project, "Wage floors raise the earnings of low-paid workers"))["id"],
+               (await entered(client, project, "I prefer short answers", kind="preference", scope="personal"))["id"]]
+        await background_idle(client)
+        backup = (await client.post("/api/backups")).json()["id"]
+        db, loop, done, embed_all = client.state["db"], asyncio.get_running_loop(), threading.Event(), search._embed_all
+        hold = db.hold_writes
+
+        async def watched(state):
+            try:
+                await embed_all(state)
+            finally:
+                done.set()
+
+        def installed_then_held():  # the harness has stopped; the download ends before the writes are held
+            helper = client.state["local_helper"].helpers[EMBEDDING]
+            helper.path.parent.mkdir(parents=True, exist_ok=True)
+            helper.path.write_bytes(WEIGHTS)
+            loop.call_soon_threadsafe(helper.model_installed)
+            assert done.wait(10)
+            hold()
+
+        def busy():
+            raise BackupBusyError("settings kept changing")
+        monkeypatch.setattr(search, "_embed_all", watched)
+        monkeypatch.setattr(db, "hold_writes", installed_then_held)
+        monkeypatch.setattr(db, "backup", busy)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (409, "backup_busy")
+        assert await _vectors(client, ids) == set(ids)
+
+
 async def test_a_whole_rebuild_while_the_app_runs_asks_for_the_runs_of_memory_it_dropped(tmp_path):
     # M2 audit area 2: the rebuilt file's runs (index.rebuilt) take the projects whose memory lacks vectors too
     from test_search import app

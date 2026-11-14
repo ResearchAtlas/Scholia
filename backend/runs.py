@@ -438,6 +438,9 @@ class Harness:
         self.keyring_backend = keyring_backend
         self.content = None  # the data folder's content store, for the trace's request bodies (set by the app)
         self.registry = Registry()
+        # Its background runs started once (kick_background): until then (a launch or a restore before its commit), an
+        # index run asked for is recorded unstarted for that kick (search._embed_all)
+        self.kicked = False
         # Local background work by workflow: async handler(harness, active, project_id, inputs) ->
         # (summary, effect), where effect(conn), if any, is applied in the run's terminal transaction.
         self.workflows = {}
@@ -2568,6 +2571,7 @@ class Harness:
         one tried again already (materials.retry_run): its retry does its work."""
         if self.registry.closed:
             return
+        self.kicked = True
         rows = await self._read(lambda conn: conn.execute(
             "SELECT id FROM runs WHERE kind = 'background' AND status = 'running'"
             " AND json_extract(inputs, '$.retried_by') IS NULL ORDER BY started_at").fetchall())
