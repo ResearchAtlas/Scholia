@@ -291,3 +291,21 @@ async def test_whats_done_takes_no_edit_so_what_is_shown_sent_and_kept_agree(tmp
             (done["content"], "inferred", done["version"])]
         lines, _ = await asyncio.to_thread(client.state["db"].read, lambda conn: memory.project_state(conn, project))
         assert lines == [f"- [done] {done['content']}"]
+
+
+async def test_an_earlier_version_is_never_deleted_alone_and_goes_with_its_head(tmp_path):
+    # design review K's rider R1 (PR 62 batch 2): a superseded version as a deletion's root is refused, whoever asks
+    from backend.db import deletion
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        first = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                         "content": "We use interviews"})).json()["id"]
+        head = (await client.patch(f"/api/memory/{first}", json={"project_id": project, "version": 1,
+                                                                 "content": "We use surveys"})).json()["id"]
+        db, store = client.state["db"], client.state["content"]
+        with pytest.raises(ValueError, match="changed"):
+            await asyncio.to_thread(deletion.delete, db, store, "memory", first)
+        assert sorted(await rows(client, "SELECT content, status FROM memory_records")) == [
+            ("We use interviews", "superseded"), ("We use surveys", "confirmed")]
+        await asyncio.to_thread(deletion.delete, db, store, "memory", head)
+        assert await rows(client, "SELECT count(*) FROM memory_records") == [(0,)]
