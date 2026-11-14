@@ -319,14 +319,27 @@ def _memory_done(index, records):
 
 async def _embed_all(state):
     """The model was just installed, or rows were made outside an index run (index.rebuilt): a run is requested for
-    every project whose index has passages without embeddings, or whose memory records lack vectors."""
+    every project whose index has passages without embeddings, or whose memory records lack vectors. The harness is the
+    one published when this runs, and only if it is this index's database's: while that database's start has not
+    published its own (a launch, or a restore before its commit), the runs are recorded unstarted in it, as open_index
+    records the launch's, and start with its background runs (backups.start_background), never before."""
     index, harness = state.get("index"), state.get("harness")
-    if index is None or harness is None:
+    if index is None or index.closed:
         return
     try:
         projects = await asyncio.to_thread(index.unembedded) | await asyncio.to_thread(_memory_pending, index)
     except Exception as error:
         log.warning("index runs after the model's install could not be requested (%s)", type(error).__name__)
+        return
+    if harness is None or harness.db is not index.db:
+        def recorded(conn):
+            for project in sorted(projects):
+                if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project,)).fetchone():
+                    request_run(conn, project, lambda conn, project, inputs: _insert_run(conn, None, project, inputs))
+        try:
+            await asyncio.to_thread(index.db.write, recorded)
+        except Exception as error:  # its database closed meanwhile (a restore abandoned): its next start asks
+            log.warning("index runs for a database still starting could not be recorded (%s)", type(error).__name__)
         return
     for project in sorted(projects):  # each on its own: one that fails leaves the others asked for
         try:

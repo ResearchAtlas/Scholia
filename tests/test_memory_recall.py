@@ -780,6 +780,67 @@ async def test_a_memory_write_still_asks_the_general_projects_run_when_its_proje
         assert asked == [general]
 
 
+async def test_a_model_installed_as_a_restored_index_rebuilds_before_its_harness_is_published_gets_its_runs(
+        tmp_path, monkeypatch):
+    # batch 4 (recheck round 4, pass 2): a restore opens its index without the model (a download already admitted), the
+    # download ends while the rebuild runs, and the rebuild ends before start() publishes the restored database's
+    # harness: its runs are recorded for that database, to start with its background runs after the restore commits
+    import threading
+    from backend.local_helper import EMBEDDING
+    from backend.runs import Harness
+    from backend.search_index import SearchIndex, Unavailable
+    from test_local_helper import WEIGHTS
+    from test_search import app
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        ids = [(await entered(client, project, "Wage floors raise the earnings of low-paid workers"))["id"],
+               (await entered(client, project, "I prefer short answers", kind="preference", scope="personal"))["id"]]
+        await background_idle(client)
+        await asyncio.to_thread(client.state["index"].apply)  # their additions have left the queue
+        backup = (await client.post("/api/backups")).json()["id"]
+        gate, rebuild = threading.Event(), SearchIndex._rebuild_all
+        refused, unembedded = threading.Event(), SearchIndex.unembedded
+
+        def held(self):
+            gate.wait(20)
+            return rebuild(self)
+
+        def read(self):  # the install's read of the restored index, refused while it rebuilds
+            try:
+                return unembedded(self)
+            except Unavailable:
+                refused.set()
+                raise
+        recover, seen = Harness.recover, []
+
+        async def installed_then_rebuilt(self, *args, **kwargs):  # start() publishes this harness only after this
+            if not seen:
+                seen.append(self)
+                helper = client.state["local_helper"].helpers[EMBEDDING]
+                helper.path.parent.mkdir(parents=True, exist_ok=True)
+                helper.path.write_bytes(WEIGHTS)
+                helper.model_installed()  # the admitted download ends
+                assert await asyncio.to_thread(refused.wait, 10)
+                gate.set()
+                index, deadline = client.state["index"], asyncio.get_running_loop().time() + 20
+                while index.building:
+                    assert asyncio.get_running_loop().time() < deadline, "the restored index's rebuild did not finish"
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.3)  # the rebuild's end has asked, before this harness is published
+                assert client.state["harness"] is not self
+            return await recover(self, *args, **kwargs)
+        monkeypatch.setattr(SearchIndex, "_rebuild_all", held)
+        monkeypatch.setattr(SearchIndex, "unembedded", read)
+        monkeypatch.setattr(Harness, "recover", installed_then_rebuilt)
+        try:
+            response = await client.post("/api/backups/restore", json={"generation": backup})
+        finally:
+            gate.set()
+        assert response.status_code == 200, response.text
+        assert seen and client.state["harness"] is seen[0]
+        assert await _vectors(client, ids) == set(ids)
+
+
 async def test_a_whole_rebuild_while_the_app_runs_asks_for_the_runs_of_memory_it_dropped(tmp_path):
     # M2 audit area 2: the rebuilt file's runs (index.rebuilt) take the projects whose memory lacks vectors too
     from test_search import app
