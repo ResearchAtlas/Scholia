@@ -171,24 +171,25 @@ def allowed(conn, project_id, record_ids, versions=None):
     is current (never superseded by the researcher: an edit, Keep or command since it was assembled means its old text
     may not leave; a proposal's edit takes its next version: versions, {id: version} as the request held them, names
     it), and is valid there now (its scope, the request's project's lock, its papers). A record an extraction replaced
-    on its own since stays allowed: the request keeps the version it read (M2 audit area 4, item 5)."""
+    on its own since stays allowed: the request keeps the version it read (M2 audit area 4, item 5). An extraction
+    never changes a record in place (it writes new versions only, apply_extraction), so a held version changed in place
+    since is always the researcher's change, and refused (design review N, Option 1)."""
     for record in record_ids:
         found = row(conn, record)
         if found is None or not valid(conn, project_id, found) or (
                 found["status"] == "superseded" and not _replaced_automatically(conn, record)):
             return False
-        if versions and versions.get(record, found["version"]) != found["version"] and not (
-                _automatic(found) and found["status"] != "proposed"):  # an extraction's own Keep is no change (R3)
+        if versions and versions.get(record, found["version"]) != found["version"]:
             return False
     return True
 
 
 def _automatic(record):
     """Whether a record's version is an extraction's own (section 8's automatic replacement, its confirmation of what
-    was only proposed or inferred), never the researcher's: marked so in the record when the extraction writes it (a
+    was only proposed or inferred, each a new version): marked so in the record when the extraction writes it (a
     deletion of its run or turn erases nothing of that), and changed in place by the researcher since at no time (a
-    Keep or an edit stamps `researcher_at`). An edit or a command writes an unmarked version (M2 audit area 4, items
-    3 and 5; batch 1)."""
+    Keep or an edit stamps `researcher_at`; only the researcher changes a record in place). An edit or a command writes
+    an unmarked version (M2 audit area 4, items 3 and 5; batch 1; design review N)."""
     return bool(record["structured"].get("extracted")) and not record["structured"].get("researcher_at")
 
 
@@ -348,13 +349,14 @@ def edit(conn, record, version, *, content=None, confirm=False):
                  structured=structured or None)
 
 
-def keep(conn, proposal, version, edited=False, researcher=True):
-    """Keep (confirm) a proposal: it replaces the record it names (supersedes_id) only if that record is still at
-    the version the proposal saw; else it stays proposed and is marked out of date (section 8), in this transaction, and
-    None is returned. Returns its id, or raises LookupError or ValueError("changed"). researcher: the researcher's Keep
-    (the views, the card, a command), stamped `researcher_at`; else an extraction's own confirmation, which is automatic
-    (_automatic; M2 audit area 4, batch 1). It writes no source: the caller that knows who acts does (edit, for the
-    views; the command's turn, for a Save; design review K, Option 2A)."""
+def keep(conn, proposal, version, edited=False):
+    """The researcher's Keep (confirm) of a proposal, in place (the views, the card, a Save command): it replaces the
+    record it names (supersedes_id) only if that record is still at the version the proposal saw; else it stays
+    proposed and is marked out of date (section 8), in this transaction, and None is returned. Returns its id, or raises
+    LookupError or ValueError("changed"). Stamped `researcher_at` (the researcher's change, _left_alone and _automatic).
+    It writes no source: the caller that knows who acts does (edit, for the views; the command's turn, for a Save;
+    design review K, Option 2A). An extraction never calls it: it confirms a proposal as the proposal's next version
+    (apply_extraction; design review N, Option 1)."""
     found = row(conn, proposal)
     if found is None or found["status"] != "proposed":
         raise LookupError(proposal)
@@ -379,8 +381,7 @@ def keep(conn, proposal, version, edited=False, researcher=True):
     # its next version, past both its own and the replaced record's (PR 51: a view that showed it before is stale)
     version = max(found["version"], current[1] if target is not None else 0) + 1
     structured = {k: v for k, v in found["structured"].items() if k not in ("out_of_date", "older", "seen", "source")}
-    if researcher:
-        structured["researcher_at"] = now
+    structured["researcher_at"] = now
     conn.execute("UPDATE memory_records SET status = 'confirmed', structured = ?, version = ?, updated_at = ? WHERE id = ?",
                  (json.dumps(structured) if structured else None, version, now, proposal))
     if found["type"] in RECALLED:
@@ -642,11 +643,12 @@ def _head(conn, record):
 def apply_extraction(conn, run_id, candidates):
     """An extraction's effect, in its terminal transaction (section 8): each candidate capped (cap), a duplicate of an
     active or pending record not stored again (the researcher's restatement is a source of it, and confirms it when it
-    was only proposed or inferred and that is eligible as a replacement is, PR 62 batch 3), and one that names a record
-    it replaces (or, confirmed, conflicts with) replacing it only when it is at least as authoritative, its source turn
-    came after the latest turn behind that record, and the researcher has not changed the record since the extraction
-    started; else it waits as a proposal naming the record (older when its turn came first). After a later explicit
-    command in the scope it stores proposals only. Nothing when its source turn is gone. Returns the counts, or None."""
+    was only proposed or inferred and that is eligible as a replacement is, as its next version: PR 62 batches 3 and 4),
+    and one that names a record it replaces (or, confirmed, conflicts with) replacing it only when it is at least as
+    authoritative, its source turn came after the latest turn behind that record, and the researcher has not changed the
+    record since the extraction started; else it waits as a proposal naming the record (older when its turn came first).
+    After a later explicit command in the scope it stores proposals only. Nothing when its source turn is gone. Returns
+    the counts, or None."""
     from backend import provenance
     found = conn.execute(
         "SELECT t.user_message, t.author, r.project_id, t.run_id, s.started_at, r.started_at FROM runs r"
@@ -700,17 +702,16 @@ def apply_extraction(conn, run_id, candidates):
             if own and (same["scope"] == "project" or personal):  # the researcher said it again: this turn is a
                 restated(conn, same["id"], turn)  # source of it too, a personal one's only from a Normal, unlocked
                 # project (item 2; Harold's decision of 2026-10-23, point 1)
-            if eligible:  # else it is left as it is, its restatement a source of it
-                if same["status"] == "proposed" and not same["supersedes_id"]:
-                    keep(conn, same["id"], None, researcher=False)  # the researcher's own words confirm what was only
-                    # proposed, by this extraction: an automatic write
-                elif same["status"] == "inferred":  # or what was only inferred, as its next version
-                    written.append(write(conn, project_id=project_id, scope=same["scope"], kind=same["type"],
-                                         content=same["content"], status="confirmed", run_id=run_id,
-                                         sources=[*sources_of(conn, same["id"]), ("turn", turn), ("run", run_id)],
-                                         replaces=same["id"], structured={"source": "researcher", "extracted": True}))
-                    counts["confirmed"] += 1
-            continue
+            # the researcher's own words confirm what was only inferred, or only proposed (and replaces nothing), as its
+            # next version: an extraction writes new versions only, never a record in place (design review N, Option 1)
+            if eligible and (same["status"] == "inferred"
+                             or same["status"] == "proposed" and not same["supersedes_id"]):
+                written.append(write(conn, project_id=project_id, scope=same["scope"], kind=same["type"],
+                                     content=same["content"], status="confirmed", run_id=run_id,
+                                     sources=[*sources_of(conn, same["id"]), ("turn", turn), ("run", run_id)],
+                                     replaces=same["id"], structured={"source": "researcher", "extracted": True}))
+                counts["confirmed"] += 1
+            continue  # else it is left as it is, its restatement a source of it
         head = _head(conn, candidate["replaces"]) if candidate["replaces"] else None  # as the record stands now
         target = next((r for r in pending if r["id"] == head and r["status"] in ACTIVE and (
             r["scope"] == "project" or (personal and own))), None)  # a personal one: the researcher's own words only

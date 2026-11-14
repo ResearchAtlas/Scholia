@@ -1046,3 +1046,27 @@ async def test_a_save_said_again_after_a_correction_shows_no_replacement_of_its_
         assert turns[1]["memory"][0]["records"][0]["replaced"] == "the sample is 30 interviews"
         [item] = turns[2]["memory"]
         assert item["action"] == "saved" and "replaced" not in item["records"][0]
+
+
+async def test_a_bare_forget_after_a_turn_whose_words_confirmed_a_proposal_lists_that_record(tmp_path):
+    # PR 62 batch 4, design review N's participant note 2, probed: the extraction confirms the proposal as a version of
+    # its own, so "forget this" lists it among the records that turn's extraction made, beside the other one it wrote
+    from backend import memory
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use thirty interviews",
+            status="proposed", sources=[("project", project)], structured={"extracted": True}))
+        extracted(provider, candidate("We use thirty interviews", "confirmed", span="we use thirty interviews"),
+                  candidate("We code in pairs", "confirmed", span="we code in pairs"))
+        await send(client, conversation, "We use thirty interviews and we code in pairs")
+        await background_idle(client)
+        sending = asyncio.create_task(send(client, conversation, "forget this"))
+        ask = await open_ask(client, conversation)
+        assert sorted(r["content"] for r in ask["params"]["records"]) == [
+            "We code in pairs", "We use thirty interviews"]
+        assert proposal not in [r["id"] for r in ask["params"]["records"]]  # the new version, not the proposal's row
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "not_now"})
+        await asyncio.wait_for(sending, 10)

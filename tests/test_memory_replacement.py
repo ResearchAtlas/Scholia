@@ -498,4 +498,76 @@ async def test_a_newer_extractions_restatement_still_confirms_an_earlier_duplica
                                                          "we use thirty interviews"))
         await _in(client, steps)
         found = await rows(client, "SELECT status FROM memory_records WHERE type = 'project_state' ORDER BY version")
-        assert found == ([("superseded",), ("confirmed",)] if status == "inferred" else [("confirmed",)])
+        assert found == [("superseded",), ("confirmed",)]  # either as its next version (batch 4, design review N)
+
+
+async def test_no_extraction_ever_changes_a_record_in_place(tmp_path):
+    # design review N, Option 1 (PR 62 batch 4): over every branch of apply_extraction (a new record, a replacement,
+    # a proposal naming a record, an inferred duplicate, a proposed duplicate, an ineligible duplicate), each record
+    # that existed before keeps its version, text and marks; it can only be superseded by a new version
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+
+        def state(conn):
+            return {i: (v, c, s, st) for i, v, c, s, st in conn.execute(
+                "SELECT id, version, content, structured, status FROM memory_records")}
+
+        def applied(conn, text, records):
+            _, run = _turn_and_extraction(conn, project, conversation, text)
+            before = state(conn)
+            memory.apply_extraction(conn, run, records)
+            after = state(conn)
+            for record, (version, content, structured, status) in before.items():
+                assert after[record][:3] == (version, content, structured), (text, record)
+                assert after[record][3] in (status, "superseded"), (text, record)
+
+        def steps(conn):
+            first = memory.write(conn, project_id=project, scope="project", kind="project_state",
+                                 content="The sample is 30 interviews", status="confirmed",
+                                 sources=[("project", project)])
+            for content, status in (("We code in pairs", "inferred"), ("We use a codebook", "proposed")):
+                memory.write(conn, project_id=project, scope="project", kind="project_state", content=content,
+                             status=status, sources=[("project", project)], structured={"extracted": True})
+            applied(conn, "The sample is 35 interviews", _says("The sample is 35 interviews", first))  # replacement
+            [(head,)] = conn.execute("SELECT id FROM memory_records WHERE content = 'The sample is 35 interviews'")
+            applied(conn, "Maybe 50", [{"type": "project_state", "content": "The sample may be 50 interviews",
+                                        "status": "proposed", "span": "", "replaces": head}])  # a proposal naming it
+            applied(conn, "We use surveys", _says("We use surveys"))  # a new record
+            applied(conn, "We code in pairs", _says("We code in pairs"))  # inferred duplicate, confirmed
+            applied(conn, "We use a codebook", _says("We use a codebook"))  # proposed duplicate, confirmed
+            _, early = _turn_and_extraction(conn, project, conversation, "We meet weekly")
+            applied(conn, "It seems we meet weekly", _says_as("We meet weekly", "inferred", "we meet weekly"))
+            before = state(conn)
+            memory.apply_extraction(conn, early, _says("We meet weekly"))  # ineligible duplicate: left as it is
+            assert state(conn) == before
+        await _in(client, steps)
+        assert dict(await rows(client, "SELECT content, status FROM memory_records WHERE status != 'superseded'")) == {
+            "The sample is 35 interviews": "confirmed", "The sample may be 50 interviews": "proposed",
+            "We use surveys": "confirmed", "We code in pairs": "confirmed", "We use a codebook": "confirmed",
+            "We meet weekly": "inferred"}
+
+
+async def test_a_proposal_an_extraction_confirms_stays_as_a_hidden_earlier_version_and_goes_with_forget(tmp_path):
+    # design review N's participant note 3: one more stored row, not shown, removed with the record by Forget
+    from backend import memory
+    from test_memory import forget
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+
+        def steps(conn):
+            proposal = memory.write(conn, project_id=project, scope="project", kind="project_state",
+                                    content="We use thirty interviews", status="proposed",
+                                    sources=[("project", project)], structured={"extracted": True})
+            _, run = _turn_and_extraction(conn, project, conversation, "We use thirty interviews")
+            memory.apply_extraction(conn, run, _says("We use thirty interviews"))
+            return proposal
+        proposal = await _in(client, steps)
+        listed = (await client.get(f"/api/memory?project_id={project}")).json()["project"]
+        assert [(r["content"], r["status"], r["version"]) for r in listed] == [
+            ("We use thirty interviews", "confirmed", 2)]
+        assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", proposal) == [("superseded",)]
+        assert (await forget(client, listed[0]["id"])).json() == {"ok": True}
+        assert await rows(client, "SELECT count(*) FROM memory_records") == [(0,)]

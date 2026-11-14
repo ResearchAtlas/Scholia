@@ -428,8 +428,9 @@ async def test_a_confirmed_restatement_confirms_the_pending_proposal(tmp_path):
         extracted(provider, candidate("A survey of managers", "confirmed", span="a survey of managers"))
         await send(client, conversation, "We will run a survey of managers")
         await background_idle(client)
-        assert await rows(client, "SELECT status FROM memory_records WHERE content = 'A survey of managers'") == [
-            ("confirmed",)]
+        # (PR 62 batch 4, design review N: confirmed as the proposal's next version, the proposal its earlier one)
+        assert await rows(client, "SELECT status, version FROM memory_records WHERE content = 'A survey of managers'"
+                                  " ORDER BY version") == [("superseded", 1), ("confirmed", 2)]
 
 
 # M2 audit area 4, item 8 (design review E's rider R1): the request for an index run follows the write that needs it,
