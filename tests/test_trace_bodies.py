@@ -114,7 +114,7 @@ async def test_a_failed_cleanup_after_the_deletion_commits_still_removes_the_bod
         run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
         content = client.state["content"]
         real = content.collect_garbage
-        monkeypatch.setattr(content, "collect_garbage", lambda now=None: (_ for _ in ()).throw(OSError("disk")))
+        monkeypatch.setattr(content, "collect_garbage", lambda **kwargs: (_ for _ in ()).throw(OSError("disk")))
         assert (await client.delete(f"/api/materials/{material}")).status_code == 200  # committed; cleanup failed
         found = await bodies_of(client, run_id)
         assert found and all(status == 410 for status, _, _ in found.values())
