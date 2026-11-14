@@ -347,27 +347,74 @@ test('another project\'s change while the chosen papers are refreshed asks again
   }
 });
 
-// Batch 4 (PR 61 recheck round 4, both passes' probe): a paper's notice is bound to the paper it came from. Start
-// replacing A's file, go Back, open B, then A's request fails: B shows no notice, and A's shows again only on A's page.
-test('a paper\'s late notice is kept for that paper and never shown on another', async () => {
-  const { paperNotice, notePaper } = await import('../src/library.js');
-  let held = null;
+// Batch 4 and batch 5 (PR 61 recheck rounds 4 and 5): what a paper's own actions said (its file's replacement: notice;
+// its details' save: saved) is held by the Library per paper and per kind, and a completion changes it only when it
+// belongs to the latest action of that kind for its own paper: one paper's completion never touches another's, and an
+// older action's never overwrites a newer one's. Opening a page lets go of what was shown, not of which action is latest.
+test('a paper\'s feedback is changed only by the latest action of its kind on that paper', async () => {
+  const { paperAction, paperFeedback } = await import('../src/library.js');
+  let held = {};
   const set = (next) => { held = typeof next === 'function' ? next(held) : next; };
-  const onNoticeA = notePaper('a', set); // what paper A's page was given
-  onNoticeA(null); // A's replacement starts
-  held = null; // Back, then B opened (openPaper clears it)
-  const onNoticeB = notePaper('b', set);
-  assert.equal(paperNotice(held, 'b'), null);
-  onNoticeA('That file is larger than Scholia reads.'); // A's request fails late
-  assert.equal(paperNotice(held, 'b'), null);
-  assert.equal(paperNotice(held, 'a'), 'That file is larger than Scholia reads.');
-  onNoticeB('B was replaced.');
-  onNoticeA(null); // A's next replacement starts: B's notice stays
-  assert.equal(paperNotice(held, 'b'), 'B was replaced.');
-  onNoticeB(null);
-  assert.equal(paperNotice(held, 'b'), null);
+  const tooLarge = 'That file is larger than Scholia reads.';
+
+  // Round 5, pass 1: replacing A, B opened, B's replacement started; B fails first, then A.
+  const a1 = paperAction('a', 'notice', set);
+  held = {}; // B opened (openPaper)
+  const b1 = paperAction('b', 'notice', set);
+  b1(tooLarge);
+  a1('A failed late.');
+  assert.equal(paperFeedback(held, 'b', 'notice'), tooLarge); // B's own notice stays
+  assert.equal(paperFeedback(held, 'a', 'notice'), 'A failed late.'); // A's is A's (round 4: never shown on B)
+
+  // Round 5, pass 2: replacing A, Back, A reopened, a second replacement; the first fails after it, the second succeeds.
+  held = {};
+  const a2 = paperAction('a', 'notice', set);
+  held = {}; // Back, then A reopened
+  const a3 = paperAction('a', 'notice', set);
+  a2('The engine is not responding.');
+  assert.equal(paperFeedback(held, 'a', 'notice'), null); // the older one is refused
+  a3(null); // succeeded: nothing to say
+  assert.equal(paperFeedback(held, 'a', 'notice'), null);
+
+  // Round 5, pass 2: replacing A, B opened, an unsupported file chosen on B; then A fails late.
+  held = {};
+  const a4 = paperAction('a', 'notice', set);
+  held = {};
+  paperAction('b', 'notice', set)('Not read: notes.txt');
+  a4('A failed late.');
+  assert.equal(paperFeedback(held, 'b', 'notice'), 'Not read: notes.txt');
+
+  // Round 5, pass 1, Saved: saves on A and B, B answers first, then A: both are saved.
+  held = {};
+  const saveA = paperAction('a', 'saved', set);
+  const saveB = paperAction('b', 'saved', set);
+  saveB(true);
+  saveA(true);
+  assert.deepEqual([paperFeedback(held, 'a', 'saved'), paperFeedback(held, 'b', 'saved')], [true, true]);
+  // A newer save, or an edit after it, refuses the older save's answer; another kind is untouched.
+  const saveA2 = paperAction('a', 'saved', set);
+  const noticeA = paperAction('a', 'notice', set);
+  saveA(true);
+  noticeA('Replaced, with a note.');
+  assert.deepEqual([paperFeedback(held, 'a', 'saved'), paperFeedback(held, 'a', 'notice')], [null, 'Replaced, with a note.']);
+  saveA2(true);
+  assert.equal(paperFeedback(held, 'a', 'saved'), true);
+
   const library = readFileSync(fileURLToPath(new URL('../src/components/Library.jsx', import.meta.url)), 'utf8');
-  assert.match(library, /notice=\{paperNotice\(heldNotice, paper\.id\)\} onNotice=\{notePaper\(paper\.id, setHeldNotice\)\}/);
+  assert.match(library, /notice=\{paperFeedback\(feedback, paper\.id, 'notice'\)\} saved=\{paperFeedback\(feedback, paper\.id, 'saved'\) === true\}/);
+  assert.match(library, /onAction=\{\(kind\) => paperAction\(paper\.id, kind, setFeedback\)\}/);
+  const paper = readFileSync(fileURLToPath(new URL('../src/components/Paper.jsx', import.meta.url)), 'utf8');
+  assert.match(paper, /const report = onAction\('notice'\);[\s\S]{0,120}addTo\(project\.id, \[\.\.\.files\]\.slice\(0, 1\), t, report,/);
+  assert.match(paper, /const report = onAction\('saved'\);\s*if \(await run\([^\n]*\)\) \{\s*report\(true\);/);
+  assert.doesNotMatch(paper, /onNotice|onSaved/);
+});
+
+// The Library's own Add notices (a drop, Add files, a reference file's or Zotero's import): only the newest Add's.
+test('an older Add\'s late notice never replaces a newer one\'s', () => {
+  const library = readFileSync(fileURLToPath(new URL('../src/components/Library.jsx', import.meta.url)), 'utf8');
+  assert.match(library, /const report = addNotice\(\);\s*const result = await addTo\(project\.id, files, t, report\);/);
+  assert.match(library, /onStart=\{\(\) => \{ importing\.current = addNotice\(\); \}\}/);
+  assert.match(library, /onDone=\{\(text\) => \{ importing\.current\?\.\(text\); libraryChanged\(project\.id\); \}\}/);
 });
 
 // Design review F's rider 2: a memory change is heard by the conversation side, and moves no papers' generation.

@@ -258,7 +258,7 @@ test('the Library and the @-mentions read the papers only through useLibraryRead
   assert.match(mention, /useLibraryRead\(typed \? projectId : null, \(\) => get\(/);
   assert.doesNotMatch(library, /readGuard|forget/);
   assert.match(library, /if \(result\) libraryChanged\(project\.id\);/); // Add
-  assert.match(library, /onDone=\{\(text\) => \{ setNotice\(text\); libraryChanged\(project\.id\); \}\}/); // a reference file or Zotero
+  assert.match(library, /onDone=\{\(text\) => \{ importing\.current\?\.\(text\); libraryChanged\(project\.id\); \}\}/); // an import
 });
 
 test('design review F\'s rider 1: the delete dialog fires its change when its request settles, with a notice or failing', async () => {

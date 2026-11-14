@@ -23,19 +23,20 @@ import { cn } from '@/lib/utils';
 
 // index: the project's search index status, for Details (S1-17); target: a search result's passage
 // ({ id, ordinal }), which the text view opens at.
-// onDelete opens its delete dialog, which the Library keeps above its read of the papers; saved and notice (what its
-// save and its file's replacement said) are the Library's too, so they stay as the page is drawn again after the change
-// (M2 audit, area 1, design review F's option 2.2 and rider 1).
-export function Paper({ material, project, index, target, onBack, onChanged, onDelete, saved, onSaved, notice, onNotice }) {
+// onDelete opens its delete dialog, which the Library keeps above its read of the papers; notice and saved (what its
+// file's replacement and its details' save said) are the Library's too, so they stay as the page is drawn again after
+// the change (M2 audit, area 1, design review F's option 2.2 and rider 1); onAction(kind) starts one and gives its report,
+// which only the latest action of that kind on this paper can use (library.js paperAction).
+export function Paper({ material, project, index, target, onBack, onChanged, onDelete, notice, saved, onAction }) {
   const t = useT();
   const replace = useRef(null);
   const reason = reasonKey(material.reason);
   const { busy: replacing, run } = useAction(); // one replacement at a time: none finishes after a later choice
 
   function replaceFile(files) {
-    onNotice(null);
+    const report = onAction('notice');
     return run(async () => {
-      if (await addTo(project.id, [...files].slice(0, 1), t, onNotice, { materialId: material.id,
+      if (await addTo(project.id, [...files].slice(0, 1), t, report, { materialId: material.id,
         replaces: material.version?.id })) libraryChanged(project.id); // the version shown when the file was chosen;
       // every view showing the paper's text or title reads it again (the Library's listing among them)
     });
@@ -68,7 +69,7 @@ export function Paper({ material, project, index, target, onBack, onChanged, onD
           {material.readable && <ReadAgain material={material} onDone={onChanged} />}
           {notice && <p role="status" className="rounded-md bg-muted px-3 py-2 text-sm">{notice}</p>}
         </header>
-        <Details material={material} saved={saved} onSaved={(done) => { onSaved(done); if (done) libraryChanged(project.id); }} />
+        <Details material={material} saved={saved} onAction={onAction} afterSave={() => libraryChanged(project.id)} />
         <section className="grid gap-2 text-sm">
           <h4 className="font-semibold">{t('paper.about')}</h4>
           <Facts material={material} project={project} index={index} />
@@ -81,7 +82,7 @@ export function Paper({ material, project, index, target, onBack, onChanged, onD
 
 // The details the researcher may correct; a save is kept as checked by the researcher, so no lookup
 // replaces it, and says it was saved only once the backend has saved it.
-function Details({ material, saved, onSaved }) {
+function Details({ material, saved, onAction, afterSave }) {
   const t = useT();
   const id = useId();
   const before = detailsOf(material);
@@ -97,11 +98,14 @@ function Details({ material, saved, onSaved }) {
 
   async function save(event) {
     event.preventDefault();
-    onSaved(false);
-    if (await run(() => patch(`/api/materials/${encodeURIComponent(material.id)}`, body))) onSaved(true);
+    const report = onAction('saved');
+    if (await run(() => patch(`/api/materials/${encodeURIComponent(material.id)}`, body))) {
+      report(true);
+      afterSave();
+    }
   }
 
-  const set = (name) => (event) => { if (saved) onSaved(false); setForm((current) => ({ ...current, [name]: event.target.value })); };
+  const set = (name) => (event) => { if (saved) onAction('saved'); setForm((current) => ({ ...current, [name]: event.target.value })); };
   const field = (name, label, control) => (
     <div className="grid gap-1.5">
       <label htmlFor={`${id}-${name}`} className="text-xs font-medium text-muted-foreground">{label}</label>

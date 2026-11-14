@@ -489,11 +489,11 @@ test('a paper\'s new file, saved details and deletion are library changes', () =
   const paper = source('Paper.jsx');
   const library = source('Library.jsx');
   assert.match(paper, /replaces: material\.version\?\.id \}\)\) libraryChanged\(project\.id\);/);
-  assert.match(paper, /onSaved=\{\(done\) => \{ onSaved\(done\); if \(done\) libraryChanged\(project\.id\); \}\}/);
+  assert.match(paper, /afterSave=\{\(\) => libraryChanged\(project\.id\)\}/);
   assert.doesNotMatch(paper, /DeleteDialog/);
   assert.match(paper, /onClick=\{onDelete\}/);
   assert.match(library, /onSettled=\{\(\) => libraryChanged\(project\.id\)\}/);
-  assert.match(library, /saved=\{saved === paper\.id\}/);
+  assert.match(library, /saved=\{paperFeedback\(feedback, paper\.id, 'saved'\) === true\}/);
   // the one dialog survives the page giving way to the list at the change (batch 2 review F1): keyed, and the last child
   // of both forms of the panel, so its notice or its error stays on screen
   assert.match(library, /<DeleteDialog key="delete"/);
@@ -501,7 +501,7 @@ test('a paper\'s new file, saved details and deletion are library changes', () =
   assert.equal(forms.length, 2);
   for (const form of forms) assert.ok(form.endsWith('{dialog}') && form.split('{dialog}').length === 2, form.slice(0, 80));
   // and a page's notice and Saved line are not carried to the next page opened (review F2)
-  assert.match(library, /function openPaper\(found\) \{\s*setSaved\(null\);\s*setHeldNotice\(null\);\s*setOpen\(found\);/);
+  assert.match(library, /function openPaper\(found\) \{\s*setFeedback\(\{\}\);\s*setOpen\(found\);/);
   assert.equal([...library.matchAll(/setOpen\(/g)].length, 1); // only through openPaper
   // a project's deletion in the Sidebar moves the papers' generation (rider 2: a memory change does not)
   assert.match(source('Sidebar.jsx'), /if \(kind === 'deleteProject'\) libraryChanged\(null\);/);

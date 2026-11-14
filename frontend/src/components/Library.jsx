@@ -11,7 +11,7 @@ import { useAction } from '../action.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
 import { ACCEPT, addFiles, authorNames, choosePapers, chosenPapers, detailsSource, latestLookup, libraryChanged, libraryEvents,
-  newest, notePaper, ocrPages, paperNotice, reasonKey, sortFiles, stateKey, takeOpening, typeKey, unsettled, uploadsWaiting,
+  newest, ocrPages, paperAction, paperFeedback, reasonKey, sortFiles, stateKey, takeOpening, typeKey, unsettled, uploadsWaiting,
   watchChosen, watchUploads, yearOf } from '../library.js';
 import { useLibraryRead } from '../libraryRead.js';
 import { problemText } from '../action.js';
@@ -66,8 +66,7 @@ export function Library({ project }) {
   const t = useT();
   const { listing, problem, load } = useLibrary(project?.id);
   const [deleting, setDeleting] = useState(null); // the paper whose delete dialog is open, above the read (rider 1)
-  const [saved, setSaved] = useState(null); // the paper whose details were just saved: its page is drawn again
-  const [heldNotice, setHeldNotice] = useState(null); // what a paper's own action said, bound to it (library.js paperNotice)
+  const [feedback, setFeedback] = useState({}); // what each paper's own actions said (library.js paperAction)
   const [open, setOpen] = useState(null); // the paper whose page is shown: { id, target } (a result's passage)
   const index = useIndex(project?.id, listing);
   const search = useSearch(project?.id);
@@ -85,15 +84,24 @@ export function Library({ project }) {
   const chosen = useSyncExternalStore(watchChosen, () => chosenPapers(project?.id));
   // A paper's page opened, or let go: what another page's save or replacement said is not this one's.
   function openPaper(found) {
-    setSaved(null);
-    setHeldNotice(null);
+    setFeedback({});
     setOpen(found);
   }
 
-  async function add(files) {
+  // The Library's own Add notices (a drop, Add files, an import from the Add menu) are the newest Add's: an older Add
+  // that answers late says nothing over a newer one (PR 61 recheck round 5's class).
+  const adds = useRef(0);
+  const importing = useRef(null);
+  function addNotice() {
+    const mine = ++adds.current;
     setNotice(null);
-    const result = await addTo(project.id, files, t, setNotice);
-    if (result?.materials.some((m) => m.existing)) setNotice(t('library.alreadyHere'));
+    return (text) => { if (mine === adds.current) setNotice(text); };
+  }
+
+  async function add(files) {
+    const report = addNotice();
+    const result = await addTo(project.id, files, t, report);
+    if (result?.materials.some((m) => m.existing)) report(t('library.alreadyHere'));
     if (result) libraryChanged(project.id);
   }
 
@@ -112,8 +120,8 @@ export function Library({ project }) {
         <Paper material={paper} project={project} index={index} target={open.target}
           onBack={() => { openPaper(null); load(); }} onChanged={load}
           onDelete={() => setDeleting({ id: paper.id, title: paper.title })}
-          saved={saved === paper.id} onSaved={(done) => setSaved(done ? paper.id : null)}
-          notice={paperNotice(heldNotice, paper.id)} onNotice={notePaper(paper.id, setHeldNotice)} />
+          notice={paperFeedback(feedback, paper.id, 'notice')} saved={paperFeedback(feedback, paper.id, 'saved') === true}
+          onAction={(kind) => paperAction(paper.id, kind, setFeedback)} />
         {dialog}
       </>
     );
@@ -132,8 +140,8 @@ export function Library({ project }) {
         </p>
         <input ref={input} type="file" multiple accept={ACCEPT} className="hidden" aria-hidden="true" tabIndex={-1}
           data-testid="library-files" onChange={(event) => { add(event.target.files); event.target.value = ''; }} />
-        <AddMenu project={project} onFiles={() => input.current?.click()} onStart={() => setNotice(null)}
-          onDone={(text) => { setNotice(text); libraryChanged(project.id); }}>
+        <AddMenu project={project} onFiles={() => input.current?.click()} onStart={() => { importing.current = addNotice(); }}
+          onDone={(text) => { importing.current?.(text); libraryChanged(project.id); }}>
           {(importing) => (
             <Button size="sm" variant="outline" className="h-8" disabled={adding || !project || importing}>
               <FilePlus2 aria-hidden="true" />{t('library.add')}

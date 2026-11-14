@@ -197,12 +197,24 @@ async function retitleChosen(asked) {
     .map((paper) => (ids.has(paper.id) ? { ...paper, title: titles.get(paper.id) } : paper)));
 }
 
-// What a paper's own action said (its file's replacement), held by the Library so it stays as the page is drawn again
-// after the change, and bound to the paper it came from: a late answer to paper A's request never shows on paper B's
-// page, and A's next action clears only A's (PR 61 recheck round 4). held: { id, text } or null.
-export const paperNotice = (held, id) => (held?.id === id ? held.text : null);
-export const notePaper = (id, setHeld) => (text) => setHeld((held) => (text === null ? (held?.id === id ? null : held)
-  : { id, text }));
+// What a paper's own actions said (its file's replacement: 'notice', a text; its details' save: 'saved', true), held by
+// the Library per paper and per kind so it stays as the page is drawn again after the change. paperAction(id, kind,
+// setHeld) starts an action, clearing what that kind said for that paper, and returns its report(value), which changes
+// the feedback only while it is still the latest action of its kind on its paper: one paper's answer never touches
+// another's, and an older action's never overwrites a newer one's (PR 61 recheck rounds 4 and 5). Opening a page clears
+// what is held (the Library's openPaper), not which action is latest. held: { [paper id]: { [kind]: value } }.
+const latestActions = new Map();
+let actions = 0;
+export const paperFeedback = (held, id, kind) => held?.[id]?.[kind] ?? null;
+export function paperAction(id, kind, setHeld) {
+  const action = ++actions;
+  latestActions.set(`${id}\n${kind}`, action);
+  const report = (value) => {
+    if (latestActions.get(`${id}\n${kind}`) === action) setHeld((held) => ({ ...held, [id]: { ...held?.[id], [kind]: value } }));
+  };
+  report(null);
+  return report;
+}
 
 // S1-19b: a cited paper opened at its passage, from an answer's chip: the Library shows it when it is
 // next drawn for its project, or at once when it is open.
