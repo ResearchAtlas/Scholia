@@ -1194,6 +1194,63 @@ async def test_a_memory_write_refused_as_a_restore_stops_the_work_is_asked_again
         assert held == {record}, (held, await _index_runs(client))
 
 
+async def test_a_memory_write_whose_first_ask_is_refused_as_the_harness_resumes_before_its_second_is_asked_again(
+        tmp_path, monkeypatch):
+    # batch 5, internal review F1: the write's own-project ask is refused (the harness stopped), the harness resumes
+    # while its General ask reads General's id, and that ask then succeeds: the refused one waits on the harness
+    import threading
+    from test_search import app
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        record = await write(client, _unindexed(project, "Wage floors raise the earnings of low-paid workers"))
+        harness, general, reached, release = client.state["harness"], search._general, threading.Event(), threading.Event()
+
+        def held(conn):
+            if not release.is_set():
+                reached.set()
+                assert release.wait(15)
+            return general(conn)
+        monkeypatch.setattr(search, "_general", held)
+        await harness.shutdown()
+        asked = asyncio.ensure_future(search.embed_memory_soon(client.state, project))
+        assert await asyncio.to_thread(reached.wait, 15)  # its own-project ask refused, General's id being read
+        await harness.resume()
+        release.set()
+        await asked
+        held_now = await _vectors(client, [record], timeout=5)
+        assert held_now == {record}, (held_now, await _index_runs(client))
+
+
+async def test_a_start_whose_kick_fails_shuts_its_harness_down(tmp_path, monkeypatch):
+    # batch 5, internal review F2: the rollback start (kick true) publishes, then kicks; a kick that fails stops that
+    # harness, as a recover() that failed did before
+    from backend import backups
+    from backend.runs import Harness
+    from test_search import app
+    async with app(tmp_path, install=False) as client:
+        await _two_records(client)
+        backup = (await client.post("/api/backups")).json()["id"]
+        old, kick, commit, failed, kicked = client.state["harness"], Harness.kick_background, backups._commit_journal, \
+            [], []
+
+        def failing(*args):
+            if not failed:
+                failed.append(1)
+                raise OSError("the journal could not be committed")
+            return commit(*args)
+
+        async def failing_kick(self):
+            if self is not old:  # the previous database's start again, after the restore was put back
+                kicked.append(self)
+                raise RuntimeError("its running rows could not be read")
+            return await kick(self)
+        monkeypatch.setattr(backups, "_commit_journal", failing)
+        monkeypatch.setattr(Harness, "kick_background", failing_kick)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code >= 400, response.text
+        assert kicked and all(h.registry.closed for h in kicked)
+
+
 async def test_a_failed_restore_put_back_publishes_its_harness_before_it_starts_its_background_runs(tmp_path,
                                                                                                     monkeypatch):
     # S8 (design review L3): "started" implies "published", so no run a start's kick or an ask starts meets a state

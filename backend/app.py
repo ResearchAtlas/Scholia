@@ -371,7 +371,11 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         state.pop("damaged", None)
         state.pop("damaged_code", None)
         if kick:  # published before it starts anything: no run it starts meets a state without its gate
-            await harness.kick_background()
+            try:
+                await harness.kick_background()
+            except BaseException:  # stopped, as a recover() that fails stops it
+                await harness.shutdown()
+                raise
 
     @contextlib.asynccontextmanager
     async def lifespan(app):

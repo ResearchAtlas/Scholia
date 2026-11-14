@@ -360,18 +360,22 @@ async def embed_memory_soon(state, project_id):
     index, harness = state.get("index"), state.get("harness")
     if index is None or harness is None or not _installed(state):
         return
+    def again():
+        return embed_memory_soon(state, project_id)
     try:  # the project's first: reading General's id cannot lose it
         await _request(harness, project_id)
     except Exception as error:
         log.warning("an index run for memory could not be requested (%s)", type(error).__name__)
+        if harness.registry.closed:  # refused as stopped (a restore that may not go ahead): the same two at its kick
+            harness.asks_after_kick[project_id] = again
     try:
         general = await asyncio.to_thread(harness.db.read, _general)
         if general != project_id:
             await _request(harness, general)
     except Exception as error:
         log.warning("the General project's index run for memory could not be requested (%s)", type(error).__name__)
-    if harness.registry.closed:  # stopped meanwhile (a restore that may not go ahead): the same two, if it resumes
-        harness.asks_after_kick[project_id] = lambda: embed_memory_soon(state, project_id)
+        if harness.registry.closed:
+            harness.asks_after_kick[project_id] = again
 
 
 async def after_deletion(state, project_id):
