@@ -197,6 +197,13 @@ async function retitleChosen(asked) {
     .map((paper) => (ids.has(paper.id) ? { ...paper, title: titles.get(paper.id) } : paper)));
 }
 
+// What a paper's own action said (its file's replacement), held by the Library so it stays as the page is drawn again
+// after the change, and bound to the paper it came from: a late answer to paper A's request never shows on paper B's
+// page, and A's next action clears only A's (PR 61 recheck round 4). held: { id, text } or null.
+export const paperNotice = (held, id) => (held?.id === id ? held.text : null);
+export const notePaper = (id, setHeld) => (text) => setHeld((held) => (text === null ? (held?.id === id ? null : held)
+  : { id, text }));
+
 // S1-19b: a cited paper opened at its passage, from an answer's chip: the Library shows it when it is
 // next drawn for its project, or at once when it is open.
 let opening = null;

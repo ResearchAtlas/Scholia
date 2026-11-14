@@ -347,6 +347,29 @@ test('another project\'s change while the chosen papers are refreshed asks again
   }
 });
 
+// Batch 4 (PR 61 recheck round 4, both passes' probe): a paper's notice is bound to the paper it came from. Start
+// replacing A's file, go Back, open B, then A's request fails: B shows no notice, and A's shows again only on A's page.
+test('a paper\'s late notice is kept for that paper and never shown on another', async () => {
+  const { paperNotice, notePaper } = await import('../src/library.js');
+  let held = null;
+  const set = (next) => { held = typeof next === 'function' ? next(held) : next; };
+  const onNoticeA = notePaper('a', set); // what paper A's page was given
+  onNoticeA(null); // A's replacement starts
+  held = null; // Back, then B opened (openPaper clears it)
+  const onNoticeB = notePaper('b', set);
+  assert.equal(paperNotice(held, 'b'), null);
+  onNoticeA('That file is larger than Scholia reads.'); // A's request fails late
+  assert.equal(paperNotice(held, 'b'), null);
+  assert.equal(paperNotice(held, 'a'), 'That file is larger than Scholia reads.');
+  onNoticeB('B was replaced.');
+  onNoticeA(null); // A's next replacement starts: B's notice stays
+  assert.equal(paperNotice(held, 'b'), 'B was replaced.');
+  onNoticeB(null);
+  assert.equal(paperNotice(held, 'b'), null);
+  const library = readFileSync(fileURLToPath(new URL('../src/components/Library.jsx', import.meta.url)), 'utf8');
+  assert.match(library, /notice=\{paperNotice\(heldNotice, paper\.id\)\} onNotice=\{notePaper\(paper\.id, setHeldNotice\)\}/);
+});
+
 // Design review F's rider 2: a memory change is heard by the conversation side, and moves no papers' generation.
 test('a memory change moves no papers\' generation, and a change to the papers does', async () => {
   const { memoryChanged } = await import('../src/memory.js');

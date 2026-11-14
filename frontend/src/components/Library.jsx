@@ -11,8 +11,8 @@ import { useAction } from '../action.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
 import { ACCEPT, addFiles, authorNames, choosePapers, chosenPapers, detailsSource, latestLookup, libraryChanged, libraryEvents,
-  newest, ocrPages, reasonKey, sortFiles, stateKey, takeOpening, typeKey, unsettled, uploadsWaiting, watchChosen,
-  watchUploads, yearOf } from '../library.js';
+  newest, notePaper, ocrPages, paperNotice, reasonKey, sortFiles, stateKey, takeOpening, typeKey, unsettled, uploadsWaiting,
+  watchChosen, watchUploads, yearOf } from '../library.js';
 import { useLibraryRead } from '../libraryRead.js';
 import { problemText } from '../action.js';
 import { DeleteDialog } from './DeleteDialog.jsx';
@@ -67,7 +67,7 @@ export function Library({ project }) {
   const { listing, problem, load } = useLibrary(project?.id);
   const [deleting, setDeleting] = useState(null); // the paper whose delete dialog is open, above the read (rider 1)
   const [saved, setSaved] = useState(null); // the paper whose details were just saved: its page is drawn again
-  const [paperNotice, setPaperNotice] = useState(null); // what a paper's own action said, kept as its page is drawn again
+  const [heldNotice, setHeldNotice] = useState(null); // what a paper's own action said, bound to it (library.js paperNotice)
   const [open, setOpen] = useState(null); // the paper whose page is shown: { id, target } (a result's passage)
   const index = useIndex(project?.id, listing);
   const search = useSearch(project?.id);
@@ -86,7 +86,7 @@ export function Library({ project }) {
   // A paper's page opened, or let go: what another page's save or replacement said is not this one's.
   function openPaper(found) {
     setSaved(null);
-    setPaperNotice(null);
+    setHeldNotice(null);
     setOpen(found);
   }
 
@@ -113,7 +113,7 @@ export function Library({ project }) {
           onBack={() => { openPaper(null); load(); }} onChanged={load}
           onDelete={() => setDeleting({ id: paper.id, title: paper.title })}
           saved={saved === paper.id} onSaved={(done) => setSaved(done ? paper.id : null)}
-          notice={paperNotice} onNotice={setPaperNotice} />
+          notice={paperNotice(heldNotice, paper.id)} onNotice={notePaper(paper.id, setHeldNotice)} />
         {dialog}
       </>
     );
