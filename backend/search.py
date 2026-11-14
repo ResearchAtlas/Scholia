@@ -68,7 +68,8 @@ log = logging.getLogger(__name__)
 # What a request for an index run (_request) raises when a stop refused it, and nothing else does: AdmissionError, the
 # harness stopped at the request's admission (Harness.record_background); DatabaseClosedError, under a request already
 # admitted, a restore holding the writes or the database closing or closed (Database.write), or the database closed
-# under the started run's look (Database.read, through _started and Harness.start_again). Design review P, Option 3.
+# under the started run's look (Database.read, through _started and Harness.start_again). embed_memory_soon's read of
+# General's id (Database.read) raises it only for a closed database, a stop too. Design review P, Option 3.
 STOPPED = (AdmissionError, DatabaseClosedError)
 
 QUERY_CHARS = 1000
