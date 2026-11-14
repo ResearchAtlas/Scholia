@@ -1158,6 +1158,42 @@ async def test_an_install_as_a_failed_restore_is_put_back_after_its_kick_gets_it
         assert held == set(ids), (published, held, await _index_runs(client), list(client.state["harness"].registry.runs))
 
 
+async def test_a_memory_write_refused_as_a_restore_stops_the_work_is_asked_again_when_it_resumes(tmp_path, monkeypatch):
+    # S7 (design review L2, rider W; designs E and E2's case left): the record has committed, a restore stops the work
+    # before its runs are asked for, and the restore is then refused
+    from backend.db import BackupBusyError
+    from backend.runs import Harness
+    from test_search import app
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await background_idle(client)
+        backup = (await client.post("/api/backups")).json()["id"]
+        db, soon, shutdown = client.state["db"], search.embed_memory_soon, Harness.shutdown
+        restoring, stopped = [], asyncio.Event()
+
+        async def announced(self, *args, **kwargs):  # the real one closes the registry before it first waits
+            stopped.set()
+            return await shutdown(self, *args, **kwargs)
+
+        async def stopped_first(state, project_id):
+            if not restoring:
+                restoring.append(asyncio.ensure_future(client.post("/api/backups/restore", json={"generation": backup})))
+                await asyncio.wait_for(stopped.wait(), 15)
+                assert state["harness"].registry.closed
+            return await soon(state, project_id)
+
+        def busy():
+            raise BackupBusyError("settings kept changing")
+        monkeypatch.setattr(Harness, "shutdown", announced)
+        monkeypatch.setattr(search, "embed_memory_soon", stopped_first)
+        monkeypatch.setattr(db, "backup", busy)
+        record = (await entered(client, project, "Wage floors raise the earnings of low-paid workers"))["id"]
+        response = await restoring[0]
+        assert (response.status_code, response.json()["code"]) == (409, "backup_busy")
+        held = await _vectors(client, [record], timeout=5)
+        assert held == {record}, (held, await _index_runs(client))
+
+
 async def test_a_failed_restore_put_back_publishes_its_harness_before_it_starts_its_background_runs(tmp_path,
                                                                                                     monkeypatch):
     # S8 (design review L3): "started" implies "published", so no run a start's kick or an ask starts meets a state

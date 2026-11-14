@@ -370,6 +370,8 @@ async def embed_memory_soon(state, project_id):
             await _request(harness, general)
     except Exception as error:
         log.warning("the General project's index run for memory could not be requested (%s)", type(error).__name__)
+    if harness.registry.closed:  # stopped meanwhile (a restore that may not go ahead): the same two, if it resumes
+        harness.asks_after_kick[project_id] = lambda: embed_memory_soon(state, project_id)
 
 
 async def after_deletion(state, project_id):
