@@ -21,6 +21,7 @@ import logging
 import weakref
 
 from backend import provenance
+from backend.db.content import referenced_sql
 from backend.extraction import EXTRACTORS, extractor_of
 
 log = logging.getLogger(__name__)
@@ -264,15 +265,17 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
         def run(conn):
             if check is not None:
                 check(conn)
-            return _delete(conn, kind, object_id, remove_all_trace)
-        revoked = db.write(run)
+            # the content referenced before: what of it the deletion leaves unreferenced is collected at once
+            referenced = [sha256 for (sha256,) in conn.execute(referenced_sql(conn))]
+            return _delete(conn, kind, object_id, remove_all_trace), referenced
+        revoked, referenced = db.write(run)
     if on_committed is not None:
         on_committed(revoked)
     # The deletion is committed. These finish removing its traces, and the next
     # deletion or collection retries them if they fail now. Collection goes first,
     # since the rows it removes would otherwise stay in the WAL.
     try:
-        content.collect_garbage()
+        content.collect_garbage(released=referenced)
     except Exception as error:
         log.warning("content collection after a deletion failed (%s)", type(error).__name__)
     try:

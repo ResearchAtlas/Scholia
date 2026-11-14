@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import signal
 import sqlite3
 import subprocess
@@ -13,6 +14,7 @@ import pytest
 import backend.db.database as database_module
 import backend.db.deletion as deletion_module
 from backend.db import DB_NAME, ContentStore, Database, delete, new_id
+from backend.db.content import IDLE_AFTER, referenced_sql
 from backend.db.deletion import DELETE, KINDS, NOT_DELETED, ON_DELETE
 from backend.db.migrations import MIGRATIONS
 from backend.extraction import PDF, extractor_of
@@ -266,11 +268,149 @@ def test_deleting_a_project_removes_everything_it_owned_and_nothing_else(db, sto
     assert not any(text in json.dumps(data) for text in ("Thesis", "Chat p", "Paper p", "Draft p", "fact p", "quote p"))
     assert (tmp_path / "data" / f"{DB_NAME}-wal").stat().st_size == 0  # no deleted page left in the WAL
 
-    store.collect_garbage(now=later())  # the deleted project's files were added just now
+    # its files, added just now, went with the deletion, and the other project's stay (M2 audit 1 F8)
     assert dump(db, skip=GOVERNANCE)["content_files"] == before["content_files"]
     assert store.read(other["paper"]) == b"paper q"
     with pytest.raises(FileNotFoundError):
         store.read(x["paper"])
+
+
+@pytest.mark.parametrize("kind", ["project", "conversation", "material"])
+def test_a_deletion_removes_at_once_the_files_only_it_referenced(db, store, kind):
+    # M2 audit 1 F8: a file added within the hour stayed in content/ until collection found it idle
+    other = populate(db, store, add_project(db, "Other"), "q")
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    loose = store.put(b"being added")  # its record is not committed yet: the idle rule keeps it
+    deleted = {"project": x["project"], "conversation": x["c1"], "material": x["m1"]}[kind]
+    gone = {"project": [x["paper"], x["body"]], "conversation": [x["body"]], "material": [x["paper"]]}[kind]
+
+    delete(db, store, kind, deleted)
+
+    for sha256 in gone:
+        with pytest.raises(FileNotFoundError):
+            store.read(sha256)
+        assert one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", sha256) == (0,)
+    assert store.read(other["paper"]) == b"paper q" and store.read(other["body"]) == b"tool output q"
+    assert store.read(loose) == b"being added"
+    for sha256 in {"project": [], "conversation": [x["paper"]], "material": [x["body"]]}[kind]:
+        assert store.read(sha256)  # still referenced (the body by its run's event)
+
+
+def test_a_file_put_again_and_named_by_a_new_record_while_the_deletion_collects_is_kept(db, store, monkeypatch):
+    # PR 59 batch 2, item 1: after collection read which hashes have rows, the same bytes were put again, a record
+    # named them and the hold ended; with the clock set back, the file looked older than the deletion and was removed
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    real, again = ContentStore._stored_files, []
+
+    def put_again_first(self):
+        if not again:
+            with self.hold() as held:
+                again.append(self.put(b"paper p", "application/pdf", held))
+                db.write(lambda conn: conn.execute(
+                    "INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current)"
+                    " VALUES (?, ?, 1, ?, 0)", (new_id(), other, again[0])))
+            # the clock set back past the idle window while it was put, so only the put counter keeps the file
+            past = time.time() - IDLE_AFTER.total_seconds() - 60
+            os.utime(self._path(again[0]), (past, past))
+        yield from real(self)
+
+    other = new_id()
+    db.write(lambda conn: conn.execute(
+        "INSERT INTO materials (id, project_id, title, source) VALUES (?, ?, 'Same paper', 'upload')",
+        (other, x["project"])))
+    monkeypatch.setattr(ContentStore, "_stored_files", put_again_first)
+    delete(db, store, "material", x["m1"])
+    assert again == [x["paper"]] and store.read(x["paper"]) == b"paper p"
+    assert one(db, "SELECT count(*) FROM material_versions WHERE file_sha256 = ?", x["paper"]) == (1,)
+
+
+@pytest.mark.parametrize("hours", [2, 24 * 30])
+def test_a_deletion_after_the_clock_was_set_back_removes_its_files_at_once(db, store, hours):
+    # Design review H, K5: rows and files written before the clock was set back looked later than the deletion, so
+    # its paper's file and row stayed, past the idle rule too, for as long as the clock was behind
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    ahead = datetime.now(UTC) + timedelta(hours=hours)  # when they were written, by the clock as it was then
+    db.write(lambda conn: conn.execute("UPDATE content_files SET created_at = ? WHERE sha256 = ?",
+                                       (ahead.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z", x["paper"])))
+    os.utime(store._path(x["paper"]), (ahead.timestamp(), ahead.timestamp()))
+    delete(db, store, "material", x["m1"])
+    with pytest.raises(FileNotFoundError):
+        store.read(x["paper"])
+    assert one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", x["paper"]) == (0,)
+
+
+def test_a_paper_added_and_deleted_at_once_leaves_no_file(db, store, monkeypatch):
+    # Design review H, K6: a paper added after the deletion's request started, and deleted by it, kept the idle rule
+    started = datetime.now(UTC) - timedelta(minutes=1)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return started  # the deletion's request started before the paper was added
+
+    # the base's condition (the deletion read its start from this clock); the deletion reads no clock now (2B)
+    monkeypatch.setattr(deletion_module, "datetime", Clock, raising=False)
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    delete(db, store, "material", x["m1"])
+    with pytest.raises(FileNotFoundError):
+        store.read(x["paper"])
+
+
+def test_a_collection_whose_commit_fails_after_it_removed_a_file_leaves_no_record_naming_a_missing_file(
+        db, store, caplog):
+    # Design review H, option 2B: the file goes inside the collection's transaction; if that transaction then fails,
+    # its row is back but nothing names it, and a later collection removes the row
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    old = store.put(b"long unused")  # an idle row the same collection removes, after the paper's file
+    past = time.time() - 7200
+    os.utime(store._path(old), (past, past))
+    db.write(lambda conn: (
+        conn.execute("UPDATE content_files SET created_at = '2000-01-01T00:00:00.000Z' WHERE sha256 = ?", (old,)),
+        conn.execute(f"CREATE TRIGGER failing BEFORE DELETE ON content_files WHEN OLD.sha256 = '{old}'"
+                     " BEGIN SELECT RAISE(ABORT, 'injected'); END")))
+    with caplog.at_level(logging.WARNING):
+        delete(db, store, "material", x["m1"])
+    assert "content collection after a deletion failed" in caplog.text
+    assert not store._path(x["paper"]).exists()
+    assert one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", x["paper"]) == (1,)  # rolled back
+    assert not db.read(lambda conn: conn.execute(  # no record names it
+        f"SELECT 1 WHERE ? IN ({referenced_sql(conn)})", (x["paper"],)).fetchone())
+    db.write(lambda conn: conn.execute("DROP TRIGGER failing"))
+    store.collect_garbage(now=later())
+    assert one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", x["paper"]) == (0,)
+
+
+@pytest.mark.parametrize("held", [True, False])
+def test_a_put_in_progress_while_a_deletion_collects_keeps_its_file_and_its_row(db, store, monkeypatch, held):
+    # Design review H, option 2B (rewritten from "a file added again while a deletion runs keeps the idle rule"): the
+    # same bytes put again, their file in place and their row not yet committed, while the deletion collects
+    import threading
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    placed, go, real = threading.Event(), threading.Event(), db.write
+
+    def write(fn, committed=None):  # the put's own row insert waits until the deletion has collected
+        if threading.current_thread().name == "putter" and not go.is_set():
+            placed.set()
+            go.wait(10)
+        return real(fn, committed)
+
+    monkeypatch.setattr(db, "write", write)
+
+    def put():
+        if held:
+            with store.hold() as hold:
+                store.put(b"paper p", "application/pdf", hold)
+        else:
+            store.put(b"paper p", "application/pdf")
+
+    putter = threading.Thread(target=put, name="putter")
+    putter.start()
+    assert placed.wait(10)
+    delete(db, store, "material", x["m1"])
+    go.set()
+    putter.join(10)
+    assert store.read(x["paper"]) == b"paper p"
+    assert one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", x["paper"]) == (1,)
 
 
 def test_the_general_project_cannot_be_deleted(db, store):
@@ -570,10 +710,8 @@ def test_a_database_at_schema_1_gets_the_guard_for_its_earlier_deletions(tmp_pat
                 "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (deleted, project)))
         db.write(lambda conn: conn.execute(
             "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (new_id(), project)))
-    # taken before the first migration it ran: the oldest generation, promoted to weekly once more than the daily
-    # generations kept were taken (S1-21b's migration 0009 made it eight)
-    generation = min((g for kind in ("daily", "weekly") if (data / "backups" / kind).is_dir()
-                      for g in (data / "backups" / kind).iterdir()), key=lambda g: g.name)
+    # the one backup, taken before the first migration it ran (M2 audit 6 F1)
+    [generation] = (data / "backups" / "daily").iterdir()
     backup = sqlite3.connect(f"{(generation / DB_NAME).as_uri()}?mode=ro", uri=True)
     try:
         assert backup.execute("PRAGMA user_version").fetchone() == (1,)
@@ -679,7 +817,7 @@ KILLED_DELETION = r"""
 import os, signal, sqlite3, sys, time
 
 
-def crash(*args):
+def crash(*args, **kwargs):
     os.kill(os.getpid(), signal.SIGKILL)
     while True:  # the signal is delivered asynchronously; never return to the next statement
         time.sleep(1)
