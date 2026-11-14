@@ -4,11 +4,11 @@
 // them; every format also shows its passages as text, in order. The cited passage's highlight comes
 // with S1-19's citations; here a passage is highlighted while it is pointed at or focused, and Tab
 // reaches each passage, in the text and on the page.
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { ArrowLeft, FileUp, Trash2 } from 'lucide-react';
-import { useT } from '../i18n/index.js';
+import { LanguageContext, useT } from '../i18n/index.js';
 import { patch } from '../api.js';
-import { useAction } from '../action.js';
+import { problemText, useAction } from '../action.js';
 import { visible } from '../text.js';
 import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPointed, libraryChanged, NOT_POINTED, pageFailedKey, pageImage,
   pageLines, pageOffsets, pagePart, pagesWithin, pageWindow, PAGE_WIDTH, partMove, passOn, PASSAGE_STRETCH, passageStretch, pointing,
@@ -81,13 +81,15 @@ export function Paper({ material, project, index, target, onBack, onChanged, onD
 }
 
 // The details the researcher may correct; a save is kept as checked by the researcher, so no lookup
-// replaces it, and says it was saved only once the backend has saved it.
+// replaces it, and says it was saved only once the backend has saved it. saved: what the latest save said, held by the
+// Library (true, or { problem }), so an older save's answer, which draws the page again, never wipes a newer one's.
 function Details({ material, saved, onAction, afterSave }) {
   const t = useT();
+  const language = useContext(LanguageContext);
   const id = useId();
   const before = detailsOf(material);
   const [form, setForm] = useState(before);
-  const { busy, problem, run } = useAction();
+  const { busy, run } = useAction();
   const shown = useRef(before); // the saved details the form last took
   const key = `${material.id}:${material.updated_at}`;
   useEffect(() => { // newly saved details (a lookup, or this form's save) fill the form, but for the fields being edited
@@ -99,13 +101,19 @@ function Details({ material, saved, onAction, afterSave }) {
   async function save(event) {
     event.preventDefault();
     const report = onAction('saved');
-    if (await run(() => patch(`/api/materials/${encodeURIComponent(material.id)}`, body))) {
+    await run(async () => {
+      try {
+        await patch(`/api/materials/${encodeURIComponent(material.id)}`, body);
+      } catch (error) {
+        report({ problem: problemText(t, error, language) });
+        return;
+      }
       report(true);
       afterSave();
-    }
+    });
   }
 
-  const set = (name) => (event) => { if (saved) onAction('saved'); setForm((current) => ({ ...current, [name]: event.target.value })); };
+  const set = (name) => (event) => { if (saved === true) onAction('saved'); setForm((current) => ({ ...current, [name]: event.target.value })); };
   const field = (name, label, control) => (
     <div className="grid gap-1.5">
       <label htmlFor={`${id}-${name}`} className="text-xs font-medium text-muted-foreground">{label}</label>
@@ -127,8 +135,8 @@ function Details({ material, saved, onAction, afterSave }) {
         placeholder={t('paper.field.doiPlaceholder')} onChange={set('doi')} />)}
       {!visible(form.title) && <p className="text-xs text-destructive">{t('paper.titleNeeded')}</p>}
       {!validYear(form.year) && <p className="text-xs text-destructive">{t('paper.yearInvalid')}</p>}
-      {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
-      {saved && <p role="status" className="text-sm text-success">{t('paper.saved')}</p>}
+      {saved?.problem && <p role="alert" className="text-sm text-destructive">{saved.problem}</p>}
+      {saved === true && <p role="status" className="text-sm text-success">{t('paper.saved')}</p>}
       <div className="flex gap-2">
         <Button type="submit" size="sm" disabled={busy || invalid || !Object.keys(body).length}>{t('common.save')}</Button>
         <Button type="button" size="sm" variant="ghost" disabled={busy || !Object.keys(body).length}

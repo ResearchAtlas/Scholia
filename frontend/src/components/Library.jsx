@@ -120,7 +120,7 @@ export function Library({ project }) {
         <Paper material={paper} project={project} index={index} target={open.target}
           onBack={() => { openPaper(null); load(); }} onChanged={load}
           onDelete={() => setDeleting({ id: paper.id, title: paper.title })}
-          notice={paperFeedback(feedback, paper.id, 'notice')} saved={paperFeedback(feedback, paper.id, 'saved') === true}
+          notice={paperFeedback(feedback, paper.id, 'notice')} saved={paperFeedback(feedback, paper.id, 'saved')}
           onAction={(kind) => paperAction(paper.id, kind, setFeedback)} />
         {dialog}
       </>

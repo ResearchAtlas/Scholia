@@ -493,7 +493,7 @@ test('a paper\'s new file, saved details and deletion are library changes', () =
   assert.doesNotMatch(paper, /DeleteDialog/);
   assert.match(paper, /onClick=\{onDelete\}/);
   assert.match(library, /onSettled=\{\(\) => libraryChanged\(project\.id\)\}/);
-  assert.match(library, /saved=\{paperFeedback\(feedback, paper\.id, 'saved'\) === true\}/);
+  assert.match(library, /saved=\{paperFeedback\(feedback, paper\.id, 'saved'\)\}/);
   // the one dialog survives the page giving way to the list at the change (batch 2 review F1): keyed, and the last child
   // of both forms of the panel, so its notice or its error stays on screen
   assert.match(library, /<DeleteDialog key="delete"/);
