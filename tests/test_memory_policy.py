@@ -1152,8 +1152,26 @@ async def test_an_extractions_own_keep_of_a_shown_proposal_is_no_change_at_dispa
                 _, run = _turn_and_extraction(conn, project, conversation, "We use interviews")
                 memory.apply_extraction(conn, run, [{**_says_as("We use interviews", "confirmed",
                                                                 "we use interviews")[0], "type": "decision"}])
+                # the confirmation happened, as the proposal's next version (the internal review of batch 4)
+                assert conn.execute("SELECT status, version FROM memory_records WHERE id = ?",
+                                    (proposal,)).fetchone() == ("superseded", 1)
             return memory.allowed(conn, project, [proposal], held)
         assert await asyncio.to_thread(client.state["db"].write, steps) is (by == "extraction")
+
+
+async def test_any_change_in_place_of_a_held_version_refuses_whoever_wrote_it(tmp_path):
+    # design review N, Option 1: allowed reads no "who" for a held version (R3's exception is gone); a version changed
+    # in place, even of a record marked an extraction's and unstamped, is refused (pins the exception's removal)
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+
+        def steps(conn):
+            record = memory.write(conn, project_id=project, scope="project", kind="decision",
+                                  content="We use interviews", status="proposed", sources=[("project", project)],
+                                  structured={"extracted": True})
+            conn.execute("UPDATE memory_records SET status = 'confirmed', version = 2 WHERE id = ?", (record,))
+            return memory.allowed(conn, project, [record], {record: 1})
+        assert await asyncio.to_thread(client.state["db"].write, steps) is False
 
 
 # PR 62 batch 4 (round 4, astra pass 2; design review N, Option 1): an extraction never changes a record in place, so
