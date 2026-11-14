@@ -58,13 +58,19 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from backend import asks, local_helper
-from backend.db import deletion, new_id, utc_now
+from backend.db import DatabaseClosedError, deletion, new_id, utc_now
 from backend.local_helper import EMBEDDING, HelperUnavailable, InputRefused, Refused
 from backend.runs import AdmissionError, RunOutcome, _event, _revoked, _running, derived_status
 from backend.search_index import DAMAGE, DIMENSIONS, SearchIndex, Unavailable, digest, index_text, readings
 from backend.settings import load_settings, visible
 
 log = logging.getLogger(__name__)
+# What a request for an index run (_request) raises when a stop refused it, and nothing else does: AdmissionError, the
+# harness stopped at the request's admission (Harness.record_background); DatabaseClosedError, under a request already
+# admitted, a restore holding the writes or the database closing or closed (Database.write), or the database closed
+# under the started run's look (Database.read, through _started and Harness.start_again). embed_memory_soon's read of
+# General's id (Database.read) raises it only for a closed database, a stop too. Design review P, Option 3.
+STOPPED = (AdmissionError, DatabaseClosedError)
 
 QUERY_CHARS = 1000
 MAX_LIMIT = 50
@@ -112,14 +118,16 @@ def identity(config):
             else pin["file"], "runtime": runtime, "dimensions": DIMENSIONS}
 
 
-async def open_index(state, db):
+async def open_index(state, db, harness=None):
     """Open the index for db (at launch, and again on the database a restore puts in place), closing
-    the one before; the index closes with db (Database.closing). Index runs are requested (recorded
+    the one before; the index closes with db (Database.closing), and asks its runs of harness, db's own (None: nothing is
+    asked, as an index opened on its own in a test). Index runs are requested (recorded
     unstarted: the app's background runs start them, backups.start_background, never before) for every
     project with queue rows left to apply, and, while the model is installed, every project whose index
     has passages without embeddings, or every project with papers when the vectors are wanted again
-    (dropped, or the file being rebuilt). A failure leaves search keyword-only with nothing indexed
-    (index_unavailable), and the app runs."""
+    (dropped, or the file being rebuilt), and every project whose memory records lack vectors
+    (_memory_pending). A failure leaves search keyword-only with nothing indexed (index_unavailable),
+    and the app runs."""
     previous = state.pop("index", None)
     if previous is not None:
         try:
@@ -138,14 +146,16 @@ async def open_index(state, db):
         return
     db.closing.append(index.close)  # a restore under way or abandoned, or shutdown: nothing outlives db
     state["index"] = index
-    state["model_installed"] = lambda: asyncio.ensure_future(_embed_all(state))
+    # The model's install (a download or an import) and a rebuild's end ask this index's runs of its own harness, never
+    # one looked up later (a restore replaces both)
+    state["model_installed"] = asked = lambda: asyncio.ensure_future(_embed_all(state, index, harness))
     loop = asyncio.get_running_loop()
 
     def rebuilt():  # rows made outside an index run (in the writer): a file rebuilt while the app runs, or the
         # queue applied after a failed pass; the projects whose passages lack embeddings get their runs
         if _installed(state):
             try:
-                loop.call_soon_threadsafe(state["model_installed"])
+                loop.call_soon_threadsafe(asked)
             except RuntimeError:  # the app stopped meanwhile: the next launch requests the runs
                 pass
     index.rebuilt = rebuilt
@@ -165,6 +175,9 @@ async def open_index(state, db):
     except Exception as error:  # unreadable now (being replaced): every project is taken as pending
         log.warning("the search index could not be read at open (%s)", type(error).__name__)
         pending = None
+    # The memory records without a vector, every one of them while the vectors are wanted again (the opening's pass has
+    # pruned the queue's memory additions, which no pass embeds)
+    remembered = await asyncio.to_thread(_memory_pending, index, pending is not None) if installed else set()
 
     def requested(conn):
         # Every index run still recorded running ran in a process that has ended (or in a database a restore put
@@ -184,6 +197,7 @@ async def open_index(state, db):
             projects |= pending if pending is not None else {p for (p,) in conn.execute(
                 "SELECT DISTINCT m.project_id FROM materials m JOIN material_versions v ON v.material_id = m.id"
                 " AND v.is_current = 1 WHERE v.file_sha256 IS NOT NULL")}
+            projects |= remembered
         for project in sorted(projects):
             if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project,)).fetchone():
                 request_run(conn, project, lambda conn, project, inputs: _insert_run(conn, None, project, inputs),
@@ -191,6 +205,10 @@ async def open_index(state, db):
     await asyncio.to_thread(db.write, requested)
     if rebuilding is None:
         index.apply_soon()
+    elif not installed:  # a model installed while the opening's rebuild runs finds the index unreadable (_embed_all):
+        # the rebuild, once ready, asks for what lacks embeddings (index.rebuilt), as later rebuilds do; one that failed is
+        # retried, its retry asking (_rebuild_soon). With the model installed, the runs above already take everything.
+        rebuilding.add_done_callback(lambda _: index.building or index.closed or rebuilt())
 
 
 def _insert_run(conn, run_id, project_id, inputs):
@@ -267,17 +285,113 @@ def _downloading(state):
     return local is not None and local.download is not None and local.download.state == "running"
 
 
-async def _embed_all(state):
-    """The model was just installed, or rows were made outside an index run (index.rebuilt): a run is requested for
-    every project whose index has passages without embeddings."""
-    index, harness = state.get("index"), state.get("harness")
-    if index is None or harness is None:
+def _memory_pending(index, read=True):
+    """The projects whose index runs embed the active recalled memory records without a vector under their scope, nor a
+    refusal of their content (read from the index; without read, or while it cannot be read, every one: its vectors
+    dropped or being rebuilt). A vector whose removal is queued (a record moved away, and back since) does not count: the
+    removal takes it by id. A project record's run is its project's, which it is deleted with; a personal one's is the
+    General project's, which cannot be deleted (every project's run embeds personal records, General's among them). It
+    answers the launch, the install and a rebuild's end; a memory write asks by name (embed_memory_soon). The queue never
+    embeds a memory addition (SearchIndex._apply_queue): only these runs do (M2 audit, area 2; design review E,
+    Option 1)."""
+    from backend import memory
+    # Read: sqlite-vec did not load, so no vector can be made (the next launch where it loads asks). Unread, it tells
+    # nothing: a file that failed at open did so before loading it, and the rebuild replacing it keeps no vector.
+    if read and not index.vectors:
+        return set()
+    found, general, leaving = index.db.read(lambda conn: (conn.execute(
+        "SELECT id, scope, project_id, content FROM memory_records WHERE status IN (SELECT value FROM json_each(?))"
+        " AND type IN (SELECT value FROM json_each(?))",
+        (json.dumps(memory.ACTIVE), json.dumps(memory.RECALLED))).fetchall(), _general(conn),
+        {m for (m,) in conn.execute("SELECT target_id FROM index_queue WHERE target = 'memory' AND op = 'remove'")}))
+    have = set()
+    if read and found:
+        try:
+            have = _memory_done(index, {m: (f"project:{project}" if scope == "project" else "personal", content)
+                                        for m, scope, project, content in found}) - leaving
+        except Exception as error:  # unreadable now (being replaced): every record is taken as pending
+            log.warning("the search index's memory could not be read (%s)", type(error).__name__)
+    return {project if scope == "project" else general for m, scope, project, _ in found if m not in have}
+
+
+def _general(conn):
+    return conn.execute("SELECT id FROM projects WHERE kind = 'general'").fetchone()[0]
+
+
+def _memory_done(index, records):
+    """The ones of records ({memory id: (its scope, its content)}) with a vector under that scope (a moved record's,
+    under the project it left, waits for its queued removal), or with the helper's refusal of that content kept (asked
+    for again only once the content, a new version, or the model changes, as a passage's refusal)."""
+    return index.memory_embedded(list(records), {m: scope for m, (scope, _) in records.items()}) | index.memory_refused(
+        {m: digest(content) for m, (_, content) in records.items()})
+
+
+async def _embed_all(state, index, harness, retry=True):
+    """The model was just installed, or rows were made outside an index run (index.rebuilt): a run is requested of the
+    index's own harness for every project whose index has passages without embeddings, or whose memory records lack
+    vectors. While that harness cannot start runs (its background runs not started yet: a launch, or a restore before its
+    commit; or stopped: a restore that may not go ahead), nothing is read or written: the ask waits on the harness, and
+    its kick asks again (Harness.kick_background). Decided in one step, with no await between the look and the wait. A
+    request refused by a stop (STOPPED: known by the error, never by the harness's state when it arrives) waits the same
+    way, unless the harness admits again by then (a restore refused meanwhile, its kick past): then the same ask is made
+    again at once, once (retry false: one refused again waits). No run is recorded here (design reviews L, Option A,
+    and P, Option 3)."""
+    if harness is None or index.closed:
+        return
+
+    def again(retry=True):
+        return _embed_all(state, index, harness, retry)
+    if not harness.kicked or harness.registry.closed:
+        harness.asks_after_kick["all"] = again
         return
     try:
-        for project in sorted(await asyncio.to_thread(index.unembedded)):
-            await _request(harness, project)
-    except Exception as error:
+        projects = await asyncio.to_thread(index.unembedded) | await asyncio.to_thread(_memory_pending, index)
+    except Exception as error:  # a whole rebuild: its end asks (index.rebuilt)
         log.warning("index runs after the model's install could not be requested (%s)", type(error).__name__)
+        return
+    for project in sorted(projects):  # each on its own: one that fails leaves the others asked for
+        try:
+            await _request(harness, project)
+        except Exception as error:
+            log.warning("an index run after the model's install could not be requested (%s)", type(error).__name__)
+            if isinstance(error, STOPPED):  # refused by a stop, whatever the harness is by now
+                if retry and not harness.registry.closed:  # that stop has ended, its kick past: again now, once
+                    return await again(False)
+                harness.asks_after_kick["all"] = again  # else at its next kick (Harness.resume)
+
+
+async def embed_memory_soon(state, project_id, retry=True):
+    """After a memory write in the project (a record created, edited or kept, a command, an extraction, a move), while
+    the search model is installed: the project's run, then the General project's, asked by name, each on its own. A
+    project record is embedded by its project's run; a personal one by any project's, and General cannot be deleted. So
+    nothing about the record or the index is consulted, which a deletion or a rebuild since the commit could have
+    changed (design review E2, Option A). Never a third project's run: one the researcher cancelled there stays so
+    (reading R29); General's starts again at the next memory write. An ask refused by a stop (STOPPED) makes the same
+    two again at once, once, if the harness admits again by then, else waits on it for its kick (design review P)."""
+    index, harness = state.get("index"), state.get("harness")
+    if index is None or harness is None or not _installed(state):
+        return
+
+    def again(retry=True):
+        return embed_memory_soon(state, project_id, retry)
+    try:  # the project's first: reading General's id cannot lose it
+        await _request(harness, project_id)
+    except Exception as error:
+        log.warning("an index run for memory could not be requested (%s)", type(error).__name__)
+        if isinstance(error, STOPPED):  # refused by a stop (a restore that may not go ahead): the same two again,
+            if retry and not harness.registry.closed:  # now and once if it admits again by now, else at its kick
+                return await again(False)
+            harness.asks_after_kick[project_id] = again
+    try:
+        general = await asyncio.to_thread(harness.db.read, _general)
+        if general != project_id:
+            await _request(harness, general)
+    except Exception as error:
+        log.warning("the General project's index run for memory could not be requested (%s)", type(error).__name__)
+        if isinstance(error, STOPPED):
+            if retry and not harness.registry.closed:
+                return await again(False)
+            harness.asks_after_kick[project_id] = again
 
 
 async def after_deletion(state, project_id):
@@ -567,7 +681,10 @@ async def _counts(index, project_id):
 
 # S1-21a: memory embeddings (vec_memory). An index run embeds the active recalled records of its project and the
 # personal ones that lack a vector, each request carrying the run's dispatch check (the record still active); recall
-# asks for the nearest within `[retrieval] memory_ms` (backend/runs.py Harness._recall), else takes the newest.
+# asks for the nearest within `[retrieval] memory_ms` (backend/runs.py Harness._recall), else takes the newest. The
+# launch, the install and a rebuild's end ask the runs of what lacks a vector (_memory_pending: a project record's own
+# project, and the General project for a personal one); a memory write asks its project's run and General's by name
+# (embed_memory_soon).
 
 
 def memory_scopes(project_id):
@@ -592,7 +709,8 @@ async def _embed_memory(state, harness, active, project_id, drained):
         return [(r["id"], "personal" if r["scope"] == "personal" else f"project:{project_id}", r["content"])
                 for r in memory.in_scope(conn, project_id, kinds=memory.RECALLED)]
     records = await asyncio.to_thread(db.read, wanted)
-    have = await asyncio.to_thread(index.memory_embedded, [m for m, _, _ in records]) if records else set()
+    have = await asyncio.to_thread(_memory_done, index, {m: (scope, content) for m, scope, content in records}) \
+        if records else set()
     stored = 0
     for memory_id, scope, content in (r for r in records if r[0] not in have):
         def admit(conn, memory_id=memory_id):
@@ -600,10 +718,20 @@ async def _embed_memory(state, harness, active, project_id, drained):
             return tuple(row or ()) == ("running", None) and memory_id in _active_memory(conn, [memory_id], project_id)
         try:
             [vector] = await local_helper.embed(state, [content], project_id=project_id, admit=admit)
-        except InputRefused:
+        except InputRefused:  # its content, refused as such: kept, while the record is still of this scope
+            await drained(index.refuse_memory, memory_id, digest(content),
+                          lambda ids: db.read(lambda conn: _active_memory(conn, ids, project_id)))
             continue
-        except HelperUnavailable:  # refused by the check (forgotten meanwhile) or the helper stopped: the next run
-            continue
+        except HelperUnavailable as unavailable:  # as for a passage (_index_run): refused by the check, or failed
+            def now(conn, memory_id=memory_id):
+                return (_running(conn, run_id) and not _revoked(conn, run_id),
+                        memory_id in _active_memory(conn, [memory_id], project_id))
+            running, current = await asyncio.to_thread(db.read, now)
+            if not running:
+                raise RunOutcome("cancelled", "project_changed", "revoked") from None
+            if not current:  # forgotten or moved as it was asked for: never sent
+                continue
+            raise RunOutcome("failed", unavailable.reason) from None  # Retry, or the next launch, embeds it
         if len(vector) == DIMENSIONS:
             # stored only while the record is still of this scope, read as it is written (a move meanwhile queues its
             # vector's removal; this one is then never written to the old partition)

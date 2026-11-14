@@ -828,7 +828,7 @@ async def test_a_passage_the_helper_refuses_is_counted_and_passed_over_until_its
         client.remote.refuse = None
         index = client.state["index"]
         await asyncio.to_thread(index._write, index._drop_vectors)  # another model: every vector asked for again
-        await search._embed_all(client.state)
+        await client.state["model_installed"]()
         status = await idle(client, project)
         assert status["passages"]["refused"] == 0 and status["passages"]["embedded"] == status["passages"]["embeddable"]
 
@@ -1145,8 +1145,8 @@ async def test_the_installs_request_while_a_run_runs_is_one_rerun_after_it(tmp_p
         [material] = (await added(client, project, WAGES))["materials"]
         await asyncio.wait_for(client.remote.reached.wait(), 10)
         [running] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
-        await search._embed_all(client.state)  # as the model's install calls it
-        await search._embed_all(client.state)  # twice: still one rerun
+        await client.state["model_installed"]()  # as the model's install calls it
+        await client.state["model_installed"]()  # twice: still one rerun
         assert [r["run_id"] for r in await runs_of(client, "index", project)] == [running["run_id"]]
         [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE id = ?", running["run_id"])
         assert json.loads(inputs)["again"] == {"rebuild": False}
@@ -1360,7 +1360,7 @@ async def test_every_trigger_while_the_projects_run_runs_is_one_rerun_after_it(t
         patched = await client.patch(f"/api/materials/{first['id']}", json={"title": "Wage Floors, Retitled"})
         assert patched.status_code == 200, patched.text
         assert (await client.delete(f"/api/materials/{old['id']}")).status_code == 200
-        await search._embed_all(client.state)
+        await client.state["model_installed"]()
         retried = (await client.post(f"/api/runs/{cancelled}/retry")).json()["run_id"]
         rebuilt = (await client.post(f"/api/projects/{project}/index/rebuild")).json()
         assert retried == rebuilt["run_id"] == running and rebuilt["rebuild_pending"] is True  # the running run's id
