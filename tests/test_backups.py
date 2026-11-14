@@ -230,6 +230,76 @@ async def test_a_full_backup_never_holds_a_key_typed_into_a_settings_file(tmp_pa
     assert b"citation_style" in read(export, "settings/config.toml") and b"#" not in read(export, "settings/config.toml")
 
 
+async def test_the_zotero_switch_survives_a_full_backup_and_its_restore(tmp_path):
+    # M2 audit 6 F2: [zotero] was an open section, which the archive's filter (known_only) leaves out
+    from backend import zotero
+    data, destination = tmp_path / "data", tmp_path / "chosen"
+    destination.mkdir()
+    async with started(data) as client:
+        current = (await client.get("/api/settings")).json()
+        saved = await client.put("/api/settings", json={"hash": current["hash"], "updates": {"zotero.enabled": False}})
+        assert saved.status_code == 200, saved.text
+        run = await archived_run(client, "/api/backups/full", {"destination": str(destination)})
+        assert run.status == "succeeded", run
+        assert b"enabled = false" in read(destination / run.result["file"].rsplit("/", 1)[1], "config.toml")
+        response = await client.post("/api/backups/restore", json={"file": run.result["file"]})
+        assert response.status_code == 200, response.text
+        assert not zotero.enabled(data)
+        assert (await client.get("/api/zotero/status")).json() == {"state": "off"}
+
+
+async def test_a_restored_full_backup_shows_its_own_run_as_it_ended(tmp_path):
+    # M2 audit 6 F4: its copy of the database was taken while its run ran, so recovery ended that run interrupted
+    data, destination = tmp_path / "data", tmp_path / "chosen"
+    destination.mkdir()
+    async with started(data) as client:
+        run = await archived_run(client, "/api/backups/full", {"destination": str(destination)})
+        assert run.status == "succeeded", run
+        response = await client.post("/api/backups/restore", json={"file": run.result["file"]})
+        assert response.status_code == 200, response.text
+        [(status, finished, summary)] = await rows(client, "SELECT status, finished_at, summary FROM runs WHERE id = ?",
+                                                   run.row["run_id"])
+        assert status == "succeeded" and finished and json.loads(summary)["projects"] == run.result["projects"]
+        events = [kind for (kind,) in await rows(client, "SELECT type FROM run_events WHERE run_id = ? ORDER BY seq",
+                                                 run.row["run_id"])]
+        assert events[-1:] == ["run_finished"] and events.count("run_finished") == 1
+        [listed] = [r for r in (await client.get("/api/activity")).json()["runs"] if r["run_id"] == run.row["run_id"]]
+        assert listed["status"] == "succeeded"
+    assert not [p for p in destination.iterdir() if p.suffix != ".zip"]  # nothing else left beside it
+
+
+@pytest.mark.parametrize("archive", ["full", "export"])
+async def test_a_paper_deleted_after_an_archive_listed_its_file_and_before_it_held_it_stays_in_the_archive(
+        tmp_path, monkeypatch, archive):
+    # PR 59 batch 1, item 2: the deletion's collection, which no longer waits for files to be idle, removed a file the
+    # archive's copy or read of the records listed, before the archive held it
+    from backend.db import ContentStore, delete
+    data, destination = tmp_path / "data", tmp_path / "chosen"
+    destination.mkdir()
+    async with started(data) as client:
+        project = await new_project(client)
+        sha256 = await stored_material(client, project, b"%PDF-1.7 a paper", "application/pdf")
+        [(material,)] = await rows(client, "SELECT id FROM materials WHERE project_id = ?", project)
+        real, deleted = ContentStore.hold, []
+
+        def deleted_first(self, hashes=()):  # the paper deleted in the interval, its deletion's collection run
+            if sha256 in hashes and not deleted:
+                deleted.append(delete(client.state["db"], self, "material", material))
+            return real(self, hashes)
+
+        monkeypatch.setattr(ContentStore, "hold", deleted_first)
+        path = "/api/backups/full" if archive == "full" else f"/api/projects/{project}/export"
+        run = await archived_run(client, path, {"destination": str(destination)})
+        assert run.status == "succeeded" and deleted, run
+    file = destination / run.result["file"].rsplit("/", 1)[1]
+    if archive == "full":
+        assert run.result["missing_files"] == 0
+        assert read(file, f"content/{sha256[:2]}/{sha256}") == b"%PDF-1.7 a paper"
+    else:
+        [listed] = json.loads(read(file, "materials.json"))
+        assert read(file, listed["versions"][0]["file"]) == b"%PDF-1.7 a paper"
+
+
 async def test_a_full_backup_is_recorded_before_anything_is_written_and_removed_if_it_fails(tmp_path, monkeypatch):
     import errno
     import backend.db.database as database_module
@@ -405,6 +475,184 @@ async def test_a_restore_works_where_the_file_system_has_no_hard_links(tmp_path,
         assert (await client.get(f"/api/projects/{later}")).status_code == 200
 
 
+@pytest.mark.parametrize("source", ["automatic", "file"])
+async def test_a_restore_of_an_older_schemas_backup_keeps_its_safety_copy(tmp_path, source):
+    # M2 audit 6 F1: the backups taken before the restored database's migrations rotated the safety copy out. Its state
+    # at its own schema is then in one backup, taken before the migrations, as at a launch (design review H, R3).
+    data = tmp_path / "data"
+
+    def older():  # an M1 data folder (schema 3) and its backup
+        with Database(data, migrations=MIGRATIONS[:3]) as db:
+            generation = db.backup()
+        with zipfile.ZipFile(tmp_path / "m1.zip", "w") as archive:  # the same backup as a file
+            for path in generation.iterdir():
+                archive.write(path, path.name)
+        return generation.name
+
+    name = await asyncio.to_thread(older)
+    async with started(data) as client:
+        later = await new_project(client, "Later")
+        before = {b["id"].split("/")[1] for b in (await client.get("/api/backups")).json()["backups"]}
+        [old] = [b["id"] for b in (await client.get("/api/backups")).json()["backups"] if b["id"].endswith(name)]
+        body = {"generation": old} if source == "automatic" else {"file": str(tmp_path / "m1.zip")}
+        response = await client.post("/api/backups/restore", json=body)
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["schema_version"] == len(MIGRATIONS)
+        listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
+        assert result["safety_copy"] in listed and listed[result["safety_copy"]]["schema_version"] == len(MIGRATIONS)
+        conn = sqlite3.connect((data / "backups" / result["safety_copy"] / DB_NAME).as_uri() + "?mode=ro", uri=True)
+        assert later in {project for (project,) in conn.execute("SELECT id FROM projects")}
+        conn.close()
+        assert old in listed  # and the backup restored from
+        added = sorted(b["schema_version"] for i, b in listed.items() if i.split("/")[1] not in before)
+        assert added == [3, len(MIGRATIONS)]
+
+
+@pytest.mark.parametrize("outcome", ["committed", "rolled back"])
+async def test_a_restore_of_an_older_automatic_backup_keeps_the_backup_before_its_migrations_only_when_committed(
+        tmp_path, monkeypatch, outcome):
+    # PR 59 batch 1, item 5, and design review H, R3 and R4: committed, the restore adds its safety copy and the backup
+    # before its migrations; rolled back, only its safety copy
+    data = tmp_path / "data"
+
+    def older():  # an M1 data folder (schema 3) with its backup
+        with Database(data, migrations=MIGRATIONS[:3]) as db:
+            return db.backup().name
+
+    name = await asyncio.to_thread(older)
+    async with started(data) as client:
+        [old] = [b["id"] for b in (await client.get("/api/backups")).json()["backups"] if b["id"].endswith(name)]
+        before = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+        if outcome == "rolled back":
+            def failing(*args):
+                raise OSError("the journal cannot be written")
+            monkeypatch.setattr(backups_module, "_commit_journal", failing)
+        response = await client.post("/api/backups/restore", json={"generation": old})
+        assert response.status_code == (200 if outcome == "committed" else 500), response.text
+        listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
+    added = sorted(listed[i]["schema_version"] for i in set(listed) - before)
+    assert added == ([3, len(MIGRATIONS)] if outcome == "committed" else [len(MIGRATIONS)]) and old in listed
+
+
+async def test_a_rolled_back_restore_from_an_older_schema_file_leaves_only_its_safety_copy(tmp_path, monkeypatch):
+    # Design review H, B7 (Fable round 2's two failed file restores): the copy the migrations took held the file's
+    # records, records purged earlier included, in an automatic backup though nothing was changed
+    data = tmp_path / "data"
+
+    def older():
+        with Database(data, migrations=MIGRATIONS[:3]) as db:
+            generation = db.backup()
+        with zipfile.ZipFile(tmp_path / "m1.zip", "w") as archive:
+            for path in generation.iterdir():
+                archive.write(path, path.name)
+
+    await asyncio.to_thread(older)
+    async with started(data) as client:
+        before = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+
+        def failing(*args):
+            raise OSError("the journal cannot be written")
+        monkeypatch.setattr(backups_module, "_commit_journal", failing)
+        for _ in range(2):
+            response = await client.post("/api/backups/restore", json={"file": str(tmp_path / "m1.zip")})
+            assert (response.status_code, response.json()["code"]) == (500, "restore_failed")
+        listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
+    assert sorted(listed[i]["schema_version"] for i in set(listed) - before) == [len(MIGRATIONS)] * 2  # safety copies
+
+
+def fables_folder(data, now):
+    """Weekly backups 16 and 9 days old and daily ones 6 to 1 days old, at schema 3 (Fable's folder): the daily names."""
+    from datetime import timedelta
+    with Database(data, migrations=MIGRATIONS[:3]) as db:
+        return [db.backup(now=now - timedelta(days=days)).name for days in (16, 9, 6, 5, 4, 3, 2, 1)][2:]
+
+
+async def test_failed_restores_leave_the_weeks_backups(tmp_path, monkeypatch):
+    # Design review H, B2 (Fable's recheck probe C): each failed restore rotated one of the week's backups out with its
+    # safety copy, and on 74bf868 another with the backup before its migrations
+    from datetime import UTC, datetime
+    data = tmp_path / "data"
+    week = await asyncio.to_thread(fables_folder, data, datetime.now(UTC))
+    async with started(data) as client:
+        def failing(*args):
+            raise OSError("the journal cannot be written")
+        monkeypatch.setattr(backups_module, "_commit_journal", failing)
+        for _ in range(4):
+            response = await client.post("/api/backups/restore", json={"generation": f"daily/{week[1]}"})
+            assert response.status_code == 500, response.text
+        listed = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+    assert {f"daily/{name}" for name in week} <= listed
+
+
+@pytest.mark.parametrize("outcome", ["committed", "rolled back"])
+@pytest.mark.parametrize("rotation", ["promoted", "deleted"])
+async def test_a_restore_of_a_backup_over_a_week_old_its_safety_copy_rotates_keeps_a_backup_of_it(
+        tmp_path, monkeypatch, rotation, outcome):
+    # PR 59 batch 1, item 5, rewritten for design review H: a backup over a week old is still rotated by count; the
+    # restore's own backup before its migrations is then what keeps that state, promoted or deleted
+    from datetime import UTC, datetime, timedelta
+    data = tmp_path / "data"
+    now = datetime.now(UTC)
+
+    def older():  # with "deleted", a weekly one two days older than it, so the rotation deletes it
+        with Database(data, migrations=MIGRATIONS[:3]) as db:
+            if rotation == "deleted":
+                db.backup(now=now - timedelta(days=10))
+            name = db.backup(now=now - timedelta(days=8)).name
+            for days in range(5, 0, -1):
+                db.backup(now=now - timedelta(days=days))
+            return name
+
+    name = await asyncio.to_thread(older)
+    async with started(data) as client:  # its upgrade's backup: seven daily, the one restored the oldest
+        before = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+        assert f"daily/{name}" in before and len([b for b in before if b.startswith("daily/")]) == 7
+        if outcome == "rolled back":
+            def failing(*args):
+                raise OSError("the journal cannot be written")
+            monkeypatch.setattr(backups_module, "_commit_journal", failing)
+        response = await client.post("/api/backups/restore", json={"generation": f"daily/{name}"})
+        assert response.status_code == (200 if outcome == "committed" else 500), response.text
+        listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
+    names = {i.split("/")[1] for i in before}  # by name: the rotation may move one to weekly
+    added = sorted(b["schema_version"] for i, b in listed.items() if i.split("/")[1] not in names)
+    # rolled back, the copy stays only when it is the one backup of that state: the source deleted (R4)
+    kept_copy = outcome == "committed" or rotation == "deleted"
+    assert added == ([3, len(MIGRATIONS)] if kept_copy else [len(MIGRATIONS)])
+    assert (f"weekly/{name}" in listed) == (rotation == "promoted") and f"daily/{name}" not in listed
+
+
+async def restored_from_fables_folder(tmp_path, more, days=5):
+    """Fable's folder, its backup of days days ago restored, then more backups: (its name, the list, the names
+    before)."""
+    from datetime import UTC, datetime
+    data = tmp_path / "data"
+    week = await asyncio.to_thread(fables_folder, data, datetime.now(UTC))
+    async with started(data) as client:
+        before = {b["id"].split("/")[1] for b in (await client.get("/api/backups")).json()["backups"]}
+        source = week[6 - days]
+        response = await client.post("/api/backups/restore", json={"generation": f"daily/{source}"})
+        assert response.status_code == 200, response.text
+        for _ in range(more):
+            assert (await client.post("/api/backups")).status_code == 200
+        return source, (await client.get("/api/backups")).json()["backups"], before
+
+
+async def test_a_restored_backup_under_a_week_old_outlives_the_next_backups(tmp_path):
+    # Design review H, B5 and B6 (Fable's round 2 trigger A): the restored backup, as the oldest daily one, went at the
+    # next backup
+    name, listed, _ = await restored_from_fables_folder(tmp_path, 3)
+    assert f"daily/{name}" in {b["id"] for b in listed}
+
+
+async def test_a_restored_backup_has_one_backup_of_its_state_after_two_more_backups(tmp_path):
+    # Design review H, B6: with the restore's own backup before its migrations, the restored state at its schema is in
+    # a backup of its own, which lasts a week whatever else is taken
+    _, listed, before = await restored_from_fables_folder(tmp_path, 2, days=4)  # the design review's B6 probe
+    assert [b["schema_version"] for b in listed if b["id"].split("/")[1] not in before].count(3) == 1
+
+
 async def test_a_restore_stops_a_running_turn(tmp_path):
     async with started(tmp_path / "data") as client:
         backup = (await client.post("/api/backups")).json()["id"]
@@ -455,7 +703,7 @@ async def test_restoring_an_encrypted_full_backup_needs_its_passphrase_and_bring
         file = (await archived_run(client, "/api/backups/full", {"destination": str(destination),
                                                              "passphrase": PASSPHRASE})).result["file"]
         await client.delete(f"/api/projects/{project}")
-        (data / "content" / sha256[:2] / sha256).unlink()
+        assert not (data / "content" / sha256[:2] / sha256).exists()  # gone with the deletion (M2 audit 1 F8)
 
         for body, code in (({"file": file}, "passphrase_required"),
                            ({"file": file, "passphrase": "wrong"}, "wrong_passphrase")):
@@ -570,6 +818,164 @@ async def test_a_project_exports_as_markdown_json_its_files_and_settings_without
     assert read(path, "settings/AGENTS.md") == b"Use APA."
     assert b"sk-or-typed-by-hand" not in read(path, "settings/config.toml")
     assert not any(b"Elsewhere" in read(path, name) for name in names(path)) and mode(path) == 0o600
+
+
+async def test_a_project_export_holds_its_citations_notes_asks_and_waiting_messages(tmp_path):
+    # M2 audit 6 F3 (and 5 F4): the export kept an answer's markers but not what they cite, nor the steering notes a
+    # step read, the asks a turn put and their answers, the messages waiting to send, or the turn a memory names
+    data, destination = tmp_path / "data", tmp_path / "chosen"
+    destination.mkdir()
+    async with started(data) as client:
+        project = await new_project(client)
+        conversation = (await client.post("/api/conversations", json={"project_id": project,
+                                                                      "title": "Sampling"})).json()["id"]
+        run_id = (await send(client, conversation, "How large a sample do I need?"))[0]["run_id"]
+        own_file = await stored_material(client, project, b"%PDF-1.7 a paper", "application/pdf")
+        [(material, version)] = await rows(client, "SELECT m.id, v.id FROM materials m JOIN material_versions v"
+                                                   " ON v.material_id = m.id WHERE m.project_id = ?", project)
+        elsewhere = await new_project(client, "Elsewhere")  # a paper of the project a moved conversation came from
+        foreign_file = await stored_material(client, elsewhere, b"%PDF-1.7 another paper", "application/pdf")
+        [(foreign,)] = await rows(client, "SELECT id FROM materials WHERE project_id = ?", elsewhere)
+        ask, citation, memory, own_passage, foreign_passage = new_id(), new_id(), new_id(), new_id(), new_id()
+
+        def record(conn):
+            from backend.extraction import PDF, extractor_of
+            for file, passage, ordinal in ((own_file, own_passage, 3), (foreign_file, foreign_passage, 5)):
+                extraction = new_id()  # each paper's reading, one passage each
+                conn.execute("INSERT INTO extractions (id, file_sha256, extractor, extractor_version, status)"
+                             " VALUES (?, ?, ?, ?, 'done')", (extraction, file, *extractor_of(PDF)))
+                conn.execute("INSERT INTO passages (id, extraction_id, ordinal, kind, text)"
+                             " VALUES (?, ?, ?, 'paragraph', 'the passage')", (passage, extraction, ordinal))
+            (seq,) = conn.execute("SELECT max(seq) + 1 FROM run_events WHERE run_id = ?", (run_id,)).fetchone()
+            events = [("steering_note", {"text": "Only recent ones"}), ("step_started", {"step": 7, "steering": [seq]}),
+                      ("model_attempt", {"step": 7, "dispatched": True}), ("steering_note", {"text": "Never read"}),
+                      ("ask", {"ask_id": ask, "kind": "choice", "options": ["1", "2"], "text_box": True, "params": {}}),
+                      ("ask_answered", {"ask_id": ask, "by": "researcher", "text": "The 2019 one"})]
+            for i, (kind, event) in enumerate(events):
+                conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, ?, ?)",
+                             (run_id, seq + i, kind, json.dumps(event)))
+            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, material_version_id,"
+                         " passage_id, quote, context, page, existence, support)"
+                         " VALUES (?, 'answer', ?, ?, ?, ?, 'n = 40 sufficed', ?, 4, 'ok', 'supported')",
+                         (citation, run_id, material, version, own_passage,
+                          json.dumps({"marker": "[S1.1]", "offset": 3, "sentence": "Forty."})))
+            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, material_id, material_version_id,"
+                         " passage_id, quote, context, page, evidence_type, existence) VALUES (?, 'answer', ?, ?,"
+                         " (SELECT id FROM material_versions WHERE material_id = ?), ?, 'words of another project', ?,"
+                         " 9, 'rct', 'ok')", (new_id(), run_id, foreign, foreign, foreign_passage,
+                                              json.dumps({"marker": "[S2.1]", "offset": 9, "sentence": "Also."})))
+            conn.execute("INSERT INTO citations (id, owner_kind, owner_id, context, page, evidence_type, existence)"
+                         " VALUES (?, 'answer', ?, ?, 7, 'cohort', 'source_removed')",  # its paper deleted since
+                         (new_id(), run_id, json.dumps({"marker": "[S3.1]", "offset": 12, "sentence": None})))
+            conn.execute("INSERT INTO queued_messages (id, conversation_id, text) VALUES (?, ?, 'And the power?')",
+                         (new_id(), conversation))
+            conn.execute("INSERT INTO memory_records (id, scope, project_id, type, content, status) VALUES"
+                         " (?, 'project', ?, 'decision', 'We sample forty', 'confirmed')", (memory, project))
+            conn.execute("INSERT INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'turn', ?)",
+                         (memory, run_id))
+        await asyncio.to_thread(client.state["db"].write, record)
+        run = await archived_run(client, f"/api/projects/{project}/export", {"destination": str(destination)})
+        assert run.status == "succeeded", run
+    path = destination / run.result["file"].rsplit("/", 1)[1]
+    markdown = read(path, f"conversations/{conversation}.md").decode()
+    [exported] = json.loads(read(path, "conversations.json"))
+    [turn] = exported["turns"]
+    assert [note["text"] for note in turn["steering"]] == ["Only recent ones"]  # the unread one waits, not read
+    [asked] = turn["asks"]
+    assert (asked["kind"], asked["options"], asked["answer"]["text"], asked["answer"]["by"]) == (
+        "choice", ["1", "2"], "The 2019 one", "researcher")
+    cited, moved, removed = turn["citations"]
+    assert (moved["marker"], moved["material_id"]) == ("[S2.1]", foreign)
+    assert [moved[k] for k in ("material_version", "passage_id", "passage", "quote", "page", "evidence_type")] == [None] * 6
+    assert (removed["page"], removed["evidence_type"], removed["existence"]) == (7, "cohort", "source_removed")
+    assert "- [S3.1] page 7" in markdown.splitlines()
+    assert not any(b"words of another project" in read(path, name) for name in names(path))
+    assert "- [S2.1]" in markdown.splitlines()
+    assert {k: cited[k] for k in ("id", "marker", "material_id", "material_version", "passage_id", "passage", "quote",
+                                  "page", "existence", "support")} == {
+        "id": citation, "marker": "[S1.1]", "material_id": material, "material_version": 0, "passage_id": own_passage,
+        "passage": 3, "quote": "n = 40 sufficed", "page": 4, "existence": "ok", "support": "supported"}
+    assert foreign_passage not in json.dumps(exported)
+    assert material in {m["id"] for m in json.loads(read(path, "materials.json"))}
+    assert [q["text"] for q in exported["queued"]] == ["And the power?"]
+    [kept] = json.loads(read(path, "memory.json"))
+    assert kept["sources"] == [{"kind": "turn", "id": run_id}] and turn["run_id"] == run_id
+    lines = [line for line in markdown.splitlines() if line]
+    assert lines.index("*Note for Scholia: Only recent ones*") < lines.index(
+        "*Scholia asked (choice). The answer: The 2019 one*") < lines.index("## Scholia")
+    assert "- [S1.1] A paper, page 4: “n = 40 sufficed”" in lines and "Never read" not in markdown
+    assert lines[-2:] == ["## Waiting to send", "And the power?"]
+
+
+async def step_reached(gate, sending, timeout=15):
+    """Wait for the gated step, at most timeout seconds; a send that ended first raises its error or fails."""
+    reached = asyncio.ensure_future(gate.reached.wait())
+    done, _ = await asyncio.wait({reached, sending}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    if reached not in done:
+        reached.cancel()
+        if sending in done:
+            raise AssertionError(f"the turn ended before its gated step: {sending.result()}")
+        sending.cancel()
+        raise AssertionError("the gated step did not start in time")
+
+
+async def exported_conversation(client, project, conversation, destination):
+    """A project export's record and Markdown of one conversation."""
+    run = await archived_run(client, f"/api/projects/{project}/export", {"destination": str(destination)})
+    assert run.status == "succeeded", run
+    path = destination / run.result["file"].rsplit("/", 1)[1]
+    [found] = [c for c in json.loads(read(path, "conversations.json")) if c["id"] == conversation]
+    return found, read(path, f"conversations/{conversation}.md").decode()
+
+
+async def test_an_export_holds_a_note_not_read_yet_and_then_as_read_once(tmp_path):
+    # PR 59 batch 1, item 1: a note sent while its turn runs, not read by a step yet and not queued yet, was in neither
+    # the turn's steering nor the waiting messages
+    from agentic import Scripted, call
+    from test_follow_up import Gate, running_run, steer
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    gate = Gate(0)
+    provider = Scripted(None, "Done.")
+    provider.script[0] = gate.wrap(provider, {"calls": [call("list_materials")]})
+    async with started(tmp_path / "data", provider) as client:
+        project = await new_project(client)
+        conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await step_reached(gate, sending)
+        assert (await steer(client, await running_run(client, conversation), "Only recent ones")).status_code == 200
+        waiting, markdown = await exported_conversation(client, project, conversation, destination)
+        [turn] = waiting["turns"]
+        assert [(n["text"], n["state"]) for n in turn["steering"]] == [("Only recent ones", "pending")]
+        assert waiting["queued"] == [] and "*Note for Scholia, not read yet: Only recent ones*" in markdown
+        gate.open.set()
+        assert (await asyncio.wait_for(sending, 30))[-1]["status"] == "succeeded"
+        done, markdown = await exported_conversation(client, project, conversation, destination)
+        assert [(n["text"], n["state"]) for n in done["turns"][0]["steering"]] == [("Only recent ones", "read")]
+        assert done["queued"] == [] and markdown.count("Only recent ones") == 1
+
+
+async def test_an_export_holds_a_note_queued_at_its_turns_end_only_as_waiting(tmp_path):
+    # PR 59 batch 1, item 1: no step was left to read it, so the turn's end queued it: once, as a waiting message
+    from agentic import Scripted
+    from test_follow_up import Gate, running_run, steer
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    gate = Gate(0)
+    provider = Scripted(None)
+    provider.script.append(gate.wrap(provider, "The answer."))
+    provider.script.pop(0)
+    async with started(tmp_path / "data", provider) as client:
+        project = await new_project(client)
+        conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
+        sending = asyncio.create_task(send(client, conversation, "How many?"))
+        await step_reached(gate, sending)  # the last step (an answer) is in flight
+        assert (await steer(client, await running_run(client, conversation), "Also say how many")).status_code == 200
+        gate.open.set()
+        assert (await asyncio.wait_for(sending, 30))[-1]["status"] == "succeeded"
+        found, markdown = await exported_conversation(client, project, conversation, destination)
+    assert found["turns"][0]["steering"] == [] and [q["text"] for q in found["queued"]] == ["Also say how many"]
+    assert markdown.count("Also say how many") == 1
 
 
 async def test_a_private_project_exports_only_encrypted(tmp_path):

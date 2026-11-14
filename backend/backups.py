@@ -42,14 +42,14 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
-from backend import APP_VERSION, i18n
+from backend import APP_VERSION, budgets, i18n
 from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseCloseError, DatabaseClosedError,
                         DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError, close_failed, utc_now)
-from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _open_checked, _stamp_of, \
+from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _generations, _mkdir_private, _open_checked, _stamp_of, \
     closing_connection, list_generations
 from backend.db.content import IDLE_AFTER
 from backend.db.migrations import MIGRATIONS
-from backend.runs import RunOutcome, _through
+from backend.runs import RunOutcome, _event, _through
 from backend.settings import known_only, write_private
 
 log = logging.getLogger(__name__)
@@ -578,7 +578,7 @@ def register(harness, state):
                                             state.get("content"), memory=inputs.get("memory", True))
                 else:
                     write = lambda: _full_backup(db, destination, passphrase, state["archives"], stop,  # noqa: E731
-                                                 progress, state.get("content"))
+                                                 progress, state.get("content"), active.run_id)
                 result = await harness.work(active, write)
         except BackupError as error:
             raise RunOutcome("failed", error.code) from None
@@ -591,26 +591,30 @@ def register(harness, state):
     harness.workflows["project_export"] = archive
 
 
-def _full_backup(db, destination, passphrase, archives, stop=None, progress=None, store=None):
+def _full_backup(db, destination, passphrase, archives, stop=None, progress=None, store=None, run_id=None):
     with _written(), _watched(archives, None, passphrase) as archive, contextlib.ExitStack() as held:
-        return _write_full_backup(db, destination, passphrase, archive, stop, progress, store, held)
+        return _write_full_backup(db, destination, passphrase, archive, stop, progress, store, held, run_id)
 
 
-def _write_full_backup(db, destination, passphrase, archive, stop=None, progress=None, store=None, held=None):
+def _write_full_backup(db, destination, passphrase, archive, stop=None, progress=None, store=None, held=None,
+                       run_id=None):
     """store and held: the content store and a stack, which holds the files the backup lists from collection
-    until it is written (ContentStore.hold)."""
+    until it is written (ContentStore.hold). run_id: the backup's own run, which its copy of the database shows
+    ended (_ended_in_copy)."""
     staging = _staging(db.data_dir)
     try:
-        with _backup_errors():
-            info = db.snapshot(staging / "copy")
-        with closing_connection(sqlite3.connect((staging / "copy" / DB_NAME).as_uri() + "?mode=ro", uri=True)) as copy:
-            sensitive, projects = copy.execute(
-                f"SELECT count(*) FILTER (WHERE sensitivity IN {SENSITIVE}), count(*) FROM projects").fetchone()
-            # Only the files the copy's records refer to: one of a project deleted moments ago, which
-            # collection keeps for a while, would leave without the encryption its project needed.
-            hashes = [sha256 for sha256, *_ in _referenced_content(copy)]
-        if store is not None and held is not None:  # read later: none is collected meanwhile
-            held.enter_context(store.hold(hashes))
+        with _listing(store, held):  # from the copy until its files are held, collection removes none
+            with _backup_errors():
+                info = db.snapshot(staging / "copy")
+            with closing_connection(sqlite3.connect((staging / "copy" / DB_NAME).as_uri() + "?mode=ro",
+                                                    uri=True)) as copy:
+                sensitive, projects = copy.execute(
+                    f"SELECT count(*) FILTER (WHERE sensitivity IN {SENSITIVE}), count(*) FROM projects").fetchone()
+                # Only the files the copy's records refer to: one of a project deleted moments ago, which
+                # collection keeps for a while, would leave without the encryption its project needed.
+                hashes = [sha256 for sha256, *_ in _referenced_content(copy)]
+            if store is not None and held is not None:  # read later: none is collected meanwhile
+                held.enter_context(store.hold(hashes))
         if sensitive and not passphrase:
             raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
         entries, left_out = [], []
@@ -635,6 +639,8 @@ def _write_full_backup(db, destination, passphrase, archive, stop=None, progress
                 missing += 1
         record = {"encrypted": passphrase is not None, "projects": projects, "content_files": len(hashes) - missing,
                   "missing_files": missing, "settings_left_out": left_out, "schema_version": info["schema_version"]}
+        if run_id is not None:
+            _ended_in_copy(staging / "copy" / DB_NAME, run_id, record)
         path = _write_zip(destination, "scholia-backup", entries, passphrase, stop=stop or (lambda: db.closed),
                           archive=archive, progress=progress,
                           audit=lambda file: db.write(lambda conn: conn.execute(  # its destination, never content
@@ -643,6 +649,46 @@ def _write_full_backup(db, destination, passphrase, archive, stop=None, progress
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return {"ok": True, "file": str(path), **record, "size": path.stat().st_size}
+
+
+def _daily_names(data_dir):
+    return {generation.name for generation in _generations(data_dir / "backups" / "daily")}
+
+
+def _remove_added(data_dir, listed, body):
+    """After a restore rolled back: remove the daily backups it added after listed (the backup its migrations took, of
+    the state that was put back), when the backup restored still holds that state: a file, or one still in daily or
+    weekly. One the safety copy rotated out leaves the added copy as the only backup of its state, which stays. A
+    failure is logged; the backup then stays until rotation."""
+    if body.generation is not None and not any(
+            (data_dir / "backups" / kind / _generation_folder(data_dir, body.generation).name).is_dir()
+            for kind in KINDS):
+        return
+    for generation in _generations(data_dir / "backups" / "daily"):
+        if generation.name not in listed:
+            try:
+                shutil.rmtree(generation)
+            except OSError as error:
+                log.warning("removing a backup a failed restore took failed (%s)", type(error).__name__)
+
+
+def _listing(store, held):
+    """ContentStore.listing for an archive that holds what it lists (store and held given); else nothing."""
+    return store.listing() if store is not None and held is not None else contextlib.nullcontext()
+
+
+def _ended_in_copy(path, run_id, summary):
+    """The full backup's own run ended succeeded in its copy of the database, which was taken while the run ran: a
+    restore of it would otherwise find the run running, and recovery would end it interrupted (M2 audit 6 F4). The copy
+    leaves the data folder only once the backup is written, which is the run's success; summary is its result but for
+    the file's name and size, known only then."""
+    with closing_connection(sqlite3.connect(path, autocommit=True)) as copy:
+        copy.execute("BEGIN IMMEDIATE")
+        if copy.execute("SELECT 1 FROM runs WHERE id = ? AND status = 'running'", (run_id,)).fetchone():
+            _event(copy, run_id, "run_finished", {"status": "succeeded"})
+            copy.execute("UPDATE runs SET status = 'succeeded', waiting = NULL, finished_at = ?, summary = ?,"
+                         " settled_cost_usd = 0 WHERE id = ?", (utc_now(), json.dumps(summary), run_id))
+        copy.execute("COMMIT")
 
 
 # Restore
@@ -748,8 +794,13 @@ async def _replace(state, body, staging, purges):
                 return None
 
         restore_id = str(uuid.uuid4())  # its journal's: only that journal is ever undone for it
+        listed = None
         try:
+            # The daily backups so far, the safety copy included: a rolled-back restore removes what it adds after
+            # them (the backup its migrations take), as nothing else takes a backup meanwhile (design review H, R4)
+            listed = await asyncio.to_thread(_daily_names, data_dir)
             journal = await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside, restore_id, earlier)
+            # as a launch opens it: a backup before its first migration, which rotates nothing under a week old (R3)
             restored = await asyncio.to_thread(Database, data_dir)  # its checks and migrations
             await state["start"](restored, kick=False)  # recovered; nothing is served or runs on its own yet
             missing = await recorded("missing_files", _missing_files, restored)
@@ -771,6 +822,8 @@ async def _replace(state, body, staging, purges):
                 await _stop(state, restored)
             rolled_back = await _roll_back(state, restored, damaged, restore_id)
             await asyncio.to_thread(_remove_if_empty, aside)  # made before its journal: none, if it failed before
+            if rolled_back and listed is not None:
+                await asyncio.to_thread(_remove_added, data_dir, listed, body)
             if not rolled_back:
                 _limit(state, "restore_interrupted", "A restore could neither be finished nor undone; restore a backup")
                 _forget(state)
@@ -1394,20 +1447,23 @@ def _write_export(db, project_id, destination, passphrase, language, archive, st
                   held=None, memory=True):
     """store and held: as for _write_full_backup. memory: the project's memory records go in memory.json (its personal
     records never do)."""
-    data = db.read(lambda conn: _project_records(conn, project_id, memory))
-    if data is None:
-        raise BackupError(404, "not_found", "No such project")
-    if store is not None and held is not None:  # the papers' files, read later: none is collected meanwhile
-        held.enter_context(store.hold([v["file_sha256"] for m in data["materials"] for v in m["versions"]
-                                         if v["file_sha256"]]))
+    with _listing(store, held):  # from the read until its files are held, collection removes none
+        data = db.read(lambda conn: _project_records(conn, project_id, memory))
+        if data is None:
+            raise BackupError(404, "not_found", "No such project")
+        if store is not None and held is not None:  # the papers' files, read later: none is collected meanwhile
+            held.enter_context(store.hold([v["file_sha256"] for m in data["materials"] for v in m["versions"]
+                                             if v["file_sha256"]]))
     if data["project"]["sensitivity"] in SENSITIVE and not passphrase:
         raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
     entries = [("project.json", _json({"format": "scholia-project-export", "version": 1, "app_version": APP_VERSION,
                                        "exported_at": utc_now(), "project": data["project"]})),
                ("conversations.json", _json(data["conversations"]))]
     # Names in a zip are readable without its passphrase, so files are named by id, never by title.
+    titles = {material["id"]: material["title"] for material in data["materials"]}  # this project's papers only
     for conversation in data["conversations"]:
-        entries.append((f"conversations/{conversation['id']}.md", _conversation_markdown(conversation, language)))
+        entries.append((f"conversations/{conversation['id']}.md", _conversation_markdown(conversation, language,
+                                                                                          titles)))
     if data["artifacts"]:
         entries.append(("artifacts.json", _json(data["artifacts"])))
         for artifact in data["artifacts"]:
@@ -1469,14 +1525,17 @@ def _project_records(conn, project_id, memory=True):
     conversations = rows("SELECT id, title, title_source, created_at, updated_at FROM conversations"
                          " WHERE project_id = ? ORDER BY created_at, id", project_id)
     for conversation in conversations:
+        # run_id: what a memory record's turn source names (M2 audit 6 F3)
         conversation["turns"] = rows(
-            "SELECT t.seq, t.author, t.user_message AS message, t.answer, r.status, r.cancel_reason, t.reason_code,"
-            " r.settled_cost_usd AS cost_usd, t.accounting, r.started_at, r.finished_at,"
+            "SELECT t.run_id, t.seq, t.author, t.user_message AS message, t.answer, r.status, r.cancel_reason,"
+            " t.reason_code, r.settled_cost_usd AS cost_usd, t.accounting, r.started_at, r.finished_at,"
             " t.retry_of_run_id AS continues FROM turns t JOIN runs r ON r.id = t.run_id"
             " WHERE t.conversation_id = ? ORDER BY t.seq", conversation["id"])
         for turn in conversation["turns"]:
             for key in ("message", "answer", "accounting"):
                 turn[key] = json.loads(turn[key]) if turn[key] else None
+            _turn_records(conn, turn, rows, project_id)
+        conversation["queued"] = budgets.queued(conn, conversation["id"])  # the researcher's messages waiting to send
     materials = rows("SELECT id, title, csl, source, source_key, evidence_type, proposed_by, resolved_at, checked_at,"
                      " checked_by, retraction, created_at, updated_at FROM materials WHERE project_id = ?"
                      " ORDER BY created_at, id", project_id)
@@ -1502,7 +1561,46 @@ def _project_records(conn, project_id, memory=True):
             "memory": records}
 
 
-def _conversation_markdown(conversation, language="en"):
+def _turn_records(conn, turn, rows, project_id):
+    """What else a turn's record holds that its export needs (M2 audit 6 F3; ticket 16: readable without the app). The
+    steering notes, the researcher's own words in the turn: each read by a step, or, while the record has the turn
+    running, not read yet (pending); one its turn ended without reading is queued by that end in the same transaction,
+    so it is a waiting message instead, and never both (budgets.queue_unread_notes; PR 59 batch 1). Its asks
+    and their answers: an agent's own question and option labels are model text kept only while its run runs, so an
+    ask of a finished turn names its options by number. Its answer's citations, as recorded, so each marker resolves
+    to its paper (materials.json, by id), version, passage, quote and page, with its existence and support checks; of
+    another project's paper (a conversation moved here may cite one) only its id and the checks, as the export carries
+    nothing of another project's."""
+    run_id, carried = turn["run_id"], budgets.carried_notes(conn, turn["run_id"])
+    turn["steering"], turn["asks"], asks = [], [], {}
+    for seq, at, kind, data in conn.execute(
+            "SELECT seq, at, type, data FROM run_events WHERE run_id = ?"
+            " AND type IN ('steering_note', 'ask', 'ask_answered') ORDER BY seq", (run_id,)):
+        data = json.loads(data)
+        if kind == "steering_note":
+            state = "read" if seq in carried else "pending" if turn["status"] == "running" else None
+            if state and data.get("text"):
+                turn["steering"].append({"text": data["text"], "state": state, "at": at})
+        elif "options" in data:  # the ask; else its answer (asks.asked)
+            asks[data["ask_id"]] = {"kind": data["kind"], "options": data["options"],
+                                    "params": data.get("params") or {}, "asked_at": at, "answer": None}
+            turn["asks"].append(asks[data["ask_id"]])
+        elif data.get("ask_id") in asks:
+            answer = {k: data[k] for k in ("by", "option", "text", "withdrawn") if k in data}
+            asks[data["ask_id"]]["answer"] = {**answer, "at": at}
+    # what is drawn from the paper itself: of this project's papers, and kept by one whose paper was deleted
+    own = "CASE WHEN c.material_id IS NULL OR m.project_id = ?1 THEN {} END"
+    turn["citations"] = rows(
+        "SELECT c.id, json_extract(c.context, '$.marker') AS marker, json_extract(c.context, '$.sentence') AS sentence,"
+        f" c.material_id, {own.format('v.seq')} AS material_version, {own.format('c.passage_id')} AS passage_id,"
+        f" {own.format('p.ordinal')} AS passage, {own.format('c.quote')} AS quote, {own.format('c.page')} AS page,"
+        f" {own.format('c.evidence_type')} AS evidence_type, c.existence, c.support, c.checked_at FROM citations c"
+        " LEFT JOIN materials m ON m.id = c.material_id"
+        " LEFT JOIN material_versions v ON v.id = c.material_version_id LEFT JOIN passages p ON p.id = c.passage_id"
+        " WHERE c.owner_kind = 'answer' AND c.owner_id = ?2 ORDER BY c.rowid", project_id, run_id)
+
+
+def _conversation_markdown(conversation, language="en", titles=None):
     """A conversation as Markdown, its headings in language (section 12)."""
     def text(key, **params):
         return i18n.render(f"export.{key}", language, **params)
@@ -1511,13 +1609,39 @@ def _conversation_markdown(conversation, language="en"):
     for turn in conversation["turns"]:
         author = text("researcher" if turn["author"] == "researcher" else "other_conversation")
         lines += [f"## {author} ({turn['started_at']})", "", (turn["message"] or {}).get("text", ""), ""]
+        # the notes and asks in the order they were said, before the answer they shaped
+        said = []
+        for note in turn.get("steering", []):
+            key = "note_pending" if note.get("state") == "pending" else "note"
+            said.append((note["at"], f"*{text(key, text=note['text'])}*"))
+        for ask in turn.get("asks", []):
+            answer = ask["answer"] or {}
+            reply = answer.get("text") or answer.get("option")
+            said.append((ask["asked_at"], f"*{text('asked', kind=ask['kind'], answer=reply)}*" if reply
+                         else f"*{text('asked_unanswered', kind=ask['kind'])}*"))
+        for _, line in sorted(said, key=lambda item: item[0]):
+            lines += [line, ""]
         if turn["answer"]:
             lines += ["## Scholia", "", turn["answer"].get("text", ""), ""]
             if turn["answer"].get("cut"):  # stopped at the model's output limit
                 lines += [f"*{text('cut')}*", ""]
+            cited = [c for c in turn.get("citations", []) if c["marker"]]
+            if cited:  # each marker with its paper, page and quote, so the answer reads without the app
+                lines += [f"### {text('sources')}", ""]
+                for c in cited:
+                    where = ", ".join(part for part in ((titles or {}).get(c["material_id"]),
+                                                        text("page", page=c["page"]) if c["page"] is not None else None)
+                                      if part)
+                    quote = f": “{c['quote']}”" if c["quote"] else ""
+                    lines.append(f"- {c['marker']}" + (f" {where}" if where else "") + quote)
+                lines.append("")
         elif turn["status"] != "running":
             status = text(f"status.{turn['status']}")
             lines += [f"*{text('no_answer', status=status)}*", ""]
+    if conversation.get("queued"):
+        lines += [f"## {text('waiting')}", ""]
+        for queued in conversation["queued"]:
+            lines += [queued["text"], ""]
     return "\n".join(lines).encode("utf-8")
 
 

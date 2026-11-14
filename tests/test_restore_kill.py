@@ -46,6 +46,18 @@ def replacing(source, target, *args, **kwargs):
 
 
 backups.os.replace = replacing
+import backend.db.database as database
+usable = database._usable_state
+
+
+def usable_until_schema_7(conn, latest):  # the restored database killed while it migrates, at schema 7
+    found = usable(conn, latest)
+    if scenario == "migrating" and found[0] == 7:
+        crash()
+    return found
+
+
+database._usable_state = usable_until_schema_7
 
 
 class Keyring:
@@ -120,6 +132,22 @@ async def test_a_crash_after_the_database_was_swapped_is_finished_forward_at_lau
     assert not (data / "backups" / backups_module.JOURNAL).exists()
     assert not (data / "backups" / backups_module.STAGING).exists() or \
         list((data / "backups" / backups_module.STAGING).iterdir()) == []
+
+
+async def test_a_restore_killed_while_migrating_and_replayed_at_launch_still_lists_the_backup_restored(tmp_path):
+    # Design review H, Fable's round 2 trigger B: the replay's own backup before its migrations rotated out the backup
+    # restored, the oldest daily one, and with it the only copy of its state at its schema
+    from datetime import UTC, datetime
+    from test_backups import fables_folder
+    data = tmp_path / "data"
+    week = await asyncio.to_thread(fables_folder, data, datetime.now(UTC))
+    async with started(data):  # upgraded, with its backup before the migrations: seven daily ones
+        pass
+    await asyncio.to_thread(run_child, data, "migrating", f"daily/{week[1]}")
+    async with started(data, setup=False) as client:
+        listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
+    assert not (data / "backups" / backups_module.JOURNAL).exists()  # finished forward
+    assert f"daily/{week[1]}" in listed and listed[f"daily/{week[1]}"]["schema_version"] == 3
 
 
 async def test_a_crash_while_putting_the_previous_state_back_is_finished_back_at_launch(tmp_path):
