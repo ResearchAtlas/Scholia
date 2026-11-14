@@ -691,11 +691,17 @@ def apply_extraction(conn, run_id, candidates):
         if same is not None:
             counts["duplicates"] += 1
             late = late_anywhere if same["scope"] == "personal" else late_project
+            # raising its authority is an automatic replacement too, so it takes section 8's conditions as a replacement
+            # does: its source turn after the latest turn behind the record (read before this turn joins it), and no
+            # change of the researcher's since the extraction started (PR 62 batch 3); never a personal one from a
+            # stricter project
+            eligible = status == "confirmed" and not late and (same["scope"] == "project" or personal) \
+                and turn_started > _latest_turn(conn, same) and _left_alone(conn, same, run_started)
             if own and (same["scope"] == "project" or personal):  # the researcher said it again: this turn is a
                 restated(conn, same["id"], turn)  # source of it too, a personal one's only from a Normal, unlocked
                 # project (item 2; Harold's decision of 2026-10-23, point 1)
-            if status == "confirmed" and not late and (same["scope"] == "project" or personal):  # never a personal one
-                if same["status"] == "proposed" and not same["supersedes_id"]:  # from a stricter project
+            if eligible:  # else it is left as it is, its restatement a source of it
+                if same["status"] == "proposed" and not same["supersedes_id"]:
                     keep(conn, same["id"], None, researcher=False)  # the researcher's own words confirm what was only
                     # proposed, by this extraction: an automatic write
                 elif same["status"] == "inferred":  # or what was only inferred, as its next version

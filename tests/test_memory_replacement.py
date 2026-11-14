@@ -442,3 +442,60 @@ async def test_a_proposal_kept_in_the_views_outlives_its_conversation(tmp_path):
         assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", record) == [("confirmed",)]
         assert await rows(client, "SELECT source_kind, source_id FROM memory_sources WHERE memory_id = ?", record) == [
             ("researcher", "views")]
+
+
+# PR 62 batch 3 (round 3, both astra passes): raising a duplicate's authority is an automatic replacement too, so an
+# older extraction finishing last neither confirms a newer inference nor keeps a newer proposal (section 8: its source
+# turn must come after the latest turn behind the record); a newer restatement still does. Its turn is still a source.
+def _says_as(text, status, span):
+    return [{"type": "project_state", "content": text, "status": status, "span": span, "replaces": ""}]
+
+
+@pytest.mark.parametrize("earlier, later, content, span, status", [
+    # pass 1's order: the later turn's extraction infers the same words and finishes first
+    ("We use thirty interviews", "It seems we use thirty interviews", "We use thirty interviews",
+     "we use thirty interviews", "inferred"),
+    # pass 2's order
+    ("The sample is 30 interviews", "The sample is 30 interviews according to the draft", "The sample is 30 interviews",
+     "the sample is 30 interviews", "inferred"),
+    # pass 1's proposed variant: the later turn's extraction only proposes it (from the answer)
+    ("We use thirty interviews", "What if we use thirty interviews", "We use thirty interviews", "", "proposed"),
+])
+async def test_an_older_extraction_finishing_last_never_raises_a_newer_duplicates_authority(
+        tmp_path, earlier, later, content, span, status):
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+
+        def steps(conn):
+            first, early = _turn_and_extraction(conn, project, conversation, earlier)
+            _, late = _turn_and_extraction(conn, project, conversation, later)
+            memory.apply_extraction(conn, late, _says_as(content, status, span))
+            memory.apply_extraction(conn, early, _says_as(content, "confirmed", content.lower()))
+            return first
+        first = await _in(client, steps)
+        assert await rows(client, "SELECT status, version FROM memory_records WHERE type = 'project_state'") == [
+            (status, 1)]
+        [(record,)] = await rows(client, "SELECT id FROM memory_records WHERE type = 'project_state'")
+        assert ("turn", first) in await rows(  # the older restatement is still a source of it
+            client, "SELECT source_kind, source_id FROM memory_sources WHERE memory_id = ?", record)
+
+
+@pytest.mark.parametrize("status", ["inferred", "proposed"])
+async def test_a_newer_extractions_restatement_still_confirms_an_earlier_duplicate(tmp_path, status):
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+
+        def steps(conn):
+            _, early = _turn_and_extraction(conn, project, conversation, "It seems we use thirty interviews")
+            memory.apply_extraction(conn, early, _says_as("We use thirty interviews", status,
+                                                          "we use thirty interviews" if status == "inferred" else ""))
+            _, late = _turn_and_extraction(conn, project, conversation, "We use thirty interviews")
+            memory.apply_extraction(conn, late, _says_as("We use thirty interviews", "confirmed",
+                                                         "we use thirty interviews"))
+        await _in(client, steps)
+        found = await rows(client, "SELECT status FROM memory_records WHERE type = 'project_state' ORDER BY version")
+        assert found == ([("superseded",), ("confirmed",)] if status == "inferred" else [("confirmed",)])
