@@ -533,6 +533,30 @@ async def test_keep_both_makes_the_record_its_own_paper_not_looked_up(tmp_path):
         assert len(client.provider.scholarly.requests) == requests
 
 
+@pytest.mark.parametrize("level", ["normal", "local_only"])
+async def test_keep_both_looks_up_a_kept_records_identifier_new_to_the_project(tmp_path, level):
+    """M2 audit, area 1 (section 7.5; F3a): a duplicate kept by its title, whose DOI no paper of the project has, is
+    looked up as an import's paper is (a Local only project asking first), so a retracted work is flagged; one kept
+    by its DOI is not (the test above: its DOI was looked up with the paper already here)."""
+    retracted = "10.5555/kept.by.title"
+    async with started(tmp_path / "data", scholarly(openalex={retracted: openalex_work(retracted, "Same Title",
+                                                                                         retracted=True)})) as client:
+        project = await project_of(client, level=level)
+        await imported(client, project, ris(("Same Title", "PY  - 2020\n")))
+        await imported(client, project, ris(("Same Title", f"PY  - 2020\nDO  - {retracted}\n")))
+        [ask] = await merge_asks(client, project)
+        assert ask["params"]["matched"] == "title"
+        assert (await answer(client, ask, "keep_both")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        if level == "local_only":
+            [question] = await asks_of(client, project, kind="identifier_lookup")
+            assert (await answer(client, question, "lookup")).status_code == 200
+        await background_idle(client)
+        [kept] = [m for m in (await listing(client, project))["materials"] if m["csl"].get("DOI")]
+        assert (kept["retraction"], kept["lookup"]["outcome"]) == ("retracted", "resolved")
+        assert [path for _, path, _ in client.provider.scholarly.requests] == [f"/works/doi:{retracted}"]
+
+
 async def first_project(client):
     """The project listed first (after the general one): the one changed last."""
     return [p["id"] for p in (await client.get("/api/projects")).json()["projects"] if p["kind"] != "general"][0]

@@ -10,8 +10,12 @@ import { ApiError, get, post } from '../api.js';
 import { useAction } from '../action.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { ACCEPT, addFiles, authorNames, choosePapers, chosenPapers, detailsSource, latestLookup, libraryEvents, newest, ocrPages,
-  reasonKey, sortFiles, stateKey, takeOpening, typeKey, unsettled, uploadsWaiting, watchChosen, watchUploads, yearOf } from '../library.js';
+import { ACCEPT, addFiles, authorNames, choosePapers, chosenPapers, detailsSource, latestLookup, libraryChanged, libraryEvents,
+  newest, ocrPages, paperAction, paperFeedback, reasonKey, sortFiles, stateKey, takeOpening, typeKey, unsettled, uploadsWaiting,
+  watchChosen, watchUploads, yearOf } from '../library.js';
+import { useLibraryRead } from '../libraryRead.js';
+import { problemText } from '../action.js';
+import { DeleteDialog } from './DeleteDialog.jsx';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
 import { AddMenu } from './AddMenu.jsx'; // S1-14: Add offers a reference file
@@ -26,38 +30,19 @@ import { LocalOnlySearchNote } from './LocalHelper.jsx';
 
 const POLL_MS = 1500; // while a paper is read, a lookup runs or a question waits
 
-// Reads the project's papers, again while anything is under way and whenever they change. Only the
-// newest read's answer is kept: one asked for another project, or before a later read, is dropped.
+// Reads the project's papers, again while anything is under way and whenever they change: what libraryRead.js shows
+// (only the newest read of the papers' current generation: after a change nothing read before it, loading until a
+// read asked after it answers, and a failed one shows the error and nothing old).
 export function useLibrary(projectId) {
-  const [listing, setListing] = useState(null);
-  const [problem, setProblem] = useState(null);
-  const [reads, setReads] = useState(0);
-  const [asked] = useState(newest);
-  const load = useCallback(async () => {
-    const current = asked();
-    if (!projectId) return;
-    try {
-      const found = await get(`/api/projects/${encodeURIComponent(projectId)}/materials`);
-      if (!current()) return;
-      setListing(found);
-      setProblem(null);
-    } catch (error) {
-      if (current()) setProblem(error instanceof ApiError ? error.code : 'internal');
-    } finally {
-      if (current()) setReads((n) => n + 1);
-    }
-  }, [projectId, asked]);
-  useEffect(() => { setListing(null); load(); }, [load]);
-  useEffect(() => {
-    const changed = (event) => { if (event.detail === null || event.detail === projectId) load(); };
-    libraryEvents.addEventListener('changed', changed);
-    return () => libraryEvents.removeEventListener('changed', changed);
-  }, [projectId, load]);
+  const read = useLibraryRead(projectId || null, () => get(`/api/projects/${encodeURIComponent(projectId)}/materials`));
+  const listing = read.value;
+  const problem = read.error ? (read.error instanceof ApiError ? read.error.code : 'internal') : null;
+  const load = read.reload;
   useEffect(() => {
     if (!unsettled(listing) && !problem) return undefined;
     const timer = setTimeout(load, POLL_MS);
     return () => clearTimeout(timer);
-  }, [listing, problem, reads, load]);
+  }, [listing, read.error, load]);
   return { listing, problem, load };
 }
 
@@ -80,6 +65,8 @@ export async function addTo(projectId, fileList, t, notify, options) {
 export function Library({ project }) {
   const t = useT();
   const { listing, problem, load } = useLibrary(project?.id);
+  const [deleting, setDeleting] = useState(null); // the paper whose delete dialog is open, above the read (rider 1)
+  const [feedback, setFeedback] = useState({}); // what each paper's own actions said (library.js paperAction)
   const [open, setOpen] = useState(null); // the paper whose page is shown: { id, target } (a result's passage)
   const index = useIndex(project?.id, listing);
   const search = useSearch(project?.id);
@@ -89,28 +76,59 @@ export function Library({ project }) {
   const input = useRef(null);
   // S1-19b: a cited paper opened from an answer's chip, at its passage; papers chosen for the next message
   useEffect(() => {
-    const take = () => { const found = takeOpening(project?.id); if (found) setOpen(found); };
+    const take = () => { const found = takeOpening(project?.id); if (found) openPaper(found); };
     take();
     libraryEvents.addEventListener('open', take);
     return () => libraryEvents.removeEventListener('open', take);
   }, [project?.id]);
   const chosen = useSyncExternalStore(watchChosen, () => chosenPapers(project?.id));
-
-  async function add(files) {
-    setNotice(null);
-    const result = await addTo(project.id, files, t, setNotice);
-    if (result?.materials.some((m) => m.existing)) setNotice(t('library.alreadyHere'));
-    load();
+  // A paper's page opened, or let go: what another page's save or replacement said is not this one's.
+  function openPaper(found) {
+    setFeedback({});
+    setOpen(found);
   }
 
+  // The Library's own Add notices (a drop, Add files, an import from the Add menu) are the newest Add's: an older Add
+  // that answers late says nothing over a newer one (PR 61 recheck round 5's class).
+  const adds = useRef(0);
+  function addNotice() {
+    const mine = ++adds.current;
+    setNotice(null);
+    return (text) => { if (mine === adds.current) setNotice(text); };
+  }
+
+  async function add(files) {
+    const report = addNotice();
+    const result = await addTo(project.id, files, t, report);
+    if (result?.materials.some((m) => m.existing)) report(t('library.alreadyHere'));
+    if (result) libraryChanged(project.id);
+  }
+
+  // A paper's delete dialog stays open above the read with its notice or its error, while the panel behind it reads
+  // the papers again: its change is fired when its request settles, however it ends (design review F's rider 1). It is
+  // the last child, keyed, in both of the panel's forms (a paper's page, the list), so React keeps the one dialog, its
+  // notice and its error with it, as the page gives way to the list at the change.
+  const dialog = <DeleteDialog key="delete" target={deleting ? { kind: 'material', id: deleting.id,
+    title: t('paper.deleteTitle', { title: deleting.title }), body: t('paper.deleteBody') } : null}
+    onClose={() => setDeleting(null)} onSettled={() => libraryChanged(project.id)}
+    onDone={() => { setDeleting(null); openPaper(null); }} />;
   const paper = open && listing?.materials.find((m) => m.id === open.id);
   if (paper) {
-    return <Paper material={paper} project={project} index={index} target={open.target}
-      onBack={() => { setOpen(null); load(); }} onChanged={load} />;
+    return (
+      <>
+        <Paper key={paper.id} material={paper} project={project} index={index} target={open.target}
+          onBack={() => { openPaper(null); load(); }} onChanged={load}
+          onDelete={() => setDeleting({ id: paper.id, title: paper.title })}
+          notice={paperFeedback(feedback, paper.id, 'notice')} saved={paperFeedback(feedback, paper.id, 'saved')}
+          onAction={(kind) => paperAction(paper.id, kind, setFeedback)} />
+        {dialog}
+      </>
+    );
   }
   const searching = Boolean(search.shown);
   const materials = listing?.materials ?? [];
   return (
+    <>
     <div className={cn('flex h-full min-h-0 flex-col', over && 'bg-brand-soft/40')}
       onDragOver={(event) => { if (event.dataTransfer?.types?.includes('Files')) { event.preventDefault(); setOver(true); } }}
       onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOver(false); }}
@@ -121,8 +139,8 @@ export function Library({ project }) {
         </p>
         <input ref={input} type="file" multiple accept={ACCEPT} className="hidden" aria-hidden="true" tabIndex={-1}
           data-testid="library-files" onChange={(event) => { add(event.target.files); event.target.value = ''; }} />
-        <AddMenu project={project} onFiles={() => input.current?.click()} onStart={() => setNotice(null)}
-          onDone={(text) => { setNotice(text); load(); }}>
+        <AddMenu project={project} onFiles={() => input.current?.click()}
+          onStart={() => { const report = addNotice(); return (text) => { report(text); libraryChanged(project.id); }; }}>
           {(importing) => (
             <Button size="sm" variant="outline" className="h-8" disabled={adding || !project || importing}>
               <FilePlus2 aria-hidden="true" />{t('library.add')}
@@ -134,7 +152,7 @@ export function Library({ project }) {
       <div className="scroll-thin min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
         {project?.sensitivity === 'local_only' && <LocalOnlySearchNote />}
         <SearchResults search={search} project={project}
-          onOpen={(result) => setOpen({ id: result.material_id, target: { id: result.passage_id, ordinal: result.ordinal } })} />
+          onOpen={(result) => openPaper({ id: result.material_id, target: { id: result.passage_id, ordinal: result.ordinal } })} />
         {problem && <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{errorText(t, problem)}</p>}
         {notice && <p role="status" className="rounded-md bg-muted px-3 py-2 text-sm">{notice}</p>}
         {adding && <p role="status" className="text-sm text-muted-foreground">{t('library.adding')}</p>}
@@ -155,7 +173,7 @@ export function Library({ project }) {
               chosen={chosen.some((paper) => paper.id === material.id)}
               onChoose={(on) => choosePapers(project.id, on ? [...chosen, { id: material.id, title: material.title }]
                 : chosen.filter((paper) => paper.id !== material.id))}
-              onOpen={() => setOpen({ id: material.id })} onChanged={load} />)}
+              onOpen={() => openPaper({ id: material.id })} onChanged={load} />)}
           </ul>
         )}
         {listing && !searching && (
@@ -169,6 +187,8 @@ export function Library({ project }) {
         )}
       </div>
     </div>
+    {dialog}
+    </>
   );
 }
 
@@ -338,28 +358,29 @@ export function useIndex(projectId, listing) {
   return index;
 }
 
-// The search field's text and the newest search's results; a search asked before a later one, or
-// for another project, is dropped.
+// The search field's text and the newest search's results, read through libraryRead.js with the query searched: a
+// change to the papers drops the results shown and searches again, and only the newest search's answer, its error and
+// whether it is under way are shown (a search asked before a change, or before a later search, never is). Asking for
+// the query shown searches it again.
 function useSearch(projectId) {
+  const t = useT();
+  const language = useContext(LanguageContext);
   const [text, setText] = useState('');
-  const [shown, setShown] = useState(null); // { query, found }
-  const [asked] = useState(newest);
-  const { busy, problem, run, reset } = useAction();
-  useEffect(() => { asked(); setText(''); setShown(null); reset(); }, [projectId]);
-  async function search() {
-    const query = queryOf(text);
-    if (!query || !projectId) return;
-    const current = asked();
-    const found = await run(() => searchProject(projectId, query));
-    if (found && current()) setShown({ query, found });
+  const [query, setQuery] = useState(null); // the query searched, or null
+  useEffect(() => { setText(''); setQuery(null); }, [projectId]);
+  const read = useLibraryRead(projectId && query ? `${projectId}\n${query}` : null, () => searchProject(projectId, query));
+  function search() {
+    const wanted = queryOf(text);
+    if (!wanted || !projectId) return;
+    if (wanted === query) read.reload();
+    else setQuery(wanted);
   }
   function clear() {
-    asked();
     setText('');
-    setShown(null);
-    reset();
+    setQuery(null);
   }
-  return { text, setText, shown, busy, problem, search, clear };
+  return { text, setText, shown: read.value ? { query, found: read.value } : null, busy: read.busy,
+    problem: read.error ? problemText(t, read.error, language) : null, search, clear };
 }
 
 // The search field: Enter searches (not while an input method composes: onFieldKey), Escape clears.

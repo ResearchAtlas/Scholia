@@ -370,6 +370,38 @@ def _delete(conn, kind, object_id, remove_all_trace):
     conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.held.output')"
                  " WHERE json_type(inputs, '$.held.output') IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(runs.inputs,"
                  f" '$.memory_ids') j WHERE j.value IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')}))")
+    # M2 audit, area 1 (backend/provenance.py's rule: run events name records by id only): a run that outlives a deleted
+    # paper keeps none of its identifiers in its inputs, the only place runs hold them: a lookup's identifier for it and
+    # its question's (covers, read only while the lookup runs, which this deletion revokes), and a Zotero import's key
+    # of its item, in its items and the items done.
+    for material, project, source, source_key in conn.execute(
+            f"SELECT id, project_id, source, source_key FROM materials WHERE rowid IN {_doomed('materials')} AND project_id"
+            f" NOT IN (SELECT id FROM projects WHERE rowid IN {_doomed('projects')})").fetchall():
+        conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.covers', ?) WHERE workflow = 'lookup'"
+                     f" AND rowid NOT IN {_doomed('runs')}"
+                     " AND EXISTS (SELECT 1 FROM json_each(runs.inputs, '$.material_ids') j WHERE j.value = ?)",
+                     (f'$.identifiers."{material}"', material))
+        # A Zotero import's keys of the items that came to it: its own item's, in every import of its library, and any
+        # other item a running import names it for (inputs.papers: merged into it, or already there by its PDF).
+        keys = {}
+        for run, item in conn.execute("SELECT r.id, j.value FROM runs r, json_each(r.inputs, ?) j"
+                                      " WHERE r.project_id = ? AND r.workflow = 'zotero_import'",
+                                      (f'$.papers."{material}"', project)):
+            keys.setdefault(run, set()).add(item)
+        library, _, key = (source_key or "").rpartition("/items/")
+        if source == "zotero" and library:
+            for (run,) in conn.execute("SELECT id FROM runs WHERE project_id = ? AND workflow = 'zotero_import'"
+                                       " AND json_extract(inputs, '$.library') = ?", (project, library)).fetchall():
+                keys.setdefault(run, set()).add(key)
+        for run, gone in keys.items():
+            row = conn.execute(f"SELECT inputs FROM runs WHERE id = ? AND rowid NOT IN {_doomed('runs')}", (run,)).fetchone()
+            inputs = json.loads(row[0] or "{}") if row else {}
+            kept = {name: [k for k in inputs[name] if k not in gone] for name in ("items", "done")
+                    if gone & set(inputs.get(name) or [])}
+            if material in (inputs.get("papers") or {}):
+                kept["papers"] = {paper: items for paper, items in inputs["papers"].items() if paper != material}
+            if kept:
+                conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps({**inputs, **kept}), run))
     # S1-21a: what's done, from AAB's own records: papers removed from a project that stays (no title is kept)
     from backend import memory
     for removed_from, count in conn.execute(
@@ -465,8 +497,11 @@ def _revoke(conn):
     )"""
     revoked = sorted(run_id for (run_id,) in conn.execute(
         f"{in_scope} SELECT id FROM runs WHERE status = 'running' AND id IN (SELECT id FROM scope)"))
+    # A revoked run applies no effect, so what it holds only while it runs (`held`: a Merge's record, an agent's
+    # question, an extraction's reply) goes now, in the deletion's transaction, not at its terminal record (design
+    # review F, option 1.1 rule (a)).
     conn.execute(
-        f"{in_scope} UPDATE runs SET cancel_reason = 'revoked'"
+        f"{in_scope} UPDATE runs SET cancel_reason = 'revoked', inputs = json_remove(inputs, '$.held')"
         f" WHERE status = 'running' AND id IN (SELECT id FROM scope) AND rowid NOT IN {_doomed('runs')}"
     )
     return revoked

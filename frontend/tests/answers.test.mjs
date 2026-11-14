@@ -12,7 +12,8 @@ import { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import Answer, { Chip, backedSentences } from '../src/markdown.js';
 import { readTrace, summarize, turnRanges } from '../src/trace.js';
-import { MAX_CHOSEN, choosePapers, chosenPapers, openPaperAt, readGuard, takeOpening, watchChosen } from '../src/library.js';
+import { MAX_CHOSEN, choosePapers, chosenPapers, libraryChanged, libraryEvents, libraryGeneration, openPaperAt, readGuard, takeOpening,
+  watchChosen } from '../src/library.js';
 import { NOTICES } from '../src/live.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
@@ -242,6 +243,181 @@ test('Details names each step\'s tool calls and outcomes and the skills used, ne
   assert.deepEqual(found.steps.map((s) => s.phase), ['answer', 'answer_from_library']);
   assert.deepEqual(found.skills, ['help']); // once
   assert.equal(found.pairs.reused, 2);
+});
+
+// M2 audit, area 1: a library change drops chosen papers' titles at once, then drops those deleted since and gives the
+// others their titles now; a read that fails keeps their ids, untitled (the message stays restricted to them, and no
+// title of a deleted paper stays); one asked before a later change is not applied, and another project's change is
+// not heard.
+test('a library change drops chosen papers deleted since and retitles the others', async () => {
+  const original = globalThis.fetch;
+  const asked = [];
+  let answers = [];
+  globalThis.fetch = (path) => { asked.push(path); return answers.shift()(); };
+  const listed = (...materials) => async () => ({ ok: true, json: async () => ({ materials }) });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  try {
+    choosePapers('p1', [{ id: 'a', title: 'A' }, { id: 'gone', title: 'Deleted' }]);
+    libraryChanged('p2'); // another project's change
+    await settle();
+    assert.equal(asked.length, 0);
+    answers = [listed({ id: 'a', title: 'A, retitled' }, { id: 'c', title: 'C' })];
+    libraryChanged('p1');
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'a', title: null }, { id: 'gone', title: null }]); // at once
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'a', title: 'A, retitled' }]);
+    let late;
+    answers = [() => new Promise((resolve) => { late = resolve; }), listed({ id: 'a', title: 'A again' })];
+    libraryChanged(null); // every project's
+    libraryChanged('p1'); // a later change: the read before it is not applied
+    await settle();
+    late({ ok: true, json: async () => ({ materials: [] }) });
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'a', title: 'A again' }]);
+    answers = [async () => { throw new TypeError('dropped'); }];
+    libraryChanged('p1');
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'a', title: null }]); // kept, untitled: the backend refuses a deleted one
+  } finally {
+    globalThis.fetch = original;
+    choosePapers('p1', []);
+  }
+});
+
+// Round 2 (R5; design review F's test 6): a change while nothing is chosen still moves the papers' generation, so an
+// older read never retitles papers chosen after it.
+test('a read asked before a change made with nothing chosen never retitles a paper chosen after it', async () => {
+  const original = globalThis.fetch;
+  let late;
+  globalThis.fetch = () => new Promise((resolve) => { late = resolve; });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  try {
+    choosePapers('p1', [{ id: 'a', title: 'A' }]);
+    libraryChanged('p1'); // its read, R0, waits
+    choosePapers('p1', []);
+    libraryChanged('p1'); // nothing chosen: no read, but a new generation
+    choosePapers('p1', [{ id: 'b', title: 'B, as it is now' }]);
+    late({ ok: true, json: async () => ({ materials: [{ id: 'b', title: 'B, as it was' }] }) });
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'b', title: 'B, as it is now' }]);
+  } finally {
+    globalThis.fetch = original;
+    choosePapers('p1', []);
+  }
+});
+
+// Batch 3 (PR 61 recheck round 3, pass 1's probe): a change in another project moves the generation while the chosen
+// papers' refresh is pending (or failed); a refresh of the new generation replaces it, so the deleted paper still leaves
+// and the others still take their titles. With none owed, another project's change asks nothing.
+test('another project\'s change while the chosen papers are refreshed asks again, and its answer is applied', async () => {
+  const original = globalThis.fetch;
+  const asked = [];
+  globalThis.fetch = (path) => new Promise((resolve) => asked.push({ path, resolve }));
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const listed = (...materials) => ({ ok: true, json: async () => ({ materials }) });
+  try {
+    choosePapers('p1', [{ id: 'kept', title: 'Kept' }, { id: 'gone', title: 'Deleted Next' }]);
+    libraryChanged('p1'); // the deletion: R0 asked
+    libraryChanged('p2'); // an upload finishing in another project, before R0 answers
+    await settle();
+    assert.deepEqual(asked.map((r) => r.path), ['/api/projects/p1/materials', '/api/projects/p1/materials']);
+    asked[0].resolve(listed({ id: 'kept', title: 'Kept' }, { id: 'gone', title: 'Deleted Next' })); // asked before: dropped
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'kept', title: null }, { id: 'gone', title: null }]);
+    asked[1].resolve(listed({ id: 'kept', title: 'Kept, retitled' }));
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'kept', title: 'Kept, retitled' }]);
+    libraryChanged('p2'); // nothing pending: another project's change asks nothing
+    await settle();
+    assert.equal(asked.length, 2);
+    libraryChanged('p1'); // a refresh that fails is owed: another project's change asks it again
+    await settle();
+    asked[2].resolve({ ok: false, status: 503, json: async () => ({ code: 'unreachable' }) });
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'kept', title: null }]);
+    libraryChanged('p2');
+    await settle();
+    assert.equal(asked.length, 4);
+    asked[3].resolve(listed({ id: 'kept', title: 'Kept, again' }));
+    await settle();
+    assert.deepEqual(chosenPapers('p1'), [{ id: 'kept', title: 'Kept, again' }]);
+  } finally {
+    globalThis.fetch = original;
+    choosePapers('p1', []);
+  }
+});
+
+// Batch 4 and batch 5 (PR 61 recheck rounds 4 and 5): what a paper's own actions said (its file's replacement: notice;
+// its details' save: saved) is held by the Library per paper and per kind, and a completion changes it only when it
+// belongs to the latest action of that kind for its own paper: one paper's completion never touches another's, and an
+// older action's never overwrites a newer one's. Opening a page lets go of what was shown, not of which action is latest.
+test('a paper\'s feedback is changed only by the latest action of its kind on that paper', async () => {
+  const { paperAction, paperFeedback } = await import('../src/library.js');
+  let held = {};
+  const set = (next) => { held = typeof next === 'function' ? next(held) : next; };
+  const tooLarge = 'That file is larger than Scholia reads.';
+
+  // Round 5, pass 1: replacing A, B opened, B's replacement started; B fails first, then A.
+  const a1 = paperAction('a', 'notice', set);
+  held = {}; // B opened (openPaper)
+  const b1 = paperAction('b', 'notice', set);
+  b1(tooLarge);
+  a1('A failed late.');
+  assert.equal(paperFeedback(held, 'b', 'notice'), tooLarge); // B's own notice stays
+  assert.equal(paperFeedback(held, 'a', 'notice'), 'A failed late.'); // A's is A's (round 4: never shown on B)
+
+  // Round 5, pass 2: replacing A, Back, A reopened, a second replacement; the first fails after it, the second succeeds.
+  held = {};
+  const a2 = paperAction('a', 'notice', set);
+  held = {}; // Back, then A reopened
+  const a3 = paperAction('a', 'notice', set);
+  a2('The engine is not responding.');
+  assert.equal(paperFeedback(held, 'a', 'notice'), null); // the older one is refused
+  a3(null); // succeeded: nothing to say
+  assert.equal(paperFeedback(held, 'a', 'notice'), null);
+
+  // Round 5, pass 2: replacing A, B opened, an unsupported file chosen on B; then A fails late.
+  held = {};
+  const a4 = paperAction('a', 'notice', set);
+  held = {};
+  paperAction('b', 'notice', set)('Not read: notes.txt');
+  a4('A failed late.');
+  assert.equal(paperFeedback(held, 'b', 'notice'), 'Not read: notes.txt');
+
+  // Round 5, pass 1, Saved: saves on A and B, B answers first, then A: both are saved.
+  held = {};
+  const saveA = paperAction('a', 'saved', set);
+  const saveB = paperAction('b', 'saved', set);
+  saveB(true);
+  saveA(true);
+  assert.deepEqual([paperFeedback(held, 'a', 'saved'), paperFeedback(held, 'b', 'saved')], [true, true]);
+  // A newer save, or an edit after it, refuses the older save's answer; another kind is untouched.
+  const saveA2 = paperAction('a', 'saved', set);
+  const noticeA = paperAction('a', 'notice', set);
+  saveA(true);
+  noticeA('Replaced, with a note.');
+  assert.deepEqual([paperFeedback(held, 'a', 'saved'), paperFeedback(held, 'a', 'notice')], [null, 'Replaced, with a note.']);
+  saveA2(true);
+  assert.equal(paperFeedback(held, 'a', 'saved'), true);
+
+  // how the Library and the page use it, by behaviour: tests/library_scenarios.test.mjs (r4 to r5fail, redraw)
+});
+
+// Design review F's rider 2: a memory change is heard by the conversation side, and moves no papers' generation.
+test('a memory change moves no papers\' generation, and a change to the papers does', async () => {
+  const { memoryChanged } = await import('../src/memory.js');
+  const before = libraryGeneration();
+  let heard = 0;
+  const listen = () => { heard += 1; };
+  libraryEvents.addEventListener('changed', listen);
+  try {
+    memoryChanged(null);
+    assert.deepEqual([libraryGeneration(), heard], [before, 1]);
+    libraryChanged('p1');
+    assert.deepEqual([libraryGeneration(), heard], [before + 1, 2]);
+  } finally {
+    libraryEvents.removeEventListener('changed', listen);
+  }
 });
 
 test('papers chosen for the next message are one project\'s, kept once each, and a cited paper opens once', () => {

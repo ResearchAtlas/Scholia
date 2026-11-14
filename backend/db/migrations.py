@@ -724,4 +724,70 @@ _0012 = r"""
 ALTER TABLE queued_messages ADD COLUMN material_ids TEXT CHECK (material_ids IS NULL OR json_valid(material_ids));
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009, _0010, _0011, _0012)
+# M2 audit, area 1 (section 4.2: JSON columns are checked with json_valid): materials.lookup_filled (0006) is checked by
+# triggers, as a STRICT table's CHECK cannot be added to a column in place; a paper written before keeps its value.
+# merge_filled: the fields a confirmed Merge gave the paper (a JSON list of CSL keys, or NULL), which a later record of
+# it (a Zotero re-import, a lookup tried again) keeps where that record gives none (backend/references.py _answered).
+# Which fields a Merge confirmed before now gave was never recorded, so such a paper has none (design review G, option
+# 2.1, pending Harold): its next record replaces its details as before.
+# zotero_file: the PDF a Zotero paper's item gave when last imported, in one of three states: its SHA-256, NULL (Zotero
+# has given none), or 'unknown', which only this migration writes: a paper made before now whose file versions did not
+# all come from its imports (a researcher's file among them), so which one Zotero last gave is not known; its next
+# import that reads a PDF goes by the earlier rule once (backend/zotero.py _update) and records it (design review G,
+# option 1.2, pending Harold). No time is read: a paper whose every file version an import made is known by count.
+# Then, once (design review F, option 1.1 rule (b), pending Harold), the identifying fields earlier builds wrote into
+# lookup and Zotero events go (a lookup step's identifier, its question's covers, a Zotero step's item key; events name
+# papers by id only, backend/provenance.py), with the append-only trigger lifted for this transaction and recreated as
+# 0001 has it; an ended import keeps no item keys, and one under way keeps only the items it has not reached.
+_0013 = r"""
+ALTER TABLE materials ADD COLUMN merge_filled TEXT CHECK (merge_filled IS NULL OR json_valid(merge_filled));
+ALTER TABLE materials ADD COLUMN zotero_file TEXT
+    CHECK (zotero_file IS NULL OR zotero_file = 'unknown' OR length(zotero_file) = 64);
+
+-- Read once into a table keyed by paper, so the work grows with the library, not with papers times steps.
+CREATE TEMP TABLE zotero_given (material TEXT PRIMARY KEY, files INTEGER NOT NULL) WITHOUT ROWID;
+INSERT INTO temp.zotero_given
+    SELECT json_extract(e.data, '$.material_id'), count(*) FROM run_events e JOIN runs r ON r.id = e.run_id
+    WHERE r.workflow = 'zotero_import' AND e.type = 'step_finished' AND json_extract(e.data, '$.version') = 1
+    AND json_type(e.data, '$.material_id') = 'text'
+    GROUP BY 1;
+UPDATE materials SET zotero_file = CASE
+    WHEN (SELECT count(*) FROM material_versions v WHERE v.material_id = materials.id AND v.file_sha256 IS NOT NULL)
+        = coalesce((SELECT files FROM temp.zotero_given g WHERE g.material = materials.id), 0)
+    THEN (SELECT v.file_sha256 FROM material_versions v WHERE v.material_id = materials.id AND v.is_current = 1)
+    ELSE 'unknown' END
+WHERE source = 'zotero';
+DROP TABLE temp.zotero_given;
+
+DROP TRIGGER run_events_no_update;
+UPDATE run_events SET data = json_remove(data, '$.identifier', '$.covers', '$.key')
+WHERE type IN ('step_finished', 'ask')
+    AND run_id IN (SELECT id FROM runs WHERE workflow IN ('lookup', 'zotero_import'))
+    AND (json_type(data, '$.identifier') = 'text' OR json_type(data, '$.key') = 'text'
+         OR json_type(data, '$.covers') IS NOT NULL);
+CREATE TRIGGER run_events_no_update BEFORE UPDATE ON run_events
+BEGIN
+    SELECT RAISE(ABORT, 'run_events is append-only');
+END;
+UPDATE runs SET inputs = json_remove(inputs, '$.items', '$.done')
+WHERE workflow = 'zotero_import' AND status != 'running';
+UPDATE runs SET inputs = json_set(json_remove(inputs, '$.done'), '$.items', json((
+    SELECT json_group_array(j.value) FROM json_each(runs.inputs, '$.items') j
+    WHERE j.value NOT IN (SELECT value FROM json_each(runs.inputs, '$.done')))))
+WHERE workflow = 'zotero_import' AND status = 'running';
+
+CREATE TRIGGER materials_lookup_filled_valid BEFORE INSERT ON materials
+WHEN NEW.lookup_filled IS NOT NULL AND NOT json_valid(NEW.lookup_filled)
+BEGIN
+    SELECT RAISE(ABORT, 'materials.lookup_filled is not JSON');
+END;
+
+CREATE TRIGGER materials_lookup_filled_valid_update BEFORE UPDATE OF lookup_filled ON materials
+WHEN NEW.lookup_filled IS NOT NULL AND NOT json_valid(NEW.lookup_filled)
+BEGIN
+    SELECT RAISE(ABORT, 'materials.lookup_filled is not JSON');
+END;
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008, _0009, _0010, _0011, _0012,
+                               _0013)
