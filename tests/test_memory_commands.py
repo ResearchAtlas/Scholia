@@ -952,6 +952,10 @@ async def test_continue_of_a_forget_cut_short_says_how_many_it_forgot_and_forget
         left = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress' ORDER BY id")
         again = await _continued(client, stream[0]["run_id"])
         assert {"type": "memory", "action": "applied_before", "count": 1, "of": 3} in again
+        # recorded as nothing applied: else the late rule would read every such Continue as a later command (batch 3)
+        [(data,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'memory_proposed'",
+                               again[0]["run_id"])
+        assert (json.loads(data)["action"], json.loads(data)["applied"]) == ("applied_before", 0)
         assert await rows(client, "SELECT id FROM memory_records WHERE type != 'progress' ORDER BY id") == left
         assert len(left) == 2
         turn = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1]
