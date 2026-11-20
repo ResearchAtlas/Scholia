@@ -103,6 +103,54 @@ async def test_a_change_while_a_lookup_is_in_flight_sends_nothing_more_and_write
             assert await rows(client, "SELECT count(*) FROM materials WHERE checked_by = 'lookup'") == [(0,)]
 
 
+def kept_anywhere(data, text):
+    """Where text is left in the data folder's database, its backups and its other files (the stored files
+    themselves, content/, aside), and in any value of the database: [] when nowhere."""
+    found = [str(path.relative_to(data)) for path in data.rglob("*") if path.is_file()
+             and "content" not in path.relative_to(data).parts and text.encode() in path.read_bytes()]
+    import sqlite3
+    conn = sqlite3.connect(data / "scholia.sqlite3")
+    try:
+        for (table,) in conn.execute("SELECT name FROM sqlite_schema WHERE type = 'table'").fetchall():
+            found += [f"{table}: {value}" for row in conn.execute(f'SELECT * FROM "{table}"')
+                      for value in row if isinstance(value, str) and text in value]
+        # and no run that ended or was revoked holds anything (design review F's test 9)
+        found += [f"held: {run}" for (run,) in conn.execute(
+            "SELECT id FROM runs WHERE (status != 'running' OR cancel_reason = 'revoked')"
+            " AND json_type(inputs, '$.held') IS NOT NULL")]
+    finally:
+        conn.close()
+    return found
+
+
+# M2 audit, area 1 (backend/provenance.py's rule: run events name things by id only; section 16): a paper deleted
+# with Remove all trace and Delete everywhere leaves its identifier in no run's events or inputs, nor in any backup,
+# whether its lookup resolved or waits on a Local only question; the batch's other paper keeps its own.
+@pytest.mark.parametrize("level", ["normal", "local_only"])
+async def test_a_deleted_papers_identifier_is_left_in_no_run_and_no_backup(tmp_path, level):
+    other = "10.5555/kept.paper"
+    records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "The Kept Paper")}
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client, level=level)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()),
+                             ("kept.md", f"# Kept\n\ndoi:{other}\n".encode()))
+        if level == "local_only":
+            [ask] = await ask_of(client, project)  # its question covers both identifiers
+        else:
+            assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        doomed, kept = (m["id"] for m in result["materials"])
+        response = await client.delete(f"/api/materials/{doomed}", params={"remove_all_trace": "true",
+                                                                            "purge_backups": "true"})
+        assert response.status_code == 200 and response.json()["ok"] is True
+        await background_idle(client)
+        assert kept_anywhere(tmp_path / "data", DOI) == []
+        paper = (await client.get(f"/api/materials/{kept}")).json()
+        if level == "normal":  # what the Library shows of the lookup of the paper that stays
+            assert (paper["title"], paper["lookup"]["identifier"]) == ("The Kept Paper", f"doi:{other}")
+        else:
+            assert paper["lookup"]["status"] == "cancelled" and paper["lookup"]["cancel_reason"] == "revoked"
+
+
 async def test_a_local_only_projects_ask_is_withdrawn_when_it_no_longer_needs_one(tmp_path):
     async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
         project = await project_of(client, level="local_only")
@@ -521,6 +569,20 @@ async def test_a_record_with_malformed_entries_skips_them_and_still_resolves():
     assert failed.value.code == "unavailable"
 
 
+async def test_a_record_whose_title_has_nothing_visible_is_no_record_and_an_invisible_field_is_left_out():
+    """M2 audit, area 1 (the invisible-title class): as a file's name and the details form, a looked-up title or field
+    with no visible character (only zero-width or direction marks) is none."""
+    for blank in ("\u200b", "\u202e \u200b"):
+        with pytest.raises(lookup.Failed):
+            lookup._openalex(DOI, json.dumps({**openalex_work(DOI, TITLE), "title": blank, "display_name": blank}).encode())
+        with pytest.raises(lookup.Failed):
+            lookup._crossref(DOI, json.dumps({"message": {**crossref_work(DOI, TITLE), "title": [blank]}}).encode())
+        with pytest.raises(lookup.Failed):
+            lookup._arxiv(synthetic.ARXIV, arxiv_feed(synthetic.ARXIV, blank))
+        record = {**openalex_work(DOI, TITLE), "primary_location": {"source": {"display_name": blank}}}
+        assert "container-title" not in lookup._openalex(DOI, json.dumps(record).encode()).csl
+
+
 async def test_a_records_fields_reach_the_csl_only_as_short_strings_and_plausible_years():
     def openalex(**fields):
         return lookup._openalex(DOI, json.dumps({**openalex_work(DOI, TITLE), **fields}).encode()).csl
@@ -585,6 +647,87 @@ async def test_a_failed_lookup_leaves_the_material_imported_with_incomplete_meta
         assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
         [paper] = await settled(client, project)
         assert paper["title"] == TITLE and paper["checked_by"] == "lookup"
+
+
+async def test_a_merges_fields_survive_the_retry_of_the_uploads_lookup(tmp_path):
+    """M2 audit, area 1: a Merge's fields are the researcher's choice, so a lookup of the upload tried again (with
+    its batch's failed paper) replaces its looked-up details and keeps them."""
+    from test_reference_import import answer, imported as imported_references, merge_asks, ris
+    other = "10.5555/never.answered"
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)})
+    mock.answers = {"api.crossref.org": [503, 503, 503]}  # the second paper's DOI: OpenAlex has none, Crossref no answer
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()),
+                             ("second.md", f"# Second\n\ndoi:{other}\n".encode()))
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "failed"
+        await imported_references(client, project, ris((TITLE, f"DO  - {DOI}\nAB  - The merged abstract.\nKW  - wages\n")))
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        paper = result["materials"][0]["id"]
+        merged = (await client.get(f"/api/materials/{paper}")).json()
+        assert (merged["csl"]["abstract"], merged["csl"]["keyword"]) == ("The merged abstract.", "wages")
+        mock.openalex[DOI] = openalex_work(DOI, TITLE, venue="Journal of Later Records")
+        again = await client.post(f"/api/runs/{result['lookup_run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        retried = (await client.get(f"/api/materials/{paper}")).json()
+        assert retried["csl"]["container-title"] == "Journal of Later Records"  # the lookup's details, replaced
+        assert (retried["csl"]["abstract"], retried["csl"]["keyword"]) == ("The merged abstract.", "wages")
+
+
+async def test_r3_an_uploads_venue_its_lookup_no_longer_gives_goes_at_retry_after_the_upgrade(tmp_path):
+    """Design review G's test 6 (round 2 R3, the upload's variant; option 2.1, pending Harold): a Merge into an upload
+    confirmed before 0013 is not marked, so the lookup tried again after the upgrade writes its record afresh: a venue it
+    no longer gives goes, and so does the old Merge's field (the stated limit)."""
+    from test_reference_import import answer, imported as imported_references, merge_asks, ris
+    from test_zotero import as_before_0013
+    data, other = tmp_path / "data", "10.5555/never.answered"
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE, venue="Journal of Early Records")})
+    mock.answers = {"api.crossref.org": [503, 503, 503]}
+    async with started(data, MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()),
+                             ("second.md", f"# Second\n\ndoi:{other}\n".encode()))
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "failed"
+        await imported_references(client, project, ris((TITLE, f"DO  - {DOI}\nKW  - wages\n")))
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        paper = result["materials"][0]["id"]
+    await as_before_0013(data)
+    record = openalex_work(DOI, TITLE)
+    record["primary_location"] = {"source": None}  # no venue any more
+    mock = MockScholarly(openalex={DOI: record})
+    async with started(data, MockProvider(scholarly=mock), setup=False) as client:
+        again = await client.post(f"/api/runs/{result['lookup_run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        retried = (await client.get(f"/api/materials/{paper}")).json()
+        assert "container-title" not in retried["csl"] and "keyword" not in retried["csl"]
+
+
+async def test_a_resumed_lookup_that_finds_no_identifier_shows_none(tmp_path):
+    """Batch 3 (PR 61 recheck round 3, pass 1's probe): a lookup resolved a reference file's paper by its DOI, its run was
+    left running (its terminal write lost), and a re-import took the DOI away; resumed, the run finds no identifier, and
+    the paper's Details show none, not the earlier DOI its inputs kept."""
+    from test_reference_import import imported as imported_references, ris
+    data = tmp_path / "data"
+    async with started(data, scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client)
+        result = await imported_references(client, project, ris(("A Record With a DOI", f"DO  - {DOI}\nPY  - 2020\n")))
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        [paper] = result["imported"]
+        assert (await client.get(f"/api/materials/{paper}")).json()["lookup"]["identifier"] == f"doi:{DOI}"
+
+        def left_running(conn):  # as a crash before its terminal record, and a re-import that dropped the DOI
+            conn.execute("UPDATE runs SET status = 'running', finished_at = NULL, summary = NULL WHERE id = ?",
+                         (result["lookup_run_id"],))
+            conn.execute("UPDATE materials SET csl = json_remove(csl, '$.DOI') WHERE id = ?", (paper,))
+        await asyncio.to_thread(client.state["db"].write, left_running)
+    async with started(data, scholarly(openalex={DOI: openalex_work(DOI, TITLE)}), setup=False) as client:
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        lookup_shown = (await client.get(f"/api/materials/{paper}")).json()["lookup"]
+        assert (lookup_shown["outcome"], lookup_shown["identifier"]) == ("no_identifier", None)
 
 
 async def test_a_failed_lookup_tried_again_twice_at_once_is_tried_again_once(tmp_path):

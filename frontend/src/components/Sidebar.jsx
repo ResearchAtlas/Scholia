@@ -20,6 +20,7 @@ import { cn } from '@/lib/utils';
 import { SUGGESTED_HOLDS, holdsBody } from '../projects.js';
 import { HoldsChoice } from './Governance.jsx';
 import { memoryChanged } from '../memory.js'; // S1-21a
+import { libraryChanged } from '../library.js';
 
 export function Sidebar({ projects, projectId, conversations, conversationId, onProject, onProjectsChanged,
   onConversation, onConversationsChanged, onNewConversation, onSettings, onHide }) {
@@ -132,6 +133,7 @@ export function Sidebar({ projects, projectId, conversations, conversationId, on
           const kind = dialog?.kind;
           setDialog(null);
           memoryChanged(null); // S1-21a: records resting only on what was deleted went with it
+          if (kind === 'deleteProject') libraryChanged(null); // and its papers (a memory change moves no generation)
           if (kind === 'deleteProject') onProjectsChanged(); // another project is shown
           else onConversationsChanged(deleted);
         }} />

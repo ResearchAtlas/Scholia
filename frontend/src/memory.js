@@ -3,7 +3,7 @@
 // Where we left off's dismissal for this return; and the message box filled by its next-step button (nothing is sent
 // until Send).
 import { ApiError, del, get, patch, post } from './api.js';
-import { libraryChanged } from './library.js';
+import { libraryEvents } from './library.js';
 import { errorText } from './text.js';
 
 // A turn's memory actions (backend/runs.py Harness._memory_command, update_progress), as catalog keys.
@@ -36,10 +36,12 @@ const dismissed = new Set();
 export const leftOffDismissed = (projectId, latest) => dismissed.has(`${projectId}:${latest}`);
 export const dismissLeftOff = (projectId, latest) => dismissed.add(`${projectId}:${latest}`);
 
-// Memory changed (a record saved, kept, edited or forgotten, here or by a turn): the library's one change, so every
+// Memory changed (a record saved, kept, edited or forgotten, here or by a turn): the library's one change event, so every
 // view, question and read that drops and reads again when a paper is deleted does so too (Harold, 2026-10-21: no
-// client-held derived state; S1-21a fix batch 4: one invalidation path). projectId: the project, or null for any.
-export const memoryChanged = (projectId = null) => libraryChanged(projectId);
+// client-held derived state; S1-21a fix batch 4: one invalidation path). projectId: the project, or null for any. It
+// moves no papers' generation (library.js libraryChanged): the Library and the message box's papers hold no memory text
+// (M2 audit, area 1, design review F's rider 2, pending Harold).
+export const memoryChanged = (projectId = null) => libraryEvents.dispatchEvent(new CustomEvent('changed', { detail: projectId }));
 
 // The message box's text, put there by the next-step button: the conversation's composer takes it.
 export const composerFill = new EventTarget();
