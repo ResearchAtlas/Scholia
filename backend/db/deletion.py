@@ -328,6 +328,10 @@ def _delete(conn, kind, object_id, remove_all_trace):
     rowid, project_id, is_general = root
     if is_general:
         raise ValueError("the General project cannot be deleted")
+    if kind == "memory" and conn.execute("SELECT status FROM memory_records WHERE rowid = ?",
+                                         (rowid,)).fetchone()[0] == "superseded":
+        # an earlier version goes only with the record that replaced it, never alone (M2 audit area 4, design K's R1)
+        raise ValueError("changed")
 
     conn.execute("PRAGMA defer_foreign_keys = ON")  # checked at COMMIT, so no row may be left dangling
     conn.execute("CREATE TEMP TABLE doomed (seq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, rid INTEGER NOT NULL, UNIQUE (tbl, rid))")

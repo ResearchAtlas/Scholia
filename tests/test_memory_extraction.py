@@ -428,5 +428,59 @@ async def test_a_confirmed_restatement_confirms_the_pending_proposal(tmp_path):
         extracted(provider, candidate("A survey of managers", "confirmed", span="a survey of managers"))
         await send(client, conversation, "We will run a survey of managers")
         await background_idle(client)
-        assert await rows(client, "SELECT status FROM memory_records WHERE content = 'A survey of managers'") == [
-            ("confirmed",)]
+        # (PR 62 batch 4, design review N: confirmed as the proposal's next version, the proposal its earlier one)
+        assert await rows(client, "SELECT status, version FROM memory_records WHERE content = 'A survey of managers'"
+                                  " ORDER BY version") == [("superseded", 1), ("confirmed", 2)]
+
+
+# M2 audit area 4, item 8 (design review E's rider R1): the request for an index run follows the write that needs it,
+# so a cancellation landing while the write commits never drops it
+async def test_an_extraction_cancelled_while_its_records_commit_still_asks_for_their_index_run(tmp_path, monkeypatch):
+    import time
+    provider = MockProvider()
+    real = memory.apply_extraction
+    asked = []
+
+    async def index(self, project_id):
+        asked.append(project_id)
+    monkeypatch.setattr(runs.Harness, "_index_memory", index)
+    async with started(tmp_path / "data", provider) as client:
+        harness, loop = client.state["harness"], asyncio.get_running_loop()
+        project = await project_of(client)
+
+        def applying(conn, run_id, candidates):
+            found = real(conn, run_id, candidates)  # in the terminal write; the cancel lands before it returns
+            loop.call_soon_threadsafe(harness._request_cancel, harness.registry.runs[run_id], "researcher")
+            time.sleep(0.2)
+            return found
+        monkeypatch.setattr(memory, "apply_extraction", applying)
+        extracted(provider, candidate("We use interviews", "confirmed", span="we use interviews"))
+        await send(client, await conversation_in(client, project), "We use interviews")
+        await background_idle(client)
+        assert await rows(client, "SELECT content, status FROM memory_records WHERE type = 'decision'") == [
+            ("We use interviews", "confirmed")]
+        assert asked == [project]
+
+
+async def test_an_extraction_is_shown_the_notes_its_turns_steps_read_as_the_researchers_words(tmp_path, monkeypatch):
+    # M2 audit area 4, item 9 (Fable 5 F4): a read steering note is the researcher's own words (Harold, 2026-11-11), so
+    # the extraction is shown it after the message, and a record resting on it may be confirmed
+    from backend import budgets
+    real = budgets.read_notes
+
+    def notes(conn, run_id):
+        if conn.execute("SELECT 1 FROM turns WHERE run_id = ? AND json_extract(user_message, '$.text') = 'Hello there'",
+                        (run_id,)).fetchone():
+            return ["Also, we sample thirty nurses"]
+        return real(conn, run_id)
+    monkeypatch.setattr(budgets, "read_notes", notes)
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        extracted(provider, candidate("We sample thirty nurses", "confirmed", "project_state", span="we sample thirty nurses"))
+        await send(client, await conversation_in(client, project), "Hello there")
+        await background_idle(client)
+        [request] = provider.extractions
+        assert "Hello there\n\nAlso, we sample thirty nurses" in "\n".join(m["content"] for m in request["messages"])
+        assert await rows(client, "SELECT content, status FROM memory_records WHERE type = 'project_state'") == [
+            ("We sample thirty nurses", "confirmed")]

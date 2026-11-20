@@ -11,6 +11,7 @@ import { attempt, changeRecord, forgetRecord, keepUnsaved, keptEvents, keptUnsav
   recordText, review, settled } from '../memory.js';
 import { libraryEvents, readGuard } from '../library.js';
 import { LoadState, Section } from './fields.jsx';
+import { DeleteDialog } from './DeleteDialog.jsx';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 
@@ -38,9 +39,9 @@ export function MemorySection({ project }) {
       {!found ? <LoadState problem={problem} onRetry={load} /> : (
         <div className="grid gap-6">
           {found.memory_enabled === false && <p className="text-sm text-muted-foreground">{t('memory.offNote')}</p>}
-          <Records title={t('memory.personal')} records={found.personal}
+          <Records title={t('memory.personal')} records={found.personal} projectId={project?.id}
             onFailed={(failed, id) => setUnsaved((kept) => settled(kept, failed, id))} />
-          {project && <Records title={t('memory.project')} records={found.project}
+          {project && <Records title={t('memory.project')} records={found.project} projectId={project.id}
             onFailed={(failed, id) => setUnsaved((kept) => settled(kept, failed, id))} />}
         </div>
       )}
@@ -92,7 +93,7 @@ function useMemoryAction(onFailed) {
   return { busy, act };
 }
 
-function Records({ title, records, onFailed }) {
+function Records({ title, records, projectId, onFailed }) {
   const t = useT();
   const pending = records.filter((r) => r.status === 'proposed');
   const kept = records.filter((r) => r.status !== 'proposed');
@@ -103,20 +104,22 @@ function Records({ title, records, onFailed }) {
       {pending.length > 0 && (
         <div className="grid gap-2">
           <p className="text-xs font-medium text-muted-foreground">{t('leftOff.confirm')}</p>
-          <ul className="grid gap-2">{pending.map((r) => <Proposal key={r.id} proposal={r} onFailed={onFailed} />)}</ul>
+          <ul className="grid gap-2">{pending.map((r) => <Proposal key={r.id} proposal={r} projectId={projectId}
+            onFailed={onFailed} />)}</ul>
         </div>
       )}
       {kept.length > 0 && <ul className="divide-y rounded-lg border">{kept.map((r) => <Row key={r.id} record={r}
-        onFailed={onFailed} />)}</ul>}
+        projectId={projectId} onFailed={onFailed} />)}</ul>}
     </div>
   );
 }
 
-function Row({ record, onFailed }) {
+function Row({ record, projectId, onFailed }) {
   const t = useT();
   const language = useContext(LanguageContext);
   const { busy, act } = useMemoryAction(onFailed);
   const [editing, setEditing] = useState(null);
+  const [forgetting, setForgetting] = useState(false);
   const written = record.type === 'progress' || record.type === 'agent_note'; // by the app or the agent: never confirmed
   const since = record.valid_from ? new Intl.DateTimeFormat(language, { dateStyle: 'medium' }).format(new Date(record.valid_from)) : null;
   const kinds = [...new Set(record.sources.map((s) => s.kind))];
@@ -130,7 +133,7 @@ function Row({ record, onFailed }) {
         <form className="grid gap-2" onSubmit={(event) => {
           event.preventDefault();
           if (visible(editing)) {
-            act(() => changeRecord(record, { content: editing }), true, record.id).then((saved) => { if (saved) setEditing(null); });
+            act(() => changeRecord(record, { content: editing }, projectId), true, record.id).then((saved) => { if (saved) setEditing(null); });
           }
         }}>
           <label className="sr-only" htmlFor={`memory-${record.id}`}>{t('memory.contentLabel')}</label>
@@ -144,25 +147,32 @@ function Row({ record, onFailed }) {
         <div className="flex flex-wrap gap-2">
           {!written && record.status === 'inferred' && (
             <Button size="sm" variant="outline" className="h-7" disabled={busy}
-              onClick={() => act(() => changeRecord(record, { status: 'confirmed' }), false, record.id)}>{t('memory.confirm')}</Button>
+              onClick={() => act(() => changeRecord(record, { status: 'confirmed' }, projectId), false, record.id)}>{t('memory.confirm')}</Button>
           )}
-          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setEditing(record.content)}>
-            {t('memory.edit')}</Button>
-          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => act(() => forgetRecord(record), false, record.id)}>
+          {record.type !== 'progress' && ( // what's done is drawn and counted from the library's records: never edited
+            <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setEditing(record.content)}>
+              {t('memory.edit')}</Button>
+          )}
+          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setForgetting(true)}>
             {t('memory.forget')}</Button>
         </div>
       )}
+      <Forget record={record} open={forgetting} onClose={() => setForgetting(false)}
+        onDelete={(everywhere) => act(() => forgetRecord(record, everywhere), false, record.id)} />
     </li>
   );
 }
 
 // One proposal in Things to confirm: Keep confirms it at the version shown (one whose record changed meanwhile comes
-// back marked out of date); Edit saves the researcher's own words for it, confirmed; Forget deletes it.
-export function Proposal({ proposal, onFailed }) {
+// back marked out of date); Edit saves the researcher's own words for it, confirmed; Forget deletes it. projectId: the
+// project it is answered from.
+export function Proposal({ proposal, projectId, onFailed }) {
   const t = useT();
   const { busy, act: acted } = useMemoryAction(onFailed);
   const [editing, setEditing] = useState(null);
-  const act = (body) => acted(() => review({ id: proposal.id, version: proposal.version, ...body }), body.action === 'edit',
+  const [forgetting, setForgetting] = useState(false);
+  const act = (body) => acted(() => review({ id: proposal.id, version: proposal.version, project_id: projectId ?? null,
+    ...body }), body.action === 'edit',
     proposal.id);
   const marks = [proposal.structured?.older && t('memory.older'), proposal.structured?.out_of_date && t('memory.outOfDate'),
     proposal.structured?.source === 'answer' && t('memory.fromAnswer')].filter(Boolean);
@@ -188,10 +198,25 @@ export function Proposal({ proposal, onFailed }) {
             onClick={() => act({ action: 'keep' })}>{t('memory.keep')}</Button>
           <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setEditing(proposal.content)}>
             {t('memory.edit')}</Button>
-          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => act({ action: 'forget' })}>
+          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => setForgetting(true)}>
             {t('memory.forget')}</Button>
         </div>
       )}
+      <Forget record={proposal} open={forgetting} onClose={() => setForgetting(false)}
+        onDelete={(everywhere) => acted(() => forgetRecord(proposal, everywhere), false, proposal.id)} />
     </li>
+  );
+}
+
+// Forget through the delete dialog (ticket 18, Retention; M2 audit area 4, item 6): its note that deleted data stays in
+// the automatic backups for about five weeks, and "Delete everywhere including backups", at the version shown. The
+// dialog only asks: onDelete is the row's own action (useMemoryAction), so what it could not do is kept outside the
+// views and every view reads again, even when a refresh has removed the row meanwhile (MB1, MB12; batch 1).
+function Forget({ record, open, onClose, onDelete }) {
+  const t = useT();
+  return (
+    <DeleteDialog target={open ? { kind: 'memory', id: record.id, title: t('memory.forgetTitle'),
+      body: t('memory.forgetBody', { content: recordText(t, record) }) } : null}
+      onClose={onClose} onDelete={onDelete} />
   );
 }
