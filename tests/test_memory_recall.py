@@ -654,9 +654,12 @@ async def test_a_personal_proposal_confirmed_from_another_project_gets_its_vecto
         text = "Remember: I prefer short answers" if by == "command" else "I prefer short answers"
         await send(client, await conversation_in(client, second), text)
         await background_idle(client, timeout=20)
-        assert await rows(client, "SELECT status, project_id FROM memory_records WHERE id = ?", proposal) == [
-            ("confirmed", first)]
-        assert await _vectors(client, [proposal]) == {proposal}
+        # design review N: a command keeps the proposal in place; an extraction writes its next version, in its own project
+        [(current, status, owner)] = await rows(client, "SELECT id, status, project_id FROM memory_records"
+                                                        " WHERE scope = 'personal' AND status != 'superseded'")
+        assert (status, owner) == (("confirmed", first) if by == "command" else ("confirmed", second))
+        assert (current == proposal) == (by == "command")
+        assert await _vectors(client, [current]) == {current}
 
 
 def _deleting_on_ask(client, project):
@@ -672,7 +675,8 @@ def _deleting_on_ask(client, project):
 @pytest.mark.parametrize("site", ["create", "edit", "keep"])
 async def test_a_personal_record_whose_project_is_deleted_before_the_request_gets_its_vector(tmp_path, monkeypatch,
                                                                                               site):
-    # batch 3 (recheck round 3, pass 1 finding 1 and pass 2 finding 1): the surviving record's project_id is NULL
+    # batch 3 (recheck round 3, pass 1 finding 1 and pass 2 finding 1): the surviving record's project_id is NULL. An
+    # edit or Keep names the Normal project it is made from (PR 62, Fable 4 F2)
     from test_search import app
     async with app(tmp_path) as client:
         project = await project_of(client)
@@ -685,10 +689,10 @@ async def test_a_personal_record_whose_project_is_deleted_before_the_request_get
         response = {"create": lambda: client.post("/api/memory", json={"project_id": project, "type": "preference",
                                                                        "content": "I prefer short answers",
                                                                        "scope": "personal"}),
-                    "edit": lambda: client.patch(f"/api/memory/{record}", json={"version": 1,
+                    "edit": lambda: client.patch(f"/api/memory/{record}", json={"project_id": project, "version": 1,
                                                                                 "content": "I prefer brief answers"}),
-                    "keep": lambda: client.post("/api/memory/review", json={"id": record, "action": "keep",
-                                                                            "version": 1})}[site]()
+                    "keep": lambda: client.post("/api/memory/review", json={"project_id": project, "id": record,
+                                                                            "action": "keep", "version": 1})}[site]()
         assert (await response).status_code in (200, 201)
         [(kept, scope, owner)] = await rows(client, "SELECT id, scope, project_id FROM memory_records"
                                                     " WHERE status = 'confirmed'")
@@ -729,7 +733,7 @@ async def test_a_record_written_during_the_opening_rebuild_gets_its_vector(tmp_p
 async def test_a_project_deleted_between_an_edit_and_its_reread_restarts_no_other_projects_cancelled_run(
         tmp_path, monkeypatch, site):
     # batch 3 (recheck round 3, both passes, finding 3): the reread finds project_id NULL; a write never names a third
-    # project, whose cancelled run stays so
+    # project, whose cancelled run stays so. The edit or Keep names the Normal project it is made from (PR 62, Fable 4 F2)
     from test_search import app, runs_of
     async with app(tmp_path) as client:
         project, other = await project_of(client, "First"), await project_of(client, "Other")
@@ -753,9 +757,11 @@ async def test_a_project_deleted_between_an_edit_and_its_reread_restarts_no_othe
                 asyncio.run_coroutine_threadsafe(client.delete(f"/api/projects/{project}"), loop).result(20)
             return done
         monkeypatch.setattr(db, "write", write_then_delete)
-        response = await (client.patch(f"/api/memory/{record}", json={"version": 1, "content": "I prefer brief answers"})
+        response = await (client.patch(f"/api/memory/{record}", json={"project_id": project, "version": 1,
+                                                                       "content": "I prefer brief answers"})
                           if site == "edit" else
-                          client.post("/api/memory/review", json={"id": record, "action": "keep", "version": 1}))
+                          client.post("/api/memory/review", json={"project_id": project, "id": record, "action": "keep",
+                                                                  "version": 1}))
         monkeypatch.setattr(db, "write", real)
         assert response.status_code == 200, response.text
         await background_idle(client)
