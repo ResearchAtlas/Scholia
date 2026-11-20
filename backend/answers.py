@@ -158,10 +158,12 @@ async def check(body: Check, request: Request):
     size, judge = values["retrieval"]["judge_pairs"], visible(values["models"].get("judge"))
 
     def cited(conn):
-        return conn.execute(
+        found = conn.execute(
             "SELECT c.id, json_extract(c.context, '$.sentence'), c.passage_id, c.material_id FROM citations c"
             " WHERE c.owner_kind = 'answer' AND c.owner_id = ? AND c.existence = 'ok' AND c.passage_id IS NOT NULL"
             " ORDER BY c.rowid", (body.run_id,)).fetchall()
+        now = resolve_now(conn, [c[0] for c in found])  # as its chip reads now: one removed since is not checked
+        return [c for c in found if now.get(c[0]) == "ok"]
     expected = await asyncio.to_thread(state["db"].read, cited)
 
     def record(conn, ids):

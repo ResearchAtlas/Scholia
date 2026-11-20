@@ -255,7 +255,7 @@ async def test_a_newer_readings_failed_commit_leaves_the_older_reading_and_its_c
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fails", ["resolving citations", "the run's terminal record"])
+@pytest.mark.parametrize("fails", ["pointing citations", "the run's terminal record"])
 async def test_a_failure_after_the_earlier_reading_is_superseded_rolls_the_whole_commit_back(tmp_path, monkeypatch, quick,
                                                                                             fails):
     """Charter section 10, a commit followed by a failure: supersede runs to its end (passages and
@@ -284,12 +284,15 @@ async def test_a_failure_after_the_earlier_reading_is_superseded_rolls_the_whole
                            conn.execute("SELECT count(*) FROM tombstones WHERE kind = 'reading'").fetchone()[0],
                            conn.execute("SELECT passage_id FROM citations WHERE id = ?", (kept,)).fetchone()[0]))
 
-    if fails == "resolving citations":
+    if fails == "pointing citations":  # design review J: citations are pointed before the earlier reading goes
+        real_supersede = materials_module.supersede
+
         def failing(conn, *args):
+            real_supersede(conn, *args)
             seen(conn)
             raise RuntimeError("a failure after the earlier reading was superseded")
 
-        real, target = materials_module._resolve, (materials_module, "_resolve")
+        real, target = real_supersede, (materials_module, "supersede")
     else:
         real_event = runs_module._event
 
@@ -797,6 +800,8 @@ async def test_a_citation_one_re_read_cannot_find_is_found_again_by_a_later_one_
         kept = await cite(client, paper["id"], cited, "rose sharply")
         late = await cite(client, paper["id"], None, "second paragraph", existence="not_found")  # unresolved from the start
         gone = await cite(client, paper["id"], None, "rose sharply", existence="source_removed")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # as a deletion leaves one (W5)
+            "UPDATE citations SET material_id = NULL, material_version_id = NULL, quote = NULL WHERE id = ?", (gone,)))
 
         async def read_as(name):
             monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", name))
