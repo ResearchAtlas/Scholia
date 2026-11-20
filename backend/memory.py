@@ -350,7 +350,7 @@ def edit(conn, record, version, *, content=None, confirm=False):
                  structured=structured or None)
 
 
-def keep(conn, proposal, version, edited=False):
+def keep(conn, proposal, version):
     """The researcher's Keep (confirm) of a proposal, in place (the views, the card, a Save command): it replaces the
     record it names (supersedes_id) only if that record is still at the version the proposal saw; else it stays
     proposed and is marked out of date (section 8), in this transaction, and None is returned. Returns its id, or raises
