@@ -330,9 +330,8 @@ def test_a_deletions_collection_keeps_a_file_whose_row_and_reference_commit_afte
     # PR 59 round 5's P2 (design review Q), through a deletion's cleanup: the same sweep as the hourly pass
     from test_content_store import first_put_racing
     x = populate(db, store, add_project(db, "Thesis"), "p")
-    joined, path = first_put_racing(store, db, monkeypatch, minutes)
-    delete(db, store, "material", x["m1"])
-    joined()
+    with first_put_racing(store, db, monkeypatch, minutes) as path:
+        delete(db, store, "material", x["m1"])
     assert path.is_file() and one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", path.name) == (1,)
     with pytest.raises(FileNotFoundError):  # the deleted paper's own file went at once
         store.read(x["paper"])

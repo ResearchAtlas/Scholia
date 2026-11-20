@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hashlib
 import io
 import os
@@ -465,53 +466,60 @@ def test_a_put_while_collection_checks_a_row_keeps_the_row(store, db, monkeypatc
     assert [row[0] for row in rows(db)] == [sha256]
 
 
+@contextlib.contextmanager
 def first_put_racing(store, db, monkeypatch, minutes):
     """Design review Q's ordering: a first put of new bytes places its file, held, with no row yet; the clock then
-    moves ahead by minutes; the collection that follows reads the rows before the put's row, a record naming it and
-    the end of its caller's hold all commit. Returns (start the collection, the hash)."""
-    placed, go, done, found = threading.Event(), threading.Event(), threading.Event(), []
-    real_write = db.write
+    moves ahead by minutes; the collection the block starts reads the rows before the put's row, a record naming it and
+    the end of its caller's hold all commit. Yields the file's path. On leaving, the putter is released and joined
+    whatever happened, and the ordering is asserted to have held (each wait ended by its event, not its timeout)."""
+    placed, go, done, found, waited, failed = (threading.Event(), threading.Event(), threading.Event(), [], [], [])
+    real_write, real_files = db.write, ContentStore._stored_files
 
     def write(fn, *args, **kwargs):
         if threading.current_thread() is putter and not placed.is_set():  # its row insert waits
             placed.set()
-            go.wait(10)
+            waited.append(go.wait(10))
         return real_write(fn, *args, **kwargs)
 
     def put():
-        with store.hold() as held:
-            found.append(store.put(b"first bytes", "application/pdf", held))
-            add_material_version(db, found[0])
-        done.set()
+        try:
+            with store.hold() as held:
+                found.append(store.put(b"first bytes", "application/pdf", held))
+                add_material_version(db, found[0])
+            done.set()
+        except BaseException as error:  # said by the block's end, not lost in the thread
+            failed.append(error)
 
+    def files(self):  # the collection has read the rows: the put commits now
+        if not go.is_set():
+            listed.append(True)
+            go.set()
+            assert done.wait(10), "the put did not commit"
+        yield from real_files(self)
+
+    listed = []
     monkeypatch.setattr(db, "write", write)
     putter = threading.Thread(target=put)
     putter.start()
-    assert placed.wait(10)
-    path = store._path(hashlib.sha256(b"first bytes").hexdigest())
-    age(path, timedelta(minutes=minutes))
-    real_files = ContentStore._stored_files
-
-    def files(self):  # the collection has read the rows: the put commits now
-        go.set()
-        assert done.wait(10)
-        yield from real_files(self)
-
-    monkeypatch.setattr(ContentStore, "_stored_files", files)
-
-    def joined():
+    try:
+        assert placed.wait(10), "the put did not place its file"
+        path = store._path(hashlib.sha256(b"first bytes").hexdigest())
+        age(path, timedelta(minutes=minutes))
+        monkeypatch.setattr(ContentStore, "_stored_files", files)
+        yield path
+    finally:
+        go.set()  # never left waiting, whatever failed
         putter.join(10)
-        assert not putter.is_alive()
-    return joined, path
+    assert not putter.is_alive() and not failed, failed
+    assert listed == [True] and waited == [True], "the put was not released by the collection's listing"
 
 
 @pytest.mark.parametrize("minutes", [0, 59, 61, 120])
 def test_the_hourly_collection_keeps_a_file_whose_row_and_reference_commit_after_it_read_the_rows(
         store, db, monkeypatch, minutes):
     # PR 59 round 5's P2 (design review Q): the sweep decided "no row" from its earlier read of the rows
-    joined, path = first_put_racing(store, db, monkeypatch, minutes)
-    store.collect_garbage()
-    joined()
+    with first_put_racing(store, db, monkeypatch, minutes) as path:
+        store.collect_garbage()
     assert len(rows(db)) == 1 and path.is_file()
     assert db.read(lambda conn: conn.execute(
         "SELECT count(*) FROM material_versions WHERE file_sha256 = ?", (path.name,)).fetchone()) == (1,)
