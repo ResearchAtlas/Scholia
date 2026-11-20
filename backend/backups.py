@@ -1630,6 +1630,13 @@ def _turn_records(conn, turn, rows, project_id):
         " LEFT JOIN materials m ON m.id = c.material_id"
         " LEFT JOIN material_versions v ON v.id = c.material_version_id LEFT JOIN passages p ON p.id = c.passage_id"
         " WHERE c.owner_kind = 'answer' AND c.owner_id = ?2 ORDER BY c.rowid", project_id, run_id)
+    # as its chip reads now (the conversation read's overlay, T7): one removed since is removed, with no verdict, quote
+    # or passage shown as current (PR 63's phase B internal review)
+    from backend import answers  # it imports what imports this module
+    now = answers.resolve_now(conn, [c["id"] for c in turn["citations"]])
+    for c in turn["citations"]:
+        if c["existence"] == "ok" and now.get(c["id"]) == "source_removed":
+            c.update(existence="source_removed", support="unchecked", quote=None, passage_id=None, passage=None)
 
 
 def _conversation_markdown(conversation, language="en", titles=None):

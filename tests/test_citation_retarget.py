@@ -237,6 +237,54 @@ async def test_a_citation_stored_removed_on_a_passage_a_reread_keeps_exists_agai
 
 
 
+async def test_a_project_export_says_of_a_citation_what_its_chip_says(tmp_path):
+    # PR 63's phase B internal review (P3-3): the export read a citation's stored existence and verdict, where the
+    # conversation read applies resolve_now (T7): a citation whose replacement lacks its quote exported as ok, supported
+    import json
+    from test_backups import archived_run, read
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        await added(client, project, paper("Wage Floors", "Rents rose in the synthetic city."), material_id=material)
+        await idle(client, project)
+        assert (await chip_of(client, conversation))["existence"] == "source_removed"
+        destination = tmp_path / "chosen"
+        destination.mkdir()
+        run = await archived_run(client, f"/api/projects/{project}/export", {"destination": str(destination)})
+        assert run.status == "succeeded", run
+    [exported] = json.loads(read(destination / run.result["file"].rsplit("/", 1)[1], "conversations.json"))
+    [citation] = exported["turns"][0]["citations"]
+    assert (citation["existence"], citation["support"], citation["quote"]) == ("source_removed", "unchecked", None)
+
+
+async def test_the_chooser_takes_the_citations_own_passage_then_its_text_then_its_page_then_its_place(tmp_path):
+    # PR 63's phase B internal review (P3-4): no test pinned locate's order. Five passages of one reading hold the
+    # quote; each step of the order is asked for with the steps before it out of the way.
+    quote = "the quote"
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, paper("Five", *[f"Paragraph {i} holds {quote}." for i in range(5)]))
+        db = client.state["db"]
+        passages = await rows(client, "SELECT id, ordinal FROM passages WHERE instr(text, ?) > 0 ORDER BY ordinal", quote)
+        assert len(passages) == 5
+        [(a, oa), (b, _), (c, oc), (d, _), (e, oe)] = passages
+
+        def shape(conn):
+            conn.execute("UPDATE passages SET text = ? WHERE id = ?", (f"The old text, with {quote}.", b))
+            conn.execute("UPDATE passages SET page = 7 WHERE id IN (?, ?)", (d, e))
+        await asyncio.to_thread(db.write, shape)
+
+        def chosen(**given):
+            return asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, quote, **given)[0])
+        old = f"The old text, with {quote}."
+        assert await chosen(text=old, page=7, passage_id=a, ordinal=oe) == a  # its own passage, while it holds the quote
+        assert await chosen(text=old, page=7, passage_id=None, ordinal=oe) == b  # then one with its old passage's text
+        assert await chosen(text="Gone.", page=7, passage_id=None, ordinal=oc) == d  # then on its page, nearest its place
+        assert await chosen(text="Gone.", page=7, passage_id=None, ordinal=oe) == e
+        assert await chosen(text="Gone.", page=None, passage_id=None, ordinal=oe) == c  # with no page: pageless first,
+        assert await chosen(text="Gone.", page=None, passage_id=None, ordinal=oa) == a  # then nearest its place
+
+
 async def test_a_papers_reading_changes_only_where_its_citations_are_pointed_again():
     # Design review J's source pin: a paper's reading changes only in materials.add_version (its versions) and
     # materials._store (a reading and its passages, served by _serve), each of which points the paper's citations again
