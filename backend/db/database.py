@@ -779,7 +779,7 @@ def _rotate(backups, keep, now=None):
     where it was however it ends, and the next backup or idle check after it
     catches up (design review R, Option 1).
     """
-    if any((backups / STAGING).glob(f"*/{RESTORING}")):
+    if _restoring(backups):
         return
     daily, weekly = backups / "daily", backups / "weekly"
     now = _stamp_of(keep) if keep is not None else now or datetime.now(UTC)
@@ -796,6 +796,24 @@ def _rotate(backups, keep, now=None):
             shutil.rmtree(old)
     for old in _generations(weekly)[:-WEEKLY_KEPT]:
         shutil.rmtree(old)
+
+
+def _restoring(backups):
+    """Whether a restore is in progress: a folder in STAGING holds RESTORING. A folder that cannot be listed raises
+    (Path.glob would read it as empty), so the caller rotates nothing (PR 63's recheck r2; design review R)."""
+    try:
+        with os.scandir(backups / STAGING) as entries:
+            folders = [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
+    except FileNotFoundError:  # no staging folder: no restore
+        return False
+    for folder in folders:
+        try:
+            with os.scandir(folder) as entries:
+                if any(entry.name == RESTORING for entry in entries):
+                    return True
+        except FileNotFoundError:  # removed as it was listed: a restore or backup that has ended
+            continue
+    return False
 
 
 def _settings_folders(data_dir):

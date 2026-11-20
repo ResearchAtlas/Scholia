@@ -225,3 +225,44 @@ async def test_a_second_restore_put_back_after_one_that_could_not_be_leaves_the_
             "SELECT json_extract(data, '$.interrupted'), json_extract(data, '$.finished') FROM audit_log"
             " WHERE event = 'restore'").fetchall())
         assert rows == [(1, "forward")]
+
+
+@pytest.mark.parametrize("error", ["EACCES", "EIO"])
+async def test_a_staging_folder_that_cannot_be_listed_rotates_nothing(tmp_path, monkeypatch, caplog, error):
+    # PR 63's recheck r2 (pass 1 F5, pass 2 F1): the guard asked Path.glob, which swallows a listing's error, so an
+    # unlistable staging folder read as no restore and retention deleted; design R says nothing is rotated then
+    import errno
+    import logging
+    import os
+    import backend.db.database as database_module
+    from backend.db.database import RESTORING, STAGING
+
+    def body():
+        now = datetime.now(UTC)
+        data = tmp_path / "data"
+        with Database(data) as db:
+            for days in (60, 53, 46, 39, 30):  # one weekly backup more than retention keeps once the next one rotates
+                db.backup(now=now - timedelta(days=days))
+            backups = data / "backups"
+            (backups / "weekly").mkdir(exist_ok=True)
+            for generation in sorted((backups / "daily").iterdir()):
+                generation.rename(backups / "weekly" / generation.name)
+            (backups / STAGING / "a-restore" / RESTORING).mkdir(parents=True)
+            before = sorted(p.name for p in (backups / "weekly").iterdir())
+            real = os.scandir
+
+            def failing(path="."):
+                if not isinstance(path, int) and os.path.basename(os.fspath(path)) in (STAGING, "a-restore"):
+                    raise OSError(getattr(errno, error), os.strerror(getattr(errno, error)))
+                return real(path)
+            monkeypatch.setattr(database_module.os, "scandir", failing)
+            import glob  # Path.glob's own scanner, bound at its import, fails the same way
+            for owner in [o for o in vars(glob).values() if isinstance(o, type) and "scandir" in vars(o)]:
+                monkeypatch.setattr(owner, "scandir", staticmethod(failing))
+            with caplog.at_level(logging.WARNING, logger="backend.db.database"):
+                db._apply_retention(now=now)
+            monkeypatch.undo()
+            assert sorted(p.name for p in (backups / "weekly").iterdir()) == before  # nothing rotated
+            assert "retention failed" in caplog.text  # and said, as any retention failure is
+
+    await asyncio.to_thread(body)
