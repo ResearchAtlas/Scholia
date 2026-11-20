@@ -228,14 +228,21 @@ def scanned_pdf(lines, size=(612, 792), dpi=300):
         document = pdfium.PdfDocument.new()
         try:
             page = document.new_page(*size)
-            bitmap = pdfium.PdfBitmap.new_native(width, height, raw.FPDFBitmap_Gray)
-            for row in range(height):
-                ctypes.memmove(ctypes.addressof(bitmap.buffer) + row * bitmap.stride, pixels[row * stride:row * stride + width], width)
             image = pdfium.PdfImage.new(document)
-            image.set_bitmap(bitmap)
-            bitmap.close()  # the image keeps its own reference; released inside the lock
-            image.set_matrix(pdfium.PdfMatrix().scale(*size))
-            page.insert_obj(image)
+            try:
+                bitmap = pdfium.PdfBitmap.new_native(width, height, raw.FPDFBitmap_Gray)
+                try:
+                    for row in range(height):
+                        ctypes.memmove(ctypes.addressof(bitmap.buffer) + row * bitmap.stride,
+                                       pixels[row * stride:row * stride + width], width)
+                    image.set_bitmap(bitmap)
+                finally:
+                    bitmap.close()  # the image keeps its own reference; released inside the lock
+                image.set_matrix(pdfium.PdfMatrix().scale(*size))
+                page.insert_obj(image)
+            except BaseException:
+                image.close()  # on no page: released here, inside the lock, however it failed
+                raise
             page.gen_content()
             out = io.BytesIO()
             document.save(out)

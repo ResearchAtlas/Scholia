@@ -1024,9 +1024,11 @@ def render_page(data, number, scale=2.0):
                 while math.ceil(width * scale) * math.ceil(height * scale) > MAX_PAGE_PIXELS:  # pypdfium2 rounds up
                     scale *= 0.99
                 bitmap = page.render(scale=scale, rev_byteorder=True)
-                width, height, stride, channels = bitmap.width, bitmap.height, bitmap.stride, bitmap.n_channels
-                pixels = bytes(bitmap.buffer)
-                bitmap.close()
+                try:
+                    width, height, stride, channels = bitmap.width, bitmap.height, bitmap.stride, bitmap.n_channels
+                    pixels = bytes(bitmap.buffer)
+                finally:
+                    bitmap.close()  # inside the lock, a failed copy too (PR 63's first review)
             finally:
                 page.close()
         finally:

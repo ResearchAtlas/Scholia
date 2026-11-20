@@ -35,12 +35,18 @@ def pdf(pages, *, scanned=(), size=(612, 792), rotation=0):
                 page.set_rotation(rotation)
                 if number in scanned:
                     image = pdfium.PdfImage.new(document)
-                    bitmap = pdfium.PdfBitmap.new_native(40, 40, raw.FPDFBitmap_BGR)
-                    bitmap.fill_rect((180, 180, 180, 255), 0, 0, 40, 40)
-                    image.set_bitmap(bitmap)
-                    bitmap.close()  # the image keeps its own reference; released inside the lock
-                    image.set_matrix(pdfium.PdfMatrix().scale(width, height))
-                    page.insert_obj(image)
+                    try:
+                        bitmap = pdfium.PdfBitmap.new_native(40, 40, raw.FPDFBitmap_BGR)
+                        try:
+                            bitmap.fill_rect((180, 180, 180, 255), 0, 0, 40, 40)
+                            image.set_bitmap(bitmap)
+                        finally:
+                            bitmap.close()  # the image keeps its own reference; released inside the lock
+                        image.set_matrix(pdfium.PdfMatrix().scale(width, height))
+                        page.insert_obj(image)
+                    except BaseException:
+                        image.close()  # on no page: released here, inside the lock, however it failed
+                        raise
                 for x, y, font_size, text, *font in lines:
                     obj = raw.FPDFPageObj_NewTextObj(document, (font[0] if font else "Helvetica").encode(), font_size)
                     encoded = (text + "\0").encode("utf-16-le")
