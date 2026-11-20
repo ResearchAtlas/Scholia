@@ -19,8 +19,10 @@ export function useRead(changes, key, read) {
   const newest = useRef(0);
   const reader = useRef(read);
   reader.current = read;
+  const shown = useRef(key); // what is read now: a reload kept from an earlier key reads nothing (the reader is this key's)
+  shown.current = key;
   const reload = useCallback(() => {
-    if (key === null || key === undefined) return;
+    if (key === null || key === undefined || key !== shown.current) return; // design review U, rule H
     const mine = ++newest.current;
     const asked = { key, generation: changes.now() };
     setAsking(asked);
