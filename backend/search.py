@@ -732,11 +732,12 @@ async def _embed_memory(state, harness, active, project_id, drained):
             if not current:  # forgotten or moved as it was asked for: never sent
                 continue
             raise RunOutcome("failed", unavailable.reason) from None  # Retry, or the next launch, embeds it
-        if len(vector) == DIMENSIONS:
-            # stored only while the record is still of this scope, read as it is written (a move meanwhile queues its
-            # vector's removal; this one is then never written to the old partition)
-            stored += await drained(index.store_memory, [(memory_id, scope, vector)],
-                                    lambda ids: db.read(lambda conn: _active_memory(conn, ids, project_id))) or 0
+        if len(vector) != DIMENSIONS:  # not this model's, as for a passage: nothing would ever be stored (design E, R2)
+            raise RunOutcome("failed", "request_failed")
+        # stored only while the record is still of this scope, read as it is written (a move meanwhile queues its
+        # vector's removal; this one is then never written to the old partition)
+        stored += await drained(index.store_memory, [(memory_id, scope, vector)],
+                                lambda ids: db.read(lambda conn: _active_memory(conn, ids, project_id))) or 0
     return stored
 
 

@@ -1560,6 +1560,21 @@ async def test_a_whole_rebuild_while_the_app_runs_asks_for_the_runs_of_memory_it
         assert await _vectors(client, ids) == set(ids)
 
 
+async def test_a_helper_answering_a_memory_vector_of_another_dimension_fails_the_run(tmp_path, monkeypatch):
+    # design E's R2 (PR 60's rechecks, PR 63's first review pass 1 finding 11): the vector was skipped and the run
+    # succeeded with the record unembedded; as with a passage, it fails with request_failed
+    import synthetic_materials as synthetic
+    from test_search import app, runs_of
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await background_idle(client)
+        monkeypatch.setattr(synthetic, "embedding", lambda text, dimensions=512: [1.0] * dimensions)
+        await entered(client, project, "Wage floors raise the earnings of low-paid workers")
+        await background_idle(client)
+        assert [(r["status"], (r["result"] or {}).get("reason")) for r in await runs_of(client, "index", project)][-1] == (
+            "failed", "request_failed")
+
+
 async def test_a_helper_that_fails_on_a_memory_record_fails_the_run_and_retry_embeds_it(tmp_path):
     # M2 audit area 2: as with a passage, the run fails with the helper's reason, so Retry (or the next launch) embeds it
     from test_search import app, runs_of
