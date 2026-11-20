@@ -129,14 +129,16 @@ export function Sidebar({ projects, projectId, conversations, conversationId, on
           : dialog?.kind === 'deleteProject' ? { kind: 'project', id: dialog.project.id,
             title: t('project.deleteTitle', { name: projectName(t, dialog.project) }), body: t('project.deleteBody') }
             : null}
-        onDone={(deleted) => {
-          const kind = dialog?.kind;
-          setDialog(null);
+        onSettled={(deleted) => { // as its request settles, however it ends: it may be deleted though it failed, and a
+          // notice keeps the dialog open (design review F, site 3)
           memoryChanged(null); // S1-21a: records resting only on what was deleted went with it
-          if (kind === 'deleteProject') libraryChanged(null); // and its papers (a memory change moves no generation)
-          if (kind === 'deleteProject') onProjectsChanged(); // another project is shown
+          // and a project's papers, or a conversation's runs, whose questions the Library lists (a memory change moves
+          // no generation)
+          libraryChanged(dialog?.kind === 'deleteProject' ? null : projectId);
+          if (dialog?.kind === 'deleteProject') onProjectsChanged(); // another project is shown
           else onConversationsChanged(deleted);
-        }} />
+        }}
+        onDone={() => setDialog(null)} />
     </nav>
   );
 }
