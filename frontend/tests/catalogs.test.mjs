@@ -53,3 +53,13 @@ test('the catalog check fails on missing keys, extra keys and placeholder mismat
     'zh-CN: e is not in en',
   ]);
 });
+
+test('a turn stopped at a limit says Continue starts it again from the message (Harold, 2026-11-14)', () => {
+  // Continue is a new turn told why the last one stopped; it does not carry the recorded steps in M2
+  for (const key of ['turn.limitSteps', 'turn.limitToolCalls', 'turn.limitMinutes']) {
+    assert.match(en[key], /Continue starts it again from your message\.$/, key);
+    assert.doesNotMatch(en[key], /go on/, key);
+    assert.match(zhCN[key], /从你的消息重新开始。$/, key);
+    assert.doesNotMatch(zhCN[key], /接着进行/, key);
+  }
+});
