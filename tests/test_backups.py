@@ -561,6 +561,47 @@ async def test_a_rolled_back_restore_from_an_older_schema_file_leaves_only_its_s
     assert sorted(listed[i]["schema_version"] for i in set(listed) - before) == [len(MIGRATIONS)] * 2  # safety copies
 
 
+async def test_a_restore_from_an_older_schema_file_put_back_only_at_the_next_launch_leaves_only_its_safety_copy(
+        tmp_path, monkeypatch):
+    # PR 59's Fable round 3 (R4's limits, P3, privacy and deletion): a restore that failed and could not be put back
+    # at once was put back by a later launch, which kept the copy its migrations took, the file's records (records
+    # purged earlier included) then in an automatic backup though nothing was changed
+    data = tmp_path / "data"
+
+    def older():
+        with Database(data, migrations=MIGRATIONS[:3]) as db:
+            generation = db.backup()
+        with zipfile.ZipFile(tmp_path / "m1.zip", "w") as archive:
+            for path in generation.iterdir():
+                archive.write(path, path.name)
+
+    await asyncio.to_thread(older)
+    real, calls = backups_module._back_from_journal, []
+
+    def failing_once(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise OSError("the files cannot be put back now")
+        return real(*args)
+
+    committing = backups_module._commit_journal
+
+    def failing(data_dir, journal, audits):  # the restore's commit and the launch's replay forward, not a put back
+        if not any(audit.get("finished") == "back" for audit in audits):
+            raise OSError("the journal cannot be written")
+        return committing(data_dir, journal, audits)
+    monkeypatch.setattr(backups_module, "_commit_journal", failing)
+    monkeypatch.setattr(backups_module, "_back_from_journal", failing_once)
+    async with started(data) as client:
+        before = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+        response = await client.post("/api/backups/restore", json={"file": str(tmp_path / "m1.zip")})
+        assert (response.status_code, response.json()["code"]) == (500, "restore_interrupted")
+    async with started(data) as client:  # the launch replays it, cannot commit it, and puts the previous state back
+        assert len(calls) == 2
+        listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
+    assert sorted(listed[i]["schema_version"] for i in set(listed) - before) == [len(MIGRATIONS)]  # its safety copy
+
+
 def fables_folder(data, now):
     """Weekly backups 16 and 9 days old and daily ones 6 to 1 days old, at schema 3 (Fable's folder): the daily names."""
     from datetime import timedelta

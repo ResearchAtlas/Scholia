@@ -655,14 +655,14 @@ def _daily_names(data_dir):
     return {generation.name for generation in _generations(data_dir / "backups" / "daily")}
 
 
-def _remove_added(data_dir, listed, body):
-    """After a restore rolled back: remove the daily backups it added after listed (the backup its migrations took, of
-    the state that was put back), when the backup restored still holds that state: a file, or one still in daily or
-    weekly. One the safety copy rotated out leaves the added copy as the only backup of its state, which stays. A
-    failure is logged; the backup then stays until rotation."""
-    if body.generation is not None and not any(
-            (data_dir / "backups" / kind / _generation_folder(data_dir, body.generation).name).is_dir()
-            for kind in KINDS):
+def _remove_added(data_dir, listed, generation):
+    """After a restore was put back (_back, at once or at a later launch): remove the daily backups it added after
+    listed (the backups its migrations took, of the state that was put back), when the backup restored, generation
+    (None for a file), still holds that state: a file, or one still in daily or weekly. One a rotation removed leaves
+    the added copy as the only backup of its state, which stays. A failure is logged; the backup then stays until
+    rotation."""
+    if generation is not None and not any(
+            (data_dir / "backups" / kind / _generation_folder(data_dir, generation).name).is_dir() for kind in KINDS):
         return
     for generation in _generations(data_dir / "backups" / "daily"):
         if generation.name not in listed:
@@ -796,12 +796,13 @@ async def _replace(state, body, staging, purges):
                 return None
 
         restore_id = str(uuid.uuid4())  # its journal's: only that journal is ever undone for it
-        listed = None
         try:
-            # The daily backups so far, the safety copy included: a rolled-back restore removes what it adds after
-            # them (the backup its migrations take), as nothing else takes a backup meanwhile (design review H, R4)
+            # The daily backups so far, the safety copy included, in its journal: a restore put back removes what it
+            # adds after them (the backups its migrations take), as nothing else takes a backup meanwhile (design
+            # review H, R4), at once or at a later launch
             listed = await asyncio.to_thread(_daily_names, data_dir)
-            journal = await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside, restore_id, earlier)
+            journal = await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside, restore_id, earlier,
+                                              listed, body.generation)
             # as a launch opens it: a backup before its first migration, which rotates nothing under a week old (R3)
             restored = await asyncio.to_thread(Database, data_dir)  # its checks and migrations
             await state["start"](restored, kick=False)  # recovered; nothing is served or runs on its own yet
@@ -822,10 +823,8 @@ async def _replace(state, body, staging, purges):
             log.warning("a restore failed (%s); the previous state is put back", type(error).__name__)
             if restored is not None and state.get("db") is restored:  # it started: stopped before it served anything
                 await _stop(state, restored)
-            rolled_back = await _roll_back(state, restored, damaged, restore_id)
+            rolled_back = await _roll_back(state, restored, damaged, restore_id)  # its put back removes what it added
             await asyncio.to_thread(_remove_if_empty, aside)  # made before its journal: none, if it failed before
-            if rolled_back and listed is not None:
-                await asyncio.to_thread(_remove_added, data_dir, listed, body)
             if not rolled_back:
                 _limit(state, "restore_interrupted", "A restore could neither be finished nor undone; restore a backup")
                 _forget(state)
@@ -1060,7 +1059,7 @@ SIDECARS = (f"{DB_NAME}-wal", f"{DB_NAME}-shm")
 JOURNAL = "restore.json"  # under backups/: a restore putting a backup in place, until it has ended
 
 
-def _put_in_place(data_dir, staged, aside, restore_id, audits=()):
+def _put_in_place(data_dir, staged, aside, restore_id, audits=(), listed=(), generation=None):
     """Put the staged backup's database, settings files and content files in place of the live ones.
 
     The live database keeps its name until the staged one replaces it in one rename, so a crash
@@ -1070,7 +1069,8 @@ def _put_in_place(data_dir, staged, aside, restore_id, audits=()):
     plan; each move is synced as it is made, and every step can be taken again, so a launch after a
     crash or a power loss finishes what was begun (finish_interrupted_restore). After a failure,
     _back puts back what was moved, from the journal. restore_id names the journal; audits are
-    an earlier restore's rows still to write, which it carries. Returns the journal: the caller
+    an earlier restore's rows still to write, which it carries; listed, the daily backups before it, and generation, the
+    automatic backup restored, let a put back remove what it added (_remove_added). Returns the journal: the caller
     commits it (_commit_journal) once the restored app has started, and ends it once its audit
     rows are written. Refused after a failed close in this process (close_failed), before anything moves.
     """
@@ -1089,6 +1089,8 @@ def _put_in_place(data_dir, staged, aside, restore_id, audits=()):
         "live_database": (data_dir / DB_NAME).exists(),
         "live": [name for name in SWAPPED if _exists(data_dir / name)],
         "backup": [name for name in SWAPPED if _exists(staged / name)],
+        "listed": sorted(listed),
+        "generation": generation,
     }
     write_private(data_dir / "backups" / JOURNAL, json.dumps(journal).encode())
     _forward(data_dir, journal)
@@ -1204,6 +1206,8 @@ def _back(data_dir, journal, audit=False):
             _move(aside / sidecar, data_dir / sidecar)
     _fsync(data_dir)
     _remove_if_empty(aside)  # empty now; one that is not is kept
+    if "listed" in journal:  # what the restore added goes with it, however it is put back (design review H, R4)
+        _remove_added(data_dir, set(journal["listed"]), journal["generation"])
     audits = [*journal.get("audits", []), *([{"id": journal.get("id"), "interrupted": True, "finished": "back"}]
                                              if audit else [])]
     if audits:  # rows still to write, its own at launch or an earlier restore's it carried: kept for them
