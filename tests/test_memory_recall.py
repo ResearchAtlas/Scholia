@@ -166,6 +166,40 @@ async def test_recall_ranks_by_meaning_when_the_search_model_answers_and_a_forgo
         assert await asyncio.to_thread(index.memory_embedded, [wages["id"]]) == set()  # removed, checked gone
 
 
+async def test_an_index_that_goes_unavailable_after_the_nearest_lookup_falls_back_to_the_newest(tmp_path, monkeypatch):
+    # PR 62's round 7 pass 2 (P2), the last follow-up PR's item 15: a rebuild starting between recall's nearest lookup
+    # and its read of which records have vectors raised out of recall, so the turn failed (ticket 31: then by recency)
+    from cited import cited
+    from backend.search_index import SearchIndex, Unavailable
+    from test_search import idle
+    async with cited(tmp_path) as client:
+        project = await project_of(client)
+        for i in range(11):
+            await entered(client, project, f"Unrelated item {i} about scheduling")
+        wages = await entered(client, project, "Wage floors raise the earnings of low-paid workers")
+        await idle(client, project)
+        await background_idle(client, timeout=20)
+        nearest = []
+
+        def rebuilding(self, ids):  # the nearest lookup has answered; the index is rebuilding now
+            raise Unavailable("rebuilding")
+        real_nearest = search.nearest_memory
+
+        async def answered(*args):
+            nearest.append(await real_nearest(*args))
+            return nearest[-1]
+        monkeypatch.setattr(search, "nearest_memory", answered)
+        monkeypatch.setattr(SearchIndex, "memory_embedded", rebuilding)
+        stream = await send(client, await conversation_in(client, project),
+                            "Last time we decided what about wage floors and earnings?")
+        assert stream[-1]["status"] == "succeeded", stream[-1]
+        assert nearest and wages["id"] in nearest[0]  # the lookup did answer, so the second read is what failed
+        [(trace,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'retrieval_trace'"
+                                        " AND json_extract(data, '$.memory') IS NOT NULL", stream[0]["run_id"])
+        trace = json.loads(trace)["memory"]
+        assert (trace["mode"], trace["reason"], trace["records"][0]) == ("recency", "unavailable", wages["id"])
+
+
 async def test_an_earlier_decision_memory_lacks_is_said_missing_never_invented(tmp_path):
     # R3: the missing-information section says so; that the answer never invents one is [PAID]
     provider = MockProvider()
