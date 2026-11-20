@@ -12,6 +12,7 @@ import { DEFAULTS, LIMITS, clamp, columns, fromSettings, panelShareAt, toSetting
 import { errorText } from '../text.js';
 import { places, subscribe } from '../live.js';
 import { libraryChanged, newest } from '../library.js';
+import { generation, useRead } from '../libraryRead.js';
 import { projectName } from '../projects.js';
 import { addTo } from './Library.jsx';
 import { Divider } from './Divider.jsx';
@@ -22,6 +23,17 @@ import { Settings } from './Parts.jsx';
 import { cn } from '@/lib/utils';
 
 const CURRENT = 'scholia.project';
+const RETRY_MS = 1000; // between reads of a list that could not be read
+const NONE = [];
+
+// A list that could not be read is read again after a pause, as a conversation is.
+function useRetry({ error, reload }) {
+  useEffect(() => {
+    if (!error) return undefined;
+    const timer = setTimeout(reload, RETRY_MS);
+    return () => clearTimeout(timer);
+  }, [error, reload]);
+}
 
 function useWindowWidth() {
   const [width, setWidth] = useState(window.innerWidth);
@@ -54,11 +66,27 @@ export function Shell({ health, settings, onLanguage }) {
   const width = useWindowWidth();
   const [layout, setLayout] = useState(() => fromSettings(settings.values));
   const [drawer, setDrawer] = useState(false);
-  const [projects, setProjects] = useState([]);
-  const [projectId, setProjectId] = useState(null);
   const [panel, setPanel] = useState('none');
-  const [conversations, setConversations] = useState([]);
-  const [conversationId, setConversationId] = useState(null);
+  // What the window shows: a project and one of its conversations. undefined: not decided yet (nothing read yet, or
+  // what was shown was removed), and then no conversation, so no message box, is drawn; a conversation null: a new
+  // one. A list decides only what is not decided; after that only the researcher's own actions change it, never a
+  // read (design review S).
+  const [open, setOpen] = useState({ projectId: undefined, conversationId: undefined });
+  const { projectId, conversationId } = open;
+  const openProject = useCallback((id) => { setOpen({ projectId: id, conversationId: undefined }); setPanel('none'); }, []);
+  const openConversation = useCallback((id) => setOpen((now) => ({ ...now, conversationId: id })), []);
+  // The lists, through the Library's read (libraryRead.js): shown only when read since the last removal of something
+  // they name (a deletion's request settled, a conversation moved), never one asked before it, and nothing old after
+  // a read that failed.
+  const [removals] = useState(() => ({ projects: generation(), conversations: generation() }));
+  const projectsRead = useRead(removals.projects, 'projects', () => get('/api/projects'));
+  const conversationsRead = useRead(removals.conversations, projectId ?? null,
+    () => get(`/api/conversations?project_id=${encodeURIComponent(projectId)}`));
+  useRetry(projectsRead);
+  useRetry(conversationsRead);
+  const projects = projectsRead.value?.projects ?? null;
+  const conversations = conversationsRead.value?.conversations ?? null;
+  const loadConversations = conversationsRead.reload;
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notice, setNotice] = useState(null);
   const [dropping, setDropping] = useState(false); // files are dragged over the window
@@ -70,49 +98,30 @@ export function Shell({ health, settings, onLanguage }) {
     setNotice(errorText(t, error instanceof ApiError ? error.code : 'internal'));
   }, [t]);
 
-  // Only the newest read of the projects is shown, with the newest project asked for.
-  const projectReads = useRef({ count: 0, prefer: undefined });
-  const loadProjects = useCallback(async (prefer) => {
-    const reads = projectReads.current;
-    const read = ++reads.count;
-    if (prefer !== undefined) reads.prefer = prefer;
-    let listed;
-    try {
-      ({ projects: listed } = await get('/api/projects'));
-    } catch (error) {
-      if (read === reads.count) reads.prefer = undefined; // a failed read's preference does not outlive it
-      throw error;
-    }
-    if (read !== reads.count) return listed; // a newer read is under way
-    const wanted = reads.prefer ?? remembered();
-    reads.prefer = undefined;
-    setProjects(listed);
-    const chosen = listed.find((p) => p.id === wanted) ?? listed.find((p) => p.kind !== 'general') ?? listed[0];
-    setProjectId(chosen?.id ?? null);
-    return listed;
-  }, []);
+  // a list that could not be read is also said once, as the window's other failures are (it is read again meanwhile)
+  useEffect(() => { if (projectsRead.error) fail(projectsRead.error); }, [Boolean(projectsRead.error), fail]);
+  useEffect(() => { if (conversationsRead.error) fail(conversationsRead.error); }, [Boolean(conversationsRead.error), fail]);
 
-  const loadConversations = useCallback(async () => {
-    const id = shown.current;
-    if (!id) return null;
-    const { conversations: listed } = await get(`/api/conversations?project_id=${encodeURIComponent(id)}`);
-    if (shown.current !== id) return null;
-    setConversations(listed);
-    return listed;
-  }, []);
-
-  useEffect(() => {
-    loadProjects().catch(fail);
-  }, [loadProjects, fail]);
+  useEffect(() => { // no project decided: the one open before, or the first
+    if (projectId !== undefined || !projects) return;
+    const wanted = remembered();
+    openProject((projects.find((p) => p.id === wanted) ?? projects.find((p) => p.kind !== 'general') ?? projects[0])?.id ?? null);
+  }, [projects, projectId, openProject]);
+  useEffect(() => { // no conversation decided: the project's first, or a new one (which needs no list) when it has none
+    // or its list cannot be read
+    if (!projectId || conversationId !== undefined || !(conversations || conversationsRead.error)) return;
+    const first = conversations?.[0]?.id ?? null;
+    setOpen((now) => (now.projectId === projectId && now.conversationId === undefined ? { ...now, conversationId: first } : now));
+  }, [projectId, conversationId, conversations, conversationsRead.error]);
 
   useEffect(() => { // the list shows which conversations run
     const timers = new Set();
     const unsubscribe = subscribe((id, turn, type) => {
       if (type !== 'run_started' && type !== 'run_finished') return;
-      loadConversations().catch(() => {});
+      loadConversations();
       // ponytail: a title run follows a first answer; one later look shows its title, poll if titles lag
       if (type === 'run_finished') {
-        const timer = setTimeout(() => { timers.delete(timer); loadConversations().catch(() => {}); }, 4000);
+        const timer = setTimeout(() => { timers.delete(timer); loadConversations(); }, 4000);
         timers.add(timer);
       }
     });
@@ -123,14 +132,10 @@ export function Shell({ health, settings, onLanguage }) {
     if (!projectId) return;
     remember(projectId);
     shown.current = projectId;
-    setConversations([]);
-    setConversationId(null);
-    setPanel('none');
-    loadConversations().then((listed) => listed && setConversationId(listed[0]?.id ?? null)).catch(fail);
     get(`/api/settings?project_id=${encodeURIComponent(projectId)}`)
       .then((loaded) => shown.current === projectId && setPanel(loaded.values?.ui?.panel ?? 'none'))
       .catch(() => {});
-  }, [projectId, loadConversations, fail]);
+  }, [projectId]);
 
   const saveLayout = useCallback((next) => {
     const before = toSettings(saved.current);
@@ -181,22 +186,31 @@ export function Shell({ health, settings, onLanguage }) {
   const overlaid = panel !== 'none' && view.overlay; // the panel covers the conversation, which is inert meanwhile
 
   function newConversation() { // a blank conversation; it is made at its first message
-    setConversationId(null);
+    openConversation(null);
     setDrawer(false);
   }
 
   const sidebar = (
     <Sidebar
-      projects={projects}
+      projects={projects ?? NONE}
       projectId={projectId}
       conversations={conversations}
+      problem={conversationsRead.error && errorText(t, conversationsRead.error instanceof ApiError ? conversationsRead.error.code : 'internal')}
       conversationId={conversationId}
-      onProject={(id) => { setProjectId(id); setDrawer(false); }}
-      onProjectsChanged={(prefer) => loadProjects(prefer).catch(fail)}
-      onConversation={(id) => { setConversationId(id); setDrawer(false); }}
-      onConversationsChanged={async (removed) => { // removed: one deleted, or whose deletion failed (it is still listed)
-        const listed = await loadConversations().catch(fail);
-        if (removed && removed === conversationId && !listed?.some((c) => c.id === removed)) setConversationId(listed?.[0]?.id ?? null);
+      onProject={(id) => { openProject(id); setDrawer(false); }}
+      onProjectCreated={(id) => { openProject(id); projectsRead.reload(); }}
+      // A removal's request settled (removed: it is known to be gone; else it may be): nothing the lists read before is
+      // shown, and what the researcher removed is left at once, in their own action; what may be there still stays open.
+      onProjectDeleted={(id, removed) => {
+        removals.projects.move();
+        removals.conversations.move();
+        if (removed) setOpen((now) => (now.projectId === id ? { projectId: undefined, conversationId: undefined } : now));
+      }}
+      onConversation={(id) => { openConversation(id); setDrawer(false); }}
+      onConversationsChanged={loadConversations}
+      onConversationRemoved={(id, removed) => {
+        removals.conversations.move();
+        if (removed) setOpen((now) => (now.conversationId === id ? { ...now, conversationId: undefined } : now));
       }}
       onNewConversation={newConversation}
       onSettings={() => { setDrawer(false); setSettingsOpen(true); }}
@@ -204,10 +218,10 @@ export function Shell({ health, settings, onLanguage }) {
     />
   );
 
-  const conversation = useMemo(() => conversations.find((c) => c.id === conversationId) ?? null,
+  const conversation = useMemo(() => conversations?.find((c) => c.id === conversationId) ?? null,
     [conversations, conversationId]);
 
-  const project = projects.find((p) => p.id === projectId);
+  const project = projects?.find((p) => p.id === projectId);
   return (
     <div className="relative flex h-full"
       onDragOver={(event) => { if (hasFiles(event)) { event.preventDefault(); setDropping(true); } }}
@@ -244,8 +258,12 @@ export function Shell({ health, settings, onLanguage }) {
       <div className="flex min-w-0 flex-1 flex-col bg-background">
         <div className="relative flex min-h-0 flex-1">
           <div className="min-w-0 flex-1" inert={overlaid || undefined}>
-            <ConversationView
+            {!projectId || conversationId === undefined ? (projectsRead.error
+              ? <p role="alert" className="p-6 text-sm text-destructive">{errorText(t, projectsRead.error instanceof ApiError ? projectsRead.error.code : 'internal')}</p>
+              : <p role="status" className="p-6 text-sm text-muted-foreground">{t('common.loading')}</p>
+            ) : <ConversationView
               key={`${projectId}:${conversationId ?? 'new'}`}
+              conversationId={conversationId}
               conversation={conversation}
               projectId={projectId}
               panel={panel}
@@ -253,9 +271,9 @@ export function Shell({ health, settings, onLanguage }) {
               onShowSidebar={() => (view.narrow ? setDrawer(true)
                 : (() => { const next = { ...layout, sidebarOpen: true }; setLayout(next); saveLayout(next); })())}
               onPanel={togglePanel}
-              onCreated={(id) => { setConversationId(id); loadConversations().catch(fail); }}
+              onCreated={(id) => { openConversation(id); loadConversations(); }}
               onLibrary={() => panel !== 'library' && togglePanel('library')}
-            />
+            />}
           </div>
           {panel !== 'none' && !view.overlay && (
             <Divider
@@ -280,7 +298,7 @@ export function Shell({ health, settings, onLanguage }) {
       </div>
       <Settings open={settingsOpen} onOpenChange={(open) => { setSettingsOpen(open); if (!open) setSettingsPage(null); }}
         startPage={settingsPage} health={health} onLanguage={onLanguage}
-        project={project} onProjectChanged={() => loadProjects(projectId).catch(fail)} />
+        project={project} onProjectChanged={projectsRead.reload} />
       {notice && (
         <div role="alert" className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 animate-fade-up rounded-lg border bg-card px-4 py-2.5 text-sm shadow-lg"
           onClick={() => setNotice(null)}>

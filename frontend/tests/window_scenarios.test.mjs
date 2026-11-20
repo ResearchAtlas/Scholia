@@ -72,7 +72,7 @@ const scenarios = {
     for (const ending of ['fail', 'answer']) {
       const asked = backend({ '/api/conversations/c1': () => ({ turns: [], queued: [] }), '/api/asks': () => ({ asks: [] }) });
       const { ConversationView } = await load.component('ConversationView');
-      const ui = await mount([jsx(ConversationView, { conversation: { id: 'c1', title: 'T' }, projectId: 'p1', panel: 'none',
+      const ui = await mount([jsx(ConversationView, { conversationId: 'c1', conversation: { id: 'c1', title: 'T' }, projectId: 'p1', panel: 'none',
         onPanel() {}, onLibrary() {} }, 'c1')], { strict }).settle();
       const choose = (...files) => act(ui, () => host(ui, (p) => p['data-testid'] === 'composer-files', 'attach')
         .onChange({ target: { files, value: '' } }));
@@ -90,7 +90,7 @@ const scenarios = {
   async attachAlone({ mount, jsx }, strict) {
     const asked = backend({ '/api/conversations/c1': () => ({ turns: [], queued: [] }), '/api/asks': () => ({ asks: [] }) });
     const { ConversationView } = await load.component('ConversationView');
-    const ui = await mount([jsx(ConversationView, { conversation: { id: 'c1', title: 'T' }, projectId: 'p1', panel: 'none',
+    const ui = await mount([jsx(ConversationView, { conversationId: 'c1', conversation: { id: 'c1', title: 'T' }, projectId: 'p1', panel: 'none',
       onPanel() {}, onLibrary() {} }, 'c1')], { strict }).settle();
     await act(ui, () => host(ui, (p) => p['data-testid'] === 'composer-files', 'attach')
       .onChange({ target: { files: [file('a.pdf')], value: '' } }));
@@ -104,8 +104,8 @@ const scenarios = {
     const told = [];
     const before = library.libraryGeneration();
     const ui = await mount([jsx(Sidebar, { projects: [{ id: 'p1', name: 'P', kind: 'research' }], projectId: 'p1',
-      conversations: [{ id: 'c1', title: 'T' }], conversationId: 'c1', onProject() {}, onProjectsChanged: () => told.push('projects'),
-      onConversation() {}, onConversationsChanged: (removed) => told.push(`conversations ${removed}`), onNewConversation() {},
+      conversations: [{ id: 'c1', title: 'T' }], conversationId: 'c1', onProject() {}, onProjectDeleted: () => told.push('projects'),
+      onConversation() {}, onConversationRemoved: (removed, known) => told.push(`conversations ${removed} ${known}`), onNewConversation() {},
       onSettings() {} })], { strict }).settle();
     const items = ui.find((p, type) => type === 'ui:DropdownMenuItem' && p.onSelect);
     await act(ui, () => items.find((item) => ui.said((p) => p === item.props)[0] === 'Delete').props.onSelect());
@@ -115,7 +115,7 @@ const scenarios = {
     assert.match(deletion.path, /\/api\/conversations\/c1/);
     await act(ui, () => deletion.answer({ ok: true, files_left: true }));
     assert.equal(said(ui, 'alert').length, 1); // the dialog says what is left, and stays open
-    assert.deepEqual(told, ['conversations c1']);
+    assert.deepEqual(told, ['conversations c1 true']);
     assert.ok(library.libraryGeneration() > before);
   },
   // A project's deletion that failed: it may have been deleted all the same, so the lists are read again.
@@ -125,14 +125,14 @@ const scenarios = {
     const told = [];
     const before = library.libraryGeneration();
     const ui = await mount([jsx(Sidebar, { projects: [{ id: 'p1', name: 'P', kind: 'research' }], projectId: 'p1',
-      conversations: [], conversationId: null, onProject() {}, onProjectsChanged: () => told.push('projects'),
-      onConversation() {}, onConversationsChanged: () => told.push('conversations'), onNewConversation() {},
+      conversations: [], conversationId: null, onProject() {}, onProjectDeleted: (id, known) => told.push(`projects ${known}`),
+      onConversation() {}, onConversationRemoved: () => told.push('conversations'), onNewConversation() {},
       onSettings() {} })], { strict }).settle();
     const items = ui.find((p, type) => type === 'ui:DropdownMenuItem' && p.onSelect);
     await act(ui, () => items.find((item) => /^Delete /.test(ui.said((p) => p === item.props)[0])).props.onSelect());
     await act(ui, () => ui.find((p, type) => type === 'ui:Button' && p.variant === 'destructive').at(-1).props.onClick());
     await act(ui, () => asked.find((r) => r.method === 'DELETE').fail('internal', 500));
-    assert.deepEqual(told, ['projects']);
+    assert.deepEqual(told, ['projects false']);
     assert.ok(library.libraryGeneration() > before);
   },
 };

@@ -22,8 +22,8 @@ import { HoldsChoice } from './Governance.jsx';
 import { memoryChanged } from '../memory.js'; // S1-21a
 import { libraryChanged } from '../library.js';
 
-export function Sidebar({ projects, projectId, conversations, conversationId, onProject, onProjectsChanged,
-  onConversation, onConversationsChanged, onNewConversation, onSettings, onHide }) {
+export function Sidebar({ projects, projectId, conversations, problem, conversationId, onProject, onProjectCreated, onProjectDeleted,
+  onConversation, onConversationsChanged, onConversationRemoved, onNewConversation, onSettings, onHide }) {
   const t = useT();
   const [dialog, setDialog] = useState(null); // { kind, conversation? }
   const project = projects.find((p) => p.id === projectId);
@@ -75,10 +75,14 @@ export function Sidebar({ projects, projectId, conversations, conversationId, on
 
       <h2 className="px-4 pb-1 pt-2 text-xs font-medium text-muted-foreground">{t('sidebar.conversations')}</h2>
       <ul className="scroll-thin min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 pb-2">
-        {conversations.length === 0 && (
+        {/* null: not read since what it lists changed (Shell.jsx): nothing read before is shown */}
+        {conversations === null && (problem
+          ? <li role="alert" className="px-2 py-3 text-sm text-destructive">{problem}</li>
+          : <li role="status" className="px-2 py-3 text-sm text-muted-foreground">{t('common.loading')}</li>)}
+        {conversations?.length === 0 && (
           <li className="px-2 py-3 text-sm text-muted-foreground">{t('sidebar.noConversations')}</li>
         )}
-        {conversations.map((c) => (
+        {conversations?.map((c) => (
           <li key={c.id} className="group relative">
             <button type="button" onClick={() => onConversation(c.id)} aria-current={c.id === conversationId ? 'page' : undefined}
               className={cn('flex w-full items-center gap-2 rounded-md py-1.5 pl-2.5 pr-8 text-left text-sm transition-colors hover:bg-accent',
@@ -118,25 +122,25 @@ export function Sidebar({ projects, projectId, conversations, conversationId, on
       </div>
 
       <NewProjectDialog open={dialog?.kind === 'project'} onClose={() => setDialog(null)}
-        onCreated={(created) => { setDialog(null); onProjectsChanged(created.id); }} />
+        onCreated={(created) => { setDialog(null); onProjectCreated(created.id); }} />
       <RenameDialog conversation={dialog?.kind === 'rename' ? dialog.conversation : null} onClose={() => setDialog(null)}
         onDone={() => { setDialog(null); onConversationsChanged(); }} />
       <MoveDialog conversation={dialog?.kind === 'move' ? dialog.conversation : null} projects={projects} from={project}
-        onClose={() => setDialog(null)} onDone={(moved) => { setDialog(null); onConversationsChanged(moved); }} />
+        onClose={() => setDialog(null)} onDone={(moved) => { setDialog(null); onConversationRemoved(moved, true); }} />
       <DeleteDialog onClose={() => setDialog(null)}
         target={dialog?.kind === 'delete' ? { kind: 'conversation', id: dialog.conversation.id,
           title: t('conversation.deleteTitle'), body: t('conversation.deleteBody') }
           : dialog?.kind === 'deleteProject' ? { kind: 'project', id: dialog.project.id,
             title: t('project.deleteTitle', { name: projectName(t, dialog.project) }), body: t('project.deleteBody') }
             : null}
-        onSettled={(deleted) => { // as its request settles, however it ends: it may be deleted though it failed, and a
-          // notice keeps the dialog open (design review F, site 3)
+        onSettled={(id, deleted) => { // as its request settles, however it ends (deleted: it is known to be; else it may
+          // be, though it failed), and a notice keeps the dialog open (design review F, site 3)
           memoryChanged(null); // S1-21a: records resting only on what was deleted went with it
           // and a project's papers, or a conversation's runs, whose questions the Library lists (a memory change moves
           // no generation)
           libraryChanged(dialog?.kind === 'deleteProject' ? null : projectId);
-          if (dialog?.kind === 'deleteProject') onProjectsChanged(); // another project is shown
-          else onConversationsChanged(deleted);
+          if (dialog?.kind === 'deleteProject') onProjectDeleted(id, deleted);
+          else onConversationRemoved(id, deleted);
         }}
         onDone={() => setDialog(null)} />
     </nav>

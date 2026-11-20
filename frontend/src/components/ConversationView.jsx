@@ -65,15 +65,15 @@ function useConversationAsks(conversationId, watching, projectId) {
   return { asks: known.asks, load };
 }
 
-export function ConversationView({ conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated,
+export function ConversationView({ conversationId, conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated,
   onLibrary }) {
   const t = useT();
   const [draft, setDraft] = useState(null); // a new conversation, made at its first message
-  const id = conversation?.id ?? draft;
+  const id = conversationId ?? draft; // the list's row (conversation) gives only its title
   const live = useLiveTurn(id);
   // a turn opens a place only while shown here (live.js), said in the commit that shows it: never a passive effect's delay
   useLayoutEffect(() => showing(projectId, id), [projectId, id]);
-  const [turns, setTurns] = useState(conversation ? null : []);
+  const [turns, setTurns] = useState(conversationId ? null : []);
   const [queued, setQueued] = useState([]); // S1-33: messages waiting as the next turn, as last read
   const [failed, setFailed] = useState(false);
   const [problem, setProblem] = useState(null);
@@ -197,7 +197,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       await send(target, `/api/conversations/${target}/message/stream`, { content: text, ...messageRoute(currentChoice()),
         ...(papers.length ? { material_ids: papers.map((paper) => paper.id) } : {}) }, text, since);
       if (papers.length) choosePapers(projectId, []); // they went with this message
-      if (!conversation && here.current) onCreated(target);
+      if (!conversationId && here.current) onCreated(target);
       return true;
     } catch (error) {
       if (isActiveRun(error)) return followUp(text); // a turn started meanwhile: the message follows the setting

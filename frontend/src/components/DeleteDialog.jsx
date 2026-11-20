@@ -37,7 +37,7 @@ export function DeleteDialog({ target, onClose, onDone, onDelete, onSettled }) {
       return;
     }
     const result = await run(() => api('DELETE', deletePath(target.kind, target.id, { everywhere, removeAllTrace })));
-    onSettled?.(target.id);
+    onSettled?.(target.id, Boolean(result));
     if (!result) return;
     const said = deletionNotices(result);
     if (said.length) setNotices(said); // deleted, but not wholly: say so before it closes

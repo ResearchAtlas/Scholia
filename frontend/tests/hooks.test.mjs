@@ -95,11 +95,12 @@ function component(hook) {
 
 // libraryRead.js's hook, given the stand-in's hooks and the real papers' generation.
 function readHook(react) {
-  const { useLibraryRead } = declarations(file('libraryRead.js'), ['useLibraryRead']);
-  return new Function('useCallback', 'useEffect', 'useRef', 'useState', 'useSyncExternalStore', 'libraryGeneration',
-    'watchLibrary', `return (${useLibraryRead});`)(react.useCallback, react.useEffect, react.useRef, react.useState,
-    react.useSyncExternalStore, libraryGeneration, watchLibrary);
+  const { useRead } = declarations(file('libraryRead.js'), ['useRead']);
+  const core = new Function('useCallback', 'useEffect', 'useRef', 'useState', 'useSyncExternalStore', `return (${useRead});`)(
+    react.useCallback, react.useEffect, react.useRef, react.useState, react.useSyncExternalStore);
+  return (key, read) => core(PAPERS, key, read);
 }
+const PAPERS = { watch: watchLibrary, now: libraryGeneration };
 
 // A request the test answers when it chooses: asked[n].answer(value) or .fail(error).
 function requests() {
