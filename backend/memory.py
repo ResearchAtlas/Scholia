@@ -27,6 +27,7 @@ import unicodedata
 from datetime import UTC, datetime, timedelta
 
 from backend.db import new_id, utc_now
+from backend.openrouter import whole_text
 
 TYPES = ("profile", "project_state", "decision", "event", "preference", "progress", "agent_note")
 PERSONAL_TYPES = ("profile", "preference")
@@ -555,9 +556,9 @@ def parse(text):
     and writes nothing). A reply in one code fence is read inside it."""
     body = (text or "").strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", body, re.S)
-    try:
-        found = json.loads(fenced.group(1) if fenced else body)
-    except (ValueError, TypeError):
+    try:  # half a surrogate pair its escapes give is the replacement character (openrouter.whole_text)
+        found = whole_text(json.loads(fenced.group(1) if fenced else body))
+    except (ValueError, TypeError, RecursionError):
         return None
     if not isinstance(found, dict) or set(found) != {"records"} or not isinstance(found["records"], list) \
             or len(found["records"]) > MAX_CANDIDATES:

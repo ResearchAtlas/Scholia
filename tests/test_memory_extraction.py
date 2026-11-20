@@ -211,6 +211,21 @@ async def test_a_malformed_reply_fails_the_extraction_and_writes_nothing(tmp_pat
         assert [r for r in await records(client, project) if r["type"] != "progress"] == []
 
 
+async def test_an_extractor_reply_holding_half_a_surrogate_pair_writes_its_record_with_the_replacement_character(
+        tmp_path):
+    # PR 63's first review (pass 1 finding 4) and the internal review of phase A: the reply's JSON, decoded a second
+    # time here, gave half a pair, which the database cannot store, and the extraction run was left running
+    provider = MockProvider()
+    extracted(provider, candidate("We use interviews \ud83d.", "confirmed", span="we use interviews"))
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        await send(client, await conversation_in(client, project), "We use interviews.")
+        await background_idle(client)
+        assert await rows(client, "SELECT status FROM runs WHERE workflow = 'memory'") == [("succeeded",)]
+        assert [r["content"] for r in await records(client, project) if r["type"] != "progress"] == [
+            "We use interviews \ufffd."]
+
+
 async def test_a_refused_extraction_is_recorded_with_its_cost_and_not_sent_again(tmp_path):
     provider = MockProvider()
     provider.memory_replies.append((403, {"error": {"message": "refused by policy"}}))
