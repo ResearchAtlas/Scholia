@@ -185,6 +185,24 @@ async def test_an_uploads_lookup_answered_later_puts_the_project_first_only_when
         assert await first_project(client) == (other if edited else project)
 
 
+async def test_a_details_change_that_changes_nothing_leaves_the_paper_to_its_lookup(tmp_path):
+    # PR 61 batch 6's internal review: the details form's forced submit sends an empty change, which marked the paper
+    # checked by the researcher (and moved its updated_at), so its lookup then filled nothing
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client, level="local_only")
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [ask] = await ask_of(client, project)
+        paper = result["materials"][0]["id"]
+        before = (await client.get(f"/api/materials/{paper}")).json()
+        unchanged = await client.patch(f"/api/materials/{paper}", json={})
+        assert unchanged.status_code == 200 and unchanged.json()["updated_at"] == before["updated_at"]
+        assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
+                                  json={"option": "lookup"})).status_code == 200
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        found = (await client.get(f"/api/materials/{paper}")).json()
+        assert (found["title"], found["checked_by"]) == (TITLE, "lookup")
+
+
 async def test_a_lookup_resumed_after_a_restart_keeps_its_answer(tmp_path, monkeypatch):
     data = tmp_path / "data"
     async with started(data, scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:

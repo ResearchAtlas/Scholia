@@ -1172,6 +1172,8 @@ async def change_material(material_id: str, body: MaterialChange, request: Reque
         row = conn.execute("SELECT title, csl, project_id FROM materials WHERE id = ?", (material_id,)).fetchone()
         if row is None:
             raise _refused(404, "not_found", "No such material")
+        if not changes:  # a change of nothing is no edit: the paper is not marked as the researcher's
+            return _describe(conn, _material_row(conn, material_id), harness.registry), []
         csl = json.loads(row[1]) if row[1] else {}
         moved = "doi" in changes and doi != (csl.get("DOI") or None)  # changed or cleared
         if moved:
