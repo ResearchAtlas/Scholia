@@ -1059,7 +1059,7 @@ SIDECARS = (f"{DB_NAME}-wal", f"{DB_NAME}-shm")
 JOURNAL = "restore.json"  # under backups/: a restore putting a backup in place, until it has ended
 
 
-def _put_in_place(data_dir, staged, aside, restore_id, audits=(), listed=(), generation=None):
+def _put_in_place(data_dir, staged, aside, restore_id, audits=(), listed=None, generation=None):
     """Put the staged backup's database, settings files and content files in place of the live ones.
 
     The live database keeps its name until the staged one replaces it in one rename, so a crash
@@ -1089,8 +1089,7 @@ def _put_in_place(data_dir, staged, aside, restore_id, audits=(), listed=(), gen
         "live_database": (data_dir / DB_NAME).exists(),
         "live": [name for name in SWAPPED if _exists(data_dir / name)],
         "backup": [name for name in SWAPPED if _exists(staged / name)],
-        "listed": sorted(listed),
-        "generation": generation,
+        **({"listed": sorted(listed), "generation": generation} if listed is not None else {}),
     }
     write_private(data_dir / "backups" / JOURNAL, json.dumps(journal).encode())
     _forward(data_dir, journal)
@@ -1207,7 +1206,10 @@ def _back(data_dir, journal, audit=False):
     _fsync(data_dir)
     _remove_if_empty(aside)  # empty now; one that is not is kept
     if "listed" in journal:  # what the restore added goes with it, however it is put back (design review H, R4)
-        _remove_added(data_dir, set(journal["listed"]), journal["generation"])
+        try:
+            _remove_added(data_dir, set(journal["listed"]), journal.get("generation"))
+        except Exception as error:  # the files are back: an added backup then stays until rotation
+            log.warning("removing the backups a failed restore took failed (%s)", type(error).__name__)
     audits = [*journal.get("audits", []), *([{"id": journal.get("id"), "interrupted": True, "finished": "back"}]
                                              if audit else [])]
     if audits:  # rows still to write, its own at launch or an earlier restore's it carried: kept for them
