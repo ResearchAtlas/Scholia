@@ -393,8 +393,9 @@ async def test_a_stop_that_comes_while_the_title_commits_is_told_the_title_was_w
         await send(client, conversation_id)
         assert await asyncio.to_thread(checked.wait, 10)
         title = await title_run(client)
+        active = client.state["harness"].registry.runs[title]
         cancel = asyncio.create_task(client.post(f"/api/runs/{title}/cancel"))
-        await asyncio.sleep(0.1)
+        await wait_for(active.cancel_requested.is_set)  # the stop has come while the title commits (PR 63's recheck r2)
         resume.set()
         assert (await cancel).json()["status"] == "succeeded"  # the reply says how it ended
         await background_idle(client)
