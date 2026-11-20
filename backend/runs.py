@@ -438,6 +438,11 @@ class Harness:
         self.keyring_backend = keyring_backend
         self.content = None  # the data folder's content store, for the trace's request bodies (set by the app)
         self.registry = Registry()
+        # Its background runs started once (kick_background): until then (a launch or a restore before its commit), and
+        # while it is stopped, an ask for index runs waits in asks_after_kick, {key: coroutine function}, each a derived
+        # question asked again at the kick, never a list of projects (search._embed_all, search.embed_memory_soon)
+        self.kicked = False
+        self.asks_after_kick = {}
         # Local background work by workflow: async handler(harness, active, project_id, inputs) ->
         # (summary, effect), where effect(conn), if any, is applied in the run's terminal transaction.
         self.workflows = {}
@@ -1778,8 +1783,10 @@ class Harness:
                     try:
                         nearest = await asyncio.wait_for(search.nearest_memory(state, ctx["project_id"], ctx["message"]),
                                                          ctx["personal"].values["retrieval"]["memory_ms"] / 1000)
+                        reason = "unavailable" if nearest is None else None
+                        if nearest is not None and not set(nearest) & {r["id"] for r in candidates}:
+                            nearest, reason = None, "unembedded"  # no candidate has a vector yet: the newest
                         mode = "similarity" if nearest is not None else "recency"
-                        reason = None if nearest is not None else "unavailable"
                     except TimeoutError:
                         reason = "deadline"
                     except Exception as error:  # the helper or the index failed: the newest, said
@@ -2566,6 +2573,7 @@ class Harness:
         one tried again already (materials.retry_run): its retry does its work."""
         if self.registry.closed:
             return
+        self.kicked = True
         rows = await self._read(lambda conn: conn.execute(
             "SELECT id FROM runs WHERE kind = 'background' AND status = 'running'"
             " AND json_extract(inputs, '$.retried_by') IS NULL ORDER BY started_at").fetchall())
@@ -2573,6 +2581,9 @@ class Harness:
             active = self.registry.add_background(run_id)
             if active is not None:
                 active.task = asyncio.create_task(self._background(active))
+        asks, self.asks_after_kick = self.asks_after_kick, {}  # taken after its runs: each asked again, detached
+        for ask in asks.values():
+            self._detach(ask())
 
     async def start_again(self, run_id):
         """Start the one background run run_id if it is recorded running, not tried again (retried_by) and held by no

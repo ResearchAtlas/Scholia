@@ -361,15 +361,21 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         db.on_damage = damaged
         # S1-17: the index, checked against this database (the one before closed), before the background
         # runs start, so the index runs it records start with them.
-        await search.open_index(state, db)
+        await search.open_index(state, db, harness)
         try:
-            await (harness.recover() if kick else harness.recover(kick=False))
+            await harness.recover(kick=False)
         except BaseException:
             await harness.shutdown()
             raise
         state.update(db=db, content=content, gate=gate, harness=harness)
         state.pop("damaged", None)
         state.pop("damaged_code", None)
+        if kick:  # published before it starts anything: no run it starts meets a state without its gate
+            try:
+                await harness.kick_background()
+            except BaseException:  # stopped, as a recover() that fails stops it
+                await harness.shutdown()
+                raise
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -1311,6 +1317,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             async with state["archives"].stricter(source):
                 return await write(lambda conn: move(conn, source))
 
+        async def moved_and_asked(source):  # the move, then the moved records' vectors asked for under the destination's
+            # partition (MB2), followed through together (_to_end)
+            moved = await moved_from(source)
+            if moved:
+                await memory._embed_soon(state, body.project_id)
+            return moved
+
         while True:
             row = await read(lambda conn: conn.execute(
                 "SELECT project_id FROM conversations WHERE id = ?", (conversation_id,)).fetchone())
@@ -1318,9 +1331,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 raise ApiError(404, "not_found", "No such conversation or project")
             if row[0] == body.project_id:
                 break
-            if await _to_end(moved_from(row[0])):
+            if await _to_end(moved_and_asked(row[0])):
                 break
-        await memory._embed_soon(state, body.project_id)  # the moved records' vectors, under its partition (MB2)
         return await get_conversation(conversation_id)
 
     @app.delete("/api/conversations/{conversation_id}")
