@@ -45,8 +45,8 @@ from pydantic import BaseModel, Field
 from backend import APP_VERSION, budgets, i18n
 from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseCloseError, DatabaseClosedError,
                         DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError, close_failed, utc_now)
-from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _generations, _mkdir_private, _open_checked, _stamp_of, \
-    closing_connection, list_generations
+from backend.db.database import KINDS, RESTORING, SETTINGS_FILES, STAGING, _fsync, _generations, _mkdir_private, \
+    _open_checked, _stamp_of, closing_connection, list_generations
 from backend.db.content import IDLE_AFTER
 from backend.db.migrations import MIGRATIONS
 from backend.runs import RunOutcome, _event, _through
@@ -56,7 +56,6 @@ log = logging.getLogger(__name__)
 
 IDLE_CHECK_SECONDS = 600
 SENSITIVE = ("private", "local_only")  # a backup or export holding such a project is encrypted
-STAGING = ".staging"  # under backups/: restores and full backups in progress, emptied at launch and by a committed restore
 # Under backups/: damaged databases a restore moved aside. Nothing removes one on its own; only the
 # researcher's "Delete everywhere including backups" does (purge), as a deletion reaches every copy.
 DAMAGED = "damaged"
@@ -723,7 +722,7 @@ async def _restore(state, body):
             with _file_errors(500, "restore_failed", "The backup could not be put in place; nothing was changed"):
                 staging = await asyncio.to_thread(_staging, data_dir)
             with _file_errors(400, "backup_unreadable", "The backup could not be read"):
-                await asyncio.to_thread(_stage, data_dir, body, staging / "restore")
+                await asyncio.to_thread(_stage, data_dir, body, staging / RESTORING)
         state["restoring"] = True  # from here only health, the backups list and this restore are served
         return await _replace(state, body, staging, purges)
     finally:  # before anything else is served again
@@ -754,10 +753,9 @@ async def _replace(state, body, staging, purges):
                 await asyncio.to_thread(db.hold_writes)
                 if await _purges(state) != purges:  # Delete everywhere purged the backups meanwhile: not this one
                     raise BackupError(404, "not_found", "No such backup")
-                try:  # first a safety copy of the current database, as an automatic backup, whose rotation leaves
-                    # the backup restored where it is, so a restore that fails has lost nothing
-                    safety = await asyncio.to_thread(
-                        db.backup, restoring=_generation_folder(data_dir, body.generation) if body.generation else None)
+                try:  # first a safety copy of the current database, as an automatic backup (which rotates nothing
+                    # while a restore is in progress: database._rotate)
+                    safety = await asyncio.to_thread(db.backup)
                 except DatabaseDamagedError:
                     damaged = True
                 except BackupBusyError:
@@ -801,7 +799,7 @@ async def _replace(state, body, staging, purges):
             # adds after them (the backups its migrations take), as nothing else takes a backup meanwhile (design
             # review H, R4), at once or at a later launch
             listed = await asyncio.to_thread(_daily_names, data_dir)
-            journal = await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside, restore_id, earlier,
+            journal = await asyncio.to_thread(_put_in_place, data_dir, staging / RESTORING, aside, restore_id, earlier,
                                               listed, body.generation)
             # as a launch opens it: a backup before its first migration, which rotates nothing under a week old (R3)
             restored = await asyncio.to_thread(Database, data_dir)  # its checks and migrations
@@ -1077,6 +1075,13 @@ def _put_in_place(data_dir, staged, aside, restore_id, audits=(), listed=None, g
     _refuse_after_a_failed_close()
     _mkdir_private(aside.parent)
     _mkdir_private(aside)
+    # An earlier restore's journal, neither finished nor undone, which this one's replaces: what it added goes now, as
+    # nothing would remove it afterwards (design review R, rider T), and it is kept, with no list, inside this one, so
+    # a put back of this restore leaves it in place for a launch to finish (design review R's observation)
+    replaced = _read_journal(data_dir)
+    replaced = replaced if replaced and replaced.get("direction") != "done" else None
+    if replaced is not None:
+        _remove_what_it_added(data_dir, replaced)
     _sync_tree(staged)
     for folder in (aside, aside.parent, staged.parent, staged.parent.parent, data_dir / "backups"):
         _fsync(folder)
@@ -1090,6 +1095,8 @@ def _put_in_place(data_dir, staged, aside, restore_id, audits=(), listed=None, g
         "live": [name for name in SWAPPED if _exists(data_dir / name)],
         "backup": [name for name in SWAPPED if _exists(staged / name)],
         **({"listed": sorted(listed), "generation": generation} if listed is not None else {}),
+        **({"replaced": {k: v for k, v in replaced.items() if k not in ("listed", "generation")}}
+           if replaced is not None else {}),
     }
     write_private(data_dir / "backups" / JOURNAL, json.dumps(journal).encode())
     _forward(data_dir, journal)
@@ -1205,18 +1212,29 @@ def _back(data_dir, journal, audit=False):
             _move(aside / sidecar, data_dir / sidecar)
     _fsync(data_dir)
     _remove_if_empty(aside)  # empty now; one that is not is kept
-    if "listed" in journal:  # what the restore added goes with it, however it is put back (design review H, R4)
-        try:
-            _remove_added(data_dir, set(journal["listed"]), journal.get("generation"))
-        except Exception as error:  # the files are back: an added backup then stays until rotation
-            log.warning("removing the backups a failed restore took failed (%s)", type(error).__name__)
-    audits = [*journal.get("audits", []), *([{"id": journal.get("id"), "interrupted": True, "finished": "back"}]
-                                             if audit else [])]
+    _remove_what_it_added(data_dir, journal)  # however it is put back (design review H, R4)
+    own = [{"id": journal.get("id"), "interrupted": True, "finished": "back"}] if audit else []
+    if "replaced" in journal:  # the folder is the earlier restore's again: its journal back in place, for a launch to
+        # finish or undo it with its audit row (its own rows carried, this one's added)
+        earlier = {**journal["replaced"], "audits": [*journal["replaced"].get("audits", []), *own]}
+        write_private(data_dir / "backups" / JOURNAL, json.dumps(earlier).encode())
+        return earlier
+    audits = [*journal.get("audits", []), *own]
     if audits:  # rows still to write, its own at launch or an earlier restore's it carried: kept for them
         _commit_journal(data_dir, journal, audits)
         return {**journal, "direction": "done", "audits": audits}
     end_journal(data_dir)
     return None
+
+
+def _remove_what_it_added(data_dir, journal):
+    """_remove_added for a restore's journal that is put back or replaced. One written without the list removes
+    nothing; a failure is logged, and an added backup then stays until rotation."""
+    if "listed" in journal:
+        try:
+            _remove_added(data_dir, set(journal["listed"]), journal.get("generation"))
+        except Exception as error:  # the files are back: an added backup then stays until rotation
+            log.warning("removing the backups a failed restore took failed (%s)", type(error).__name__)
 
 
 def _move(source, target):
@@ -1268,6 +1286,8 @@ def finish_interrupted_restore(data_dir) -> dict | None:
         return journal
     journal = _back(data_dir, journal, audit=True)
     log.warning("a restore interrupted by a crash was undone at launch")
+    if journal is not None and journal.get("direction") != "done":  # an earlier restore's, back in place: finished now
+        return finish_interrupted_restore(data_dir)
     return journal
 
 
@@ -1313,6 +1333,10 @@ async def open_at_launch(state, maintenance):
             except Exception as failure:
                 log.error("putting the previous state back failed (%s)", type(failure).__name__)
                 _limit(state, "restore_interrupted", "A restore interrupted by a crash could not be undone; restore a backup")
+                return None
+            if journal is not None and journal.get("direction") != "done":  # an earlier restore's, back in place: the
+                # next launch finishes it (finish_interrupted_restore); nothing runs on its half state meanwhile
+                _limit(state, "restore_interrupted", "A restore interrupted by a crash could not be finished; restore a backup")
                 return None
         else:  # its background runs start with the launch's, once the launch backup has checked it (app.py)
             await _finish_journal(db, audits)

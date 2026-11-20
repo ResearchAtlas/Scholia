@@ -628,10 +628,12 @@ async def test_failed_restores_leave_the_weeks_backups(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("outcome", ["committed", "rolled back"])
 @pytest.mark.parametrize("rotation", ["promoted", "deleted"])
-async def test_a_restore_of_a_backup_over_a_week_old_its_safety_copy_rotates_keeps_a_backup_of_it(
+async def test_a_restore_of_a_backup_over_a_week_old_next_in_line_to_rotate_leaves_it_where_it_was(
         tmp_path, monkeypatch, rotation, outcome):
-    # PR 59 batch 1, item 5, rewritten for design review H: a backup over a week old is still rotated by count; the
-    # restore's own backup before its migrations is then what keeps that state, promoted or deleted
+    # PR 59 batch 1, item 5, rewritten for design review H and again for design review R (Option 1): a backup over a
+    # week old next in line to rotate (to weekly, or away) stays where it was during its own restore, since nothing is
+    # rotated while a restore is in progress; committed adds the safety copy and the backup before its migrations,
+    # rolled back the safety copy only
     from datetime import UTC, datetime, timedelta
     data = tmp_path / "data"
     now = datetime.now(UTC)
@@ -656,12 +658,9 @@ async def test_a_restore_of_a_backup_over_a_week_old_its_safety_copy_rotates_kee
         response = await client.post("/api/backups/restore", json={"generation": f"daily/{name}"})
         assert response.status_code == (200 if outcome == "committed" else 500), response.text
         listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
-    names = {i.split("/")[1] for i in before}  # by name: the rotation may move one to weekly
-    added = sorted(b["schema_version"] for i, b in listed.items() if i.split("/")[1] not in names)
-    # rolled back, the copy stays only when it is the one backup of that state: the source deleted (R4)
-    kept_copy = outcome == "committed" or rotation == "deleted"
-    assert added == ([3, len(MIGRATIONS)] if kept_copy else [len(MIGRATIONS)])
-    assert (f"weekly/{name}" in listed) == (rotation == "promoted") and f"daily/{name}" not in listed
+    added = sorted(b["schema_version"] for i, b in listed.items() if i not in before)
+    assert added == ([3, len(MIGRATIONS)] if outcome == "committed" else [len(MIGRATIONS)])
+    assert before <= set(listed) and f"daily/{name}" in listed  # every backup where it was, the source too
 
 
 @pytest.mark.parametrize("source", ["weekly", "daily"])

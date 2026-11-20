@@ -31,6 +31,9 @@ APPLICATION_ID = 0x5343484C  # "SCHL", written by migration 0001
 DAILY_KEPT = 7
 WEEKLY_KEPT = 4
 KINDS = ("daily", "weekly")  # the automatic backups, by folder under backups/
+# Under backups/: restores and full backups in progress, emptied at launch and by a committed restore. A restore's
+# folder holds RESTORING from the moment its backup is chosen until it has ended (backend.backups).
+STAGING, RESTORING = ".staging", "restore"
 SETTINGS_FILES = ("config.toml", "AGENTS.md")  # copied into each backup: personal and per project
 _STAMP = "%Y%m%dT%H%M%S%fZ"  # backup generation folder names, oldest sorts first
 BUSY_TIMEOUT_MS = 5000  # how long a connection waits for another's lock
@@ -243,7 +246,7 @@ class Database:
         """Why writing stopped (a failed integrity check), or None."""
         return self._damaged
 
-    def backup(self, now=None, restoring=None):
+    def backup(self, now=None):
         """Check the database, write a backup generation and rotate old ones.
 
         A generation holds a copy of the database, backup.json (app, schema and
@@ -253,16 +256,14 @@ class Database:
         changes it (see _copy).
 
         now, an aware UTC datetime, names the generation and defaults to the
-        current time. restoring, the generation a restore is putting in place
-        (its safety copy), is neither moved nor removed by this rotation: if the
-        restore fails, it is still there. Returns the new generation's folder. A failed integrity
+        current time. Returns the new generation's folder. A failed integrity
         check stops all later writes and raises DatabaseDamagedError. Closing
         stops a backup in progress, which then raises DatabaseClosedError and
         leaves no generation.
         """
         _refuse_event_loop()
         with self._backup_lock:
-            generation = self._backup(now or datetime.now(UTC), restoring)
+            generation = self._backup(now or datetime.now(UTC))
         self._retry_truncation()
         return generation
 
@@ -503,7 +504,7 @@ class Database:
 
     # Backups
 
-    def _backup(self, now, restoring=None):
+    def _backup(self, now):
         daily = self.backups_dir / "daily"
         _mkdir_private(self.backups_dir)
         _mkdir_private(daily)
@@ -528,7 +529,7 @@ class Database:
                 raise
         finally:
             close_connection(source)
-        self._apply_retention(keep=generation, restoring=restoring)
+        self._apply_retention(keep=generation)
         return generation
 
     def _checked_source(self):
@@ -613,11 +614,11 @@ class Database:
         except Exception as error:  # the next write retries it
             log.warning("retrying the WAL truncation after a backup failed (%s)", type(error).__name__)
 
-    def _apply_retention(self, keep=None, now=None, restoring=None):
-        """Rotate old generations, never keep nor restoring. A failure is logged, not raised: the
+    def _apply_retention(self, keep=None, now=None):
+        """Rotate old generations, never keep. A failure is logged, not raised: the
         backup itself is already published, and the next backup or check retries this."""
         try:
-            _rotate(self.backups_dir, keep, now, restoring)
+            _rotate(self.backups_dir, keep, now)
         except Exception as error:
             log.warning(
                 "backup retention failed (%s, errno %s); it is retried at the next backup check",
@@ -763,7 +764,7 @@ def _usable_state(conn, latest):
     return version, bool(has_schema)
 
 
-def _rotate(backups, keep, now=None, restoring=None):
+def _rotate(backups, keep, now=None):
     """Keep the newest daily generations, and every one under DAILY_KEPT days old; promote one a week to
     weekly, keeping the newest of those.
 
@@ -772,16 +773,20 @@ def _rotate(backups, keep, now=None, restoring=None):
     moved back. Age is told by keep's stamp, else now (default the current time):
     nothing under a week old is rotated, however many backups were taken on
     request, before deletions or by restores (design review H, R1). A clock set
-    back makes generations look younger, so it keeps more. restoring, the
-    backup a restore is putting in place, daily or weekly, is left where it is
-    this time (PR 59's rechecks: a failed restore lost it).
+    back makes generations look younger, so it keeps more. While a restore is in
+    progress (its staging folder holds RESTORING) nothing is moved or removed, by
+    any backup of any process: every generation it may need, its source first, is
+    where it was however it ends, and the next backup or idle check after it
+    catches up (design review R, Option 1).
     """
+    if any((backups / STAGING).glob(f"*/{RESTORING}")):
+        return
     daily, weekly = backups / "daily", backups / "weekly"
     now = _stamp_of(keep) if keep is not None else now or datetime.now(UTC)
     others = [generation for generation in _generations(daily) if generation != keep]
     kept_others = DAILY_KEPT - 1 if keep is not None else DAILY_KEPT
     for old in others[:max(0, len(others) - kept_others)]:
-        if now - _stamp_of(old) < timedelta(days=DAILY_KEPT) or old == restoring:
+        if now - _stamp_of(old) < timedelta(days=DAILY_KEPT):
             continue
         kept = _generations(weekly)
         if not kept or _stamp_of(old) - _stamp_of(kept[-1]) >= timedelta(days=7):
@@ -790,8 +795,7 @@ def _rotate(backups, keep, now=None, restoring=None):
         else:
             shutil.rmtree(old)
     for old in _generations(weekly)[:-WEEKLY_KEPT]:
-        if old != restoring:
-            shutil.rmtree(old)
+        shutil.rmtree(old)
 
 
 def _settings_folders(data_dir):
