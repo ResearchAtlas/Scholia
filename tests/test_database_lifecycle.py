@@ -570,7 +570,7 @@ def test_a_backup_whose_retention_fails_still_counts_and_retention_is_retried(tm
     data = tmp_path / "data"
     real_rotate = database_module._rotate
 
-    def failing_rotate(backups, keep, now=None):
+    def failing_rotate(backups, keep, now=None, restoring=None):
         raise OSError(13, "Permission denied", str(backups))
 
     with Database(data) as db:
@@ -607,7 +607,7 @@ def test_a_migration_does_not_run_without_its_backup(tmp_path, monkeypatch):
     data = tmp_path / "data"
     Database(data).close()
 
-    def losing_rotate(backups, keep, now=None):  # as if retention had removed the new generation
+    def losing_rotate(backups, keep, now=None, restoring=None):  # as if retention had removed the new generation
         for generation in (backups / "daily").iterdir():
             shutil.rmtree(generation)
 

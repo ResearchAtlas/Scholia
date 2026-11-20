@@ -623,6 +623,41 @@ async def test_a_restore_of_a_backup_over_a_week_old_its_safety_copy_rotates_kee
     assert (f"weekly/{name}" in listed) == (rotation == "promoted") and f"daily/{name}" not in listed
 
 
+@pytest.mark.parametrize("source", ["weekly", "daily"])
+async def test_a_restore_that_fails_leaves_the_backup_it_restores_where_it_was(tmp_path, monkeypatch, source):
+    # PR 59's rechecks (Fable 2, P3; Fable round 3, the weekly site): at the current schema, the safety copy's
+    # rotation promoted a daily one and so trimmed the oldest weekly backup, or deleted the oldest daily one over a week
+    # old; when the restore then failed, that backup was gone, and its state in no backup ("nothing was changed")
+    from datetime import UTC, datetime, timedelta
+    data = tmp_path / "data"
+    now = datetime.now(UTC)
+
+    def folder():  # weekly 60 to 39 days old; daily over a week old, the launch's backup promoting the 30-day one
+        with Database(data) as db:
+            weekly = [db.backup(now=now - timedelta(days=days)) for days in (60, 53, 46, 39)]
+            (data / "backups" / "weekly").mkdir()
+            for generation in weekly:
+                generation.rename(data / "backups" / "weekly" / generation.name)
+            return {days: db.backup(now=now - timedelta(days=days)).name
+                    for days in (30, 22 if source == "weekly" else 26, 14, 13, 12, 11, 10)}, weekly[1].name
+
+    daily, weekly = await asyncio.to_thread(folder)
+    restored = f"weekly/{weekly}" if source == "weekly" else f"daily/{daily[26]}"
+    async with started(data) as client:
+        assert restored in {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+        real = backups_module._commit_journal
+
+        def failing(*args):
+            raise OSError("the journal cannot be written")
+        monkeypatch.setattr(backups_module, "_commit_journal", failing)
+        response = await client.post("/api/backups/restore", json={"generation": restored})
+        assert response.status_code == 500, response.text
+        assert restored in {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+        monkeypatch.setattr(backups_module, "_commit_journal", real)
+        response = await client.post("/api/backups/restore", json={"generation": restored})
+        assert response.status_code == 200, response.text
+
+
 async def restored_from_fables_folder(tmp_path, more, days=5):
     """Fable's folder, its backup of days days ago restored, then more backups: (its name, the list, the names
     before)."""

@@ -754,8 +754,10 @@ async def _replace(state, body, staging, purges):
                 await asyncio.to_thread(db.hold_writes)
                 if await _purges(state) != purges:  # Delete everywhere purged the backups meanwhile: not this one
                     raise BackupError(404, "not_found", "No such backup")
-                try:  # first a safety copy of the current database, as an automatic backup
-                    safety = await asyncio.to_thread(db.backup)
+                try:  # first a safety copy of the current database, as an automatic backup, whose rotation leaves
+                    # the backup restored where it is, so a restore that fails has lost nothing
+                    safety = await asyncio.to_thread(
+                        db.backup, restoring=_generation_folder(data_dir, body.generation) if body.generation else None)
                 except DatabaseDamagedError:
                     damaged = True
                 except BackupBusyError:
