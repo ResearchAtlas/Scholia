@@ -16,10 +16,12 @@ function backend(state) {
     const method = init.method ?? 'GET';
     const kind = method !== 'GET' ? 'write' : path === '/api/projects' ? 'projects'
       : path.startsWith('/api/conversations?') ? 'list' : /^\/api\/conversations\/[^/?]+$/.test(path) ? 'conversation'
-        : path.startsWith('/api/asks') ? 'asks' : 'other';
+        : path.startsWith('/api/asks') ? 'asks' : state.panels && path.startsWith('/api/settings?') ? 'settings' : 'other';
     const now = () => ({ projects: { projects: clone(state.projects) },
       list: { conversations: clone(state.conversations[new URLSearchParams(path.split('?')[1]).get('project_id')] ?? []) },
-      conversation: { turns: [], queued: [] }, asks: { asks: [] } }[kind] ?? { ok: true });
+      conversation: { turns: [], queued: [] }, asks: { asks: [] },
+      settings: { values: { ui: { panel: state.panels?.[new URLSearchParams(path.split('?')[1]).get('project_id')] ?? 'none' } } },
+    }[kind] ?? { ok: true });
     if (kind === 'other') return new Promise(() => {});
     if (method === 'GET' && !held.has(kind)) return Promise.resolve(response(200, now()));
     return new Promise((resolve) => asked.push({ method, path, kind,
@@ -226,6 +228,19 @@ const scenarios = {
     await s.projectMenu(/^Project Alpha$/);
     assert.deepEqual(s.selected(), ['Title Bravo']);
     assert.equal(s.draft(), DRAFT);
+  },
+  // The recheck of the phase B internal review's fixes: the open project chosen again keeps its panel; another project
+  // takes its own.
+  async theOpenProjectChosenAgainKeepsItsPanel(w, strict) {
+    const state = { ...start(), panels: { p1: 'library', p2: 'none' } }; const s = await world(w, strict, state);
+    const library = () => s.elements().filter((e) => e.type === 'ui:Button' && e.props['aria-pressed'] === true
+      && e.text.includes('Library')).length;
+    assert.equal(library(), 1, 'at launch, its own panel');
+    await s.projectMenu(/^Project Alpha$/);
+    assert.equal(library(), 1, 'chosen again');
+    s.server.hold('settings'); // another project's panel is none until its own setting is read
+    await s.projectMenu(/^Project Beta$/);
+    assert.equal(library(), 0, 'another project');
   },
   // PR 63's phase B internal review (P3-1): in a narrow window whose projects cannot be read, the drawer (projects,
   // Settings) is still reachable.

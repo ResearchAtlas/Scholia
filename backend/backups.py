@@ -1599,8 +1599,9 @@ def _turn_records(conn, turn, rows, project_id):
     running, not read yet (pending); one its turn ended without reading is queued by that end in the same transaction,
     so it is a waiting message instead, and never both (budgets.queue_unread_notes; PR 59 batch 1). Its asks
     and their answers: an agent's own question and option labels are model text kept only while its run runs, so an
-    ask of a finished turn names its options by number. Its answer's citations, as recorded, so each marker resolves
-    to its paper (materials.json, by id), version, passage, quote and page, with its existence and support checks; of
+    ask of a finished turn names its options by number. Its answer's citations, as its chips read them now (one
+    removed since is removed), so each marker resolves to its paper (materials.json, by id), version, passage, quote and
+    page, with its existence and support checks; of
     another project's paper (a conversation moved here may cite one) only its id and the checks, as the export carries
     nothing of another project's."""
     run_id, carried = turn["run_id"], budgets.carried_notes(conn, turn["run_id"])
