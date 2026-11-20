@@ -31,7 +31,7 @@ function backend(state) {
   globalThis.setTimeout = (fn) => { timers.set(++timer, fn); return timer; }; globalThis.clearTimeout = (id) => { timers.delete(id); };
   globalThis.setInterval = () => 0; globalThis.clearInterval = () => {};
   globalThis.requestAnimationFrame = () => 0;
-  globalThis.window = { addEventListener() {}, removeEventListener() {}, innerWidth: 1400 };
+  globalThis.window = { addEventListener() {}, removeEventListener() {}, innerWidth: state.width ?? 1400 };
   globalThis.document = { addEventListener() {}, removeEventListener() {}, getElementById: () => null };
   const store = new Map();
   globalThis.localStorage = state.noStorage ? { getItem() { throw new Error('refused'); }, setItem() { throw new Error('refused'); } }
@@ -218,6 +218,23 @@ const scenarios = {
       assert.deepEqual(s.selected(), ['Title Alpha'], `storage ${noStorage ? 'refused' : 'kept'}`);
       assert.equal(s.draft(), DRAFT, `storage ${noStorage ? 'refused' : 'kept'}`);
     }
+  },
+  // PR 63's phase B internal review (P2-1): the open project chosen again in the switcher changes nothing.
+  async theOpenProjectChosenAgainKeepsWhatIsOpen(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await s.open('Title Bravo'); await s.type(DRAFT);
+    await s.projectMenu(/^Project Alpha$/);
+    assert.deepEqual(s.selected(), ['Title Bravo']);
+    assert.equal(s.draft(), DRAFT);
+  },
+  // PR 63's phase B internal review (P3-1): in a narrow window whose projects cannot be read, the drawer (projects,
+  // Settings) is still reachable.
+  async theDrawerIsReachableWhileNothingIsDecided(w, strict) {
+    const state = { ...start(), width: 500 };
+    const s = await world(w, strict, state, (server) => server.hold('projects'));
+    await s.releaseAll((r) => r.kind === 'projects', (r) => r.fail());
+    const shows = s.elements().filter((e) => e.type === 'ui:Button' && e.props['aria-label'] === 'Show sidebar');
+    assert.equal(shows.length, 1);
   },
   // This review: typed before the window's first reads answer: nothing typed is lost when they do.
   async nothingTypedBeforeTheListsAnswerIsLost(w, strict) {

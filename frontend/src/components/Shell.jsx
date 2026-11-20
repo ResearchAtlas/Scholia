@@ -20,6 +20,8 @@ import { Sidebar } from './Sidebar.jsx';
 import { ConversationView } from './ConversationView.jsx';
 import { SidePanel } from './SidePanel.jsx';
 import { Settings } from './Parts.jsx';
+import { PanelLeftOpen } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
 const CURRENT = 'scholia.project';
@@ -73,7 +75,9 @@ export function Shell({ health, settings, onLanguage }) {
   // read (design review S).
   const [open, setOpen] = useState({ projectId: undefined, conversationId: undefined });
   const { projectId, conversationId } = open;
-  const openProject = useCallback((id) => { setOpen({ projectId: id, conversationId: undefined }); setPanel('none'); }, []);
+  // another project: its conversation not decided yet (the open one chosen again changes nothing)
+  const openProject = useCallback((id) => setOpen((now) => (now.projectId === id ? now
+    : { projectId: id, conversationId: undefined })), []);
   const openConversation = useCallback((id) => setOpen((now) => ({ ...now, conversationId: id })), []);
   // The lists, through the Library's read (libraryRead.js): shown only when read since the last removal of something
   // they name (a deletion's request settled, a conversation moved), never one asked before it, and nothing old after
@@ -132,6 +136,7 @@ export function Shell({ health, settings, onLanguage }) {
     if (!projectId) return;
     remember(projectId);
     shown.current = projectId;
+    setPanel('none');
     get(`/api/settings?project_id=${encodeURIComponent(projectId)}`)
       .then((loaded) => shown.current === projectId && setPanel(loaded.values?.ui?.panel ?? 'none'))
       .catch(() => {});
@@ -183,6 +188,8 @@ export function Shell({ health, settings, onLanguage }) {
   }
 
   const view = columns({ width, ...layout, panelOpen: panel !== 'none' });
+  const showSidebar = () => (view.narrow ? setDrawer(true)
+    : (() => { const next = { ...layout, sidebarOpen: true }; setLayout(next); saveLayout(next); })());
   const overlaid = panel !== 'none' && view.overlay; // the panel covers the conversation, which is inert meanwhile
 
   function newConversation() { // a blank conversation; it is made at its first message
@@ -258,9 +265,18 @@ export function Shell({ health, settings, onLanguage }) {
       <div className="flex min-w-0 flex-1 flex-col bg-background">
         <div className="relative flex min-h-0 flex-1">
           <div className="min-w-0 flex-1" inert={overlaid || undefined}>
-            {!projectId || conversationId === undefined ? (projectsRead.error
-              ? <p role="alert" className="p-6 text-sm text-destructive">{errorText(t, projectsRead.error instanceof ApiError ? projectsRead.error.code : 'internal')}</p>
-              : <p role="status" className="p-6 text-sm text-muted-foreground">{t('common.loading')}</p>
+            {!projectId || conversationId === undefined ? (
+              <div className="flex items-start gap-1 p-3">
+                {/* the sidebar (projects, Settings) stays reachable while nothing is decided, in a narrow window too */}
+                {(view.narrow || !view.sidebarShown) && (
+                  <Button variant="ghost" size="icon" className="size-8" onClick={showSidebar} aria-label={t('sidebar.show')}>
+                    <PanelLeftOpen aria-hidden="true" />
+                  </Button>
+                )}
+                {projectsRead.error
+                  ? <p role="alert" className="p-3 text-sm text-destructive">{errorText(t, projectsRead.error instanceof ApiError ? projectsRead.error.code : 'internal')}</p>
+                  : <p role="status" className="p-3 text-sm text-muted-foreground">{t('common.loading')}</p>}
+              </div>
             ) : <ConversationView
               key={`${projectId}:${conversationId ?? 'new'}`}
               conversationId={conversationId}
@@ -268,8 +284,7 @@ export function Shell({ health, settings, onLanguage }) {
               projectId={projectId}
               panel={panel}
               showSidebarButton={view.narrow || !view.sidebarShown}
-              onShowSidebar={() => (view.narrow ? setDrawer(true)
-                : (() => { const next = { ...layout, sidebarOpen: true }; setLayout(next); saveLayout(next); })())}
+              onShowSidebar={showSidebar}
               onPanel={togglePanel}
               onCreated={(id) => { openConversation(id); loadConversations(); }}
               onLibrary={() => panel !== 'library' && togglePanel('library')}
