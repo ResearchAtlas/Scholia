@@ -11,7 +11,7 @@ import { ApiError, get, saveSettings } from '../api.js';
 import { DEFAULTS, LIMITS, clamp, columns, fromSettings, panelShareAt, toSettings } from '../layout.js';
 import { errorText } from '../text.js';
 import { places, subscribe } from '../live.js';
-import { libraryChanged } from '../library.js';
+import { libraryChanged, newest } from '../library.js';
 import { projectName } from '../projects.js';
 import { addTo } from './Library.jsx';
 import { Divider } from './Divider.jsx';
@@ -168,9 +168,13 @@ export function Shell({ health, settings, onLanguage }) {
   // question their lookup asks (a drop in the Library itself is the Library's, and goes no further:
   // the window's overlay is cleared on the way down, at every drop).
   const hasFiles = (event) => Boolean(event.dataTransfer?.types?.includes('Files')) && !settingsOpen && Boolean(projectId);
+  // Only the newest drop says how it ended: an earlier one that answers late says nothing over it (design review O's
+  // Option 1, as the Library's own Add).
+  const [newestDrop] = useState(newest);
   async function dropFiles(files) {
+    const current = newestDrop();
     if (panel !== 'library') togglePanel('library');
-    if (await addTo(projectId, files, t, setNotice)) libraryChanged(projectId);
+    if (await addTo(projectId, files, t, (text) => { if (current()) setNotice(text); })) libraryChanged(projectId);
   }
 
   const view = columns({ width, ...layout, panelOpen: panel !== 'none' });
@@ -190,9 +194,9 @@ export function Shell({ health, settings, onLanguage }) {
       onProject={(id) => { setProjectId(id); setDrawer(false); }}
       onProjectsChanged={(prefer) => loadProjects(prefer).catch(fail)}
       onConversation={(id) => { setConversationId(id); setDrawer(false); }}
-      onConversationsChanged={async (removed) => {
+      onConversationsChanged={async (removed) => { // removed: one deleted, or whose deletion failed (it is still listed)
         const listed = await loadConversations().catch(fail);
-        if (removed && removed === conversationId) setConversationId(listed?.[0]?.id ?? null);
+        if (removed && removed === conversationId && !listed?.some((c) => c.id === removed)) setConversationId(listed?.[0]?.id ?? null);
       }}
       onNewConversation={newConversation}
       onSettings={() => { setDrawer(false); setSettingsOpen(true); }}

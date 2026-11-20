@@ -229,7 +229,11 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   // Attached files join the project's Library, named as coming from this conversation, so the
   // question their lookup may ask is shown here. Before its first message a conversation does not
   // exist yet: the files are added as from the Library, which opens to show them.
+  // Only the newest attach says how it ended: an earlier one that answers late says nothing over it (design review O's
+  // Option 1, as the Library's own Add); its lookup is still watched while the newer says nothing of one.
+  const [newestAttach] = useState(newest);
   async function attach(files) {
+    const current = newestAttach();
     setProblem(null);
     setAttached(null);
     const notes = [];
@@ -239,7 +243,12 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       notes.unshift(t('conversation.attached', { count: result.materials.length }));
       if (!id) onLibrary?.();
     }
-    if (notes.length) setAttached({ text: notes.join(' '), lookup: id && result ? result.lookup_run_id : null });
+    const lookup = id && result ? result.lookup_run_id : null;
+    if (current()) {
+      if (notes.length) setAttached({ text: notes.join(' '), lookup });
+    } else if (lookup) {
+      setAttached((now) => (now && !now.lookup ? { ...now, lookup } : now));
+    }
     if (result && id) asksChanged(id); // the view showing it now reads its questions, this one or its successor
   }
 

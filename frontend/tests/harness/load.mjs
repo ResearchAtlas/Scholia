@@ -34,12 +34,16 @@ const stubs = {
     if (id === '@/lib/utils') return '\0cn';
     if (id.startsWith('@/')) return path.join(src, id.slice(2));
     if (/\/Parts\.jsx$/.test(id)) return '\0parts';
+    if (id === '@radix-ui/react-dialog') return '\0drawer'; // Shell's drawer, as host elements
     return null;
   },
   load(id) {
     if (id === '\0cn') return 'export const cn = (...a) => a.filter((x) => typeof x === "string").join(" ");';
     if (id === '\0parts') return `export { Paper } from ${JSON.stringify(path.join(src, 'components', 'Paper.jsx'))};\n`
-      + 'export const ZoteroBrowser = () => null;';
+      + 'export const ZoteroBrowser = () => null; export const Settings = () => null; export const LeftOff = () => null; export const Trace = () => null;\n'
+      + 'export const Markdown = ({ children }) => children ?? null; export const markdownReady = async () => {};';
+    if (id === '\0drawer') return `import { jsx } from ${JSON.stringify(standin)};\n`
+      + ['Root', 'Portal', 'Overlay', 'Content', 'Title'].map((name) => `export const ${name} = (props) => jsx('drawer:${name}', props);`).join('\n');
     if (id.startsWith('\0ui:')) {
       const module = id.slice(4);
       return `import { jsx } from ${JSON.stringify(standin)};\n` + [...names(module)].map((name) => (module === 'lucide-react'
@@ -63,6 +67,8 @@ export async function loader() {
         server.ssrLoadModule(standin)]);
       return { Library, library, mount, jsx };
     },
+    // another component's module, in the graph fresh() made: its stores are that graph's
+    component: (name) => server.ssrLoadModule(`/src/components/${name}.jsx`),
     close: () => server.close(),
   };
 }
