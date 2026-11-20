@@ -38,6 +38,7 @@ def pdf(pages, *, scanned=(), size=(612, 792), rotation=0):
                     bitmap = pdfium.PdfBitmap.new_native(40, 40, raw.FPDFBitmap_BGR)
                     bitmap.fill_rect((180, 180, 180, 255), 0, 0, 40, 40)
                     image.set_bitmap(bitmap)
+                    bitmap.close()  # the image keeps its own reference; released inside the lock
                     image.set_matrix(pdfium.PdfMatrix().scale(width, height))
                     page.insert_obj(image)
                 for x, y, font_size, text, *font in lines:

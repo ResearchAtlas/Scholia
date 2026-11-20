@@ -233,6 +233,7 @@ def scanned_pdf(lines, size=(612, 792), dpi=300):
                 ctypes.memmove(ctypes.addressof(bitmap.buffer) + row * bitmap.stride, pixels[row * stride:row * stride + width], width)
             image = pdfium.PdfImage.new(document)
             image.set_bitmap(bitmap)
+            bitmap.close()  # the image keeps its own reference; released inside the lock
             image.set_matrix(pdfium.PdfMatrix().scale(*size))
             page.insert_obj(image)
             page.gen_content()

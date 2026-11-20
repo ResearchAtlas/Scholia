@@ -88,22 +88,29 @@ def test_the_pdf_helpers_hold_pdfium_while_they_use_it(monkeypatch, make):
     # CI run 43542906749 (PR 61): the tests' PDF helper used pdfium while a reading thread of the app could hold it;
     # pdfium is not thread-safe, so every use holds extraction.PDFIUM
     import sys
-    import pypdfium2
+    import pypdfium2.raw as raw
     if make == "scanned_pdf" and sys.platform != "darwin":
         pytest.skip("AppKit draws the scanned page")
-    real, held = pypdfium2.PdfDocument.save, []
+    held = []
 
-    def save(document, *args, **kwargs):
-        held.append(extraction.PDFIUM.locked())
-        return real(document, *args, **kwargs)
+    def watched(name):  # saving, and releasing what it made: never by the collector, outside the lock
+        real = getattr(raw, name)
 
-    monkeypatch.setattr(pypdfium2.PdfDocument, "save", save)
+        def call(*args):
+            held.append((name, extraction.PDFIUM.locked()))
+            return real(*args)
+        monkeypatch.setattr(raw, name, call)
+
+    for name in ("FPDF_SaveAsCopy", "FPDFBitmap_Destroy", "FPDF_ClosePage", "FPDF_CloseDocument"):
+        watched(name)
     if make == "paper_pdf":
-        synthetic.paper_pdf()
+        synthetic.paper_pdf(scanned=1)
     else:
         from backend.self_test import scanned_pdf
         scanned_pdf([(72, 700, 14, "A scanned line.")])
-    assert held == [True] and not extraction.PDFIUM.locked()
+    assert {name for name, _ in held} == {"FPDF_SaveAsCopy", "FPDFBitmap_Destroy", "FPDF_ClosePage", "FPDF_CloseDocument"}
+    assert all(locked for _, locked in held), held
+    assert not extraction.PDFIUM.locked()
 
 
 def test_a_pdf_page_whose_text_leaves_characters_out_keeps_its_character_ranges_and_boxes():
