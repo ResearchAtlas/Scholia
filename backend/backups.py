@@ -1080,8 +1080,9 @@ def _put_in_place(data_dir, staged, aside, restore_id, audits=(), listed=None, g
     # a put back of this restore leaves it in place for a launch to finish (design review R's observation)
     replaced = _read_journal(data_dir)
     replaced = replaced if replaced and replaced.get("direction") != "done" else None
-    if replaced is not None:
-        _remove_what_it_added(data_dir, replaced)
+    if replaced is not None:  # the backup this restore restores from stays, though that one added it (an ordinary
+        # backup, rotated as any; the coordinator's amendment to rider T, PR 63's recheck r2)
+        _remove_what_it_added(data_dir, replaced, _generation_folder(data_dir, generation).name if generation else None)
     _sync_tree(staged)
     for folder in (aside, aside.parent, staged.parent, staged.parent.parent, data_dir / "backups"):
         _fsync(folder)
@@ -1227,12 +1228,13 @@ def _back(data_dir, journal, audit=False):
     return None
 
 
-def _remove_what_it_added(data_dir, journal):
-    """_remove_added for a restore's journal that is put back or replaced. One written without the list removes
-    nothing; a failure is logged, and an added backup then stays until rotation."""
+def _remove_what_it_added(data_dir, journal, keeping=None):
+    """_remove_added for a restore's journal that is put back or replaced, never keeping (a generation's name: the
+    backup a restore that replaces it restores from). One written without the list removes nothing; a failure is
+    logged, and an added backup then stays until rotation."""
     if "listed" in journal:
         try:
-            _remove_added(data_dir, set(journal["listed"]), journal.get("generation"))
+            _remove_added(data_dir, {*journal["listed"], *([keeping] if keeping else [])}, journal.get("generation"))
         except Exception as error:  # the files are back: an added backup then stays until rotation
             log.warning("removing the backups a failed restore took failed (%s)", type(error).__name__)
 

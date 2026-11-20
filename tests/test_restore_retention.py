@@ -266,3 +266,53 @@ async def test_a_staging_folder_that_cannot_be_listed_rotates_nothing(tmp_path, 
             assert "retention failed" in caplog.text  # and said, as any retention failure is
 
     await asyncio.to_thread(body)
+
+
+@pytest.mark.parametrize("failure", ["before its journal", "after its swap"])
+@pytest.mark.parametrize("second_source", ["migration copy", "safety copy"])
+@pytest.mark.parametrize("first_source", ["file", "automatic"])
+async def test_a_restore_after_one_that_could_not_be_put_back_keeps_the_backup_it_restores(
+        tmp_path, monkeypatch, first_source, second_source, failure):
+    # PR 63's recheck r2 (pass 1 F4, pass 2 F2): rider T removed what the unfinished restore added, the backup the second
+    # restore restores from included (the first one's backup before its migrations). That one is kept (the
+    # coordinator's amendment to T), as an ordinary backup; the safety copy is the control
+    data = tmp_path / "data"
+    await asyncio.to_thread(older, data, tmp_path / "m1.zip")
+    automatic = sorted((data / "backups" / "daily").iterdir())[0].name  # the schema 3 backup the M1 folder took
+    committing, back, sync = backups_module._commit_journal, backups_module._back_from_journal, backups_module._sync_tree
+    fail, backs, syncs = [True], [], []
+
+    def commit(*args):
+        if fail[0]:
+            raise OSError("the journal cannot be written")
+        return committing(*args)
+
+    def back_but_the_first(*args):
+        backs.append(args)
+        if len(backs) == 1:
+            raise OSError("the files cannot be put back now")
+        return back(*args)
+
+    def sync_but_the_second(*args):  # the second restore fails after rider T, before its journal is written
+        syncs.append(args)
+        if len(syncs) == 2 and failure == "before its journal":
+            raise OSError("the staged files cannot be synced")
+        return sync(*args)
+    monkeypatch.setattr(backups_module, "_commit_journal", commit)
+    monkeypatch.setattr(backups_module, "_back_from_journal", back_but_the_first)
+    monkeypatch.setattr(backups_module, "_sync_tree", sync_but_the_second)
+    async with started(data) as client:
+        before = set(await listed(client))
+        body = {"file": str(tmp_path / "m1.zip")} if first_source == "file" else {"generation": f"daily/{automatic}"}
+        response = await client.post("/api/backups/restore", json=body)
+        assert (response.status_code, response.json()["code"]) == (500, "restore_interrupted")
+        first = await listed(client)
+        added = {first[i]["schema_version"]: i for i in set(first) - before}
+        assert sorted(added) == [3, len(MIGRATIONS)]
+        source = added[3 if second_source == "migration copy" else len(MIGRATIONS)]
+        response = await client.post("/api/backups/restore", json={"generation": source})
+        assert response.status_code == 500, response.text
+        assert source in await listed(client)  # the backup it restores, where it was
+    fail[0] = False
+    async with started(data, setup=False) as client:  # the launch finishes or undoes what is left: it is kept there too
+        assert source in await listed(client)
