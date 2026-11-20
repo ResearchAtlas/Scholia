@@ -83,12 +83,40 @@ def _raw_pdf(objects):
     return bytes(out + b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref))
 
 
+@pytest.mark.parametrize("make", ["paper_pdf", "scanned_pdf"])
+def test_the_pdf_helpers_hold_pdfium_while_they_use_it(monkeypatch, make):
+    # CI run 43542906749 (PR 61): the tests' PDF helper used pdfium while a reading thread of the app could hold it;
+    # pdfium is not thread-safe, so every use holds extraction.PDFIUM
+    import sys
+    import pypdfium2
+    if make == "scanned_pdf" and sys.platform != "darwin":
+        pytest.skip("AppKit draws the scanned page")
+    real, held = pypdfium2.PdfDocument.save, []
+
+    def save(document, *args, **kwargs):
+        held.append(extraction.PDFIUM.locked())
+        return real(document, *args, **kwargs)
+
+    monkeypatch.setattr(pypdfium2.PdfDocument, "save", save)
+    if make == "paper_pdf":
+        synthetic.paper_pdf()
+    else:
+        from backend.self_test import scanned_pdf
+        scanned_pdf([(72, 700, 14, "A scanned line.")])
+    assert held == [True] and not extraction.PDFIUM.locked()
+
+
 def test_a_pdf_page_whose_text_leaves_characters_out_keeps_its_character_ranges_and_boxes():
     import pypdfium2 as pdfium
 
     data = _pdf_leaving_out(b"~~~This paragraph begins~ here and goes on")
-    textpage = pdfium.PdfDocument(data)[0].get_textpage()
-    assert (textpage.count_chars(), len(textpage.get_text_range())) == (42, 38)  # four characters left out
+    with extraction.PDFIUM:  # pdfium is not thread-safe: as the app does, the test holds its lock while it uses it
+        document = pdfium.PdfDocument(data)
+        try:
+            textpage = document[0].get_textpage()
+            assert (textpage.count_chars(), len(textpage.get_text_range())) == (42, 38)  # four characters left out
+        finally:
+            document.close()
     [passage] = extract(data, extraction.PDF).passages
     assert passage.text == "This paragraph begins here and goes on"
     assert (passage.char_start, passage.char_end) == (3, 42)  # PDFium's character indices, the left-out ones counted
