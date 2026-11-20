@@ -309,7 +309,7 @@ def test_a_file_put_again_and_named_by_a_new_record_while_the_deletion_collects_
                 db.write(lambda conn: conn.execute(
                     "INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current)"
                     " VALUES (?, ?, 1, ?, 0)", (new_id(), other, again[0])))
-            # the clock set back past the idle window while it was put, so only the put counter keeps the file
+            # the clock set back past the idle window while it was put, so only the row found at removal keeps the file
             past = time.time() - IDLE_AFTER.total_seconds() - 60
             os.utime(self._path(again[0]), (past, past))
         yield from real(self)
@@ -322,6 +322,20 @@ def test_a_file_put_again_and_named_by_a_new_record_while_the_deletion_collects_
     delete(db, store, "material", x["m1"])
     assert again == [x["paper"]] and store.read(x["paper"]) == b"paper p"
     assert one(db, "SELECT count(*) FROM material_versions WHERE file_sha256 = ?", x["paper"]) == (1,)
+
+
+@pytest.mark.parametrize("minutes", [0, 59, 61, 120])
+def test_a_deletions_collection_keeps_a_file_whose_row_and_reference_commit_after_it_read_the_rows(
+        db, store, monkeypatch, minutes):
+    # PR 59 round 5's P2 (design review Q), through a deletion's cleanup: the same sweep as the hourly pass
+    from test_content_store import first_put_racing
+    x = populate(db, store, add_project(db, "Thesis"), "p")
+    joined, path = first_put_racing(store, db, monkeypatch, minutes)
+    delete(db, store, "material", x["m1"])
+    joined()
+    assert path.is_file() and one(db, "SELECT count(*) FROM content_files WHERE sha256 = ?", path.name) == (1,)
+    with pytest.raises(FileNotFoundError):  # the deleted paper's own file went at once
+        store.read(x["paper"])
 
 
 @pytest.mark.parametrize("hours", [2, 24 * 30])

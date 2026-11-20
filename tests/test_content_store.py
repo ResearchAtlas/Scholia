@@ -3,6 +3,7 @@ import hashlib
 import io
 import os
 import stat
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -462,6 +463,81 @@ def test_a_put_while_collection_checks_a_row_keeps_the_row(store, db, monkeypatc
     assert store.read(sha256) == data
     store.put(data)  # the put's row insert, after collection committed
     assert [row[0] for row in rows(db)] == [sha256]
+
+
+def first_put_racing(store, db, monkeypatch, minutes):
+    """Design review Q's ordering: a first put of new bytes places its file, held, with no row yet; the clock then
+    moves ahead by minutes; the collection that follows reads the rows before the put's row, a record naming it and
+    the end of its caller's hold all commit. Returns (start the collection, the hash)."""
+    placed, go, done, found = threading.Event(), threading.Event(), threading.Event(), []
+    real_write = db.write
+
+    def write(fn, *args, **kwargs):
+        if threading.current_thread() is putter and not placed.is_set():  # its row insert waits
+            placed.set()
+            go.wait(10)
+        return real_write(fn, *args, **kwargs)
+
+    def put():
+        with store.hold() as held:
+            found.append(store.put(b"first bytes", "application/pdf", held))
+            add_material_version(db, found[0])
+        done.set()
+
+    monkeypatch.setattr(db, "write", write)
+    putter = threading.Thread(target=put)
+    putter.start()
+    assert placed.wait(10)
+    path = store._path(hashlib.sha256(b"first bytes").hexdigest())
+    age(path, timedelta(minutes=minutes))
+    real_files = ContentStore._stored_files
+
+    def files(self):  # the collection has read the rows: the put commits now
+        go.set()
+        assert done.wait(10)
+        yield from real_files(self)
+
+    monkeypatch.setattr(ContentStore, "_stored_files", files)
+
+    def joined():
+        putter.join(10)
+        assert not putter.is_alive()
+    return joined, path
+
+
+@pytest.mark.parametrize("minutes", [0, 59, 61, 120])
+def test_the_hourly_collection_keeps_a_file_whose_row_and_reference_commit_after_it_read_the_rows(
+        store, db, monkeypatch, minutes):
+    # PR 59 round 5's P2 (design review Q): the sweep decided "no row" from its earlier read of the rows
+    joined, path = first_put_racing(store, db, monkeypatch, minutes)
+    store.collect_garbage()
+    joined()
+    assert len(rows(db)) == 1 and path.is_file()
+    assert db.read(lambda conn: conn.execute(
+        "SELECT count(*) FROM material_versions WHERE file_sha256 = ?", (path.name,)).fetchone()) == (1,)
+
+
+def test_a_put_whose_placement_and_cleanup_both_fail_leaves_no_hold(store, db, monkeypatch):
+    # PR 59 round 5's P3 (design review Q): the put's own hold was released only after its cleanup
+    sha256 = store.put(b"stored already")
+    real_unlink = type(store.root).unlink
+
+    def unlink(path, missing_ok=False):
+        if path.name.startswith(".put-"):
+            raise OSError("cleanup failed")
+        return real_unlink(path, missing_ok=missing_ok)
+
+    def replace(source, target):
+        raise OSError("placement failed")
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(type(store.root), "unlink", unlink)
+    with store.hold() as held, pytest.raises(OSError):
+        store.put(b"stored already", None, held)
+    monkeypatch.undo()
+    assert not store._held
+    assert store.collect_garbage(now=datetime.now(UTC) + timedelta(days=100)) == 1
+    assert rows(db) == [] and stored(store) == [] and sha256
 
 
 def test_every_put_in_backend_passes_a_hold():
