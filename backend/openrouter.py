@@ -93,8 +93,15 @@ class Attempt:
 
     @property
     def reported_cost(self):
-        """The cost the provider reported, if it is a valid amount (finite, not negative, at most spending.MAX_USD)."""
-        return amount(self.usage.get("cost"))
+        """The cost the provider reported, if it is a valid amount (finite, not negative, at most spending.MAX_USD).
+        A request OpenRouter marks bring-your-own-key (is_byok) reports only its fee as cost: it costs that plus what
+        the upstream provider charged, and without a valid upstream cost it reported no cost (Harold, 2026-11-14)."""
+        cost = amount(self.usage.get("cost"))
+        if cost is None or self.usage.get("is_byok") is not True:
+            return cost
+        details = self.usage.get("cost_details")
+        upstream = amount(details.get("upstream_inference_cost")) if isinstance(details, dict) else None
+        return None if upstream is None else combined(cost + upstream)
 
     def record(self) -> dict:
         """The run-event form: counts and codes only."""
