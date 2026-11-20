@@ -68,17 +68,26 @@ export function Shell({ health, settings, onLanguage }) {
   const width = useWindowWidth();
   const [layout, setLayout] = useState(() => fromSettings(settings.values));
   const [drawer, setDrawer] = useState(false);
-  const [panel, setPanel] = useState('none');
+  // The open panel. undefined: not decided yet (none is drawn): the project's setting decides it when read, unless
+  // the researcher chose one meanwhile; a read decides only what is not decided (design review U).
+  const [chosen, setPanel] = useState(undefined);
+  const panel = chosen ?? 'none';
   // What the window shows: a project and one of its conversations. undefined: not decided yet (nothing read yet, or
   // what was shown was removed), and then no conversation, so no message box, is drawn; a conversation null: a new
   // one. A list decides only what is not decided; after that only the researcher's own actions change it, never a
   // read (design review S).
-  const [open, setOpen] = useState({ projectId: undefined, conversationId: undefined });
+  const [open, setOpen] = useState({ projectId: undefined, conversationId: undefined, visit: 0 });
   const { projectId, conversationId } = open;
-  // another project: its conversation not decided yet (the open one chosen again changes nothing)
+  // The researcher's choice of another project (its conversation not decided yet) or conversation is a new visit; the
+  // open one chosen again changes nothing.
   const openProject = useCallback((id) => setOpen((now) => (now.projectId === id ? now
-    : { projectId: id, conversationId: undefined })), []);
-  const openConversation = useCallback((id) => setOpen((now) => ({ ...now, conversationId: id })), []);
+    : { projectId: id, conversationId: undefined, visit: now.visit + 1 })), []);
+  const openConversation = useCallback((id) => setOpen((now) => (now.conversationId === id ? now
+    : { ...now, conversationId: id, visit: now.visit + 1 })), []);
+  // An answer that comes later (a removal known to have happened, a project made, a first message admitted) changes
+  // what is open only in the visit it was asked in: after any choice of the researcher's since, it changes nothing
+  // (design review U). The conversation's view is keyed by the visit, so no answer draws the message box again.
+  const answered = (change) => setOpen((now) => (now.visit === open.visit ? change(now) : now));
   // The lists, through the Library's read (libraryRead.js): shown only when read since the last removal of something
   // they name (a deletion's request settled, a conversation moved), never one asked before it, and nothing old after
   // a read that failed.
@@ -95,7 +104,6 @@ export function Shell({ health, settings, onLanguage }) {
   const [notice, setNotice] = useState(null);
   const [dropping, setDropping] = useState(false); // files are dragged over the window
   const saved = useRef(layout);
-  const shown = useRef(null); // the project shown now: a list read for another is dropped
   const opener = useRef(null); // what opened an overlaid panel, focused again when it closes
 
   const fail = useCallback((error) => {
@@ -133,13 +141,14 @@ export function Shell({ health, settings, onLanguage }) {
   }, [loadConversations]);
 
   useEffect(() => {
-    if (!projectId) return;
+    if (!projectId) return undefined;
     remember(projectId);
-    shown.current = projectId;
-    setPanel('none');
+    setPanel(undefined);
+    let asked = true; // until the project is left: a read asked at an earlier visit decides nothing
     get(`/api/settings?project_id=${encodeURIComponent(projectId)}`)
-      .then((loaded) => shown.current === projectId && setPanel(loaded.values?.ui?.panel ?? 'none'))
+      .then((loaded) => asked && setPanel((now) => now ?? loaded.values?.ui?.panel ?? 'none'))
       .catch(() => {});
+    return () => { asked = false; };
   }, [projectId]);
 
   const saveLayout = useCallback((next) => {
@@ -205,19 +214,22 @@ export function Shell({ health, settings, onLanguage }) {
       problem={conversationsRead.error && errorText(t, conversationsRead.error instanceof ApiError ? conversationsRead.error.code : 'internal')}
       conversationId={conversationId}
       onProject={(id) => { openProject(id); setDrawer(false); }}
-      onProjectCreated={(id) => { openProject(id); projectsRead.reload(); }}
+      onProjectCreated={(id, asked) => {
+        if (asked) answered((now) => ({ projectId: id, conversationId: undefined, visit: now.visit + 1 }));
+        projectsRead.reload();
+      }}
       // A removal's request settled (removed: it is known to be gone; else it may be): nothing the lists read before is
       // shown, and what the researcher removed is left at once, in their own action; what may be there still stays open.
       onProjectDeleted={(id, removed) => {
         removals.projects.move();
         removals.conversations.move();
-        if (removed) setOpen((now) => (now.projectId === id ? { projectId: undefined, conversationId: undefined } : now));
+        if (removed) answered((now) => (now.projectId === id ? { ...now, projectId: undefined, conversationId: undefined } : now));
       }}
       onConversation={(id) => { openConversation(id); setDrawer(false); }}
       onConversationsChanged={loadConversations}
       onConversationRemoved={(id, removed) => {
         removals.conversations.move();
-        if (removed) setOpen((now) => (now.conversationId === id ? { ...now, conversationId: undefined } : now));
+        if (removed) answered((now) => (now.conversationId === id ? { ...now, conversationId: undefined } : now));
       }}
       onNewConversation={newConversation}
       onSettings={() => { setDrawer(false); setSettingsOpen(true); }}
@@ -278,7 +290,7 @@ export function Shell({ health, settings, onLanguage }) {
                   : <p role="status" className="p-3 text-sm text-muted-foreground">{t('common.loading')}</p>}
               </div>
             ) : <ConversationView
-              key={`${projectId}:${conversationId ?? 'new'}`}
+              key={open.visit}
               conversationId={conversationId}
               conversation={conversation}
               projectId={projectId}
@@ -286,7 +298,7 @@ export function Shell({ health, settings, onLanguage }) {
               showSidebarButton={view.narrow || !view.sidebarShown}
               onShowSidebar={showSidebar}
               onPanel={togglePanel}
-              onCreated={(id) => { openConversation(id); loadConversations(); }}
+              onCreated={(id) => { answered((now) => ({ ...now, conversationId: id })); loadConversations(); }}
               onLibrary={() => panel !== 'library' && togglePanel('library')}
             />}
           </div>

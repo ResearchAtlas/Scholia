@@ -236,12 +236,12 @@ export function ConversationView({ conversationId, conversation, projectId, pane
     const current = newestAttach();
     setProblem(null);
     setAttached(null);
+    if (!id) onLibrary?.(); // now, in the researcher's own action, as a drop on the window: no answer opens a panel
     const notes = [];
     const result = await addTo(projectId, files, t, (text) => notes.push(text), id ? { conversationId: id } : {});
     if (result) {
       libraryChanged(projectId);
       notes.unshift(t('conversation.attached', { count: result.materials.length }));
-      if (!id) onLibrary?.();
     }
     const lookup = id && result ? result.lookup_run_id : null;
     if (current()) {

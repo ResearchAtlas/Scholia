@@ -1,0 +1,385 @@
+// Design review U's scenarios (late answers changing a newer selection, panel or read in the window): the real Shell, with
+// its Sidebar and ConversationView, on the stand-in (harness/standin.mjs), every answer released by the scenario, every
+// pause ended by it, no timer running by itself, no sleeps. Each asserts on what the drawn tree says. The helpers are
+// window_lists.test.mjs's, with a stream, a file reader, a window that can be resized and a dialog that can be cancelled.
+import test, { after } from 'node:test';
+import assert from 'node:assert/strict';
+import { loader } from './harness/load.mjs';
+
+const load = await loader();
+after(() => load.close());
+
+const clone = (value) => structuredClone(value);
+function backend(state) {
+  const asked = []; const held = new Set();
+  const response = (status, body) => ({ ok: status < 400, status, json: async () => body });
+  const query = (path) => new URLSearchParams(path.split('?')[1]).get('project_id');
+  globalThis.fetch = (path, init = {}) => {
+    const method = init.method ?? 'GET';
+    const kind = method !== 'GET' ? 'write' : path === '/api/projects' ? 'projects'
+      : path.startsWith('/api/conversations?') ? 'list' : /^\/api\/conversations\/[^/?]+$/.test(path) ? 'conversation'
+        : path.startsWith('/api/asks') ? 'asks' : path.startsWith('/api/settings?') ? 'settings'
+          : path === '/api/settings' ? 'choice' : 'other';
+    const now = () => ({ projects: { projects: clone(state.projects) },
+      list: { conversations: clone(state.conversations[query(path)] ?? []) },
+      conversation: { turns: [], queued: [] }, asks: { asks: [] }, choice: { values: {}, hash: 'h' },
+      settings: { hash: 'h', values: { ui: { panel: state.panels?.[query(path)] ?? 'none' } } },
+    }[kind] ?? { ok: true });
+    if (kind === 'other') return new Promise(() => {});
+    if (method === 'GET' && !held.has(kind)) return Promise.resolve(response(200, now()));
+    return new Promise((resolve) => asked.push({ method, path, kind,
+      answer: (body = now(), status = 200) => resolve(response(status, body)),
+      fail: (code = 'internal', status = 500) => resolve(response(status, { code })),
+      // a turn's stream: these events, and it stays open (the turn runs on)
+      stream: (...events) => resolve({ ok: true, status: 200, body: new ReadableStream({ start(controller) {
+        for (const event of events) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`)); } }) }) }));
+  };
+  globalThis.FileReader = class { readAsDataURL(file) { this.result = `data:;base64,${file.data ?? ''}`; queueMicrotask(() => this.onload()); } };
+  const timers = new Map(); let timer = 0; // no timer runs by itself: pause() lets every pause asked for so far end
+  globalThis.setTimeout = (fn) => { timers.set(++timer, fn); return timer; }; globalThis.clearTimeout = (id) => { timers.delete(id); };
+  globalThis.setInterval = () => 0; globalThis.clearInterval = () => {};
+  globalThis.requestAnimationFrame = () => 0;
+  const listeners = new Set();
+  globalThis.window = { addEventListener(type, fn) { if (type === 'resize') listeners.add(fn); }, removeEventListener(type, fn) { listeners.delete(fn); },
+    innerWidth: state.width ?? 1400 };
+  globalThis.document = { addEventListener() {}, removeEventListener() {}, getElementById: () => null };
+  const store = new Map();
+  globalThis.localStorage = { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, v) };
+  return { asked, pause: () => { const due = [...timers.values()]; timers.clear(); due.forEach((fn) => fn()); }, hold: (kind) => held.add(kind), free: (kind) => held.delete(kind),
+    resize: (width) => { globalThis.window.innerWidth = width; [...listeners].forEach((fn) => fn()); },
+    next: (test) => { const i = asked.findIndex(test); if (i < 0) throw new Error('nothing asked'); return asked.splice(i, 1)[0]; } };
+}
+
+async function world({ mount, jsx }, strict, state, before = () => {}) {
+  const server = backend(state);
+  before(server);
+  const { Shell } = await load.component('Shell');
+  const ui = await mount([jsx(Shell, { health: {}, settings: { values: {} }, onLanguage() {} })], { strict }).settle();
+  const off = (x) => x.type === 'drawer:Root' && !x.props.open; // the drawer's copy of the sidebar, closed
+  const elements = () => { const out = []; const stack = [];
+    for (const h of ui.hosts()) {
+      if (h.props) { const e = { type: h.type, props: h.props, text: [], up: [...stack] }; out.push(e); stack.push(e); }
+      else if (h.end) stack.pop(); else for (const e of stack) e.text.push(h.text);
+    }
+    return out.map((e) => ({ ...e, text: e.text.join(' ') })).filter((e) => ![e, ...e.up].some(off)); };
+  const hidden = (e) => [e, ...e.up].some((x) => (x.type === 'ui:Dialog' && !x.props.open) || x.type === 'ui:DropdownMenuContent');
+  const act = async (fn) => { fn(); await ui.settle(); };
+  const one = (found, what) => { if (found.length !== 1) throw new Error(`${what}: ${found.length} found`); return found[0]; };
+  const dialogs = () => elements().filter((e) => e.type === 'ui:Dialog' && e.props.open);
+  const api = {
+    ui, server, elements, dialogs,
+    screen: () => { const out = []; const stack = [];
+      for (const h of ui.hosts()) {
+        if (h.props) stack.push(h); else if (h.end) stack.pop();
+        else if (!stack.some((x) => off(x) || (x.type === 'ui:Dialog' && !x.props.open) || x.type === 'ui:DropdownMenuContent')) out.push(h.text);
+      }
+      return out.join(' '); },
+    selected: () => elements().filter((e) => e.type === 'button' && e.props['aria-current'] === 'page').map((e) => e.text.trim()),
+    draft: () => one(elements().filter((e) => e.type === 'textarea'), 'message box').props.value,
+    box: () => elements().filter((e) => e.type === 'textarea').length,
+    type: (value) => act(() => one(elements().filter((e) => e.type === 'textarea'), 'message box').props.onChange({ target: { value } })),
+    send: () => act(() => { one(elements().filter((e) => e.type === 'form' && !e.up.some((x) => x.type === 'ui:Dialog')), 'message form').props.onSubmit({ preventDefault() {} }); }),
+    attach: (...files) => act(() => one(elements().filter((e) => e.props['data-testid'] === 'composer-files'), 'files').props.onChange({ target: { files, value: '' } })),
+    pressed: (label) => elements().filter((e) => e.type === 'ui:Button' && e.props['aria-pressed'] === true && e.text.includes(label)).length === 1,
+    panel: (label) => act(() => one(elements().filter((e) => e.type === 'ui:Button' && 'aria-pressed' in e.props && e.text.includes(label)), label).props.onClick({ currentTarget: null })),
+    open: (title) => act(() => one(elements().filter((e) => e.type === 'button' && e.props.onClick && e.text.trim() === title && e.up.some((x) => x.type === 'ul')), title).props.onClick()),
+    menu: (title, item) => act(() => one(elements().filter((e) => e.type === 'ui:DropdownMenuItem' && e.text.trim() === item && e.up.some((x) => x.type === 'li' && x.text.join(' ').includes(title))), `${title}: ${item}`).props.onSelect()),
+    projectMenu: (item) => act(() => one(elements().filter((e) => e.type === 'ui:DropdownMenuItem' && item.test(e.text.trim())), String(item)).props.onSelect()),
+    newConversation: () => act(() => elements().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'New conversation')[0].props.onClick()),
+    field: (id, value) => act(() => one(elements().filter((e) => e.type === 'ui:Input' && e.props.id === id && !hidden(e)), id).props.onChange({ target: { value } })),
+    fieldValue: (id) => elements().filter((e) => e.type === 'ui:Input' && e.props.id === id && !hidden(e)).map((e) => e.props.value)[0],
+    submit: (label) => act(() => { one(elements().filter((e) => e.type === 'form' && !hidden(e) && e.up.some((x) => x.type === 'ui:Dialog')), label).props.onSubmit({ preventDefault() {} }); }),
+    // Cancel, as the researcher can: the button if it is enabled, then Escape (the dialog's own closing). Whether it closed.
+    cancel: async () => {
+      const [dialog] = dialogs(); if (!dialog) throw new Error('no dialog open');
+      const button = elements().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Cancel' && !hidden(e) && !e.props.disabled)[0];
+      await act(() => { if (button) button.props.onClick(); });
+      if (dialogs().length) await act(() => dialogs()[0].props.onOpenChange(false));
+      return dialogs().length === 0;
+    },
+    release: (request, how = (r) => r.answer()) => act(() => how(request)),
+    releaseAll: async (test, how = (r) => r.answer()) => { while (server.asked.some(test)) await api.release(server.next(test), how); },
+    act,
+  };
+  return api;
+}
+
+const P1 = { id: 'p1', name: 'Project Alpha', kind: 'research' };
+const P2 = { id: 'p2', name: 'Project Beta', kind: 'research' };
+const P3 = { id: 'p3', name: 'Project Gamma', kind: 'research' };
+const conv = (id, title) => ({ id, title, running: false });
+const start = () => ({ projects: [P1, P2], conversations: { p1: [conv('a', 'Title Alpha'), conv('b', 'Title Bravo'), conv('c', 'Title Charlie')], p2: [conv('z', 'Title Zulu')] } });
+const writes = (method, part = '') => (r) => r.method === method && r.path.includes(part);
+const lists = (r) => r.kind === 'list';
+const DRAFT = 'UNSENT-CANARY-DRAFT';
+const file = (name) => ({ name, size: 10, data: 'eA==' });
+const moveTo = async (s, title, target) => {
+  await s.menu(title, 'Move');
+  await s.act(() => s.elements().filter((e) => e.type === 'input' && e.props.type === 'radio' && e.props.value === target)[0].props.onChange());
+  await s.submit('move');
+};
+
+const scenarios = {
+  // r2-1 finding 1: A is moved to the other project and the answer is late; A is opened there and a message typed; the
+  // answer comes: A stays open there, with what was typed. (Behind the dialog when it cannot be cancelled: the stand-in
+  // calls handlers a modal dialog would cover, so the handler itself is what is tested.)
+  async aMoveAnsweredLateLeavesWhatWasOpenedSince(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await moveTo(s, 'Title Alpha', 'p2');
+    state.conversations.p1 = state.conversations.p1.filter((c) => c.id !== 'a'); state.conversations.p2 = [conv('z', 'Title Zulu'), conv('a', 'Title Alpha')];
+    await s.cancel();
+    await s.projectMenu(/^Project Beta$/);
+    await s.open('Title Alpha'); await s.type(DRAFT);
+    await s.release(s.server.next(writes('POST', '/move')));
+    assert.deepEqual(s.selected(), ['Title Alpha']);
+    assert.equal(s.box() && s.draft(), DRAFT);
+  },
+  // The same answer after A was moved back and opened again where it was: a later visit of the same conversation in the
+  // same project is not the one the move was asked in.
+  async aMoveAnsweredAfterItWasMovedBackLeavesIt(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await moveTo(s, 'Title Alpha', 'p2');
+    const first = s.server.next(writes('POST', '/move'));
+    state.conversations.p1 = state.conversations.p1.filter((c) => c.id !== 'a'); state.conversations.p2 = [conv('z', 'Title Zulu'), conv('a', 'Title Alpha')];
+    await s.cancel();
+    await s.projectMenu(/^Project Beta$/);
+    await s.open('Title Alpha');
+    await moveTo(s, 'Title Alpha', 'p1');
+    state.conversations.p2 = [conv('z', 'Title Zulu')]; state.conversations.p1 = [conv('b', 'Title Bravo'), conv('c', 'Title Charlie'), conv('a', 'Title Alpha')];
+    await s.release(s.server.next(writes('POST', '/move')));
+    await s.projectMenu(/^Project Alpha$/);
+    await s.open('Title Alpha'); await s.type(DRAFT);
+    await s.release(first);
+    assert.deepEqual(s.selected(), ['Title Alpha']);
+    assert.equal(s.box() && s.draft(), DRAFT);
+  },
+  // r2-1 finding 2: a new project is asked for and the answer is late; another project is opened and a message typed;
+  // the answer comes: what is open stays open, with what was typed, and the new project is listed.
+  async aNewProjectAnsweredLateOpensNothingOverALaterChoice(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await s.projectMenu(/^New project$/); await s.field('new-project', 'Project Gamma'); await s.submit('new project');
+    await s.cancel();
+    await s.projectMenu(/^Project Beta$/);
+    await s.type(DRAFT);
+    state.projects = [P1, P2, P3];
+    await s.release(s.server.next(writes('POST', '/api/projects')), (r) => r.answer(P3));
+    assert.deepEqual(s.selected(), ['Title Zulu']);
+    assert.equal(s.box() && s.draft(), DRAFT);
+    assert.ok(s.elements().some((e) => e.type === 'ui:DropdownMenuItem' && e.text.trim() === 'Project Gamma'), 'the new project is listed');
+  },
+  // The same with nothing chosen since, only typed: after a cancel the answer opens nothing and closes no other dialog;
+  // where a request under way keeps its dialog (it cannot be cancelled), nothing can be typed behind it.
+  async aCancelledDialogsAnswerChangesNothingTypedSince(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await s.projectMenu(/^New project$/); await s.field('new-project', 'Project Gamma'); await s.submit('new project');
+    const cancelled = await s.cancel();
+    if (!cancelled) { // the dialog stays while its request is under way, as the delete dialog does
+      state.projects = [P1, P2, P3]; state.conversations.p3 = [];
+      await s.release(s.server.next(writes('POST', '/api/projects')), (r) => r.answer(P3));
+      assert.equal(s.dialogs().length, 0, 'it closes when its request ends');
+      assert.ok(s.screen().includes('Project Gamma'), 'and the new project opens');
+      return;
+    }
+    await s.type(DRAFT);
+    await s.menu('Title Charlie', 'Rename'); await s.field('rename', 'Typed title');
+    state.projects = [P1, P2, P3];
+    await s.release(s.server.next(writes('POST', '/api/projects')), (r) => r.answer(P3));
+    assert.deepEqual(s.selected(), ['Title Alpha']);
+    assert.equal(s.box() && s.draft(), DRAFT);
+    assert.equal(s.fieldValue('rename'), 'Typed title', 'another dialog opened since stays open');
+  },
+  // r2-1 finding 3: a rename is asked in one project and its answer is late; another project is opened; the answer
+  // comes: the open project's list is shown and its first conversation opened, not "Loading…" for good.
+  async aRenameAnsweredLateLeavesTheOpenProjectsListRead(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await s.menu('Title Charlie', 'Rename'); await s.field('rename', 'Renamed'); await s.submit('rename');
+    await s.cancel();
+    s.server.hold('list');
+    await s.projectMenu(/^Project Beta$/);
+    await s.release(s.server.next(writes('PUT')));
+    s.server.free('list'); await s.releaseAll(lists);
+    assert.deepEqual(s.selected(), ['Title Zulu']);
+    assert.equal(s.box(), 1);
+    assert.ok(!s.elements().some((e) => e.type === 'li' && e.props.role === 'status'), 'the list is not loading');
+  },
+  // The other half of the same defect: the list read by an obsolete reload is one project's, kept under another's name;
+  // on going back to that other project it is never shown as its own, and none of its conversations is opened there.
+  async aListReadForOneProjectIsNeverShownAsAnothers(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await s.menu('Title Charlie', 'Rename'); await s.field('rename', 'Renamed'); await s.submit('rename');
+    await s.cancel();
+    s.server.hold('list');
+    await s.projectMenu(/^Project Beta$/);
+    await s.release(s.server.next(writes('PUT')));
+    await s.releaseAll(lists); // every read asked so far answers; reads asked from here on are held
+    await s.projectMenu(/^Project Alpha$/);
+    assert.ok(!s.screen().includes('Title Zulu'), `Project Beta's list under Project Alpha: ${s.screen()}`);
+    assert.ok(!s.selected().includes('Title Zulu'));
+    s.server.free('list'); await s.releaseAll(lists);
+    assert.ok(!s.selected().includes('Title Zulu'), 'after its own list answered');
+    assert.ok(s.screen().includes('Title Alpha') && !s.screen().includes('Title Zulu'));
+  },
+  // r2-2 finding 3, first site: files are attached in a new conversation and the answer is late; another project is
+  // opened and a message typed; the answer comes: that project's panel is as it was.
+  async anAttachAnsweredLateOpensNoPanelElsewhere(w, strict) {
+    const state = { ...start(), panels: { p1: 'none', p2: 'none' } }; const s = await world(w, strict, state);
+    await s.newConversation();
+    await s.attach(file('paper.pdf'));
+    await s.projectMenu(/^Project Beta$/);
+    await s.type(DRAFT);
+    assert.ok(!s.pressed('Library'), 'before the answer');
+    await s.release(s.server.next(writes('POST', '/materials')), (r) => r.answer({ materials: [{ id: 'm1' }], lookup_run_id: null }));
+    assert.ok(!s.pressed('Library'), 'after the answer');
+    assert.equal(s.draft(), DRAFT);
+  },
+  // The same in the conversation it was attached in: the panel chosen since stays.
+  async anAttachAnsweredLateKeepsThePanelChosenSince(w, strict) {
+    const state = { ...start(), panels: { p1: 'none', p2: 'none' } }; const s = await world(w, strict, state);
+    await s.newConversation();
+    await s.attach(file('paper.pdf'));
+    await s.panel('Manuscript');
+    assert.ok(s.pressed('Manuscript'));
+    await s.release(s.server.next(writes('POST', '/materials')), (r) => r.answer({ materials: [{ id: 'm1' }], lookup_run_id: null }));
+    assert.ok(s.pressed('Manuscript') && !s.pressed('Library'));
+  },
+  // Guard (green at the head): files attached in a new conversation open the Library, at the latest when they are added.
+  async anAttachInANewConversationOpensTheLibrary(w, strict) {
+    const state = { ...start(), panels: { p1: 'none', p2: 'none' } }; const s = await world(w, strict, state);
+    await s.newConversation();
+    await s.attach(file('paper.pdf'));
+    await s.release(s.server.next(writes('POST', '/materials')), (r) => r.answer({ materials: [{ id: 'm1' }], lookup_run_id: null }));
+    assert.ok(s.pressed('Library'));
+  },
+  // r2-2 finding 3, second site: the project's settings are read late; a panel is chosen meanwhile; the read answers:
+  // the panel chosen stays.
+  async aSettingsReadAnsweredLateKeepsThePanelChosen(w, strict) {
+    const state = { ...start(), panels: { p1: 'none', p2: 'none' } };
+    const s = await world(w, strict, state, (server) => server.hold('settings'));
+    await s.panel('Library');
+    assert.ok(s.pressed('Library'));
+    await s.releaseAll((r) => r.kind === 'settings' && r.method === 'GET', (r) => r.answer({ hash: 'h', values: { ui: { panel: 'none' } } }));
+    assert.ok(s.pressed('Library'));
+  },
+  // A project left and opened again: the settings read asked at the earlier visit decides nothing at the later one.
+  async aSettingsReadOfAnEarlierVisitDecidesNoPanel(w, strict) {
+    const state = { ...start(), panels: { p1: 'none', p2: 'none' } };
+    const s = await world(w, strict, state, (server) => server.hold('settings'));
+    const earlier = s.server.asked.filter((r) => r.kind === 'settings' && r.path.includes('p1')).length; // StrictMode asks twice
+    const older = Array.from({ length: earlier }, () => s.server.next((r) => r.kind === 'settings' && r.path.includes('p1')));
+    await s.projectMenu(/^Project Beta$/);
+    await s.projectMenu(/^Project Alpha$/);
+    await s.releaseAll((r) => r.kind === 'settings' && r.path.includes('p1')); // the later visit's read: none
+    assert.ok(!s.pressed('Library'));
+    for (const r of older) await s.release(r, (x) => x.answer({ hash: 'h', values: { ui: { panel: 'library' } } }));
+    assert.ok(!s.pressed('Library'), 'after the earlier visit\'s read answered');
+  },
+  // Guard (green at the head): the same two reads answering oldest first: the later visit's read is the one that decides.
+  async aSettingsReadOfAnEarlierVisitAnsweringFirstDecidesNoPanel(w, strict) {
+    const state = { ...start(), panels: { p1: 'none', p2: 'none' } };
+    const s = await world(w, strict, state, (server) => server.hold('settings'));
+    const earlier = s.server.asked.filter((r) => r.kind === 'settings' && r.path.includes('p1')).length;
+    const older = Array.from({ length: earlier }, () => s.server.next((r) => r.kind === 'settings' && r.path.includes('p1')));
+    await s.projectMenu(/^Project Beta$/);
+    await s.projectMenu(/^Project Alpha$/);
+    for (const r of older) await s.release(r, (x) => x.answer({ hash: 'h', values: { ui: { panel: 'library' } } }));
+    await s.releaseAll((r) => r.kind === 'settings' && r.path.includes('p1'));
+    assert.ok(!s.pressed('Library'));
+  },
+  // Guard (green at the head): another conversation opened, or a new one started, begins with an empty message box and
+  // its own turns; what was typed in the one left is not carried over.
+  async anotherConversationOpenedStartsEmpty(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await s.type(DRAFT);
+    await s.open('Title Bravo');
+    assert.deepEqual(s.selected(), ['Title Bravo']);
+    assert.equal(s.draft(), '');
+    await s.type(DRAFT);
+    await s.newConversation();
+    assert.deepEqual(s.selected(), []);
+    assert.equal(s.draft(), '');
+    await s.type(DRAFT);
+    await s.projectMenu(/^Project Beta$/);
+    assert.deepEqual(s.selected(), ['Title Zulu']);
+    assert.equal(s.draft(), '');
+  },
+  // Guard (green at the head): a project's remembered panel opens when its settings are read and nothing was chosen.
+  async aProjectsRememberedPanelOpens(w, strict) {
+    const state = { ...start(), panels: { p1: 'library', p2: 'none' } };
+    const s = await world(w, strict, state, (server) => server.hold('settings'));
+    assert.ok(!s.pressed('Library'));
+    await s.releaseAll((r) => r.kind === 'settings');
+    assert.ok(s.pressed('Library'));
+  },
+  // S's case left ("typed while a new conversation's first message is admitted"): the first message is sent, the next is
+  // typed while the first is admitted, and the admission's answer comes: what was typed is still in the box.
+  async typedWhileAFirstMessageIsAdmittedIsKept(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await s.newConversation();
+    await s.type('First message'); await s.send();
+    await s.release(s.server.next(writes('POST', '/api/conversations')), (r) => r.answer({ id: 'n1' }));
+    await s.type(DRAFT);
+    state.conversations.p1 = [conv('n1', 'Title New'), ...state.conversations.p1];
+    await s.release(s.server.next(writes('POST', '/message/stream')), (r) => r.stream({ type: 'run_started', run_id: 'r1', conversation_id: 'n1', seq: 1 }));
+    assert.deepEqual(s.selected(), ['Title New'], 'the window knows the conversation made');
+    assert.equal(s.draft(), DRAFT);
+  },
+  // Guard (green at the head): a new project is opened when it is made, and a moved open conversation is left.
+  async aNewProjectIsOpenedWhenItIsMade(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await s.projectMenu(/^New project$/); await s.field('new-project', 'Project Gamma'); await s.submit('new project');
+    state.projects = [P1, P2, P3]; state.conversations.p3 = [];
+    await s.release(s.server.next(writes('POST', '/api/projects')), (r) => r.answer(P3));
+    assert.equal(s.dialogs().length, 0);
+    assert.deepEqual(s.selected(), []);
+    assert.equal(s.box(), 1);
+    assert.ok(s.elements().some((e) => e.type === 'button' && e.props['aria-label'] === 'Switch project' && e.text.includes('Project Gamma')), s.screen());
+  },
+  async aMovedOpenConversationIsLeft(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await moveTo(s, 'Title Alpha', 'p2');
+    state.conversations.p1 = state.conversations.p1.filter((c) => c.id !== 'a');
+    await s.release(s.server.next(writes('POST', '/move')));
+    assert.deepEqual(s.selected(), ['Title Bravo']);
+  },
+  // Cases this review leaves under the recommended option, kept as scenarios so they are not found again as new: the
+  // window is narrowed while a move's (or a new project's) request is under way, which takes the Sidebar and its dialog
+  // away; a message is typed; the answer comes.
+  async typedAfterAMovesDialogWentWithTheSidebar(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await moveTo(s, 'Title Alpha', 'p2');
+    state.conversations.p1 = state.conversations.p1.filter((c) => c.id !== 'a');
+    await s.act(() => s.server.resize(800));
+    assert.equal(s.dialogs().length, 0, 'the dialog went with the sidebar');
+    await s.type(DRAFT);
+    await s.release(s.server.next(writes('POST', '/move')));
+    assert.equal(s.box() && s.draft(), DRAFT);
+  },
+  async typedAfterANewProjectsDialogWentWithTheSidebar(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await s.projectMenu(/^New project$/); await s.field('new-project', 'Project Gamma'); await s.submit('new project');
+    await s.act(() => s.server.resize(800));
+    assert.equal(s.dialogs().length, 0, 'the dialog went with the sidebar');
+    await s.type(DRAFT);
+    state.projects = [P1, P2, P3]; state.conversations.p3 = [];
+    await s.release(s.server.next(writes('POST', '/api/projects')), (r) => r.answer(P3));
+    assert.equal(s.box() && s.draft(), DRAFT);
+  },
+};
+
+
+const only = process.env.ONLY ? process.env.ONLY.split(',') : null;
+for (const [name, run] of Object.entries(scenarios)) {
+  if (only && !only.includes(name)) continue;
+  for (const strict of [false, true]) {
+    test(`${name}${strict ? ' (StrictMode)' : ''}`, async () => {
+      const names = ['fetch', 'FileReader', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
+        'requestAnimationFrame', 'window', 'document', 'localStorage'];
+      const kept = Object.fromEntries(names.map((n) => [n, Object.getOwnPropertyDescriptor(globalThis, n)]));
+      try {
+        await run(await load.fresh(), strict);
+      } finally {
+        for (const [n, d] of Object.entries(kept)) { if (d) Object.defineProperty(globalThis, n, d); else delete globalThis[n]; }
+      }
+    });
+  }
+}
