@@ -380,15 +380,18 @@ async def test_a_stop_that_comes_while_the_title_commits_is_told_the_title_was_w
         real = runs_module.Harness._finish_background
 
         def paused_after_the_check(self, conn, active, *args, **kwargs):
+            # the title run only: the turn's memory extraction, another background run, may finish first (CI run
+            # 44790842779, where it took this pause and the title run then met the cancel)
+            title_run = conn.execute("SELECT workflow FROM runs WHERE id = ?", (active.run_id,)).fetchone()[0] == "title"
             running = active.cancel_requested.is_set()
             real(self, conn, active, *args, **kwargs)  # checks, writes the title, then pauses before COMMIT
-            if not running:
+            if title_run and not running:
                 checked.set()
-                resume.wait(5)
+                assert resume.wait(10)
 
         monkeypatch.setattr(runs_module.Harness, "_finish_background", paused_after_the_check)
         await send(client, conversation_id)
-        await asyncio.to_thread(checked.wait, 5)
+        assert await asyncio.to_thread(checked.wait, 10)
         title = await title_run(client)
         cancel = asyncio.create_task(client.post(f"/api/runs/{title}/cancel"))
         await asyncio.sleep(0.1)
