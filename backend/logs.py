@@ -8,6 +8,7 @@ provider's error body. Tests feed canaries through the app and check the log.
 import logging
 import os
 import stat
+import traceback
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -32,6 +33,27 @@ class PrivateRotatingHandler(TimedRotatingFileHandler):
         return open(fd, self.mode, encoding=self.encoding, errors=self.errors)
 
 
+class Formatter(logging.Formatter):
+    """FORMAT, with an exception written as its type and where it was raised, for it and each one it came from, never
+    its message: a library's message can quote stored text, as SQLite's decoding error quotes a record a build before
+    PR 57 stored with half a surrogate pair (the M2 audit's PR 57 rechecks), and the server logs what it answers 500 for."""
+
+    def format(self, record):
+        record = logging.makeLogRecord(record.__dict__)  # a copy, without the full traceback another handler cached on it
+        record.exc_text = None
+        return super().format(record)
+
+    def formatException(self, ei):
+        lines, error, seen = [], ei[1], set()
+        while error is not None and id(error) not in seen:
+            seen.add(id(error))
+            frames = traceback.extract_tb(error.__traceback__)
+            where = f" at {os.path.basename(frames[-1].filename)}:{frames[-1].lineno}" if frames else ""
+            lines.append(f"{type(error).__name__}{where}")
+            error = error.__cause__ or error.__context__
+        return "\n".join(lines)
+
+
 def configure(data_dir, level=logging.INFO) -> logging.Handler:
     """Send the app's log records to <data_dir>/logs/scholia.log. Returns the handler.
     Raises NotADirectoryError when logs/ is not a real folder (a link is never followed)."""
@@ -48,7 +70,7 @@ def configure(data_dir, level=logging.INFO) -> logging.Handler:
             if path.is_file() and not path.is_symlink():
                 os.chmod(path, stat.S_IMODE(path.stat().st_mode) & 0o600)
     handler = PrivateRotatingHandler(folder / "scholia.log")
-    handler.setFormatter(logging.Formatter(FORMAT))
+    handler.setFormatter(Formatter(FORMAT))
     root = logging.getLogger()
     root.addHandler(handler)
     root.setLevel(level)

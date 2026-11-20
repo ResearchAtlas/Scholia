@@ -368,3 +368,54 @@ async def test_no_steering_queued_or_budget_answer_canary_reaches_the_log(tmp_pa
     for canary in ("CANARY-PROMPT", "CANARY-STEERING", "CANARY-QUEUED", "CANARY-EDITED", "CANARY-LIMIT", "CANARY-DISK"):
         assert canary not in text, canary
         assert not any(canary in record.getMessage() for record in caplog.records), canary
+
+
+async def test_an_exception_the_server_logs_is_written_without_its_message(tmp_path):
+    # PR 57's rechecks (astra 1, P2, privacy): a record poisoned before PR 57 (a steering note holding half a surrogate
+    # pair) makes each read of its conversation raise SQLite's decoding error, whose message quotes the stored text, and
+    # the server logs the exception it answers 500 for. Served as the desktop entry serves the app (log_config=None).
+    import socket
+    import sqlite3
+    import threading
+
+    import fastapi
+    import uvicorn
+
+    from network_guard import register_server
+
+    data = tmp_path / "data"
+    data.mkdir()
+    handler = logs.configure(data)
+    app = fastapi.FastAPI()
+
+    @app.get("/api/conversations/poisoned")
+    def poisoned():
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE run_events (data TEXT)")
+        # '{"text":"CANARY-NOTE ' and the three bytes of half a surrogate pair, as a build before PR 57 could store
+        conn.execute("INSERT INTO run_events VALUES (CAST(X'7B2274657874223A2243414E4152592D4E4F544520EDA0BD227D' AS TEXT))")
+        return conn.execute("SELECT data FROM run_events").fetchall()
+
+    try:
+        with socket.create_server(("127.0.0.1", 0)) as sock:
+            host, port = register_server(sock)
+            server = uvicorn.Server(uvicorn.Config(app, loop="asyncio", http="h11", ws="none", lifespan="off",
+                                                   log_config=None, access_log=False))
+            thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+            thread.start()
+            try:
+                for _ in range(200):
+                    if server.started:
+                        break
+                    await asyncio.sleep(0.05)
+                async with httpx.AsyncClient(base_url=f"http://{host}:{port}", timeout=10) as client:
+                    assert (await client.get("/api/conversations/poisoned")).status_code == 500
+            finally:
+                server.should_exit = True
+                await asyncio.to_thread(thread.join, 10)
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    text = (data / "logs" / "scholia.log").read_text()
+    assert "Exception in ASGI application" in text and "OperationalError" in text  # what failed, and where
+    assert "CANARY-NOTE" not in text
