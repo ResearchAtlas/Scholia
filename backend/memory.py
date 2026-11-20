@@ -1072,7 +1072,8 @@ async def create_memory(body: NewRecord, request: Request):
         return _refused(error)
     except sqlite3.IntegrityError as error:  # reading 4: never personal from a Private, Local only or locked project
         return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
-    return await asyncio.to_thread(state["db"].read, lambda conn: row(conn, record))
+    found = await asyncio.to_thread(state["db"].read, lambda conn: row(conn, record))
+    return found if found is not None else _refused(Refused(404, "not_found", "No such record"))  # deleted meanwhile
 
 
 @router.patch("/api/memory/{record_id}")
@@ -1085,6 +1086,10 @@ async def change_memory(record_id: str, body: Change, request: Request):
         content = visible(body.content)
         if content is None:
             return _refused(Refused(400, "empty", "The record is empty"))
+
+    if body.content is None and body.status is None:  # a change of nothing: no edit, and no confirmation (section 8)
+        found = await asyncio.to_thread(state["db"].read, lambda conn: row(conn, record_id))
+        return found if found is not None else _refused(Refused(404, "not_found", "No such record"))
 
     def change(conn):
         _from(conn, record_id, body.project_id)
@@ -1102,11 +1107,14 @@ async def change_memory(record_id: str, body: Change, request: Request):
 
 async def _written(state, change):
     """change(conn) written; the record it gives back read, and its index run asked for (under _to_end); None when it
-    gives none (a proposal marked out of date)."""
+    gives none (a proposal marked out of date). LookupError when a deletion took the record before the reread: it is
+    not there, and nothing of it is to be indexed."""
     record = await asyncio.to_thread(state["db"].write, change)
     if record is None:
         return None
     found = await asyncio.to_thread(state["db"].read, lambda conn: row(conn, record))
+    if found is None:
+        raise LookupError(record)
     await _embed_soon(state, found["project_id"])
     return found
 

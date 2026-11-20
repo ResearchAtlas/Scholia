@@ -163,6 +163,22 @@ async def test_a_record_written_by_any_path_has_a_source(tmp_path):
 # V3, G3: the per-project switch
 
 
+@pytest.mark.parametrize("status", ["inferred", "proposed"])
+async def test_a_change_that_names_only_the_version_changes_nothing(tmp_path, status):
+    # PR 63's first review (pass 1 finding 9): {"version": 1} alone made an inferred decision a confirmed version 2
+    # (section 8's confirmation is the researcher's), and kept a proposal
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        record = await write(client, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use interviews.", status=status,
+            sources=[("project", project)]))
+        before = await rows(client, "SELECT id, version, status, updated_at FROM memory_records ORDER BY id")
+        response = await client.patch(f"/api/memory/{record}", json={"project_id": project, "version": 1})
+        assert response.status_code == 200, response.text
+        assert (response.json()["version"], response.json()["status"]) == (1, status)
+        assert await rows(client, "SELECT id, version, status, updated_at FROM memory_records ORDER BY id") == before
+
+
 async def test_memory_off_stops_extraction_recall_and_things_to_confirm_and_a_command_says_so(tmp_path):
     provider = MockProvider()
     async with started(tmp_path / "data", provider) as client:

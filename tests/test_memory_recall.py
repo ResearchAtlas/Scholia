@@ -807,6 +807,37 @@ async def test_a_project_deleted_between_an_edit_and_its_reread_restarts_no_othe
         assert await _vectors(client, [kept]) == {kept}
 
 
+@pytest.mark.parametrize("site", ["edit", "keep"])
+async def test_a_record_deleted_between_its_edit_and_the_reread_is_not_found_not_an_error(tmp_path, monkeypatch, site):
+    # design review E2's other finding (PR 60's rounds 4 to 7, PR 63's first review pass 1 finding 10): the reread
+    # found no record and _written raised TypeError, a 500
+    from test_search import app
+    async with app(tmp_path) as client:
+        project = await project_of(client, "First")
+        if site == "edit":
+            record = (await entered(client, project, "We use interviews"))["id"]
+        else:
+            record = await write(client, lambda conn: memory.write(
+                conn, project_id=project, scope="project", kind="decision", content="We use interviews",
+                status="proposed", sources=[("project", project)]))
+        await background_idle(client)
+        db, loop, real = client.state["db"], asyncio.get_running_loop(), client.state["db"].write
+
+        def write_then_delete(fn, *args, **kwargs):  # the project, and its records, deleted once the write commits
+            done = real(fn, *args, **kwargs)
+            if getattr(fn, "__name__", "") in ("change", "answer"):
+                asyncio.run_coroutine_threadsafe(client.delete(f"/api/projects/{project}"), loop).result(20)
+            return done
+        monkeypatch.setattr(db, "write", write_then_delete)
+        response = await (client.patch(f"/api/memory/{record}", json={"project_id": project, "version": 1,
+                                                                       "content": "We use surveys"})
+                          if site == "edit" else
+                          client.post("/api/memory/review", json={"project_id": project, "id": record, "action": "keep",
+                                                                  "version": 1}))
+        monkeypatch.setattr(db, "write", real)
+        assert (response.status_code, response.json()["code"]) == (404, "not_found"), response.text
+
+
 async def test_a_memory_write_still_asks_the_general_projects_run_when_its_projects_request_fails(tmp_path, monkeypatch):
     # batch 3: each request on its own, the project's first
     from test_search import app
