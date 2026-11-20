@@ -97,6 +97,7 @@ async function world({ mount, jsx }, strict, state, before = () => {}) {
       if (dialogs().length) await act(() => dialogs()[0].props.onOpenChange(false));
       return dialogs().length === 0;
     },
+    confirmDelete: () => act(() => one(elements().filter((e) => e.type === 'ui:Button' && e.props.variant === 'destructive' && !hidden(e)), 'Delete').props.onClick()),
     release: (request, how = (r) => r.answer()) => act(() => how(request)),
     releaseAll: async (test, how = (r) => r.answer()) => { while (server.asked.some(test)) await api.release(server.next(test), how); },
     act,
@@ -344,6 +345,34 @@ const scenarios = {
   // Cases this review leaves under the recommended option, kept as scenarios so they are not found again as new: the
   // window is narrowed while a move's (or a new project's) request is under way, which takes the Sidebar and its dialog
   // away; a message is typed; the answer comes.
+  // The phase C internal review (F3): each of the three dialogs stays while its request is under way, and says so.
+  async aDialogWhoseRequestIsUnderWayStaysAndSaysSo(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    const stays = async (what, request) => {
+      assert.equal(await s.cancel(), false, `${what}: it stays`);
+      assert.ok(s.screen().includes('Working…'), `${what}: it says so`);
+      await s.release(s.server.next(request));
+    };
+    await s.projectMenu(/^New project$/); await s.field('new-project', 'Project Gamma'); await s.submit('new project');
+    state.projects = [P1, P2, P3]; state.conversations.p3 = [];
+    await stays('New project', writes('POST', '/api/projects'));
+    await s.projectMenu(/^Project Alpha$/);
+    await s.menu('Title Charlie', 'Rename'); await s.field('rename', 'Renamed'); await s.submit('rename');
+    await stays('Rename', writes('PUT'));
+    await moveTo(s, 'Title Bravo', 'p2');
+    await stays('Move', writes('POST', '/move'));
+  },
+  // The phase C internal review (F4): a deletion known to have happened leaves what it removed, though its sidebar went
+  // (the window narrowed during the request): the deleted project is not left open (rider W is for what still exists).
+  async aDeletedOpenProjectIsLeftThoughTheSidebarWent(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    state.projects = [P2]; delete state.conversations.p1;
+    await s.act(() => s.server.resize(800));
+    await s.release(s.server.next(writes('DELETE')));
+    await s.act(() => s.server.resize(1400));
+    assert.deepEqual(s.selected(), ['Title Zulu']);
+  },
   async typedAfterAMovesDialogWentWithTheSidebar(w, strict) {
     const state = start(); const s = await world(w, strict, state);
     await moveTo(s, 'Title Alpha', 'p2');

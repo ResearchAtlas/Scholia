@@ -142,8 +142,10 @@ export function Sidebar({ projects, projectId, conversations, problem, conversat
           // and a project's papers, or a conversation's runs, whose questions the Library lists (a memory change moves
           // no generation)
           libraryChanged(dialog?.kind === 'deleteProject' ? null : projectId);
-          if (dialog?.kind === 'deleteProject') onProjectDeleted(id, deleted && here.current);
-          else onConversationRemoved(id, deleted && here.current);
+          // a deletion known to have happened leaves what it removed even when the sidebar went: nothing of it can be sent
+          // to, and what was typed in it goes with it (design review S); rider W is for what still exists
+          if (dialog?.kind === 'deleteProject') onProjectDeleted(id, deleted);
+          else onConversationRemoved(id, deleted);
         }}
         onDone={() => setDialog(null)} />
     </nav>
