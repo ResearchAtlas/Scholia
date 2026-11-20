@@ -2436,6 +2436,12 @@ async function memoryFlow(ctx) {
     await views.scrollIntoViewIfNeeded(); await page.waitForTimeout(800);
     const row = dialog().getByRole('listitem').filter({ hasText: method });
     await row.getByRole('button', { name: L('memory.forget'), exact: true }).click();
+    const forgetting = page.getByRole('dialog', { name: L('memory.forgetTitle') }); // the delete dialog (M2 audit area 4)
+    await forgetting.waitFor();
+    check('Forget is the delete dialog, with its backup note and Delete everywhere',
+      (await forgetting.innerText()).includes(L('delete.retention'))
+      && await forgetting.getByRole('button', { name: L('delete.everywhere'), exact: true }).count() === 1);
+    await forgetting.getByRole('button', { name: L('common.delete'), exact: true }).click();
     await until('the record forgotten', async () => !(await listed()).some((r) => r.content === method));
     check('it is gone from the API', !(await listed()).some((r) => r.content === method));
     await views.scrollIntoViewIfNeeded();

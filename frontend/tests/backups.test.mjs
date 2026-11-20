@@ -21,6 +21,9 @@ test('a deletion asks for the backups and the trace only when chosen', () => {
   assert.equal(deletePath('project', 'p1', { removeAllTrace: true }), '/api/projects/p1?remove_all_trace=true');
   assert.equal(deletePath('conversation', 'a/b', { everywhere: true, removeAllTrace: true }),
     '/api/conversations/a%2Fb?purge_backups=true&remove_all_trace=true');
+  // M2 audit area 4, item 6: Forget names the version shown
+  assert.equal(deletePath('memory', 'm1', { version: 3 }), '/api/memory/m1?version=3');
+  assert.equal(deletePath('memory', 'm1', { version: 3, everywhere: true }), '/api/memory/m1?version=3&purge_backups=true');
 });
 
 test('a deletion that succeeded says what it could not finish', () => {

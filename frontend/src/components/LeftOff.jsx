@@ -79,7 +79,7 @@ export function LeftOff({ projectId, turn = null }) {
         <div className="grid gap-2">
           <h3 className="text-xs font-medium text-muted-foreground">{t('leftOff.confirm')}</h3>
           <ul className="grid gap-2">
-            {found.to_confirm.map((proposal) => <Proposal key={proposal.id} proposal={proposal}
+            {found.to_confirm.map((proposal) => <Proposal key={proposal.id} proposal={proposal} projectId={projectId}
               onFailed={(failed, id) => setUnsaved((kept) => settled(kept, failed, id))} />)}
           </ul>
         </div>

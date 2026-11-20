@@ -248,3 +248,64 @@ async def test_commands_recognize_english_and_chinese_and_never_a_question():
                     "更新参考文献格式", "保存文件到文献库", "请更新一下我的综述大纲", "记住我偏好简短的回答"):
         assert memory.command(message) is None, message
     assert memory.command("Remember: " + "x" * 1001) is None  # longer than a record holds: not a command
+
+
+async def test_forget_in_the_views_offers_delete_everywhere_including_backups(tmp_path):
+    # M2 audit area 4, item 6 (Fable F4; ticket 18, Retention): Forget is a deletion of the delete dialog, whose
+    # "Delete everywhere including backups" takes a fresh backup and deletes the older ones, as for a paper
+    from datetime import UTC, datetime
+    from test_backup_purge import all_generations, holds
+    secret = "Participant 7 prefers interviews at the clinic"
+    data = tmp_path / "data"
+    async with started(data) as client:
+        project = await project_of(client)
+        kept, purged = [(await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                                 "content": f"{secret} {n}"})).json()["id"]
+                         for n in (1, 2)]
+        for day in range(3):
+            await asyncio.to_thread(client.state["db"].backup, now=datetime(2026, 1, 1 + day, 3, tzinfo=UTC))
+        assert (await forget(client, kept)).json() == {"ok": True}  # Delete: the backups keep it
+        assert any(holds(g, f"{secret} 1") for g in all_generations(data))
+        found = await client.delete(f"/api/memory/{purged}", params={"version": 1, "purge_backups": "true"})
+        assert found.status_code == 200 and found.json()["ok"] is True and found.json()["purged_backups"] >= 3
+        assert not any(holds(g, secret) for g in all_generations(data))
+        [(record,)] = await rows(client, "SELECT data FROM audit_log WHERE event = 'backup_purge'")
+        assert (json.loads(record)["kind"], json.loads(record)["object_id"]) == ("memory", purged)
+        stale = await client.delete(f"/api/memory/{purged}", params={"version": 1, "purge_backups": "true"})
+        assert stale.status_code == 404  # nothing purged for a record not forgotten
+        assert await rows(client, "SELECT count(*) FROM audit_log WHERE event = 'backup_purge'") == [(1,)]
+
+
+async def test_whats_done_takes_no_edit_so_what_is_shown_sent_and_kept_agree(tmp_path):
+    # M2 audit area 4, item 7 (Fable F5, probe C): a progress record is drawn from its count and rewritten by the next
+    # paper, so an edit was neither shown nor kept; it is refused, and the views offer no Edit on it
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await added(client, project, MARKDOWN)
+        await settled(client, project)
+        [done] = [r for r in await records(client, project) if r["type"] == "progress"]
+        refused = await client.patch(f"/api/memory/{done['id']}", json={"project_id": project, "version": done["version"],
+                                                                         "content": "We screened the 2020 cohort papers"})
+        assert (refused.status_code, refused.json()["code"]) == (400, "not_editable")
+        assert await rows(client, "SELECT content, status, version FROM memory_records WHERE type = 'progress'") == [
+            (done["content"], "inferred", done["version"])]
+        lines, _ = await asyncio.to_thread(client.state["db"].read, lambda conn: memory.project_state(conn, project))
+        assert lines == [f"- [done] {done['content']}"]
+
+
+async def test_an_earlier_version_is_never_deleted_alone_and_goes_with_its_head(tmp_path):
+    # design review K's rider R1 (PR 62 batch 2): a superseded version as a deletion's root is refused, whoever asks
+    from backend.db import deletion
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        first = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                         "content": "We use interviews"})).json()["id"]
+        head = (await client.patch(f"/api/memory/{first}", json={"project_id": project, "version": 1,
+                                                                 "content": "We use surveys"})).json()["id"]
+        db, store = client.state["db"], client.state["content"]
+        with pytest.raises(ValueError, match="changed"):
+            await asyncio.to_thread(deletion.delete, db, store, "memory", first)
+        assert sorted(await rows(client, "SELECT content, status FROM memory_records")) == [
+            ("We use interviews", "superseded"), ("We use surveys", "confirmed")]
+        await asyncio.to_thread(deletion.delete, db, store, "memory", head)
+        assert await rows(client, "SELECT count(*) FROM memory_records") == [(0,)]

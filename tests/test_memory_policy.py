@@ -9,6 +9,7 @@ turn at its next paid request. Each test failed before its fix."""
 import asyncio
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -71,6 +72,9 @@ async def test_a_private_projects_restatement_never_confirms_a_personal_proposal
              "span": "i prefer tables about alice", "replaces": ""}]))
         assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", proposal) == [("proposed",)]
         assert await recalled(client, other) == []
+        # nor does its turn become a source that keeps the personal record (the internal review of M2 audit area 4)
+        assert await rows(client, "SELECT source_kind, source_id FROM memory_sources WHERE memory_id = ?", proposal) == [
+            ("project", normal)]
 
 
 async def test_a_late_extraction_never_undoes_a_forget_made_in_another_project(tmp_path):
@@ -764,6 +768,46 @@ async def test_recalled_memory_edited_mid_turn_ends_the_turn_revoked_with_contin
         assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "revoked")
 
 
+@pytest.mark.parametrize("by", ["extraction", "keep"])
+async def test_an_extractions_own_replacement_of_recalled_memory_leaves_the_turn_running_and_a_keep_ends_it(tmp_path, by):
+    # M2 audit area 4, item 5 (Fable F3, probe D): a turn's extraction replacing a record the next turn holds no longer
+    # revokes that turn (it keeps the version it read); the researcher's own Keep of a proposal replacing it still does
+    from cited import cited, with_papers
+    from backend.db import new_id
+    from test_search import WAGES
+    held = {}
+
+    async def replace_then_list(body):
+        def replace(conn):
+            extraction = new_id()
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, status) VALUES (?, ?, 'background',"
+                         " 'memory', '{}', 'succeeded')", (extraction, held["project"]))
+            if by == "extraction":
+                return memory.write(conn, project_id=held["project"], scope="project", kind="decision",
+                                    content="We decided on 35 interviews", status="confirmed", run_id=extraction,
+                                    sources=[("run", extraction)], replaces=held["record"],
+                                    structured={"extracted": True})  # as apply_extraction marks its writes
+            proposal = memory.write(conn, project_id=held["project"], scope="project", kind="decision",
+                                    content="We decided on 35 interviews", status="proposed", run_id=extraction,
+                                    sources=[("run", extraction)], structured={"extracted": True})
+            conn.execute("UPDATE memory_records SET supersedes_id = ? WHERE id = ?", (held["record"], proposal))
+            return memory.keep(conn, proposal, None)
+        await asyncio.to_thread(held["client"].state["db"].write, replace)
+        return steps_reply(provider, [call("list_materials")])
+    provider = Scripted(replace_then_list, "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "We decided on 30 interviews"})).json()["id"]
+        held.update(client=client, record=record, project=project)
+        stream = await send(client, await conversation_in(client, project), "What did we decide last time?")
+        assert "30 interviews" in json.dumps(provider.agent_steps[0])
+        if by == "extraction":
+            assert stream[-1]["status"] == "succeeded" and len(provider.agent_steps) == 2
+        else:
+            assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "revoked")
+
+
 async def test_an_extraction_whose_shown_proposal_was_edited_ends_revoked(tmp_path, monkeypatch):
     provider = MockProvider()
     async with started(tmp_path / "data", provider) as client:
@@ -1049,3 +1093,234 @@ async def test_a_refused_extraction_stopped_by_a_shutdown_before_its_receipt_is_
         assert provider.extractions == []
         assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
             ("cancelled", "revoked")]
+
+
+# M2 audit area 4, item 4 (Fable F2, probes F and G): personal memory is written only from a Normal, unlocked project,
+# judged by the project the request is made from; a stricter project's card and views list no personal proposal.
+@pytest.mark.parametrize("how", ["private", "local_only", "lock"])
+async def test_personal_memory_is_never_edited_confirmed_or_kept_from_a_stricter_projects_views(tmp_path, how):
+    async with started(tmp_path / "data") as client:
+        normal = await project_of(client)
+        strict = await project_of(client, "Strict")
+        record = await personal(client, normal, "I prefer short answers")
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=normal, scope="personal", kind="preference", content="I prefer tables", status="proposed",
+            sources=[("project", normal)]))
+        await tighten(client, strict, how)
+        refused = [
+            await client.patch(f"/api/memory/{record}", json={"project_id": strict, "version": 1,
+                                                               "content": "I prefer tables of participant Alice's data"}),
+            await client.post("/api/memory/review", json={"project_id": strict, "id": proposal, "action": "edit",
+                                                           "version": 1, "content": "Reviewing manuscript 123"}),
+            await client.post("/api/memory/review", json={"project_id": strict, "id": proposal, "action": "keep",
+                                                           "version": 1})]
+        assert [(r.status_code, r.json()["code"]) for r in refused] == [(400, "personal_from_strict")] * 3
+        assert sorted(await rows(client, "SELECT content, status FROM memory_records")) == [
+            ("I prefer short answers", "confirmed"), ("I prefer tables", "proposed")]
+        assert (await client.get(f"/api/projects/{strict}/left-off")).json()["to_confirm"] == []
+        assert (await client.get(f"/api/memory/review?project_id={strict}")).json()["proposals"] == []
+        assert [r["id"] for r in (await client.get(f"/api/memory?project_id={strict}")).json()["personal"]] == [record]
+        # from the Normal project they are listed and may be changed
+        assert [p["id"] for p in (await client.get(f"/api/memory/review?project_id={normal}")).json()["proposals"]] == [
+            proposal]
+        kept = await client.post("/api/memory/review", json={"project_id": normal, "id": proposal, "action": "keep",
+                                                              "version": 1})
+        assert kept.status_code == 200, kept.text
+        edited = await client.patch(f"/api/memory/{record}", json={"project_id": normal, "version": 1,
+                                                                    "content": "I prefer brief answers"})
+        assert edited.status_code == 200 and edited.json()["scope"] == "personal"
+
+
+@pytest.mark.parametrize("by", ["extraction", "researcher"])
+async def test_an_extractions_own_keep_of_a_shown_proposal_is_no_change_at_dispatch(tmp_path, by):
+    # design review K's rider R3 (PR 62 batch 2), restated for design review N's Option 1 (batch 4): a sibling
+    # extraction that held a proposal is refused at dispatch only for a change of the researcher's (here the views'
+    # Keep, memory.edit), never for another extraction's confirmation (apply_extraction, its next version)
+    from test_memory_replacement import _says_as, _turn_and_extraction
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+
+        def steps(conn):
+            proposal = memory.write(conn, project_id=project, scope="project", kind="decision",
+                                    content="We use interviews", status="proposed", sources=[("project", project)],
+                                    structured={"extracted": True})
+            held = {proposal: 1}  # the version the sibling's request held
+            if by == "researcher":
+                memory.edit(conn, proposal, 1)
+            else:
+                _, run = _turn_and_extraction(conn, project, conversation, "We use interviews")
+                memory.apply_extraction(conn, run, [{**_says_as("We use interviews", "confirmed",
+                                                                "we use interviews")[0], "type": "decision"}])
+                # the confirmation happened, as the proposal's next version (the internal review of batch 4)
+                assert conn.execute("SELECT status, version FROM memory_records WHERE id = ?",
+                                    (proposal,)).fetchone() == ("superseded", 1)
+            return memory.allowed(conn, project, [proposal], held)
+        assert await asyncio.to_thread(client.state["db"].write, steps) is (by == "extraction")
+
+
+async def test_any_change_in_place_of_a_held_version_refuses_whoever_wrote_it(tmp_path):
+    # design review N, Option 1: allowed reads no "who" for a held version (R3's exception is gone); a version changed
+    # in place, even of a record marked an extraction's and unstamped, is refused (pins the exception's removal)
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+
+        def steps(conn):
+            record = memory.write(conn, project_id=project, scope="project", kind="decision",
+                                  content="We use interviews", status="proposed", sources=[("project", project)],
+                                  structured={"extracted": True})
+            conn.execute("UPDATE memory_records SET status = 'confirmed', version = 2 WHERE id = ?", (record,))
+            return memory.allowed(conn, project, [record], {record: 1})
+        assert await asyncio.to_thread(client.state["db"].write, steps) is False
+
+
+# PR 62 batch 4 (round 4, astra pass 2; design review N, Option 1): an extraction never changes a record in place, so
+# its confirmation of a proposal the researcher once edited is no change at dispatch for a sibling extraction that held
+# it; any change in place of a held version is the researcher's, and refused.
+def _round_4(conn, project, conversation):
+    """Round 4's history up to B's Forget: a proposal naming A, A edited into B, the proposal edited (out of date,
+    stamped). Returns (the proposal's id, B's id)."""
+    from test_memory_replacement import _turn_and_extraction
+    first = memory.write(conn, project_id=project, scope="project", kind="project_state",
+                         content="The sample is 30 interviews", status="confirmed", sources=[("project", project)])
+    _, run = _turn_and_extraction(conn, project, conversation, "Maybe the sample could be 40 interviews")
+    memory.apply_extraction(conn, run, [{"type": "project_state", "content": "The sample may be 40 interviews",
+                                         "status": "proposed", "span": "", "replaces": first}])
+    [(proposal,)] = conn.execute("SELECT id FROM memory_records WHERE status = 'proposed'").fetchall()
+    second = memory.edit(conn, first, 1, content="The sample is 35 interviews")
+    assert memory.edit(conn, proposal, 1, content="The sample is 40 interviews") is None  # out of date: stays proposed
+    return proposal, second
+
+
+async def _history(client, project, conversation):
+    db, store = client.state["db"], client.state["content"]
+    proposal, second = await asyncio.to_thread(db.write, lambda conn: _round_4(conn, project, conversation))
+    from backend.db import deletion
+    await asyncio.to_thread(deletion.delete, db, store, "memory", second)  # B, and A with it
+    assert await rows(client, "SELECT status, version, supersedes_id FROM memory_records WHERE id = ?", proposal) == [
+        ("proposed", 2, None)]
+    return proposal
+
+
+def _hold(conn, run):
+    """An extraction's request assembled now: its records and their versions registered as _extraction_call does."""
+    found = memory.extraction_input(conn, run)
+    related = found[3]
+    conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.memory_ids', json(?),"
+                 " '$.memory_versions', json(?)) WHERE id = ?",
+                 (json.dumps([r[0] for r in related]), json.dumps({r[0]: r[4] for r in related}), run))
+    return {r[0]: r[4] for r in related}
+
+
+async def test_an_extractions_confirmation_of_a_proposal_once_edited_leaves_a_sibling_holding_it_allowed(tmp_path):
+    from test_memory_replacement import _turn_and_extraction
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        proposal = await _history(client, project, conversation)
+
+        def steps(conn):
+            _, early = _turn_and_extraction(conn, project, conversation, "The sample is 40 interviews")
+            _, late = _turn_and_extraction(conn, project, conversation, "Let us plan the coding")
+            held = _hold(conn, late)
+            assert held[proposal] == 2
+            memory.apply_extraction(conn, early, [{"type": "project_state", "content": "The sample is 40 interviews",
+                                                   "status": "confirmed", "span": "the sample is 40 interviews",
+                                                   "replaces": ""}])
+            told = []
+            return late, runs.may_dispatch(conn, late, revoke=lambda: told.append(1)), told
+        late, dispatched, told = await asyncio.to_thread(client.state["db"].write, steps)
+        assert (dispatched, told) == (True, [])
+        assert await rows(client, "SELECT cancel_reason FROM runs WHERE id = ?", late) == [(None,)]
+        assert sorted(await rows(client, "SELECT status, version, content FROM memory_records"
+                                         " WHERE id = ? OR supersedes_id = ?", proposal, proposal)) == [
+            ("confirmed", 3, "The sample is 40 interviews"), ("superseded", 2, "The sample is 40 interviews")]
+
+
+async def test_a_real_extraction_holding_a_proposal_another_extraction_confirms_is_sent_and_extracted(
+        tmp_path, monkeypatch):
+    # the same ordering through a real extraction: the earlier extraction's confirmation lands between the later one's
+    # assembly and its dispatch; the later turn then reads "Extracted"
+    from test_memory_replacement import _turn_and_extraction
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        proposal = await _history(client, project, conversation)
+        early = await asyncio.to_thread(client.state["db"].write, lambda conn: _turn_and_extraction(
+            conn, project, conversation, "The sample is 40 interviews")[1])
+        dispatch = runs.Harness._call
+
+        async def confirmed_meanwhile(self, *args, **kwargs):  # after the later request was built
+            if sys._getframe(1).f_code.co_name == "_extraction_call":
+                await asyncio.to_thread(client.state["db"].write, lambda conn: (memory.apply_extraction(
+                    conn, early, [{"type": "project_state", "content": "The sample is 40 interviews",
+                                   "status": "confirmed", "span": "the sample is 40 interviews", "replaces": ""}]),
+                    conn.execute("UPDATE runs SET status = 'succeeded' WHERE id = ?", (early,))))
+            return await dispatch(self, *args, **kwargs)
+        monkeypatch.setattr(runs.Harness, "_call", confirmed_meanwhile)
+        extracted(provider)
+        stream = await send(client, conversation, "Let us plan the coding")
+        await background_idle(client)
+        assert len(provider.extractions) == 1
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'"
+                                  " AND source_turn_id = ?", stream[0]["run_id"]) == [("succeeded", None)]
+        [turn] = [t for t in (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+                  if t["run_id"] == stream[0]["run_id"]]
+        assert turn["memory_status"] == "indexed"
+        catalog = json.loads((Path(__file__).resolve().parents[1] / "frontend/src/i18n/en.json").read_text())
+        assert catalog["trace.memoryStatus.indexed"] == "Extracted"
+        assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", proposal) == [("superseded",)]
+
+
+@pytest.mark.parametrize("change", ["edit", "views keep", "save", "held before the researcher's edit"])
+async def test_a_researchers_change_after_an_extraction_held_a_proposal_still_refuses_it(tmp_path, change):
+    # design review N's controls: every change of the researcher's after the hold refuses the holder, the last
+    # one also when an extraction's confirmation follows it (it fails the tempting repair "the extraction's Keep
+    # clears the stamp")
+    from backend.db import deletion
+    from test_memory_replacement import _turn_and_extraction
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        db, store = client.state["db"], client.state["content"]
+        if change != "held before the researcher's edit":
+            def steps(conn):
+                proposal = memory.write(conn, project_id=project, scope="project", kind="decision",
+                                        content="We use interviews", status="proposed", sources=[("project", project)],
+                                        structured={"extracted": True})
+                held = {proposal: 1}
+                if change == "edit":
+                    memory.edit(conn, proposal, 1, content="We use interviews and a survey")
+                elif change == "views keep":
+                    memory.edit(conn, proposal, 1)
+                else:
+                    assert memory.save_command(conn, project_id=project, run_id=None, action="save",
+                                               text="We use interviews")[0] == "saved"
+                return memory.allowed(conn, project, [proposal], held)
+            assert await asyncio.to_thread(db.write, steps) is False
+            return
+
+        def before(conn):
+            first = memory.write(conn, project_id=project, scope="project", kind="project_state",
+                                 content="The sample is 30 interviews", status="confirmed",
+                                 sources=[("project", project)])
+            _, run = _turn_and_extraction(conn, project, conversation, "Maybe the sample could be 40 interviews")
+            memory.apply_extraction(conn, run, [{"type": "project_state", "content": "The sample may be 40 interviews",
+                                                 "status": "proposed", "span": "", "replaces": first}])
+            [(proposal,)] = conn.execute("SELECT id FROM memory_records WHERE status = 'proposed'").fetchall()
+            held = {proposal: 1}  # held before the researcher's edit
+            second = memory.edit(conn, first, 1, content="The sample is 35 interviews")
+            assert memory.edit(conn, proposal, 1, content="The sample is 40 interviews") is None
+            return proposal, second, held
+        proposal, second, held = await asyncio.to_thread(db.write, before)
+        await asyncio.to_thread(deletion.delete, db, store, "memory", second)
+
+        def confirmed(conn):
+            _, early = _turn_and_extraction(conn, project, conversation, "The sample is 40 interviews")
+            memory.apply_extraction(conn, early, [{"type": "project_state", "content": "The sample is 40 interviews",
+                                                   "status": "confirmed", "span": "the sample is 40 interviews",
+                                                   "replaces": ""}])
+            return memory.allowed(conn, project, [proposal], held)
+        assert await asyncio.to_thread(db.write, confirmed) is False
+
