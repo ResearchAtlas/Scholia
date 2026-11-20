@@ -1083,6 +1083,10 @@ def _put_in_place(data_dir, staged, aside, restore_id, audits=(), listed=None, g
     if replaced is not None:  # the backup this restore restores from stays, though that one added it (an ordinary
         # backup, rotated as any; the coordinator's amendment to rider T, PR 63's recheck r2)
         _remove_what_it_added(data_dir, replaced, _generation_folder(data_dir, generation).name if generation else None)
+        # and its journal no longer lists what it added, so its own put back, if this restore fails before its journal
+        # replaces that one, removes nothing more (the phase C internal review, F1)
+        replaced = {k: v for k, v in replaced.items() if k not in ("listed", "generation")}
+        write_private(data_dir / "backups" / JOURNAL, json.dumps(replaced).encode())
     _sync_tree(staged)
     for folder in (aside, aside.parent, staged.parent, staged.parent.parent, data_dir / "backups"):
         _fsync(folder)
@@ -1096,8 +1100,7 @@ def _put_in_place(data_dir, staged, aside, restore_id, audits=(), listed=None, g
         "live": [name for name in SWAPPED if _exists(data_dir / name)],
         "backup": [name for name in SWAPPED if _exists(staged / name)],
         **({"listed": sorted(listed), "generation": generation} if listed is not None else {}),
-        **({"replaced": {k: v for k, v in replaced.items() if k not in ("listed", "generation")}}
-           if replaced is not None else {}),
+        **({"replaced": replaced} if replaced is not None else {}),
     }
     write_private(data_dir / "backups" / JOURNAL, json.dumps(journal).encode())
     _forward(data_dir, journal)

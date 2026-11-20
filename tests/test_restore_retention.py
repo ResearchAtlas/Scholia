@@ -268,11 +268,12 @@ async def test_a_staging_folder_that_cannot_be_listed_rotates_nothing(tmp_path, 
     await asyncio.to_thread(body)
 
 
+@pytest.mark.parametrize("launch", ["finishes", "puts back"])
 @pytest.mark.parametrize("failure", ["before its journal", "after its swap"])
 @pytest.mark.parametrize("second_source", ["migration copy", "safety copy"])
 @pytest.mark.parametrize("first_source", ["file", "automatic"])
 async def test_a_restore_after_one_that_could_not_be_put_back_keeps_the_backup_it_restores(
-        tmp_path, monkeypatch, first_source, second_source, failure):
+        tmp_path, monkeypatch, first_source, second_source, failure, launch):
     # PR 63's recheck r2 (pass 1 F4, pass 2 F2): rider T removed what the unfinished restore added, the backup the second
     # restore restores from included (the first one's backup before its migrations). That one is kept (the
     # coordinator's amendment to T), as an ordinary backup; the safety copy is the control
@@ -313,6 +314,17 @@ async def test_a_restore_after_one_that_could_not_be_put_back_keeps_the_backup_i
         response = await client.post("/api/backups/restore", json={"generation": source})
         assert response.status_code == 500, response.text
         assert source in await listed(client)  # the backup it restores, where it was
-    fail[0] = False
+    fail[0] = launch == "puts back"  # the launch's replay forward commits, or fails and puts the first restore back
     async with started(data, setup=False) as client:  # the launch finishes or undoes what is left: it is kept there too
         assert source in await listed(client)
+
+
+async def test_a_staging_entry_that_links_to_a_restoring_folder_is_a_restore(tmp_path):
+    # The phase C internal review (F2): the guard read a linked staging entry as no restore, where Path.glob followed it;
+    # in the keeping direction, it is one
+    from backend.db.database import RESTORING, STAGING, _restoring
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / RESTORING).mkdir(parents=True)
+    (tmp_path / "backups" / STAGING).mkdir(parents=True)
+    (tmp_path / "backups" / STAGING / "linked").symlink_to(elsewhere, target_is_directory=True)
+    assert _restoring(tmp_path / "backups")

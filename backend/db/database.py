@@ -803,7 +803,7 @@ def _restoring(backups):
     (Path.glob would read it as empty), so the caller rotates nothing (PR 63's recheck r2; design review R)."""
     try:
         with os.scandir(backups / STAGING) as entries:
-            folders = [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
+            folders = [entry.path for entry in entries if entry.is_dir()]  # a linked folder too: keeping is the safe way
     except FileNotFoundError:  # no staging folder: no restore
         return False
     for folder in folders:
