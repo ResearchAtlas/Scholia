@@ -181,6 +181,22 @@ async def test_a_failed_title_call_fails_only_the_title_run(tmp_path):
         assert (found["title"], found["turns"][0]["status"]) == (None, "succeeded")
 
 
+async def test_a_title_reply_holding_half_a_surrogate_pair_ends_its_run_with_the_replacement_character(tmp_path):
+    # PR 57's Fable recheck (P3): a provider's JSON escape gave half a pair, the terminal write could not store it, and
+    # the title run stayed running for good. A model's text gets the replacement character, as a file's text does.
+    provider = MockProvider()
+    provider.title_replies.append((200, b'{"choices": [{"message": {"role": "assistant", "content": "Wage \\ud83d floors"}}],'
+                                        b' "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5,'
+                                        b' "cost": 0.0003}}'))
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        assert (await send(client, conversation_id))[-1]["status"] == "succeeded"
+        await background_idle(client)
+        assert await rows(client, "SELECT status FROM runs WHERE kind = 'background' AND workflow = 'title'") == [
+            ("succeeded",)]
+        assert (await conversation(client, conversation_id))["title"] == "Wage \ufffd floors"
+
+
 # The recovery rules, applied when the app starts
 
 

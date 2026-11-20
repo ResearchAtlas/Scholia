@@ -7,6 +7,8 @@
 import json
 import re
 
+from backend.openrouter import whole_text
+
 from .types import ToolCall
 
 _FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
@@ -38,8 +40,8 @@ class ToolParser:
         if not text.strip():
             return {}
         fenced = _FENCE.match(text)
-        try:
-            value = json.loads(fenced.group(1) if fenced else text)
+        try:  # half a surrogate pair its escapes give is the replacement character (openrouter.whole_text)
+            value = whole_text(json.loads(fenced.group(1) if fenced else text))
         except (ValueError, RecursionError):  # not JSON, or nested past what the parser follows
             return None
         return value if isinstance(value, dict) else None
