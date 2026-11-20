@@ -4,17 +4,16 @@
 // them; every format also shows its passages as text, in order. The cited passage's highlight comes
 // with S1-19's citations; here a passage is highlighted while it is pointed at or focused, and Tab
 // reaches each passage, in the text and on the page.
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { ArrowLeft, FileUp, Trash2 } from 'lucide-react';
-import { useT } from '../i18n/index.js';
+import { LanguageContext, useT } from '../i18n/index.js';
 import { patch } from '../api.js';
-import { useAction } from '../action.js';
+import { problemText, useAction } from '../action.js';
 import { visible } from '../text.js';
 import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPointed, libraryChanged, NOT_POINTED, pageFailedKey, pageImage,
   pageLines, pageOffsets, pagePart, pagesWithin, pageWindow, PAGE_WIDTH, partMove, passOn, PASSAGE_STRETCH, passageStretch, pointing,
   rectStyle, reasonKey, selectedParts, takeSaved, unionRect, validYear, viewOf, waitsOn, withFocus, withNear } from '../library.js';
 import { addTo, Byline, Facts, NoFullText, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
-import { DeleteDialog } from './DeleteDialog.jsx';
 import { revealPassage } from '../search.js'; // S1-17: opened at a search result's passage
 import { Segmented } from './fields.jsx';
 import { Button } from '@/components/ui/button';
@@ -24,19 +23,22 @@ import { cn } from '@/lib/utils';
 
 // index: the project's search index status, for Details (S1-17); target: a search result's passage
 // ({ id, ordinal }), which the text view opens at.
-export function Paper({ material, project, index, target, onBack, onChanged }) {
+// onDelete opens its delete dialog, which the Library keeps above its read of the papers; notice and saved (what its
+// file's replacement and its details' save said) are the Library's too, so they stay as the page is drawn again after
+// the change (M2 audit, area 1, design review F's option 2.2 and rider 1); onAction(kind) starts one and gives its report,
+// which only the latest action of that kind on this paper can use (library.js paperAction).
+export function Paper({ material, project, index, target, onBack, onChanged, onDelete, notice, saved, onAction }) {
   const t = useT();
-  const [deleting, setDeleting] = useState(false);
-  const [notice, setNotice] = useState(null);
   const replace = useRef(null);
   const reason = reasonKey(material.reason);
   const { busy: replacing, run } = useAction(); // one replacement at a time: none finishes after a later choice
 
   function replaceFile(files) {
-    setNotice(null);
+    const report = onAction('notice');
     return run(async () => {
-      if (await addTo(project.id, [...files].slice(0, 1), t, setNotice, { materialId: material.id,
-        replaces: material.version?.id })) onChanged(); // the version shown when the file was chosen
+      if (await addTo(project.id, [...files].slice(0, 1), t, report, { materialId: material.id,
+        replaces: material.version?.id })) libraryChanged(project.id); // the version shown when the file was chosen;
+      // every view showing the paper's text or title reads it again (the Library's listing among them)
     });
   }
 
@@ -53,7 +55,7 @@ export function Paper({ material, project, index, target, onBack, onChanged }) {
           <FileUp aria-hidden="true" />{material.version?.media_type ? t(replacing ? 'paper.replacing' : 'paper.replace')
             : t(replacing ? 'paper.attaching' : 'paper.attach')}
         </Button>
-        <Button variant="ghost" size="sm" className="h-8 text-destructive hover:text-destructive" onClick={() => setDeleting(true)}>
+        <Button variant="ghost" size="sm" className="h-8 text-destructive hover:text-destructive" onClick={onDelete}>
           <Trash2 aria-hidden="true" />{t('common.delete')}
         </Button>
       </div>
@@ -67,30 +69,27 @@ export function Paper({ material, project, index, target, onBack, onChanged }) {
           {material.readable && <ReadAgain material={material} onDone={onChanged} />}
           {notice && <p role="status" className="rounded-md bg-muted px-3 py-2 text-sm">{notice}</p>}
         </header>
-        <Details material={material} onSaved={onChanged} />
+        <Details material={material} saved={saved} onAction={onAction} afterSave={() => libraryChanged(project.id)} />
         <section className="grid gap-2 text-sm">
           <h4 className="font-semibold">{t('paper.about')}</h4>
           <Facts material={material} project={project} index={index} />
         </section>
         {material.extraction && material.version && <Contents key={material.version.id} material={material} target={target} />}
       </div>
-      <DeleteDialog target={deleting ? { kind: 'material', id: material.id, title: t('paper.deleteTitle', { title: material.title }),
-        body: t('paper.deleteBody') } : null}
-        onClose={() => setDeleting(false)}
-        onDone={() => { setDeleting(false); libraryChanged(project.id); onBack(); }} />
     </div>
   );
 }
 
 // The details the researcher may correct; a save is kept as checked by the researcher, so no lookup
-// replaces it, and says it was saved only once the backend has saved it.
-function Details({ material, onSaved }) {
+// replaces it, and says it was saved only once the backend has saved it. saved: what the latest save said, held by the
+// Library (true, or { problem }), so an older save's answer, which draws the page again, never wipes a newer one's.
+function Details({ material, saved, onAction, afterSave }) {
   const t = useT();
+  const language = useContext(LanguageContext);
   const id = useId();
   const before = detailsOf(material);
   const [form, setForm] = useState(before);
-  const [saved, setSaved] = useState(false);
-  const { busy, problem, run } = useAction();
+  const { busy, run } = useAction();
   const shown = useRef(before); // the saved details the form last took
   const key = `${material.id}:${material.updated_at}`;
   useEffect(() => { // newly saved details (a lookup, or this form's save) fill the form, but for the fields being edited
@@ -101,14 +100,20 @@ function Details({ material, onSaved }) {
 
   async function save(event) {
     event.preventDefault();
-    setSaved(false);
-    if (await run(() => patch(`/api/materials/${encodeURIComponent(material.id)}`, body))) {
-      setSaved(true);
-      onSaved();
-    }
+    const report = onAction('saved');
+    await run(async () => {
+      try {
+        await patch(`/api/materials/${encodeURIComponent(material.id)}`, body);
+      } catch (error) {
+        report({ problem: problemText(t, error, language) });
+        return;
+      }
+      report(true);
+      afterSave();
+    });
   }
 
-  const set = (name) => (event) => { setSaved(false); setForm((current) => ({ ...current, [name]: event.target.value })); };
+  const set = (name) => (event) => { if (saved === true) onAction('saved'); setForm((current) => ({ ...current, [name]: event.target.value })); };
   const field = (name, label, control) => (
     <div className="grid gap-1.5">
       <label htmlFor={`${id}-${name}`} className="text-xs font-medium text-muted-foreground">{label}</label>
@@ -130,8 +135,8 @@ function Details({ material, onSaved }) {
         placeholder={t('paper.field.doiPlaceholder')} onChange={set('doi')} />)}
       {!visible(form.title) && <p className="text-xs text-destructive">{t('paper.titleNeeded')}</p>}
       {!validYear(form.year) && <p className="text-xs text-destructive">{t('paper.yearInvalid')}</p>}
-      {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
-      {saved && <p role="status" className="text-sm text-success">{t('paper.saved')}</p>}
+      {saved?.problem && <p role="alert" className="text-sm text-destructive">{saved.problem}</p>}
+      {saved === true && <p role="status" className="text-sm text-success">{t('paper.saved')}</p>}
       <div className="flex gap-2">
         <Button type="submit" size="sm" disabled={busy || invalid || !Object.keys(body).length}>{t('common.save')}</Button>
         <Button type="button" size="sm" variant="ghost" disabled={busy || !Object.keys(body).length}

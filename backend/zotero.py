@@ -33,7 +33,8 @@ archiveID field when it is, whole, "arXiv:" and an ID (Harold, 2026-10-17); neve
 cancelled:
 - an item already imported into the project (keyed by library and item key, `source_key`
   "<library>/items/<KEY>") is updated: its details replaced by the record when they changed and the
-  researcher has not edited them, and a PDF that is none of its files becomes its next version;
+  researcher has not edited them (a Merge's fields kept where the record gives none), and a PDF other than
+  the one Zotero last gave (`zotero_file`) becomes its next version unless it is its current file;
 - a new item that duplicates a paper of the project (S1-14's `references.Duplicates`) is reported
   already there when it would add nothing, else asked about through S1-14's merge run (Keep both
   imports it as its own paper, through a one-item import of its own); a PDF that is already a paper's
@@ -78,6 +79,7 @@ from backend.settings import load_settings
 
 ORIGIN = _show(ZOTERO)
 MAX_ITEMS = 100  # per import (bounded work; the browser says so at the cap)
+UNKNOWN_FILE = "unknown"  # materials.zotero_file of a paper whose last Zotero PDF migration 0013 could not tell
 PAGE = 50  # items per page of the browser
 COLLECTION_PAGES = 50  # of 100 collections each, at most
 MAX_ANSWER = 8 * 1024 * 1024  # one answer's bytes
@@ -682,9 +684,14 @@ def register(harness, content):
         return await _import(harness, active, project_id, inputs, content)
 
     harness.workflows["zotero_import"] = import_run
-    # Its lookup batch closes with its terminal record, however it ends, and is looked up then.
-    harness.endings["zotero_import"] = lambda conn, active, project_id: _close_batch(conn, harness, project_id,
-                                                                                      active.run_id)
+    # Its lookup batch closes with its terminal record, however it ends, and is looked up then; and its item keys,
+    # read only while it runs, go then (M2 audit, area 1: no ended run keeps an identifier of a paper deleted later).
+    def ending(conn, active, project_id):
+        _close_batch(conn, harness, project_id, active.run_id)
+        conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.items', '$.done', '$.papers') WHERE id = ?",
+                     (active.run_id,))
+
+    harness.endings["zotero_import"] = ending
 
 
 class _Ended(Exception):
@@ -750,12 +757,15 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
 
     library = inputs["library"]
     source_key = f"{library}/items/{key}"
-    step = {"key": key, "material_id": None, "outcome": "not_found", "pdf": None, "version": False}
+    # No item key in the event, which outlives a deleted paper: the run's inputs keep the keys, and its deletion
+    # clears its own (backend/db/deletion.py); events name papers by id only (backend/provenance.py).
+    step = {"material_id": None, "outcome": "not_found", "pdf": None, "version": False}
     looked_up = None  # (material, version, record, whether a file came) to look up
     if fetched is not None:
         csl, dropped, sha256, why = fetched
         step.update(pdf=why, left_out=dropped)
-        found = conn.execute("SELECT id, csl, checked_by, lookup_filled, title, evidence_type FROM materials"
+        found = conn.execute("SELECT id, csl, checked_by, lookup_filled, title, evidence_type, merge_filled, zotero_file"
+                             " FROM materials"
                              " WHERE project_id = ? AND source = 'zotero' AND source_key = ?",
                              (project_id, source_key)).fetchone()
         if found is not None:
@@ -778,42 +788,64 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
     if step["outcome"] in ("imported", "updated"):  # the project changed: it comes first in the list, as other imports do
         conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
     _event(conn, run_id, "step_finished", step)
-    conn.execute("UPDATE runs SET inputs = json_set(json_insert(inputs, '$.done[#]', ?), '$.batch', ?) WHERE id = ?",
-                 (key, batch, run_id))
+    now = json.loads(conn.execute("SELECT inputs FROM runs WHERE id = ?", (run_id,)).fetchone()[0])
+    now.update(done=[*(now.get("done") or []), key], batch=batch)
+    if step["material_id"]:  # the paper each item came to (made, updated, or matched), so its deletion takes the key
+        now.setdefault("papers", {}).setdefault(step["material_id"], []).append(key)
+    conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps(now), run_id))
     return step, used
 
 
 def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
     """An item imported before: its details replaced by its record when they changed (and the
-    researcher has not edited them), and its PDF, when it is none of its files, its next version.
+    researcher has not edited them), and its PDF, when it is not the one Zotero last gave nor its current file, its
+    next version.
     Returns (material, version, its record or {}, whether its current version has a file) to look up
     when its details were replaced or a file added, else None."""
-    material, stored, checked_by, filled, title, evidence = found
+    material, stored, checked_by, filled, title, evidence, merge_filled, given = found
     step["material_id"] = material
     changed = False
     own = json.loads(stored or "{}")
     for field in json.loads(filled or "[]"):  # a lookup's fields are not the record's (S1-14's lookup_filled)
         own.pop(field, None)
     if csl is not None and checked_by != "researcher":
-        if own != csl:
+        # A Merge's fields are the researcher's choice (Harold, 2026-10-17, S1-15 questions 3 and 4): kept where the
+        # record gives none, as a Merge fills only what the paper lacks; a field the record now gives is its own.
+        merged = [key for key in json.loads(merge_filled or "[]") if key in own]
+        record = {**{key: own[key] for key in merged}, **csl}
+        still = [key for key in merged if key not in csl]  # a field the record gives now is the record's from now on,
+        # even when it gives the Merge's own value, so a record that drops it later drops it from the paper too
+        if own == record and still != json.loads(merge_filled or "[]"):
+            conn.execute("UPDATE materials SET merge_filled = ? WHERE id = ?", (json.dumps(still) if still else None, material))
+        if own != record:
             changed = True
             # its retraction check and resolution were about the identifier it had: a DOI or an arXiv ID changed or gone
-            moved = reference_files.identifier(own) != reference_files.identifier(csl)
-            conn.execute("UPDATE materials SET title = ?, csl = ?, evidence_type = ?, lookup_filled = NULL, updated_at = ?"
+            moved = reference_files.identifier(own) != reference_files.identifier(record)
+            conn.execute("UPDATE materials SET title = ?, csl = ?, evidence_type = ?, lookup_filled = NULL, merge_filled = ?,"
+                         " updated_at = ?"
                          + (", resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL" if moved else "")
-                         + " WHERE id = ?", (csl["title"], json.dumps(csl), references._evidence(csl, evidence),
-                                            utc_now(), material))
-            if csl["title"] != title:  # the index text carries the title (S1-17)
+                         + " WHERE id = ?", (record["title"], json.dumps(record), references._evidence(record, evidence),
+                                            json.dumps(still) if still else None, utc_now(), material))
+            if record["title"] != title:  # the index text carries the title (S1-17)
                 search.retitled(conn, harness, project_id, material, recorded)
     current = conn.execute("SELECT id, file_sha256 FROM material_versions WHERE material_id = ? AND is_current = 1",
                            (material,)).fetchone()
     version = current[0] if current else None
-    if sha256 is not None and conn.execute("SELECT 1 FROM material_versions WHERE material_id = ? AND file_sha256 = ?",
-                                           (material, sha256)).fetchone() is None:  # one of its files already: none
-        version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF, None, recorded)
-        step["version"] = True
-        # what the old file's lookup gave it goes in add_version (materials._forget_file_lookup)
-    elif sha256 is None and step.get("pdf") and current is not None and current[1] is not None:
+    # Files follow Zotero: its PDF becomes the paper's next version when it is not the one Zotero last gave
+    # (zotero_file: back to an earlier file too, and a first one where Zotero gave none), unless it is the current file
+    # already; while Zotero's is as it was, the researcher's own replacement stays. A paper migration 0013 could not
+    # tell (UNKNOWN_FILE: a file of the researcher's among its versions) goes by the earlier rule once: when the PDF is
+    # none of its files. The PDF read is recorded either way.
+    if sha256 is not None:
+        moved_on = sha256 != given if given != UNKNOWN_FILE else conn.execute(
+            "SELECT 1 FROM material_versions WHERE material_id = ? AND file_sha256 = ?", (material, sha256)).fetchone() is None
+        if moved_on and (current is None or current[1] != sha256):
+            version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF, None, recorded)
+            step["version"] = True
+            # what the old file's lookup gave it goes in add_version (materials._forget_file_lookup)
+        if sha256 != given:
+            conn.execute("UPDATE materials SET zotero_file = ? WHERE id = ?", (sha256, material))
+    elif step.get("pdf") and current is not None and current[1] is not None:
         step["kept"] = True  # its PDF could not be read this time: the paper keeps the file it had
     step["outcome"] = "updated" if changed or step["version"] else "unchanged"
     if not (changed or step["version"]) or version is None:
@@ -852,10 +884,10 @@ def _new(conn, harness, project_id, inputs, key, source_key, csl, sha256, step, 
                                                        "server_id": inputs.get("server_id")}}})
             return None
     material = new_id()
-    conn.execute("INSERT INTO materials (id, project_id, title, csl, source, source_key, evidence_type, proposed_by)"
-                 " VALUES (?, ?, ?, ?, 'zotero', ?, ?, 'researcher')",
+    conn.execute("INSERT INTO materials (id, project_id, title, csl, source, source_key, evidence_type, proposed_by,"
+                 " zotero_file) VALUES (?, ?, ?, ?, 'zotero', ?, ?, 'researcher', ?)",
                  (material, project_id, csl["title"], json.dumps(csl), source_key,
-                  "full_text" if sha256 else references._evidence(csl)))
+                  "full_text" if sha256 else references._evidence(csl), sha256))
     version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF if sha256 else None, None,
                              recorded)
     step.update(outcome="imported", material_id=material, version=sha256 is not None)

@@ -115,7 +115,26 @@ async function upload(projectId, files, { conversationId, materialId, replaces }
 // memoryChanged), and every view, question and read guard drops what it shows and reads again. detail: the project,
 // or null for every project.
 export const libraryEvents = new EventTarget();
-export const libraryChanged = (projectId) => libraryEvents.dispatchEvent(new CustomEvent('changed', { detail: projectId }));
+// M2 audit, area 1 (design review F, option 2.2, pending Harold): a change to the papers moves the papers' generation
+// at once, before any listener runs, and the chosen papers lose their titles in the same step (one may be a deleted
+// paper's), so no holder can miss a change, move its own count late, or show a title from before it. What the Library
+// and the message box show of the papers is read through libraryRead.js, which shows only what was read in the current
+// generation. A memory change moves no generation (memory.js): the Library holds no memory text.
+let generation = 0;
+export const libraryGeneration = () => generation;
+export function watchLibrary(listener) {
+  libraryEvents.addEventListener('changed', listener);
+  return () => libraryEvents.removeEventListener('changed', listener);
+}
+export function libraryChanged(projectId) {
+  generation += 1;
+  const asked = generation;
+  const mine = chosen.papers.length > 0 && (projectId === null || projectId === chosen.projectId);
+  if (mine) choosePapers(chosen.projectId, chosen.papers.map((paper) => ({ id: paper.id, title: null })));
+  libraryEvents.dispatchEvent(new CustomEvent('changed', { detail: projectId }));
+  // A change of another project moves the generation too, so a refresh it leaves unanswered is asked again (batch 3).
+  if (mine || retitling !== null) retitleChosen(asked);
+}
 
 // S1-19b (Harold, 2026-10-21: no client-held derived state): which reads of a view may be shown after library
 // changes. libraryChanged() starts a new generation at once, in the change's own handler; ask() is called as a
@@ -153,6 +172,49 @@ export function watchChosen(listener) {
   return () => libraryEvents.removeEventListener('chosen', listener);
 }
 export const MAX_CHOSEN = 50; // as the backend takes them (backend/app.py Message.material_ids)
+
+// The chosen papers after a change (libraryChanged): those deleted since are dropped and the others take their titles
+// now, from the project's papers read again. A read that fails keeps their ids, untitled (the composer names each "a
+// chosen paper"): dropping them would send the next message unrestricted (slice-1 spec: literature restricted to the
+// selection), and the backend refuses a deleted one (selection_invalid). An answer is applied only in the generation it
+// was asked in, to the papers chosen when it was asked, and only while the same project's papers are chosen.
+let retitling = null; // the generation of the chosen papers' refresh still unanswered or failed, or null
+async function retitleChosen(asked) {
+  const { projectId, papers } = chosen;
+  retitling = papers.length ? asked : null;
+  if (!papers.length) return;
+  const ids = new Set(papers.map((paper) => paper.id));
+  let titles;
+  try {
+    titles = new Map((await get(`/api/projects/${encodeURIComponent(projectId)}/materials`)).materials.map((m) => [m.id, m.title]));
+  } catch {
+    return; // still owed: the next change, of any project, asks again
+  }
+  if (asked !== generation) return; // a newer change asked again
+  retitling = null;
+  if (chosen.projectId !== projectId) return;
+  choosePapers(projectId, chosen.papers.filter((paper) => !ids.has(paper.id) || titles.has(paper.id))
+    .map((paper) => (ids.has(paper.id) ? { ...paper, title: titles.get(paper.id) } : paper)));
+}
+
+// What a paper's own actions said (its file's replacement: 'notice', a text; its details' save: 'saved', true), held by
+// the Library per paper and per kind so it stays as the page is drawn again after the change. paperAction(id, kind,
+// setHeld) starts an action, clearing what that kind said for that paper, and returns its report(value), which changes
+// the feedback only while it is still the latest action of its kind on its paper: one paper's answer never touches
+// another's, and an older action's never overwrites a newer one's (PR 61 recheck rounds 4 and 5). Opening a page clears
+// what is held (the Library's openPaper), not which action is latest. held: { [paper id]: { [kind]: value } }.
+const latestActions = new Map();
+let actions = 0;
+export const paperFeedback = (held, id, kind) => held?.[id]?.[kind] ?? null;
+export function paperAction(id, kind, setHeld) {
+  const action = ++actions;
+  latestActions.set(`${id}\n${kind}`, action);
+  const report = (value) => {
+    if (latestActions.get(`${id}\n${kind}`) === action) setHeld((held) => ({ ...held, [id]: { ...held?.[id], [kind]: value } }));
+  };
+  report(null);
+  return report;
+}
 
 // S1-19b: a cited paper opened at its passage, from an answer's chip: the Library shows it when it is
 // next drawn for its project, or at once when it is open.

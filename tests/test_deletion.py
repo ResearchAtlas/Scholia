@@ -532,6 +532,129 @@ def test_deleting_a_material_removes_its_versions_and_marks_citations_elsewhere(
     assert store.read(x["body"]) == b"tool output p"  # still in a run's record
 
 
+def legacy_folder(data):
+    """A data folder at version 12 holding what builds before migration 0013 wrote: a lookup step's identifier and its
+    question's covers, Zotero steps with item keys (several naming one paper; a not_found and a no_title one naming
+    none; one naming a paper deleted before the upgrade), an ended import's items and done, one under way. Returns ids."""
+    from backend.db.migrations import MIGRATIONS
+    ids = {name: new_id() for name in ("project", "kept", "gone", "lookup", "ended", "running")}
+    with Database(data, migrations=MIGRATIONS[:12]) as old:
+        def legacy(conn):
+            conn.execute("INSERT INTO projects (id, name, kind) VALUES (?, 'Thesis', 'research')", (ids["project"],))
+            conn.execute("INSERT INTO materials (id, project_id, title, source, source_key) VALUES (?, ?, 'P', 'zotero', ?)",
+                         (ids["kept"], ids["project"], "users/0/items/BBBB3333"))
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, status) VALUES (?, ?, 'background',"
+                         " 'lookup', ?, 'succeeded')", (ids["lookup"], ids["project"], json.dumps({"material_ids": [ids["kept"]]})))
+            for run, status, items, done in ((ids["ended"], "succeeded", ["AAAA2222", "BBBB3333", "CCCC4444", "DDDD5555"],
+                                              ["AAAA2222", "BBBB3333", "CCCC4444", "DDDD5555"]),
+                                             (ids["running"], "running", ["EEEE6666", "FFFF7777", "GGGG8888"], ["EEEE6666"])):
+                conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, status) VALUES (?, ?, 'background',"
+                             " 'zotero_import', ?, ?)", (run, ids["project"], json.dumps(
+                                 {"library": "users/0", "items": items, "done": done}), status))
+            events = [(ids["lookup"], "ask", {"ask_id": "a1", "options": ["lookup", "skip"],
+                                               "covers": ["doi:10.5555/gone.1", "doi:10.5555/kept.1"]}),
+                      (ids["lookup"], "step_finished", {"material_id": ids["gone"], "identifier": "doi:10.5555/gone.1",
+                                                        "outcome": "resolved"}),
+                      (ids["lookup"], "step_finished", {"material_id": ids["kept"], "identifier": "doi:10.5555/kept.1",
+                                                        "outcome": "resolved"}),
+                      (ids["lookup"], "step_finished", {"material_id": ids["kept"], "identifier": None, "outcome": "no_identifier"}),
+                      (ids["ended"], "step_finished", {"key": "AAAA2222", "material_id": None, "outcome": "not_found"}),
+                      (ids["ended"], "step_finished", {"key": "BBBB3333", "material_id": ids["kept"], "outcome": "imported"}),
+                      (ids["ended"], "step_finished", {"key": "CCCC4444", "material_id": ids["gone"], "outcome": "already"}),
+                      (ids["ended"], "step_finished", {"key": "DDDD5555", "material_id": None, "outcome": "no_title"}),
+                      (ids["running"], "step_finished", {"key": "EEEE6666", "material_id": ids["gone"], "outcome": "waiting"})]
+            for seq, (run, kind, data_) in enumerate(events):
+                conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, ?, ?)",
+                             (run, seq, kind, json.dumps(data_)))
+        old.write(legacy)
+    return ids
+
+
+def test_migration_0013_takes_every_identifier_earlier_builds_wrote_into_events_and_ended_imports(tmp_path):
+    """Batch 2 (design review F, option 1.1 rule (b), pending Harold; F's tests 3, 5, 7, 8): after the upgrade no event
+    holds a lookup's identifier, a question's covers or a Zotero item key (several steps naming one paper, steps
+    naming none, a paper deleted before the upgrade); an ended import keeps no keys; one under way keeps the items it
+    has not reached; events are append-only again, and a null identifier is left as it was."""
+    data = tmp_path / "data"
+    ids = legacy_folder(data)
+    with Database(data) as db:
+        found = [json.loads(d) for (d,) in db.read(lambda conn: conn.execute("SELECT data FROM run_events ORDER BY seq").fetchall())]
+        assert found == [{"ask_id": "a1", "options": ["lookup", "skip"]},
+                         {"material_id": ids["gone"], "outcome": "resolved"},
+                         {"material_id": ids["kept"], "outcome": "resolved"},
+                         {"material_id": ids["kept"], "identifier": None, "outcome": "no_identifier"},
+                         {"material_id": None, "outcome": "not_found"},
+                         {"material_id": ids["kept"], "outcome": "imported"},
+                         {"material_id": ids["gone"], "outcome": "already"},
+                         {"material_id": None, "outcome": "no_title"},
+                         {"material_id": ids["gone"], "outcome": "waiting"}]
+        inputs = dict(db.read(lambda conn: conn.execute("SELECT id, inputs FROM runs WHERE workflow = 'zotero_import'").fetchall()))
+        assert json.loads(inputs[ids["ended"]]) == {"library": "users/0"}
+        assert json.loads(inputs[ids["running"]]) == {"library": "users/0", "items": ["FFFF7777", "GGGG8888"]}
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            db.write(lambda conn: conn.execute("UPDATE run_events SET data = '{}'"))
+    for text in ("AAAA2222", "CCCC4444", "DDDD5555", "EEEE6666", "10.5555/gone.1", "10.5555/kept.1"):
+        assert text.encode() not in (data / DB_NAME).read_bytes()
+
+
+def test_a_failure_inside_migration_0013_leaves_version_12_with_events_append_only(tmp_path):
+    """Batch 2 (design review F's test 10): 0013 lifts the events' trigger inside its one transaction; a failure after
+    that leaves the database at version 12, its events as they were, and the trigger in place and enforced."""
+    from backend.db.migrations import MIGRATIONS
+    data = tmp_path / "data"
+    legacy_folder(data)
+    with pytest.raises(Exception):
+        Database(data, migrations=MIGRATIONS[:12] + (MIGRATIONS[12] + "\nINSERT INTO no_such_table VALUES (1);\n",))
+    conn = sqlite3.connect(data / DB_NAME)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone() == (12,)
+        assert conn.execute("SELECT count(*) FROM run_events WHERE data LIKE '%AAAA2222%'").fetchone() == (1,)
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("UPDATE run_events SET data = '{}'")
+    finally:
+        conn.close()
+
+
+def test_a_run_a_deletion_revokes_holds_nothing_from_then_on(db, store):
+    """Batch 2 (design review F, option 1.1 rule (a); round 2's held Merge; F's tests 6 and 9): a Merge waiting on a paper
+    holds the incoming record (title, DOI, abstract, a Zotero key); deleting the paper revokes it and takes all it holds
+    in the deletion's transaction, before any terminal write, so a backup taken then holds none of it. The run is still
+    running, revoked, for its owner to end."""
+    project, paper, merge = add_project(db, "Thesis"), new_id(), new_id()
+    held = {"record": {"title": "A Canary Record", "DOI": "10.5555/canary.held", "abstract": "Canary abstract."},
+            "zotero": {"library": "users/0", "items": ["CANARYKEY"]}}
+    db.write(lambda conn: conn.execute("INSERT INTO materials (id, project_id, title, source) VALUES (?, ?, 'P', 'upload')",
+                                       (paper, project)) and conn.execute(
+        "INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', 'merge', ?)",
+        (merge, project, json.dumps({"material_ids": [paper], "matched": "doi", "held": held}))))
+    assert delete(db, store, "material", paper, remove_all_trace=True) == [merge]
+    row = db.read(lambda conn: conn.execute("SELECT status, cancel_reason, inputs FROM runs WHERE id = ?", (merge,)).fetchone())
+    assert row[:2] == ("running", "revoked") and "held" not in json.loads(row[2])
+    assert no_held_after_end(db) == []
+    db.backup(now=datetime.now(UTC))
+    for path in (db.data_dir / "backups").rglob("*"):
+        if path.is_file():
+            assert not any(canary in path.read_bytes() for canary in (b"A Canary Record", b"canary.held", b"CANARYKEY"))
+
+
+def no_held_after_end(db):
+    """The runs that ended or were revoked and still hold something (`held`): [] when none (design review F's test 9)."""
+    return db.read(lambda conn: conn.execute(
+        "SELECT id FROM runs WHERE (status != 'running' OR cancel_reason = 'revoked')"
+        " AND json_type(inputs, '$.held') IS NOT NULL").fetchall())
+
+
+def test_the_papers_delete_dialog_says_what_becomes_of_its_citations():
+    """M2 audit, area 1: the dialog shown before a paper's deletion says what it does (S1-19b, Harold 2026-10-21,
+    option A): answers that drew on the paper keep their text, and their citations keep no quote."""
+    from backend.db.deletion import _SOURCE_REMOVED
+    catalogs = {name: json.loads((Path(__file__).parent.parent / "frontend/src/i18n" / name).read_text())
+                for name in ("en.json", "zh-CN.json")}
+    assert "quote = NULL" in _SOURCE_REMOVED
+    assert catalogs["en.json"]["paper.deleteBody"].endswith("Answers that drew on it keep their text, but their citations keep no quotes.")
+    assert catalogs["zh-CN.json"]["paper.deleteBody"].endswith("用到它的回答会保留正文，但其中的引用不再保留引文。")
+
+
 def test_a_file_shared_with_another_material_keeps_its_extraction(db, store):
     paper = b"the same paper"
     x = populate(db, store, add_project(db, "Thesis"), "p", paper=paper)

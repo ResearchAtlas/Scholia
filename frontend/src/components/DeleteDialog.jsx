@@ -14,8 +14,10 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 // target: { kind: "project", "conversation", "material" or "memory", id, title, body }, or null when closed. A memory
 // record keeps no title in the record of its deletion, so it has no "Remove all trace". onDelete(everywhere), if given,
 // deletes in the dialog's place: the dialog closes at once and the caller owns the outcome, which outlives the dialog
-// (Forget in the memory views keeps it as their actions do, MB1).
-export function DeleteDialog({ target, onClose, onDone, onDelete }) {
+// (Forget in the memory views keeps it as their actions do, MB1). onSettled, if given, is called as soon as the dialog's
+// own deletion request ends, however it ends (deleted, deleted with something to say, or failed: it may have been
+// deleted all the same), before the dialog closes (M2 audit, area 1, design review F's rider 1).
+export function DeleteDialog({ target, onClose, onDone, onDelete, onSettled }) {
   const t = useT();
   const traceId = useId();
   const [removeAllTrace, setRemoveAllTrace] = useState(false);
@@ -35,6 +37,7 @@ export function DeleteDialog({ target, onClose, onDone, onDelete }) {
       return;
     }
     const result = await run(() => api('DELETE', deletePath(target.kind, target.id, { everywhere, removeAllTrace })));
+    onSettled?.(target.id);
     if (!result) return;
     const said = deletionNotices(result);
     if (said.length) setNotices(said); // deleted, but not wholly: say so before it closes

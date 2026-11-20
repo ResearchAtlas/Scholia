@@ -422,6 +422,83 @@ async def test_each_format_is_stored_once_and_read_into_passages(tmp_path, kept_
             p["id"] for p in passages)
 
 
+@pytest.mark.parametrize("stem", ["‮", "​​", " ​ "])
+async def test_a_file_name_with_nothing_visible_before_its_extension_gives_the_whole_name_as_the_title(tmp_path, stem):
+    """M2 audit, area 1: as the details form refuses a title with no visible character (title_needed), a paper
+    added as such a file is titled with its whole name, never an invisible one."""
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, (f"{stem}.md", b"# Notes\n\nSome text.\n")))["materials"]
+        assert (await client.get(f"/api/materials/{paper['id']}")).json()["title"] == f"{stem}.md".strip()  # as named
+
+
+async def test_an_offset_or_page_past_sqlites_integers_is_past_every_passage_never_an_error(tmp_path):
+    """M2 audit, area 1: a very large offset or page (a crafted request; the interface sends none) answers as one
+    past the last passage does: none, the section the passages end in."""
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await added(client, project, ("notes.md", synthetic.paper_markdown()))
+        [ready] = await settled(client, project)
+        path = f"/api/material-versions/{ready['version']['id']}/passages"
+        whole = (await client.get(path)).json()
+        end = (await client.get(path, params={"offset": whole["total"]})).json()
+        assert end["passages"] == [] and end["section"]
+        for params in ({"offset": 2 ** 63}, {"offset": 10 ** 30}, {"page": 2 ** 63}, {"page": -(10 ** 30)},
+                       {"page": 10 ** 30, "offset": 10 ** 30}):
+            response = await client.get(path, params=params)
+            assert response.status_code == 200, (params, response.text)
+            assert response.json()["passages"] == [] and response.json()["total"] == whole["total"]
+            if "page" not in params:
+                assert response.json()["section"] == end["section"]
+
+
+async def test_the_librarys_listing_reads_the_runs_once_however_many_papers_it_lists(tmp_path, monkeypatch):
+    """M2 audit, area 1: the listing (polled every 1.5 s while anything is under way) reads runs and their events in a
+    fixed number of statements, not one or more per paper: each such read scans every run of every project."""
+    from backend.db import new_id
+
+    async def statements(client, project):
+        found, read = [], client.state["db"].read
+
+        def traced(fn):
+            def run(conn):
+                conn.set_trace_callback(found.append)
+                try:
+                    return fn(conn)
+                finally:
+                    conn.set_trace_callback(None)
+            return read(run)
+        monkeypatch.setattr(client.state["db"], "read", traced)
+        try:
+            assert (await client.get(f"/api/projects/{project}/materials")).status_code == 200
+        finally:
+            monkeypatch.setattr(client.state["db"], "read", read)
+        return sum(" runs " in f" {sql} " or "run_events" in sql for sql in found)
+
+    def papers(project, count):
+        def seed(conn):
+            for i in range(count):
+                material, version = new_id(), new_id()
+                conn.execute("INSERT INTO materials (id, project_id, title, source, csl) VALUES (?, ?, ?, ?, '{}')",
+                             (material, project, f"Paper {i}", "zotero" if i % 2 else "upload"))
+                conn.execute("INSERT INTO material_versions (id, material_id, seq, is_current) VALUES (?, ?, 0, 1)",
+                             (version, material))
+                for workflow, inputs in (("extract", {"material_ids": [material], "version_id": version}),
+                                         ("lookup", {"material_ids": [material], "versions": {material: version}})):
+                    run = new_id()
+                    conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, status) VALUES"
+                                 " (?, ?, 'background', ?, ?, 'failed')", (run, project, workflow, json.dumps(inputs)))
+                    conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, 0, 'step_finished', ?)",
+                                 (run, json.dumps({"material_id": material, "outcome": "not_found"})))
+        return seed
+
+    async with started(tmp_path / "data") as client:
+        few, many = await project_of(client, "Few"), await project_of(client, "Many")
+        await asyncio.to_thread(client.state["db"].write, papers(few, 3))
+        await asyncio.to_thread(client.state["db"].write, papers(many, 30))
+        assert await statements(client, few) == await statements(client, many)
+
+
 async def test_the_same_file_is_one_paper_in_a_project_and_shares_its_reading_with_another(tmp_path, kept_queue):
     async with started(tmp_path / "data") as client:
         first, second = await project_of(client, "First"), await project_of(client, "Second")
