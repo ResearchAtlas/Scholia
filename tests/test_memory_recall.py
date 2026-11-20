@@ -638,26 +638,29 @@ def _personal_proposal(project, content="I prefer short answers"):
                                      status="proposed", sources=[("researcher", "views")])
 
 
-@pytest.mark.parametrize("by", ["command", "extraction"])
-async def test_a_personal_proposal_confirmed_from_another_project_gets_its_vector(tmp_path, by):
+@pytest.mark.parametrize("by", ["command", "extraction", "extraction, its project deleted at the ask"])
+async def test_a_personal_proposal_confirmed_from_another_project_gets_its_vector(tmp_path, monkeypatch, by):
     # batch 3 (recheck round 3, pass 2 finding 1): the record keeps the project it was proposed in; the write is in
-    # another project, which asks its own run and the General project's
+    # another project, which asks its own run and the General project's. Under design review N an extraction writes the
+    # proposal's next version in its own project, so its race is that project deleted before the ask (batch 5)
     from cited import Provider, cited
     from test_memory import candidate, extracted
     provider = Provider()
-    if by == "extraction":
+    if by != "command":
         extracted(provider, candidate("I prefer short answers", kind="preference", span="I prefer short answers"))
     async with cited(tmp_path, provider) as client:
         first, second = await project_of(client, "First"), await project_of(client, "Second")
         proposal = await write(client, _personal_proposal(first))
         await background_idle(client, timeout=20)
+        if by != "command" and by != "extraction":
+            monkeypatch.setattr(memory, "_embed_soon", _deleting_on_ask(client, second))
         text = "Remember: I prefer short answers" if by == "command" else "I prefer short answers"
         await send(client, await conversation_in(client, second), text)
         await background_idle(client, timeout=20)
-        # design review N: a command keeps the proposal in place; an extraction writes its next version, in its own project
+        # a command keeps the proposal in place; an extraction writes its next version, which keeps the proposal's source
         [(current, status, owner)] = await rows(client, "SELECT id, status, project_id FROM memory_records"
                                                         " WHERE scope = 'personal' AND status != 'superseded'")
-        assert (status, owner) == (("confirmed", first) if by == "command" else ("confirmed", second))
+        assert (status, owner) == ("confirmed", {"command": first, "extraction": second}.get(by))
         assert (current == proposal) == (by == "command")
         assert await _vectors(client, [current]) == {current}
 
