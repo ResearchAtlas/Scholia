@@ -1087,9 +1087,22 @@ async def change_memory(record_id: str, body: Change, request: Request):
         if content is None:
             return _refused(Refused(400, "empty", "The record is empty"))
 
-    if body.content is None and body.status is None:  # a change of nothing: no edit, and no confirmation (section 8)
-        found = await asyncio.to_thread(state["db"].read, lambda conn: row(conn, record_id))
-        return found if found is not None else _refused(Refused(404, "not_found", "No such record"))
+    if body.content is None and body.status is None:  # a change of nothing: no edit, and no confirmation (section 8);
+        # checked as a change is (where it is made from, the version shown), and the record answered as it is
+        def unchanged(conn):
+            _from(conn, record_id, body.project_id)
+            found = row(conn, record_id)
+            if found is None:
+                raise LookupError(record_id)
+            if found["version"] != body.version or found["status"] == "superseded":
+                raise ValueError("changed")
+            return found
+        try:
+            return await asyncio.to_thread(state["db"].read, unchanged)
+        except LookupError:
+            return _refused(Refused(404, "not_found", "No such record"))
+        except ValueError as error:
+            return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
 
     def change(conn):
         _from(conn, record_id, body.project_id)

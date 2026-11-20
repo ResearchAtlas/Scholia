@@ -179,6 +179,20 @@ async def test_a_change_that_names_only_the_version_changes_nothing(tmp_path, st
         assert await rows(client, "SELECT id, version, status, updated_at FROM memory_records ORDER BY id") == before
 
 
+async def test_a_change_of_nothing_is_checked_as_a_change_is(tmp_path):
+    # PR 63's phase B internal review (P3-5): the version-only PATCH answered 200 with the record whatever its version
+    # and from a Private project, where a change of a personal record is refused
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        personal = (await client.post("/api/memory", json={"project_id": project, "type": "preference",
+                                                           "scope": "personal", "content": "Short answers."})).json()
+        stale = await client.patch(f"/api/memory/{personal['id']}", json={"project_id": project, "version": 99})
+        assert (stale.status_code, stale.json()["code"]) == (409, "version_changed")
+        assert (await client.post(f"/api/projects/{project}/sensitivity", json={"level": "private"})).status_code == 200
+        strict = await client.patch(f"/api/memory/{personal['id']}", json={"project_id": project, "version": 1})
+        assert (strict.status_code, strict.json().get("code")) == (400, "personal_from_strict"), strict.text
+
+
 async def test_memory_off_stops_extraction_recall_and_things_to_confirm_and_a_command_says_so(tmp_path):
     provider = MockProvider()
     async with started(tmp_path / "data", provider) as client:
