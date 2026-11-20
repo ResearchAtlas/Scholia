@@ -315,15 +315,115 @@ def test_artifact_versions_are_deleted_only_together_with_their_artifact(db):
     "INSERT INTO conversations (id, project_id) VALUES (:id, :id)",
     "INSERT INTO runs (id, project_id, kind, attempts) VALUES (:id, :general, 'background', 3)",
     "INSERT INTO memory_records (id, scope, type, content, status) VALUES (:id, 'personal', 'progress', 'x', 'confirmed')",
+    "INSERT INTO materials (id, project_id, source, lookup_filled) VALUES (:id, :general, 'upload', '[\"page\",')",
+    "INSERT INTO materials (id, project_id, source, zotero_file) VALUES (:id, :general, 'zotero', 'not a hash')",
 ], ids=[
     "invalid-json", "invalid-json-csl", "id-not-uuid", "id-uppercase", "id-not-version-4",
     "id-only-hyphens", "id-hyphen-inside-a-group",
     "time-without-zone", "time-with-offset", "time-without-milliseconds",
     "unknown-enum", "strict-type", "missing-foreign-key", "background-attempts", "confirmed-progress",
+    "invalid-json-lookup-filled", "zotero-file-state",
 ])
 def test_the_schema_refuses_invalid_values(db, sql):
     with pytest.raises(sqlite3.IntegrityError):
         db.write(lambda conn: conn.execute(sql, {"id": new_id(), "general": general_id(conn)}))
+
+
+@pytest.mark.parametrize("before", [None, 3, 12], ids=["new", "m1", "m2-before-0013"])
+def test_lookup_filled_is_checked_with_json_valid_on_a_new_and_a_migrated_database(tmp_path, before):
+    """M2 audit, area 1 (section 4.2: JSON columns are checked with json_valid): materials.lookup_filled refuses what
+    is not JSON when written or changed, on a new database and on one migrated from M1's schema (three migrations) or
+    from the one before; a paper written before keeps its value."""
+    data, kept = tmp_path / "data", new_id()
+    if before is not None:
+        with Database(data, migrations=MIGRATIONS[:before]) as old:
+            old.write(lambda conn: conn.execute("INSERT INTO materials (id, project_id, source, title) VALUES"
+                                                " (?, ?, 'upload', 'Kept')", (kept, general_id(conn))))
+            if before >= 6:  # the column came with migration 0006
+                old.write(lambda conn: conn.execute("UPDATE materials SET lookup_filled = '[\"page\"]' WHERE id = ?", (kept,)))
+    with Database(data) as db:
+        if before is None:
+            db.write(lambda conn: conn.execute("INSERT INTO materials (id, project_id, source, title, lookup_filled)"
+                                               " VALUES (?, ?, 'upload', 'Kept', '[\"page\"]')", (kept, general_id(conn))))
+        assert db.read(lambda conn: conn.execute("SELECT title, lookup_filled FROM materials WHERE id = ?", (kept,)).fetchone()) \
+            == ("Kept", None if before == 3 else '["page"]')
+        for sql in ("UPDATE materials SET lookup_filled = '{not json' WHERE id = :kept",
+                    "INSERT INTO materials (id, project_id, source, lookup_filled) VALUES (:id, :general, 'upload', 'x')"):
+            with pytest.raises(sqlite3.IntegrityError):
+                db.write(lambda conn: conn.execute(sql, {"kept": kept, "id": new_id(), "general": general_id(conn)}))
+        db.write(lambda conn: conn.execute("UPDATE materials SET lookup_filled = NULL WHERE id = ?", (kept,)))
+        db.write(lambda conn: conn.execute("UPDATE materials SET lookup_filled = '[]' WHERE id = ?", (kept,)))
+
+
+def test_migration_0013s_backfill_grows_with_the_library_not_its_square(tmp_path):
+    """Batch 1 (review F1): 0013 fills Zotero papers' last file from their import steps in steps that grow with the
+    papers (a lookup by paper), not with papers times steps: it runs as the app opens."""
+    import json
+    from backend.db.migrations import MIGRATIONS
+
+    def steps_for(count):
+        data = tmp_path / str(count)
+        with Database(data, migrations=MIGRATIONS[:12]) as old:
+            def seed(conn):
+                project, run = general_id(conn), new_id()
+                conn.execute("INSERT INTO runs (id, project_id, kind, workflow, status) VALUES (?, ?, 'background',"
+                             " 'zotero_import', 'succeeded')", (run, project))
+                for i in range(count):
+                    material, sha = new_id(), f"{i:064x}"
+                    conn.execute("INSERT INTO content_files (sha256, size, media_type) VALUES (?, 1, 'application/pdf')", (sha,))
+                    conn.execute("INSERT INTO materials (id, project_id, title, source, source_key) VALUES"
+                                 " (?, ?, 'P', 'zotero', ?)", (material, project, f"users/0/items/K{i}"))
+                    conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current) VALUES"
+                                 " (?, ?, 0, ?, 1)", (new_id(), material, sha))
+                    conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, 'step_finished', ?)",
+                                 (run, i, json.dumps({"material_id": material, "outcome": "imported", "version": True})))
+            old.write(seed)
+        conn, counted = sqlite3.connect(data / "scholia.sqlite3"), [0]
+        try:
+            conn.set_progress_handler(lambda: counted.__setitem__(0, counted[0] + 1), 1000)
+            conn.executescript(MIGRATIONS[12])
+            assert conn.execute("SELECT count(*) FROM materials WHERE zotero_file IS NOT NULL").fetchone() == (count,)
+        finally:
+            conn.close()
+        return counted[0]
+
+    assert steps_for(2000) < 30 * steps_for(200)  # ten times the papers: about ten times the work, never a hundred
+
+
+@pytest.mark.parametrize("history, expected", [
+    ("a backward clock", "current"), ("a shared millisecond", "unknown"), ("no file", None), ("imports only", "current")])
+def test_migration_0013_knows_zoteros_last_file_by_count_never_by_time(tmp_path, history, expected):
+    """Design review G, option 1.2 (pending Harold; its tests 5 and 6): 0013 reads no time. Every file version an import
+    made (by count of the import steps that made one): Zotero's last file is the current one, whatever the clocks said
+    (A at :02, B at :01); a file of the researcher's among them, even in the same millisecond as an import: unknown;
+    no file: NULL (Zotero gave none)."""
+    import json
+    from backend.db.migrations import MIGRATIONS
+    data, material = tmp_path / "data", new_id()
+    files = {"a backward clock": [("a", "2026-01-01T00:00:02.000Z", True), ("b", "2026-01-01T00:00:01.000Z", True)],
+             "a shared millisecond": [("a", "2026-01-01T00:00:01.000Z", True), ("c", "2026-01-01T00:00:01.000Z", False)],
+             "no file": [], "imports only": [("a", "2026-01-01T00:00:01.000Z", True)]}[history]
+    with Database(data, migrations=MIGRATIONS[:12]) as old:
+        def seed(conn):
+            project, run = general_id(conn), new_id()
+            conn.execute("INSERT INTO materials (id, project_id, title, source) VALUES (?, ?, 'P', 'zotero')", (material, project))
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, status) VALUES (?, ?, 'background',"
+                         " 'zotero_import', 'succeeded')", (run, project))
+            if not files:
+                conn.execute("INSERT INTO material_versions (id, material_id, seq, is_current) VALUES (?, ?, 0, 1)",
+                             (new_id(), material))
+            for seq, (name, at, imported) in enumerate(files):
+                digest = name * 64
+                conn.execute("INSERT INTO content_files (sha256, size, media_type) VALUES (?, 1, 'application/pdf')", (digest,))
+                conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, created_at)"
+                             " VALUES (?, ?, ?, ?, ?, ?)", (new_id(), material, seq, digest, seq == len(files) - 1, at))
+                if imported:
+                    conn.execute("INSERT INTO run_events (run_id, seq, at, type, data) VALUES (?, ?, ?, 'step_finished', ?)",
+                                 (run, seq, at, json.dumps({"material_id": material, "outcome": "imported", "version": True})))
+        old.write(seed)
+    with Database(data) as db:
+        (found,) = db.read(lambda conn: conn.execute("SELECT zotero_file FROM materials WHERE id = ?", (material,)).fetchone())
+    assert found == (files[-1][0] * 64 if expected == "current" else expected)
 
 
 def test_the_schema_refuses_the_word_now_as_a_time(db):

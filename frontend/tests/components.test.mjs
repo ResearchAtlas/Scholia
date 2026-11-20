@@ -480,3 +480,31 @@ test('focus on the note goes to the view switch when the note goes, every page f
   assert.deepEqual(run(20_000, 20_000, false, 'body'), [[], false]); // focus was not on the note
   assert.deepEqual(run(15_836, 20_000, true, 'body'), [[], true]); // the note still there
 });
+
+// M2 audit, area 1 (no client-held derived state): a paper's new file and its saved details are changes every view hears;
+// its delete dialog is the Library's, above the read, and fires its change when its request settles (design review F's
+// rider 1; the dialog itself: tests/hooks.test.mjs); what the page's save and replacement said is the Library's, so it
+// stays as the page is drawn again after the change.
+test('a paper\'s new file, saved details and deletion are library changes', () => {
+  const paper = source('Paper.jsx');
+  const library = source('Library.jsx');
+  assert.match(paper, /replaces: material\.version\?\.id \}\)\) libraryChanged\(project\.id\);/);
+  assert.match(paper, /afterSave=\{\(\) => libraryChanged\(project\.id\)\}/);
+  assert.doesNotMatch(paper, /DeleteDialog/);
+  assert.match(paper, /onClick=\{onDelete\}/);
+  assert.match(library, /onSettled=\{\(\) => libraryChanged\(project\.id\)\}/);
+  assert.match(library, /saved=\{paperFeedback\(feedback, paper\.id, 'saved'\)\}/);
+  // the one dialog survives the page giving way to the list at the change (batch 2 review F1): keyed, and the last child
+  // of both forms of the panel, so its notice or its error stays on screen
+  assert.match(library, /<DeleteDialog key="delete"/);
+  const forms = [...library.matchAll(/return \(\n\s*<>([\s\S]*?)\n\s*<\/>\n\s*\);/g)].map((m) => m[1].trim());
+  assert.equal(forms.length, 2);
+  for (const form of forms) assert.ok(form.endsWith('{dialog}') && form.split('{dialog}').length === 2, form.slice(0, 80));
+  // and a page's notice and Saved line are not carried to the next page opened (review F2)
+  assert.match(library, /function openPaper\(found\) \{\s*setFeedback\(\{\}\);\s*setOpen\(found\);/);
+  assert.equal([...library.matchAll(/setOpen\(/g)].length, 1); // only through openPaper
+  // a project's deletion in the Sidebar moves the papers' generation (rider 2: a memory change does not)
+  assert.match(source('Sidebar.jsx'), /if \(kind === 'deleteProject'\) libraryChanged\(null\);/);
+  // a chosen paper whose title is being read again (library.js) is named, never blank
+  assert.match(source('ConversationView.jsx'), /chosen\.map\(\(paper\) => \(\{ \.\.\.paper, title: paper\.title \?\? t\('composer\.chosenPaper'\) \}\)\)/);
+});
