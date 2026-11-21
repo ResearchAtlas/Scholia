@@ -598,6 +598,34 @@ async def test_a_replay_whose_put_back_leaves_an_earlier_restore_keeps_the_app_l
         assert backups_module._read_journal(data) is None
 
 
+
+@pytest.mark.parametrize("restores", [2, 3, 4])
+async def test_a_restore_finished_forward_at_a_launch_writes_the_rows_its_journal_carries(tmp_path, monkeypatch, restores):
+    # The third Fable recheck (finding 2, its mutation a6): the launch's forward commit writes the rows a journal carries,
+    # and nothing failed without them. Stacked restores, none finished nor undone; a launch replays the last, cannot
+    # commit it and puts it back onto the one before; the next launch finishes that one forward. The rows: the last
+    # one's back row, then the one before's forward row, each once
+    data = tmp_path / "data"
+    await asyncio.to_thread(older, data, tmp_path / "m1.zip")
+    committing = backups_module._commit_journal
+    faults = Faults(monkeypatch)
+    async with started(data) as client:
+        _, safety, _ = await first_restore(client, tmp_path, faults, migrating=True)
+        ids = [backups_module._read_journal(data)["id"]]
+        for _ in range(restores - 1):
+            faults.back = "entry"
+            await restore(client, (500, "restore_interrupted"), generation=safety)
+            ids.append(backups_module._read_journal(data)["id"])
+    async with started(data, setup=False) as client:  # the last is replayed, cannot commit and is put back
+        assert (await client.get("/api/projects")).json()["code"] == "restore_interrupted"
+        assert backups_module._read_journal(data)["id"] == ids[-2]
+    monkeypatch.setattr(backups_module, "_commit_journal", committing)  # from here a commit works
+    async with started(data, setup=False) as client:  # the one before is replayed and finished forward
+        assert (await client.get("/api/projects")).status_code == 200
+        rows = [(a["id"], a["interrupted"], a["finished"]) for a in await restore_audits(client)]
+        assert rows == [(ids[-1], True, "back"), (ids[-2], True, "forward")]
+        assert backups_module._read_journal(data) is None
+
 async def test_a_crash_after_the_replacing_journal_is_written_removes_at_the_replay_what_the_replaced_restore_added(
         tmp_path, monkeypatch):
     # Option 1's own step: rider T runs from the written journal, in _forward, before the backup's database is in
