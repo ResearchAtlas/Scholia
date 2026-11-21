@@ -18,13 +18,13 @@ window only delays removing what nothing references.
 import collections
 import contextlib
 import hashlib
-from backend import whole_json as json
 import os
 import re
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 
+from backend import whole_json as json
 from backend.db.database import _fsync, _mkdir_private, _refuse_event_loop
 
 IDLE_AFTER = timedelta(hours=1)  # a file added or added again more recently is never collected

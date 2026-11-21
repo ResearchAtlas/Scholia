@@ -21,13 +21,12 @@ caps a candidate at proposed unless the words it rests on are in the researcher'
 an existing record only under section 8's three conditions (`apply_extraction`).
 """
 
-from backend import whole_json as json
 import re
 import unicodedata
 from datetime import UTC, datetime, timedelta
 
+from backend import whole_json as json
 from backend.db import new_id, utc_now
-from backend.openrouter import whole_text
 
 TYPES = ("profile", "project_state", "decision", "event", "preference", "progress", "agent_note")
 PERSONAL_TYPES = ("profile", "preference")
@@ -557,7 +556,7 @@ def parse(text):
     body = (text or "").strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", body, re.S)
     try:  # half a surrogate pair (an escape or raw bytes) is the replacement character (whole_json)
-        found = whole_text(json.loads(fenced.group(1) if fenced else body))
+        found = json.loads(fenced.group(1) if fenced else body)
     except (ValueError, TypeError, RecursionError):
         return None
     if not isinstance(found, dict) or set(found) != {"records"} or not isinstance(found["records"], list) \

@@ -47,7 +47,6 @@ why, and how much of the library meaning search covers.
 """
 
 import asyncio
-from backend import whole_json as json
 import logging
 import re
 import unicodedata
@@ -57,6 +56,7 @@ from pathlib import Path
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
+from backend import whole_json as json
 from backend import asks, local_helper
 from backend.db import DatabaseClosedError, deletion, new_id, utc_now
 from backend.local_helper import EMBEDDING, HelperUnavailable, InputRefused, Refused

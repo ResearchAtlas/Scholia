@@ -24,13 +24,17 @@ def whole_text(value):
 
 
 def loads(source, **options):
-    """json.loads, with half a pair the replacement character. The options go to json.loads; a value they make that
-    JSON cannot write (a Decimal) is kept only while the text is whole (no backend module asks for one here)."""
+    """json.loads, with half a pair the replacement character. The options go to json.loads. When the text holds half a
+    pair or any escape in \\ud800 to \\udfff (a whole pair's too), or comes as bytes, the value is written and read again, so
+    an option that makes a value JSON cannot write (a Decimal, a hook's object) raises TypeError then; no backend module
+    passes one here (outbound_gate keeps json for its hook)."""
     value = json.loads(source, **options)
     return value if isinstance(source, str) and not _MAY_HOLD.search(source) else whole_text(value)
 
 
 def dumps(value, **options):
-    """json.dumps of the value with half a pair the replacement character."""
+    """json.dumps of the value with half a pair the replacement character. When the text holds one, or any escape in
+    \\ud800 to \\udfff, the value is cleaned through JSON first: `default` and `cls` are not used for that, so a value
+    only they can write raises TypeError, and int keys are sorted as text; no backend module passes them here."""
     text = json.dumps(value, **options)
     return text if not _MAY_HOLD.search(text) else json.dumps(whole_text(value), **options)

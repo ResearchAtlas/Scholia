@@ -10,7 +10,6 @@ import asyncio
 import contextlib
 import dataclasses
 import hashlib
-from backend import whole_json as json
 import logging
 import secrets
 import shutil
@@ -30,6 +29,7 @@ from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 
+from backend import whole_json as json
 from backend.json_answer import WholeJSONResponse
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend import backups

@@ -24,9 +24,9 @@ primary commit with the answer.
 """
 
 import hashlib
-from backend import whole_json as json
 import re
 
+from backend import whole_json as json
 from backend import provenance
 from backend.context import MESSAGE_FRAMING, REPLY_FRAMING, count
 from backend.db.deletion import _reads_now

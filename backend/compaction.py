@@ -29,8 +29,8 @@ only in its own turn (agent.Turn.outputs); the output goes with the turn's run, 
 in the deletion's own transaction.
 """
 
-from backend import whole_json as json
 
+from backend import whole_json as json
 from backend import context, provenance
 
 SUMMARY_SLOT = 3000  # run_bodies keeps a compaction step's summary under this attempt number

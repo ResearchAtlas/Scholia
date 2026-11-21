@@ -18,9 +18,10 @@ recorded in `cuts`, for the step's trace. Tokens are counted with `count`, a con
 estimate, since AAB has no route's own tokenizer.
 """
 
-from backend import whole_json as json
 import math
 from dataclasses import dataclass, field
+
+from backend import whole_json as json
 
 MIN_OUTPUT = 1024  # the smallest output limit a step has
 MESSAGE_FRAMING = 8  # tokens a message's role and template take, counted generously

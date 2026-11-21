@@ -22,10 +22,10 @@ result or fallback, the evidence selected, the mode and why, and the time each s
 """
 
 import asyncio
-from backend import whole_json as json
 import time
 import unicodedata
 
+from backend import whole_json as json
 from backend import citations, context, search
 from backend.search_index import readings
 from backend.settings import load_settings, visible

@@ -16,10 +16,10 @@ not stay in old WAL frames, and unreferenced content files are collected.
 """
 
 import contextlib
-from backend import whole_json as json
 import logging
 import weakref
 
+from backend import whole_json as json
 from backend import provenance
 from backend.db.content import referenced_sql
 from backend.extraction import EXTRACTORS, extractor_of

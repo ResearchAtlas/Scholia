@@ -31,7 +31,6 @@ import asyncio
 import contextlib
 import errno
 import hashlib
-from backend import whole_json as json
 import logging
 import math
 import os
@@ -51,6 +50,7 @@ from fastapi import APIRouter, Request
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
+from backend import whole_json as json
 from backend.json_answer import WholeJSONResponse
 from backend.db import DatabaseClosedError
 from backend.outbound_gate import MODEL_FILE_HOSTS, OutboundDenied
@@ -459,7 +459,8 @@ class Helper:
         try:
             async with await self.local.client(project_id, timeout=REQUEST_TIMEOUT,
                                                **({"admit": admit} if admit is not None else {})) as http:
-                response = await http.post(url + path, json=body, headers={"Authorization": f"Bearer {key}"})
+                response = await http.post(url + path, content=json.dumps(body, separators=(",", ":")).encode(),
+                                           headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
             if response.status_code != 200:
                 raise InputRefused() if 400 <= response.status_code < 500 and response.status_code not in _UNAVAILABLE \
                     else HelperUnavailable("request_failed")

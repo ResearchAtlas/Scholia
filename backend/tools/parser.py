@@ -4,12 +4,12 @@
 # JSON object, a Markdown fence around it allowed as before; nothing it reads is logged (section 1.5).
 """Reading the model's tool calls."""
 
-from backend import whole_json as json
 import re
 
-from backend.openrouter import whole_text
 
 from .types import ToolCall
+
+from backend import whole_json as json
 
 _FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
 
@@ -41,7 +41,7 @@ class ToolParser:
             return {}
         fenced = _FENCE.match(text)
         try:  # half a surrogate pair (an escape or raw bytes) is the replacement character (whole_json)
-            value = whole_text(json.loads(fenced.group(1) if fenced else text))
+            value = json.loads(fenced.group(1) if fenced else text)
         except (ValueError, RecursionError):  # not JSON, or nested past what the parser follows
             return None
         return value if isinstance(value, dict) else None

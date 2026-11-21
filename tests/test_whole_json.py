@@ -17,48 +17,78 @@ KEEPS_JSON = {
     "reading.py": "a reading child's frame holding half a pair is refused (reference_files.valid), not cleaned",
     "outbound_gate.py": "the body it checks is the body sent, as it is",
     "self_test.py": "the self-test's own requests and answers, outside the product",
+    "data_folder.py": "its one record, the chosen folder's path, round-trips the file system's bytes as they are",
 }
-# the .json() decodes of an HTTP answer left as they are, by module and function, and why
-DECODES = {
-    ("app.py", "_valid_text"): "refuses a request body holding half a pair",
-    ("openrouter.py", "_json"): "through whole_text",
-    ("local_helper.py", "_post"): "the local helper's numbers: cleaning would encode every vector again",
-    ("endpoint_pricing.py", "fetch_endpoints"): "no caller in the product",
-    ("self_test.py", "check_backend"): "the self-test's own answers, outside the product",
-    ("self_test.py", "drive"): "the self-test's own answers, outside the product",
+# JSON decoded, encoded or answered outside those two places, by module and function, and why
+LEFT = {
+    (".json()", "app.py", "_valid_text"): "refuses a request body holding half a pair",
+    (".json()", "openrouter.py", "_json"): "through whole_text",
+    (".json()", "local_helper.py", "_post"): "the local helper's numbers: cleaning would encode every vector again",
+    (".json()", "endpoint_pricing.py", "fetch_endpoints"): "no caller in the product",
+    ("application/json", "answers.py", "body"): "a stored outbound body served as the bytes that were sent (ASCII)",
 }
+OTHER_JSON = {"orjson", "simplejson", "ujson", "rapidjson"}
 
 
 def modules():
     return sorted(BACKEND.rglob("*.py"))
 
 
+def uses(tree):
+    """(what, enclosing function) for each way the module touches JSON outside whole_json and the answer class."""
+    found = []
+
+    def visit(node, function):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            function = node.name
+        if isinstance(node, ast.Import):
+            found.extend(("import", alias.name) for alias in node.names
+                         if alias.name.split(".")[0] in {"json", *OTHER_JSON})
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in {"json", *OTHER_JSON}:
+            found.append(("import", node.module))
+        if isinstance(node, ast.Name) and node.id == "JSONResponse" or isinstance(node, ast.Attribute) and \
+                node.attr == "JSONResponse" or isinstance(node, ast.alias) and node.name == "JSONResponse":
+            found.append(("JSONResponse", function))
+        if isinstance(node, ast.Call):
+            if getattr(node.func, "attr", None) in ("json", "model_dump_json"):
+                found.append((f".{node.func.attr}()", function))
+            if getattr(node.func, "attr", getattr(node.func, "id", None)) == "import_module" and node.args and \
+                    isinstance(node.args[0], ast.Constant) and str(node.args[0].value).split(".")[0] in {"json", *OTHER_JSON}:
+                found.append(("import", node.args[0].value))
+            for keyword in node.keywords:
+                if keyword.arg == "json":  # httpx encodes it with the standard library
+                    found.append(("json=", function))
+                if keyword.arg == "media_type" and getattr(keyword.value, "value", None) == "application/json":
+                    found.append(("application/json", function))
+        for child in ast.iter_child_nodes(node):
+            visit(child, function)
+
+    visit(tree, "<module>")
+    return found
+
+
 def test_no_backend_module_uses_json_or_a_json_answer_but_through_the_ones_that_keep_text_whole():
-    imports, answers, decodes, apps = [], [], [], []
+    imports, answers, other, apps = [], [], set(), []
     for path in modules():
         name = path.relative_to(BACKEND).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import) and any(alias.name == "json" for alias in node.names) \
-                    or isinstance(node, ast.ImportFrom) and node.module == "json":
-                if name not in KEEPS_JSON:
-                    imports.append(name)
-            if isinstance(node, ast.Name) and node.id == "JSONResponse" \
-                    or isinstance(node, ast.alias) and node.name == "JSONResponse":
+        for what, where in uses(tree):
+            if what == "import":
+                if name not in KEEPS_JSON or where.split(".")[0] != "json":
+                    imports.append((name, where))
+            elif what == "JSONResponse":
                 if name != "json_answer.py":
-                    answers.append(name)
-            if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "FastAPI" or \
-                    isinstance(node, ast.Call) and getattr(node.func, "id", None) == "FastAPI":
+                    answers.append((name, where))
+            elif name not in KEEPS_JSON:  # a module that keeps json keeps its decodes and encodes too
+                other.add((what, name, where))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and "FastAPI" in (getattr(node.func, "attr", None), getattr(node.func, "id", None)):
                 apps.append((name, any(k.arg == "default_response_class" and getattr(k.value, "id", "") == "WholeJSONResponse"
                                        for k in node.keywords)))
-        for function in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
-            for node in ast.walk(function):
-                if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "json" and not node.args:
-                    decodes.append((name, function.name))
-    assert imports == [], "modules that import json itself: `from backend import whole_json as json`"
+    assert imports == [], "modules that import json (or another JSON library) itself: `from backend import whole_json as json`"
     assert answers == [], "modules that name JSONResponse: backend.json_answer.WholeJSONResponse"
-    assert sorted(set(decodes) - set(DECODES)) == [], ".json() decodes of an answer, as they are: whole_json.loads"
-    assert sorted(set(DECODES) - set(decodes)) == [], "named decodes that no longer exist"
+    assert sorted(other - set(LEFT)) == [], "JSON decoded, encoded or answered as it is: through whole_json"
+    assert sorted(set(LEFT) - other) == [], "named uses that no longer exist"
     assert sorted(apps) == [("app.py", True), ("data_folder.py", True)], "an app whose default answer is not the class"
 
 

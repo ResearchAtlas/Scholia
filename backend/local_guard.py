@@ -40,6 +40,7 @@ other programs running as the same user.
 """
 
 import hmac
+
 from backend import whole_json as json
 
 CLIENT_HEADER = b"x-scholia-client"

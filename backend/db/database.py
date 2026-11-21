@@ -7,7 +7,6 @@ asyncio event loop; async code uses asyncio.to_thread.
 import asyncio
 import errno
 import fcntl
-from backend import whole_json as json
 import logging
 import os
 import shutil
@@ -21,6 +20,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from backend import whole_json as json
 from backend import APP_VERSION
 from backend.db.migrations import MIGRATIONS
 

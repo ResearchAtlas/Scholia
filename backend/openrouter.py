@@ -21,7 +21,6 @@ prompt, an answer, a key, a URL or a provider's error body.
 
 import asyncio
 import hashlib
-from backend import whole_json as json
 import logging
 import sys
 import time
@@ -30,8 +29,9 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from backend import whole_json as json
 from backend import reasoning_capability
-from backend.whole_json import whole_text  # kept here for its importers (memory, tools.parser, openrouter_client)
+from backend.whole_json import whole_text
 from backend.outbound_gate import DISPATCHED, NO_RESPONSE_CACHE, OutboundDenied
 from backend.reasoning_control import resolve_reasoning_payload
 from backend.settings import visible

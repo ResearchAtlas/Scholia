@@ -11,7 +11,7 @@ screen, S2) and records another place for the next launch.
 """
 
 import ctypes
-from backend import whole_json as json
+import json  # the record of the chosen folder's path round-trips the file system's bytes (tests/test_whole_json.py)
 import logging
 import os
 import platform

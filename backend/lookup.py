@@ -19,7 +19,6 @@ nothing on retraction. Nothing here logs an identifier or a response.
 import asyncio
 import contextlib
 import email.utils
-from backend import whole_json as json
 import math
 import re
 import time
@@ -29,6 +28,7 @@ from datetime import UTC, datetime
 from urllib.parse import quote
 import httpx
 
+from backend import whole_json as json
 from backend.extraction import DOI_CHARS, Unreadable, clean_doi, untrusted_xml
 from backend.outbound_gate import OutboundDenied
 from backend.settings import visible

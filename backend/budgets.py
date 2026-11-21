@@ -15,10 +15,10 @@ what that decision left, else the limit itself (a conversation without its own, 
 becomes $20 and then $30, never compounding; a typed limit becomes the amount from then on.
 """
 
-from backend import whole_json as json
 import math
 import re
 
+from backend import whole_json as json
 from backend import governance, openrouter, spending
 from backend.runs import _budgets_now, _event, _limit_unread
 from backend.settings import PERSONAL, PROJECT, load_settings

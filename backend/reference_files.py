@@ -50,9 +50,9 @@ is never refused for a macro; one whose title is a macro has no title (no_title)
 """
 
 import io
-from backend import whole_json as json
 import logging
 import re
+from backend import whole_json as json
 from backend.extraction import ARXIV, DOI_CHARS, Unreadable
 from backend.settings import visible
 

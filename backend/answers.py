@@ -23,12 +23,12 @@ bodies it sent; and an answer's citations, resolved again or checked again.
 """
 
 import asyncio
-from backend import whole_json as json
 
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from backend import whole_json as json
 from backend import citations, governance, provenance
 from backend.settings import load_settings, visible
 from backend.db import ContentCorruptError

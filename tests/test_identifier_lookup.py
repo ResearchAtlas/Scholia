@@ -1315,3 +1315,6 @@ async def test_a_lookups_answer_holding_half_a_surrogate_pair_is_kept_with_the_r
         [paper] = await settled(client, project)
         assert paper["lookup"]["outcome"] == "resolved" and paper["lookup"]["source"] == source
         assert "Half \ufffd pair" in json.dumps(paper, ensure_ascii=False)
+        # and it is stored whole: new records hold no half pair, as an escape or as it is (the internal review, F1)
+        for value in [v for row in await rows(client, "SELECT title, csl FROM materials") for v in row if v]:
+            assert "\\ud83d" not in value and "\ud83d" not in value

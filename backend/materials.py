@@ -51,7 +51,6 @@ committed, and Needs attention otherwise, with its reason.
 import asyncio
 import base64
 import binascii
-from backend import whole_json as json
 import logging
 import time
 from typing import Annotated
@@ -60,6 +59,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from backend import whole_json as json
 from backend import asks, backups, extraction, lookup, memory, reading, search
 from backend.db import ContentCorruptError, delete, new_id, utc_now
 from backend.db.deletion import supersede

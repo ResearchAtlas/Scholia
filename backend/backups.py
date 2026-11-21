@@ -24,7 +24,6 @@ import collections
 import contextlib
 import errno
 import hashlib
-from backend import whole_json as json
 import logging
 import mimetypes
 import os
@@ -41,6 +40,7 @@ from fastapi import APIRouter, Request
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
+from backend import whole_json as json
 from backend.json_answer import WholeJSONResponse
 from backend import APP_VERSION, budgets, i18n
 from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseCloseError, DatabaseClosedError,

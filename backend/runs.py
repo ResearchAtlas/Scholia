@@ -55,7 +55,6 @@ leaves no effect.
 """
 
 import asyncio
-from backend import whole_json as json
 import logging
 import math
 import sqlite3
@@ -66,6 +65,7 @@ import unicodedata
 from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 
+from backend import whole_json as json
 from backend import (agent, budget_router, citations, compaction, context, credentials, governance, memory, openrouter,
                      openrouter_client, provenance, providers, reach, router, skills, spending)
 from backend.evidence import historical_citations
