@@ -30,7 +30,8 @@ async function world({ mount, jsx }, strict, { damaged = false } = {}) {
   const settings = async (open) => { const { Settings } = await load.component('Settings');
     return [jsx(Settings, { open, onOpenChange: (next) => { settings(next).then((drawn) => ui.show(drawn)); }, health: {},
       project: { id: 'p1', name: 'Project', kind: 'research' }, onLanguage() {}, startPage: 'advanced' })]; };
-  // as App.jsx draws it at the head: onRestored is the app's own load, which reloads nothing
+  // onRestored as App.jsx gave it before design review AB (the app's own load, which reloads nothing): the screen no
+  // longer takes it, and a scenario fails if it comes back and is called
   const screen = async () => { const { DamagedDatabaseScreen } = await load.component('Backups');
     return [jsx(DamagedDatabaseScreen, { onRestored: () => { seen.restored += 1; }, restart: false })]; };
   ui = await mount(await (damaged ? screen() : settings(true)), { strict }).settle();

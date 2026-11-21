@@ -6,10 +6,9 @@
 
 import re
 
+from backend import whole_json as json
 
 from .types import ToolCall
-
-from backend import whole_json as json
 
 _FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
 

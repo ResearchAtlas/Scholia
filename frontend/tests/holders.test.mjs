@@ -71,7 +71,7 @@ const STORES = ['localStorage', 'sessionStorage', 'indexedDB', 'caches', 'cookie
 test('everything that outlives a reload says how a deletion and a restore reach it', () => {
   const found = [];
   for (const file of files(SRC)) {
-    const code = readFileSync(join(SRC, file), 'utf8').replace(/\/\/.*$/gm, '');
+    const code = readFileSync(join(SRC, file), 'utf8').replace(/(^|\s)\/\/.*$/gm, '$1'); // a comment, not 'http://'
     for (const store of STORES) if (new RegExp(`\\b${store}\\b`).test(code)) found.push(`${file}: ${store}`);
   }
   assert.deepEqual(found.filter((key) => !STORED[key]), [], 'browser storage with no rule for a deletion and a restore');

@@ -1,7 +1,8 @@
 """The backend's JSON keeps text whole (design review AA, Option 4): backend/whole_json.py decodes and writes it, with
 half a surrogate pair the replacement character, and backend/json_answer.py answers it. The census has no judgment in
-it: no backend module imports json or names JSONResponse but those two, and the exceptions named below with their
-reason; both apps answer through the class."""
+it: no backend module imports json or names a JSON answer class but those two, and every other use of JSON that the
+census knows the forms of (listed in `uses`) is named below with its reason; both apps answer through the class. It
+checks those forms, not every way Python could reach a decoder: a new form is added here when one is found."""
 
 import ast
 import json as stdlib_json
@@ -25,9 +26,13 @@ LEFT = {
     (".json()", "openrouter.py", "_json"): "through whole_text",
     (".json()", "local_helper.py", "_post"): "the local helper's numbers: cleaning would encode every vector again",
     (".json()", "endpoint_pricing.py", "fetch_endpoints"): "no caller in the product",
-    ("application/json", "answers.py", "body"): "a stored outbound body served as the bytes that were sent (ASCII)",
+    ("application/json", "answers.py", "body"): "a stored outbound body served as the bytes that were sent (UTF-8, whole when written)",
+    (".json()", "self_test.py", "drive"): "the self-test's own answers, outside the product",
+    ("json=", "self_test.py", "drive"): "the self-test's own requests, outside the product",
+    ("json=", "self_test.py", "provider"): "the self-test's own requests, outside the product",
 }
-OTHER_JSON = {"orjson", "simplejson", "ujson", "rapidjson"}
+OTHER_JSON = {"orjson", "simplejson", "ujson", "rapidjson", "json5", "hjson", "demjson3", "yaml"}
+ANSWERS = ("fastapi.responses", "starlette.responses")
 
 
 def modules():
@@ -46,13 +51,23 @@ def uses(tree):
                          if alias.name.split(".")[0] in {"json", *OTHER_JSON})
         if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in {"json", *OTHER_JSON}:
             found.append(("import", node.module))
-        if isinstance(node, ast.Name) and node.id == "JSONResponse" or isinstance(node, ast.Attribute) and \
-                node.attr == "JSONResponse" or isinstance(node, ast.alias) and node.name == "JSONResponse":
+        answer = (node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute)
+                  else node.name if isinstance(node, ast.alias) else "")
+        if answer.endswith("JSONResponse") and answer != "WholeJSONResponse":  # ORJSONResponse, UJSONResponse too
             found.append(("JSONResponse", function))
+        if isinstance(node, ast.ImportFrom) and node.module in ANSWERS and any(a.name == "*" for a in node.names):
+            found.append(("JSONResponse", function))
+        if isinstance(node, ast.Subscript) and getattr(node.value, "attr", None) == "modules" and \
+                str(getattr(node.slice, "value", "")).split(".")[0] in {"json", *OTHER_JSON}:  # sys.modules["json"]
+            found.append(("import", node.slice.value))
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and getattr(node.value, "value", None) == "application/json" \
+                and any(getattr(t, "id", None) == "media_type" for t in (node.targets if isinstance(node, ast.Assign)
+                                                                       else [node.target])):
+            found.append(("application/json", function))
         if isinstance(node, ast.Call):
             if getattr(node.func, "attr", None) in ("json", "model_dump_json"):
                 found.append((f".{node.func.attr}()", function))
-            if getattr(node.func, "attr", getattr(node.func, "id", None)) == "import_module" and node.args and \
+            if getattr(node.func, "attr", getattr(node.func, "id", None)) in ("import_module", "__import__") and node.args and \
                     isinstance(node.args[0], ast.Constant) and str(node.args[0].value).split(".")[0] in {"json", *OTHER_JSON}:
                 found.append(("import", node.args[0].value))
             for keyword in node.keywords:
@@ -79,7 +94,7 @@ def test_no_backend_module_uses_json_or_a_json_answer_but_through_the_ones_that_
             elif what == "JSONResponse":
                 if name != "json_answer.py":
                     answers.append((name, where))
-            elif name not in KEEPS_JSON:  # a module that keeps json keeps its decodes and encodes too
+            else:  # a module that keeps json names each of its other uses too
                 other.add((what, name, where))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and "FastAPI" in (getattr(node.func, "attr", None), getattr(node.func, "id", None)):

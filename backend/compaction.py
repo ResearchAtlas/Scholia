@@ -29,7 +29,6 @@ only in its own turn (agent.Turn.outputs); the output goes with the turn's run, 
 in the deletion's own transaction.
 """
 
-
 from backend import whole_json as json
 from backend import context, provenance
 
