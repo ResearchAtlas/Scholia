@@ -785,6 +785,48 @@ const scenarios = {
     assert.ok(!s.has(byId('picker-window')), 'the window field is closed once its window is set');
     assert.equal(typed, false, 'another window could be typed while the first was saved, and the field then closed');
   },
+  // Part 2a's mutation runs found these four parts of rule C held by no scenario above; each is pinned here.
+  // While an import is under way its form cannot be closed ("Import a file..." is greyed, as Harold decided).
+  async anImportUnderWayCannotBeClosed(w, strict) {
+    const s = await partWorld(w, strict, { gets: { '/api/helper': helper(false) } }, 'LocalHelper', 'LocalHelperSection', { project: null });
+    await s.press('Import a file…');
+    await s.typeInto(inForm, '/first/model.gguf', 'the path');
+    await s.submitWith(inForm, 'the import form');
+    assert.equal(await pressIfCan(s, 'Import a file…'), false, 'the import form could be closed while its import was under way');
+  },
+  // A failed import's line is the form's: closing and opening the form again clears it, as a new form's was.
+  async aFailedImportsLineGoesWhenItsFormIsOpenedAgain(w, strict) {
+    const s = await partWorld(w, strict, { gets: { '/api/helper': helper(false) } }, 'LocalHelper', 'LocalHelperSection', { project: null });
+    await s.press('Import a file…');
+    await s.typeInto(inForm, '/first/model.gguf', 'the path');
+    await s.submitWith(inForm, 'the import form');
+    await s.release(s.server.next(writes('POST', '/api/helper/models/import')), (r) => r.fail('file_mismatch', 409));
+    assert.equal(s.says('alert').length, 1, 'the failure is said');
+    await s.press('Import a file…'); await s.press('Import a file…');
+    assert.deepEqual(s.says('alert'), [], 'an earlier import\'s failure is said in the form opened since');
+  },
+  // The data-folder screen's Choose is greyed while its folder is recorded (FolderField's readOnly), as the field is.
+  async aDataFolderBeingRecordedCannotBeChosenAgain(w, strict) {
+    const s = await drawn(w, strict, {}, 'DataFolderScreen', 'DataFolderScreen', { health: { data_folder: '/old', data_folder_problem: 'missing' } },
+      () => { globalThis.window.pywebview = { api: { choose_folder: async () => '/chosen' } }; });
+    await s.typeInto(inForm, '/first', 'the folder');
+    await s.submitWith(inForm, 'the folder form');
+    assert.equal(await pressIfCan(s, 'Choose…'), false, 'Choose could be pressed while the folder was recorded');
+  },
+  // Enter pressed again in the picker's window field while its window is saved sends nothing more.
+  async aWindowBeingSavedIsNotSentAgain(w, strict) {
+    const state = { personal: {}, gets: {
+      '/api/providers': { providers: [lab({ has_key: true })] }, '/api/models/recent': { models: [] },
+      '/api/providers/lab/models': { status: {}, models: [{ id: 'm1', name: 'Model One', offered: true, window: { status: 'needed' }, effort: { steps: [] } }] } } };
+    const s = await partWorld(w, strict, state, 'ModelPicker', 'ModelPicker', { projectId: null });
+    await s.act(() => one(s.shown().filter((e) => e.type === 'button' && e.props.role === 'option' && e.text.includes('Model One')), 'the model').props.onClick());
+    await s.typeInto(byId('picker-window'), '8192', 'the window');
+    const enter = () => s.act(() => s.field(byId('picker-window'), 'the window').props.onKeyDown({ key: 'Enter', preventDefault() {} }));
+    await enter(); await enter();
+    await s.release(s.server.next(writes('PUT', '/api/settings')), (r) => r.answer({ values: {}, hash: 'h2' }));
+    const windows = s.server.asked.filter((r) => writes('PUT', '/api/settings')(r) && Object.keys(r.body.updates).some((k) => k.includes('windows')));
+    assert.equal(windows.length, 0, 'the window was saved again after it was saved'); // saves wait their turn (api.js saveSettings)
+  },
 };
 
 // Design review AF's row vi: when a removal becomes known the projects are read again, and Settings' This project page
