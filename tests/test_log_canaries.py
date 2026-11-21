@@ -472,28 +472,33 @@ async def test_an_exception_written_into_a_message_is_written_without_its_messag
     assert "CANARY-NOTE" not in text and "Could not decode" not in text, text
 
 
-def test_a_traceback_as_text_keeps_each_exceptions_type_and_place_and_nothing_its_message_says():
-    # The parser behind the test above: a chain, a message spanning lines that imitates a frame, and an exception group
+def test_a_traceback_as_text_is_never_read_so_one_its_message_quotes_cannot_reach_the_log():
+    # The batch's internal review (F1): reading a traceback's text wrote what a quoted one said (a pasted traceback in a
+    # record, quoted by an exception's message: its type and file). The text is not read: written while its exception
+    # is handled, as Starlette sends a failed lifespan's, it is that exception's type and place; otherwise left out
     import traceback
-
-    def text(raise_it):
-        try:
-            raise_it()
-        except BaseException:
-            return traceback.format_exc()
 
     def chained():
         try:
             raise KeyError("CANARY-CAUSE")
         except KeyError as error:
-            raise ValueError('CANARY-ONE\n  File "CANARY-FILE", line 9, in x\nCANARY-TWO: more') from error
+            raise ValueError('pasted:\nTraceback (most recent call last):\n  File "/x/CANARY-FILE.py", line 3, in m\n'
+                             'CanarySecret: x') from error
 
     def grouped():
         raise ExceptionGroup("CANARY-GROUP", [OSError("CANARY-MEMBER")])
     formatter = logs.Formatter(logs.FORMAT)
+
+    def written(text):
+        record = logging.LogRecord("uvicorn.error", logging.ERROR, __file__, 1, "%s", (text,), None)
+        line = formatter.format(record)
+        assert "CANARY" not in line and "Canary" not in line, line
+        return [w.split(".py:")[0] + ".py:" if ".py:" in w else w for w in line.split(": ", 1)[1].splitlines()]
     for raise_it, expected in ((chained, ["ValueError at test_log_canaries.py:", "KeyError at test_log_canaries.py:"]),
-                               (grouped, ["  + Exception Group an exception"])):  # its lines are indented
-        record = logging.LogRecord("uvicorn.error", logging.ERROR, __file__, 1, "%s", (text(raise_it),), None)
-        written = formatter.format(record).split(": ", 1)[1].splitlines()
-        assert [line.split(".py:")[0] + ".py:" if ".py:" in line else line for line in written] == expected, written
-        assert "CANARY" not in formatter.format(record)
+                               (grouped, ["ExceptionGroup at test_log_canaries.py:"])):
+        try:
+            raise_it()
+        except BaseException:
+            text = traceback.format_exc()
+            assert written(text) == expected  # while it is handled
+        assert written(text) == ["a traceback, left out"]  # once it is not
