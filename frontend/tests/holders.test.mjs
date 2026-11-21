@@ -121,7 +121,9 @@ test('every 404 taken as a deletion is handed to where knowledge lands', () => {
 test('what is open changes in one place, and no view holds a conversation of its own', () => {
   const shell = readFileSync(join(SRC, 'components/Shell.jsx'), 'utf8');
   assert.match(shell, /const \[open, setRaw\] = useState\(/, 'the state of what is open');
-  assert.equal(shell.match(/\bsetRaw\(/g)?.length, 1, 'what is open is set outside setOpen');
+  // setRaw named twice only: where it is made, and its one call, inside setOpen (no alias, no other call: the review, F2)
+  assert.equal(shell.match(/\bsetRaw\b/g)?.length, 2, 'what is open is set outside setOpen');
+  assert.match(shell, /const setOpen = useCallback\(\(change\) => setRaw\(\(now\) => \{/, 'its one call is setOpen\'s');
   const view = readFileSync(join(SRC, 'components/ConversationView.jsx'), 'utf8');
   assert.match(view, /\n {2}const id = conversationId;\n/, 'the view takes its conversation from the Shell alone');
 });

@@ -1221,6 +1221,21 @@ const scenarios = {
     }
     assert.deepEqual(seen, { listed: false });
   },
+  // The batch I part 2b review (F1): the projects' twin of the one above. Project Alpha is deleted (answered); another
+  // client's restore brings it back; a project made here has the projects read again, and it names Alpha: Alpha is
+  // not listed, and not open.
+  async aProjectKnownDeletedThatAListNamesAgainIsNotListed(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    const projects = state.projects; const conversations = state.conversations.p1;
+    await s.projectMenu(/^Delete /); await s.confirmDelete(); deleteProject(state, 'p1');
+    await s.release(s.server.next(writes('DELETE')), (r) => r.answer({ ok: true }));
+    state.gone.delete('p1'); state.projects = [...projects, P3]; state.conversations.p1 = conversations; state.conversations.p3 = [];
+    await s.projectMenu(/^New project$/); await s.field('new-project', 'Project Gamma'); await s.submit('new project');
+    await s.release(s.server.next(writes('POST', '/api/projects')), (r) => r.answer(P3));
+    assert.ok(s.seen().includes('Project Gamma'), 'the projects were read again');
+    assert.ok(!s.elements().some((e) => e.type === 'ui:DropdownMenuItem' && e.text.trim() === 'Project Alpha'), 'a project known deleted is listed');
+    assert.ok(!/Title (Alpha|Bravo|Charlie)/.test(s.seen()), 'a project known deleted is open');
+  },
   // After a refused first message's conversation is deleted from its row: where the window is and what its box holds.
   async seenAfterADraftIsDeletedFromItsRow(w, strict) {
     const state = counted(); const s = await world(w, strict, state);
