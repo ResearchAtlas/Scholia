@@ -7,6 +7,7 @@ provider's error body. Tests feed canaries through the app and check the log.
 
 import logging
 import os
+import re
 import stat
 import traceback
 from logging.handlers import TimedRotatingFileHandler
@@ -41,6 +42,13 @@ class Formatter(logging.Formatter):
     def format(self, record):
         record = logging.makeLogRecord(record.__dict__)  # a copy, without the full traceback another handler cached on it
         record.exc_text = None
+        message = record.getMessage()
+        if record.name.split(".")[0] == "asyncio":  # past its leading words, reprs: a task's holds its exception's
+            message = re.match(r"[A-Za-z' ]*", message).group().strip() or "asyncio reported an error"
+        if TRACEBACK in message:  # a traceback sent as text, as Starlette sends a failed lifespan's for uvicorn to log
+            head, _, text = message.partition(TRACEBACK)
+            message = head + "\n".join(_where(block) for block in reversed(text.split(TRACEBACK)))
+        record.msg, record.args = message, None
         return super().format(record)
 
     def formatException(self, ei):
@@ -52,6 +60,27 @@ class Formatter(logging.Formatter):
             lines.append(f"{type(error).__name__}{where}")
             error = error.__cause__ or error.__context__
         return "\n".join(lines)
+
+
+TRACEBACK = "Traceback (most recent call last):"
+_FRAME = re.compile(r'\s+File "(.*)", line (\d+)')
+
+
+def _where(block):
+    """One exception of a traceback's text, as formatException writes it: its type and where it was raised. Only its
+    frames and its type are read, never the message after them, so nothing a message quotes can be written."""
+    where = ""
+    for line in block.splitlines():
+        if not line.strip():
+            continue
+        if line[0].isspace():
+            frame = _FRAME.match(line)
+            if frame:
+                where = f" at {os.path.basename(frame[1])}:{frame[2]}"
+            continue
+        kind = line.split(":", 1)[0]
+        return f"{kind.rsplit('.', 1)[-1]}{where}" if re.fullmatch(r"[A-Za-z_][\w.]*", kind) else f"an exception{where}"
+    return "an exception"  # no line of its type (an exception group's is indented): nothing of it read
 
 
 def configure(data_dir, level=logging.INFO) -> logging.Handler:

@@ -419,3 +419,81 @@ async def test_an_exception_the_server_logs_is_written_without_its_message(tmp_p
     text = (data / "logs" / "scholia.log").read_text()
     assert "Exception in ASGI application" in text and "OperationalError" in text  # what failed, and where
     assert "CANARY-NOTE" not in text
+
+
+def poisoned_read():
+    """SQLite's decoding error for a record a build before PR 57 could store: its message quotes '{"text":"CANARY-NOTE '."""
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE run_events (data TEXT)")
+    conn.execute("INSERT INTO run_events VALUES (CAST(X'7B2274657874223A2243414E4152592D4E4F544520EDA0BD227D' AS TEXT))")
+    return conn.execute("SELECT data FROM run_events").fetchall()
+
+
+@pytest.mark.parametrize("route", ["a failed startup", "a task nobody awaits"])
+async def test_an_exception_written_into_a_message_is_written_without_its_message(tmp_path, route):
+    # PR 63's Fable recheck (F3): the formatter wrote exc_info as type and place, but Starlette sends a failed
+    # lifespan's traceback as text that uvicorn logs as the message, and asyncio writes the task's repr, holding the
+    # exception's, into its message. Both as the desktop entry sets them up (logs.configure, log_config=None)
+    import contextlib
+    import gc
+
+    import fastapi
+    import uvicorn
+    from uvicorn.lifespan.on import LifespanOn
+
+    data = tmp_path / "data"
+    data.mkdir()
+    handler = logs.configure(data)
+    try:
+        if route == "a failed startup":
+            @contextlib.asynccontextmanager
+            async def lifespan(app):
+                poisoned_read()
+                yield
+            config = uvicorn.Config(fastapi.FastAPI(lifespan=lifespan), lifespan="on", log_config=None)
+            starting = LifespanOn(config)
+            await starting.startup()
+            assert starting.should_exit
+        else:
+            async def reads():
+                poisoned_read()
+            task = asyncio.create_task(reads())
+            await asyncio.wait([task])
+            del task  # its exception never retrieved: asyncio logs it as the task goes
+            gc.collect()
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    text = (data / "logs" / "scholia.log").read_text()
+    assert "OperationalError at test_log_canaries.py:" in text, text  # what failed, and where
+    if route == "a task nobody awaits":
+        assert "Task exception was never retrieved" in text
+    assert "CANARY-NOTE" not in text and "Could not decode" not in text, text
+
+
+def test_a_traceback_as_text_keeps_each_exceptions_type_and_place_and_nothing_its_message_says():
+    # The parser behind the test above: a chain, a message spanning lines that imitates a frame, and an exception group
+    import traceback
+
+    def text(raise_it):
+        try:
+            raise_it()
+        except BaseException:
+            return traceback.format_exc()
+
+    def chained():
+        try:
+            raise KeyError("CANARY-CAUSE")
+        except KeyError as error:
+            raise ValueError('CANARY-ONE\n  File "CANARY-FILE", line 9, in x\nCANARY-TWO: more') from error
+
+    def grouped():
+        raise ExceptionGroup("CANARY-GROUP", [OSError("CANARY-MEMBER")])
+    formatter = logs.Formatter(logs.FORMAT)
+    for raise_it, expected in ((chained, ["ValueError at test_log_canaries.py:", "KeyError at test_log_canaries.py:"]),
+                               (grouped, ["  + Exception Group an exception"])):  # its lines are indented
+        record = logging.LogRecord("uvicorn.error", logging.ERROR, __file__, 1, "%s", (text(raise_it),), None)
+        written = formatter.format(record).split(": ", 1)[1].splitlines()
+        assert [line.split(".py:")[0] + ".py:" if ".py:" in line else line for line in written] == expected, written
+        assert "CANARY" not in formatter.format(record)
