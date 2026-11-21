@@ -698,6 +698,17 @@ async def restore(body: Restore, request: Request):
     if (body.generation is None) == (body.file is None):
         raise BackupError(400, "invalid_request", "Name one automatic backup or one backup file")
     state = request.app.state.scholia
+    # Design review AC: health says a restore is under way from here, before anything is awaited, until it has ended
+    # however it ends (refused, done, put back), so a window loaded meanwhile reads nothing of a database that is about
+    # to be replaced. Counted, since a second request, refused, ends first.
+    state["restores"] = state.get("restores", 0) + 1
+    try:
+        return await _asked(state, body)
+    finally:
+        state["restores"] = state.get("restores", 1) - 1
+
+
+async def _asked(state, body):
     pending = await asyncio.to_thread(_replay_pending, state["data_dir"])
     if state["restore_lock"].locked():  # nothing awaited from here to taking it: one restore at a time
         raise BackupError(409, "restoring", "A backup is being restored")

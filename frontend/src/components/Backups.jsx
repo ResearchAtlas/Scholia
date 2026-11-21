@@ -30,6 +30,8 @@ export function BackupsSection({ restoreOnly = false }) {
     state.drawn = true;
     return () => { state.drawn = false; if (state.restored) window.location.reload(); };
   }, []);
+  // the database was replaced, or may have been: however this is left the window reloads; at once, if it has gone
+  const leave = () => { left.current.restored = true; if (!left.current.drawn) window.location.reload(); };
   const listing = useAction();
   const backingUp = useAction();
 
@@ -72,12 +74,8 @@ export function BackupsSection({ restoreOnly = false }) {
       <RestoreFromFile onRestore={(request) => setRestoring(request)} />
 
       <ConfirmRestore request={restoring} damaged={restoreOnly} onClose={() => setRestoring(null)}
-        onDone={(result) => {
-          left.current.restored = true;
-          if (!left.current.drawn) window.location.reload();
-          setRestoring(null);
-          setRestored(result);
-        }} />
+        onDone={(result) => { leave(); setRestoring(null); setRestored(result); }}
+        onUnknown={() => get('/api/health').then(() => window.location.reload(), () => {})} />
     </div>
   );
 }
@@ -233,19 +231,21 @@ function RestoreFromFile({ onRestore }) {
 }
 
 // damaged: the database is damaged, so there is no safety copy; it is moved aside instead.
-function ConfirmRestore({ request, damaged, onClose, onDone }) {
+function ConfirmRestore({ request, damaged, onClose, onDone, onUnknown }) {
   const t = useT();
   const { busy, problem, run, reset } = useAction();
   async function confirm() {
-    let unanswered = false;
+    let refused = false; // the engine said, by a code, that it did not restore: the only end that leaves the window as it is
     const result = await run(() => post('/api/backups/restore', restoreBody(request)).catch((error) => {
-      unanswered = error instanceof ApiError && error.status === 0;
+      refused = error instanceof ApiError && error.status !== 0 && error.code !== 'http_error';
       throw error;
     }));
-    if (result) onDone(result);
-    // rider U: no answer, so it may have happened or be under way still (the backend ends a restore whatever becomes of
-    // its request): if the engine answers, the window reloads and says what it finds
-    else if (unanswered) get('/api/health').then(() => window.location.reload(), () => {});
+    if (result?.ok) onDone(result);
+    // design review AC (rider U widened): any other end (no answer, an answer whose body was lost, an error the engine
+    // did not state) may be a restore that happened or is under way still (the backend ends a restore whatever becomes
+    // of its request): the engine is asked once; if it answers, the window reloads and says what it finds (App.jsx
+    // reads nothing while a restore is under way)
+    else if (!refused) onUnknown();
   }
   return (
     <Dialog open={Boolean(request)} onOpenChange={(next) => { if (!next && !busy) { reset(); onClose(); } }}>

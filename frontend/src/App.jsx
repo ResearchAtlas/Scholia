@@ -47,6 +47,9 @@ export function App() {
   const load = useCallback(async () => {
     try {
       const health = await get('/api/health');
+      // design review AC: a restore is under way (from its request to its end): nothing of a database that is about to
+      // be replaced is read; the window says so
+      if (health.restoring) throw new ApiError(503, 'restoring');
       if (health.data_folder_problem || health.database_damaged) {
         const settings = await get('/api/settings').catch(() => null); // a limited app may not serve it
         await launchLanguage(settings?.values?.ui?.language ?? 'system');

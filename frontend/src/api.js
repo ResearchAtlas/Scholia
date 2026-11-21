@@ -37,6 +37,19 @@ function failure(status, code, data) {
   return new ApiError(status, code, data?.needed_usd);
 }
 
+// An answer's JSON. A 2xx whose body cannot be read is an answer that was lost, never an empty success (design review
+// AC): it is thrown as no answer is, so every caller takes the path it has for an outcome it does not know (it reads
+// again, it leaves on a 404, a restore reloads). A failure whose body cannot be read keeps its status alone.
+async function answer(response) {
+  try {
+    return await response.json();
+  } catch (error) {
+    if (error.name === 'AbortError') throw error; // given up by the caller while the body came
+    if (response.ok) throw new ApiError(0, 'unreachable');
+    return null;
+  }
+}
+
 export async function api(method, path, body, { signal } = {}) {
   let response;
   try {
@@ -50,7 +63,7 @@ export async function api(method, path, body, { signal } = {}) {
     if (error.name === 'AbortError') throw error;
     throw new ApiError(0, 'unreachable');
   }
-  const data = await response.json().catch(() => null);
+  const data = await answer(response);
   if (!response.ok) throw failure(response.status, data?.code ?? 'http_error', data);
   return data;
 }
@@ -66,7 +79,7 @@ export async function getBlob(path, signal) {
     throw new ApiError(0, 'unreachable');
   }
   if (!response.ok) {
-    const data = await response.json().catch(() => null);
+    const data = await answer(response);
     throw failure(response.status, data?.code ?? 'http_error');
   }
   return response.blob();
@@ -86,7 +99,7 @@ export async function stream(path, body, onEvent, signal) {
       throw new ApiError(0, 'unreachable');
     });
   if (!response.ok) {
-    const data = await response.json().catch(() => null);
+    const data = await answer(response);
     throw failure(response.status, data?.code ?? 'http_error');
   }
   const reader = response.body.getReader();
@@ -137,7 +150,7 @@ export async function confirmedChange(method, path, body, ask) {
   } catch {
     throw new ApiError(0, 'unreachable');
   }
-  const data = await response.json().catch(() => null);
+  const data = await answer(response);
   if (response.ok) return data;
   if (data?.code !== 'confirmation_required' || typeof data.token !== 'string') {
     throw new ApiError(response.status, data?.code ?? 'http_error');
