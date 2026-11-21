@@ -68,7 +68,7 @@ function useConversationAsks(conversationId, watching, projectId) {
 const NEW = { turns: [], queued: [] }; // a conversation not made yet
 
 export function ConversationView({ conversationId, conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated,
-  onLibrary }) {
+  onLibrary, onNoProject }) {
   const t = useT();
   const [draft, setDraft] = useState(null); // a new conversation, made at its first message
   const id = conversationId ?? draft; // the list's row (conversation) gives only its title
@@ -214,6 +214,7 @@ export function ConversationView({ conversationId, conversation, projectId, pane
       if (isActiveRun(error)) return followUp(text); // a turn started meanwhile: the message follows the setting
       if (error instanceof ApiError && error.code === 'stopped') return false; // it stays in the box, unsent
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
+      if (!id && deleted(error)) onNoProject?.(); // no conversation could be made in it: the Shell asks for the project
       return false;
     }
   }

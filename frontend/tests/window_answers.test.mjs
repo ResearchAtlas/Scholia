@@ -935,6 +935,30 @@ const scenarios = {
     assert.deepEqual(s.selected(), ['Title Zulu']);
     assert.equal(request.signal.aborted, true, 'the stream of a conversation that went with the project is open still');
   },
+  // The rider. The project's own read answers before the engine deletes (it is there still), so the chain ends; the
+  // engine then finishes. A conversation of it is opened and its record answers 404: the project is asked again and left.
+  async aProjectDeletedAfterItWasAskedIsLeftWhenAConversationOfItAnswers404(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    await noAnswer(s);
+    assert.deepEqual(s.selected(), ['Title Alpha']);
+    deleteProject(state, 'p1');
+    await s.open('Title Bravo');
+    assert.deepEqual(s.selected(), ['Title Zulu'], 'the window stays in the deleted project');
+    assert.ok(!GONE.test(s.seen()));
+  },
+  // The rider, its other evidence: a first message in it is refused 404 (no such project).
+  async aProjectDeletedAfterItWasAskedIsLeftWhenAFirstMessageIsRefused(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    await noAnswer(s);
+    await s.newConversation();
+    deleteProject(state, 'p1');
+    await s.type(DRAFT); await s.send();
+    await s.release(s.server.next(writes('POST', '/api/conversations')), (r) => r.fail('not_found', 404));
+    assert.deepEqual(s.selected(), ['Title Zulu'], 'the window stays in the deleted project');
+    assert.ok(!GONE.test(s.seen()));
+  },
   // The limit every option leaves (kept as a scenario so it is not found again as new): the same order with nothing of
   // the window's naming the project afterwards: the window does not know, and stays.
   async aProjectDeletedAfterItWasAskedStaysUntilSomethingNamesIt(w, strict) {

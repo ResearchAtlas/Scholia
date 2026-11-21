@@ -172,7 +172,11 @@ export function Shell({ health, settings, onLanguage }) {
   useEffect(() => { // the list shows which conversations run
     const timers = new Set();
     const unsubscribe = subscribe((id, turn, type) => {
-      if (type === 'deleted') left('conversation', id);
+      if (type === 'deleted') {
+        left('conversation', id);
+        // the rider: it may have gone with its project, whose deletion this window was not told of: asked, never assumed
+        if (openNow.current.projectId) askProject(openNow.current.projectId);
+      }
       if (type !== 'run_started' && type !== 'run_finished') return;
       loadConversations();
       // ponytail: a title run follows a first answer; one later look shows its title, poll if titles lag
@@ -182,7 +186,7 @@ export function Shell({ health, settings, onLanguage }) {
       }
     });
     return () => { unsubscribe(); timers.forEach(clearTimeout); };
-  }, [loadConversations, left]);
+  }, [loadConversations, left, askProject]);
 
   useEffect(() => {
     if (!projectId) return undefined;
@@ -351,6 +355,7 @@ export function Shell({ health, settings, onLanguage }) {
               onPanel={togglePanel}
               onCreated={(id) => { answered((now) => ({ ...now, conversationId: id })); loadConversations(); }}
               onLibrary={() => panel !== 'library' && togglePanel('library')}
+              onNoProject={() => askProject(projectId)}
             />}
           </div>
           {panel !== 'none' && !view.overlay && (
