@@ -108,11 +108,24 @@ export function Shell({ health, settings, onLanguage }) {
   // project that is gone (the rider N review, P2)
   const openNow = useRef(open);
   openNow.current = open;
+  const asking = useRef(new Map()); // project id -> its next ask: one chain per project, none once the Shell is gone
+  useEffect(() => {
+    const timers = asking.current;
+    timers.drawn = true; // set again on every setup: StrictMode runs setup, cleanup and setup
+    return () => { timers.drawn = false; for (const timer of timers.values()) clearTimeout(timer); timers.clear(); };
+  }, []);
   const askProject = useCallback(function ask(id) {
+    const timers = asking.current;
+    clearTimeout(timers.get(id));
+    timers.delete(id);
     get(`/api/projects/${encodeURIComponent(id)}`).catch((error) => {
       if (deleted(error)) gone('project', id);
-      else if (!(error instanceof ApiError && error.status > 0 && error.status < 500) && openNow.current.projectId === id) {
-        setTimeout(() => ask(id), RETRY_MS);
+      else if (timers.drawn && !(error instanceof ApiError && error.status > 0 && error.status < 500)) { // no answer
+        clearTimeout(timers.get(id));
+        timers.set(id, setTimeout(() => { // asked again only while that project is still the one open
+          timers.delete(id);
+          if (openNow.current.projectId === id) ask(id);
+        }, RETRY_MS));
       }
     });
   }, [gone]);

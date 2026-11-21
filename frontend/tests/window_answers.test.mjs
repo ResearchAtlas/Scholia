@@ -43,7 +43,8 @@ function backend(state) {
     return new Promise((resolve, reject) => { init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
       asked.push({ method, path, kind, signal: init.signal, body: init.body ? JSON.parse(init.body) : null,
         answer: (body, status = 200) => resolve(body === undefined && method === 'GET' ? answer() : response(status, body ?? now())),
-        fail: (code = 'internal', status = 500) => resolve(response(status, { code })),
+        // status 0: no answer at all (fetch rejects, as when the backend cannot be reached)
+        fail: (code = 'internal', status = 500) => (status === 0 ? reject(new TypeError('Failed to fetch')) : resolve(response(status, { code }))),
         // a turn's stream: these events, and it stays open (the turn runs on)
         stream: (...events) => resolve({ ok: true, status: 200, body: new ReadableStream({ start(controller) {
           for (const event of events) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`)); } }) }),
@@ -796,6 +797,38 @@ const scenarios = {
     assert.deepEqual(s.selected(), ['Title Alpha']);
     assert.ok(s.seen().includes(QUEUED) && s.seen().includes(ASKED));
     assert.equal(s.draft(), DRAFT);
+  },
+  // The recheck of the rider N review (findings 1 to 3): the project's read after a failed deletion is asked again only
+  // while there is no answer, only while that project is open and the Shell is drawn, and as one chain per project.
+  async aProjectAskedAgainStopsWhenItIsLeftAnswersOrTheShellGoes(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    const reads = () => s.server.asked.filter((r) => r.method === 'GET' && r.path === '/api/projects/p1');
+    const failDeletion = async () => {
+      await s.projectMenu(/^Delete /); await s.confirmDelete();
+      await s.release(s.server.next(writes('DELETE')), (r) => r.fail('backup_failed', 503));
+      await s.closeDialog();
+    };
+    s.server.hold('project');
+    await failDeletion(); await failDeletion(); // two failed deletions of the open project, each asking for it
+    assert.equal(reads().length, 2);
+    for (const read of reads()) await s.release(s.server.next((r) => r === read), (r) => r.fail('unreachable', 0)); // no answer
+    await s.pause();
+    assert.equal(reads().length, 1, 'one chain per project, asked again after a pause');
+    await s.release(s.server.next((r) => r.path === '/api/projects/p1'), (r) => r.fail('forbidden', 403)); // an answer
+    await s.pause();
+    assert.equal(reads().length, 0, 'asked again after an answer that is not a 404');
+    await failDeletion();
+    await s.release(s.server.next((r) => r.path === '/api/projects/p1'), (r) => r.fail('unreachable', 503));
+    await s.projectMenu(/^Project Beta$/); // left while it is asked again
+    await s.pause();
+    assert.deepEqual(reads().map((r) => r.path), [], 'asked again though the project was left');
+    await s.projectMenu(/^Project Alpha$/);
+    await s.releaseAll((r) => r.path === '/api/projects/p1'); // the project's own read as it opens (not the deletion's)
+    await failDeletion();
+    await s.release(s.server.next((r) => r.path === '/api/projects/p1'), (r) => r.fail('database_damaged', 503));
+    await s.act(() => s.ui.show([])); // the window is replaced (App.jsx's limited state): the Shell goes
+    await s.pause(); await s.pause();
+    assert.equal(reads().length, 0, 'asked again after the Shell went');
   },
 };
 
