@@ -75,8 +75,10 @@ export function ConversationView({ conversationId, conversation, projectId, pane
   const live = useLiveTurn(id);
   // a turn opens a place only while shown here (live.js), said in the commit that shows it: never a passive effect's delay
   useLayoutEffect(() => showing(projectId, id), [projectId, id]);
-  // What was read of the conversation's record (its turns, and S1-33: the messages waiting as the next turn), held,
-  // shown and dropped together: null until it is read, and from a change until it is read again (design review Z).
+  // What was read of the conversation's record (its turns, and S1-33: the messages waiting as the next turn), held as
+  // one: null until it is read, and dropped whole at its own 404 (design review Z). A change drops the turns until the
+  // record is read again; the waiting messages, the researcher's own words with any editor open on them, stay until
+  // that read answers, and go if it fails (batch E's review, F1).
   const [record, setRecord] = useState(conversationId ? null : NEW);
   const turns = record?.turns ?? null;
   const queued = record?.queued ?? NEW.queued;
@@ -114,7 +116,10 @@ export function ConversationView({ conversationId, conversation, projectId, pane
       setStale(false);
       return true;
     } catch (error) {
-      if (current() && settle(false)) setFailed(true);
+      if (current() && settle(false)) {
+        setFailed(true);
+        setRecord((now) => (now && now.turns === null ? null : now)); // after a change: nothing read before it stays
+      }
       // the record is known to be deleted, whatever was asked before: nothing read of it stays, here or in live.js
       if (deleted(error)) { setRecord(null); forget(id); }
       return false;
@@ -135,7 +140,7 @@ export function ConversationView({ conversationId, conversation, projectId, pane
     const changed = (event) => {
       if ((event.detail !== projectId && event.detail !== null) || !id) return; // a conversation not yet created has read nothing
       guard.current.libraryChanged(); // first: every read asked before this is dropped when it arrives
-      setRecord(null);
+      setRecord((now) => now && { turns: null, queued: now.queued });
       setStale(true);
       setFailed(false);
       load();
@@ -354,8 +359,8 @@ export function ConversationView({ conversationId, conversation, projectId, pane
       {/* S1-33: outside the message box's form, so the waiting messages' own forms are never nested in it */}
       <div className="mx-auto w-full max-w-3xl shrink-0 px-4">
         <Queued conversationId={id} queued={queued} running={running} onChanged={load} onSend={(item) => sendQueued(item)} />
-        {/* as the record: not drawn from a change until the record is read again, so no spend read before it is shown */}
-        {record && <BudgetBar projectId={projectId} conversationId={id} seen={`${reads}.${live?.budget ?? 0}`} />}
+        {/* as the turns: not drawn from a change until the record is read again, so no spend read before it is shown */}
+        {turns && <BudgetBar projectId={projectId} conversationId={id} seen={`${reads}.${live?.budget ?? 0}`} />}
       </div>
       {/* Stop reaches the turn the record shows running and every stream under way here (live.js stop) */}
       <Composer running={running} problem={problem} onSend={submit} projectId={projectId} onAttach={attach}

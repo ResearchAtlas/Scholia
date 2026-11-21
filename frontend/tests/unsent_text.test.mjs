@@ -467,6 +467,32 @@ const scenarios = {
     assert.ok(send()[0].props.disabled, 'the row\'s Send would send the unedited text and discard the edit');
   },
 
+  // The whole batch E review (F1, P2): design review Z's one record dropped the waiting messages at every change to the
+  // papers or to memory (a turn's memory note is one), so an open editor of a waiting message closed with what was typed,
+  // and its close (rider Q) let the message start with its old words. A change drops the turns; the waiting messages,
+  // the researcher's own words, stay until the record is read again.
+  async aChangeElsewhereLeavesAnOpenWaitingEditorAndItsText(w, strict) {
+    const state = start({ personal: { ui: { follow_up: 'queue' } }, records: { a: { turns: [], queued: [] } } });
+    const s = await windowWorld(w, strict, state);
+    await s.type('First question'); await s.send();
+    const first = s.server.next(writes('POST', '/message/stream')).open();
+    state.records.a = { queued: [], turns: [{ run_id: 'r1', status: 'running', message: { text: 'First question' }, answer: null }] };
+    await s.act(() => first.push({ type: 'run_started', run_id: 'r1', conversation_id: 'a', seq: 1 }));
+    await s.type('Waiting message'); await s.send();
+    state.records.a.queued = [{ id: 'q1', text: 'Waiting message' }];
+    await s.release(s.server.next(writes('POST', '/queue')), (r) => r.answer({ id: 'q1', text: 'Waiting message' }));
+    await s.press('Edit');
+    assert.equal(await s.typeInto(byId('queued-q1'), NEWER, 'the edit'), true);
+    state.records.a.turns[0] = { ...state.records.a.turns[0], status: 'succeeded', answer: { text: 'An answer' }, result_saved: true };
+    await s.act(() => { first.push({ type: 'run_finished', status: 'succeeded' }); first.end(); }); // held by its editor (rider Q)
+    s.server.hold('conversation');
+    await s.act(() => w.library.libraryChanged('p1')); // a change elsewhere: the record is read again
+    assert.equal(s.has((e) => e.props.value === NEWER), true, 'the editor closed while the record is read again');
+    await s.releaseAll(reads('conversation'));
+    assert.equal(s.has((e) => e.props.value === NEWER), true, 'the editor closed once the record was read again');
+    assert.equal(s.server.asked.filter(writes('POST', '/queue/q1/send')).length, 0, 'it started with its old words');
+  },
+
   // The batch's internal review (F2): the form K fields and the Subagents add, which only the census held. Each: the
   // text sent, then something newer typed while its request is under way, then the answer: the newer text stays.
   async aProviderKeySavedKeepsAKeyTypedSince(w, strict) {
