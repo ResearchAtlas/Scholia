@@ -55,7 +55,7 @@ export function Segmented({ label, options, value, onChange, disabled }) {
 // A text or a whole number, committed on Enter or on leaving the field. suggestions are
 // offered under it; an empty field commits null (back to the default) when allowEmpty.
 export function CommitField({ id, value, onCommit, type = 'text', min, above, step, suggestions, placeholder, allowEmpty,
-  className, inputMode }) {
+  className, inputMode, readOnly }) {
   const listId = useId();
   const [draft, setDraft] = useState(value ?? '');
   const edited = useRef(false); // typed in since the last commit
@@ -66,6 +66,7 @@ export function CommitField({ id, value, onCommit, type = 'text', min, above, st
   // Saves what was typed. Leaving the field saves only after typing; Enter always saves, so a
   // refused save can be tried again. Saving a value that did not change is harmless.
   function commit(asked) {
+    if (readOnly) return; // its commit is under way: Enter again sends nothing more (design review AF)
     if (!edited.current && !asked) return;
     edited.current = false;
     const decided = commitDecision(String(draft).trim(), { type, min, above, step, allowEmpty });
@@ -80,7 +81,7 @@ export function CommitField({ id, value, onCommit, type = 'text', min, above, st
   return (
     <>
       <Input id={id} type={type === 'number' ? 'text' : type} inputMode={inputMode ?? (type === 'number' ? 'decimal' : undefined)}
-        value={draft} placeholder={placeholder} list={suggestions ? listId : undefined} className={cn('h-9', className)}
+        value={draft} placeholder={placeholder} list={suggestions ? listId : undefined} className={cn('h-9', className)} readOnly={readOnly}
         onChange={(event) => { edited.current = true; setDraft(event.target.value); }} onBlur={() => commit(false)}
         onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); commit(true); } }} />
       {suggestions && (

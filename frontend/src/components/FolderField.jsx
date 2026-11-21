@@ -8,7 +8,9 @@ import { folderPicker } from '../backups.js';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 
-export function FolderField({ label, hint, value, onChange, placeholder }) {
+// readOnly: the form's request is under way, so its answer, not the researcher, decides what comes next (design review
+// AF's rule C); its Choose is busy with it.
+export function FolderField({ label, hint, value, onChange, placeholder, readOnly }) {
   const t = useT();
   const id = useId();
   const [pick, setPick] = useState(() => folderPicker());
@@ -29,9 +31,9 @@ export function FolderField({ label, hint, value, onChange, placeholder }) {
       <div className="flex gap-2">
         <Input id={id} value={value} spellCheck={false} autoComplete="off" className="font-mono text-xs md:text-xs"
           placeholder={placeholder ?? t('folder.placeholder')} aria-describedby={hint ? `${id}-hint` : undefined}
-          onChange={(event) => onChange(event.target.value)} />
+          onChange={(event) => onChange(event.target.value)} readOnly={readOnly} />
         {pick && (
-          <Button type="button" variant="outline" className="shrink-0" onClick={choose}>
+          <Button type="button" variant="outline" className="shrink-0" disabled={readOnly} onClick={choose}>
             <FolderOpen aria-hidden="true" />{t('folder.choose')}
           </Button>
         )}

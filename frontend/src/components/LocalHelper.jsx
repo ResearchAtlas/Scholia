@@ -49,6 +49,7 @@ export function LocalHelperSection({ project }) {
   const [importing, setImporting] = useState(false);
   const cancelling = useAction();
   const restarting = useAction();
+  const importAction = useAction(); // the import's, held here: while it is under way only its answer closes its form
   const model = status?.models?.[0];
   const offered = downloadOffered(project);
 
@@ -83,14 +84,14 @@ export function LocalHelperSection({ project }) {
                   <Download aria-hidden="true" />{t('helper.download')}
                 </Button>
               )}
-              <Button variant="outline" aria-expanded={importing} disabled={downloading(status)}
-                onClick={() => setImporting((open) => !open)}>
+              <Button variant="outline" aria-expanded={importing} disabled={downloading(status) || importAction.busy}
+                onClick={() => { importAction.reset(); setImporting((open) => !open); }}>
                 <FileInput aria-hidden="true" />{t('helper.import')}
               </Button>
             </div>
           )}
           {importing && needsModel(status) && (
-            <ImportForm model={model} onDone={(data) => { setStatus(data); setImporting(false); }} />
+            <ImportForm model={model} action={importAction} onDone={(data) => { setStatus(data); setImporting(false); }} />
           )}
           {offered && (
             <ModelConsent open={consent} status={status} project={project} onClose={() => setConsent(false)}
@@ -263,12 +264,12 @@ function Detail({ label, children }) {
 
 // Import for offline installs: the model file named by its full path, typed or picked in the app's
 // window. Scholia copies it only if its size and SHA-256 match the pin.
-function ImportForm({ model, onDone }) {
+function ImportForm({ model, action, onDone }) {
   const t = useT();
   const id = useId();
   const [path, setPath] = useState('');
   const [pick, setPick] = useState(() => modelFilePicker());
-  const { busy, problem, run } = useAction();
+  const { busy, problem, run } = action;
   useEffect(() => { // pywebview adds its bridge after the page has loaded
     const ready = () => setPick(() => modelFilePicker());
     window.addEventListener('pywebviewready', ready);
@@ -290,7 +291,7 @@ function ImportForm({ model, onDone }) {
             placeholder={t('helper.importPlaceholder')} aria-describedby={`${id}-hint`}
             onChange={(event) => setPath(event.target.value)} readOnly={busy} />
           {pick && (
-            <Button type="button" variant="outline" className="shrink-0" onClick={async () => {
+            <Button type="button" variant="outline" className="shrink-0" disabled={busy} onClick={async () => {
               const chosen = await pick().catch(() => null);
               if (chosen) setPath(chosen);
             }}><FolderOpen aria-hidden="true" />{t('folder.choose')}</Button>

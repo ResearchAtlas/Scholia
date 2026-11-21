@@ -528,6 +528,7 @@ const scenarios = {
     await s.submitWith(byId('key-lab'), 'the key form');
     const put = s.server.next(writes('PUT', '/api/keys/lab'));
     assert.equal(await s.typeInto(byId('key-lab'), NEWER, 'the key'), true);
+    state.gets['/api/providers'].providers[0].has_key = true; // the reread after the save moves the card to Ready (AF)
     await s.release(put, (r) => r.answer({}));
     assert.equal(s.field(byId('key-lab'), 'the key').props.value, NEWER);
   },
@@ -614,13 +615,221 @@ const scenarios = {
     await s.submitWith((e) => e.type === 'ui:Input', 'the export form');
     assert.equal(s.server.next(writes('POST', '/api/projects/p1/export')).body.passphrase, undefined, 'the passphrase no longer shown was sent');
   },
+  // r8 pass 1, site 1: a provider's first key is saved; a replacement is typed while the save is under way; the reread
+  // after the save moves the card from Needs setup to Ready.
+  async aFirstKeySavedKeepsAReplacementTypedSince(w, strict) {
+    const state = { personal: { providers: {} }, gets: { '/api/providers': { providers: [lab()] } } };
+    const s = await partWorld(w, strict, state, 'Providers', 'Providers');
+    await s.typeInto(byId('key-lab'), SUBMITTED, 'the key');
+    await s.submitWith(byId('key-lab'), 'the key form');
+    const put = s.server.next(writes('PUT', '/api/keys/lab'));
+    assert.equal(put.body.key, SUBMITTED);
+    assert.equal(await s.typeInto(byId('key-lab'), NEWER, 'the key'), true);
+    state.gets['/api/providers'].providers[0].has_key = true; // as the reread after the save says
+    await s.release(put, (r) => r.answer({ ok: true }));
+    assert.ok(s.shown().some((e) => e.type === 'h3' && e.text.trim() === 'Ready'), 'the card is under Ready');
+    assert.equal(s.field(byId('key-lab'), 'the key').props.value, NEWER, 'the replacement typed since is gone');
+    assert.equal(s.server.asked.filter(writes('PUT', '/api/keys')).length, 0, 'the replacement was sent');
+  },
+  // This review, the same remount: what the save said (the key store was unavailable: the key is in a file) is the
+  // card's too, and goes with it.
+  async aFirstKeysStoreWarningIsStillShown(w, strict) {
+    const state = { personal: { providers: {} }, gets: { '/api/providers': { providers: [lab()] } } };
+    const s = await partWorld(w, strict, state, 'Providers', 'Providers');
+    await s.typeInto(byId('key-lab'), SUBMITTED, 'the key');
+    await s.submitWith(byId('key-lab'), 'the key form');
+    state.gets['/api/providers'].providers[0].has_key = true;
+    await s.release(s.server.next(writes('PUT', '/api/keys/lab')), (r) => r.answer({ ok: true, warning: 'credential_store_unavailable' }));
+    assert.ok(s.says('status').some((text) => text.includes(KEY_STORE)), 'the key store warning is not shown');
+  },
+  // This review, the same remount by another answer: a key typed and not saved, and the provider turned off (or on).
+  async aKeyTypedIsKeptWhenItsProviderIsTurnedOff(w, strict) {
+    const state = { personal: { providers: {} }, gets: { '/api/providers': { providers: [lab({ has_key: true })] } } };
+    const s = await partWorld(w, strict, state, 'Providers', 'Providers');
+    assert.equal(await s.typeInto(byId('key-lab'), NEWER, 'the key'), true);
+    await s.press('Off');
+    state.gets['/api/providers'].providers[0].enabled = false;
+    await s.release(s.server.next(writes('PUT', '/api/settings')), (r) => r.answer({ values: { providers: { lab: { enabled: false } } }, hash: 'h2', problems: [] }));
+    assert.ok(s.shown().some((e) => e.type === 'h3' && e.text.trim() === 'Off'), 'the card is under Off');
+    assert.equal(s.field(byId('key-lab'), 'the key').props.value, NEWER, 'the key typed is gone');
+  },
+  // Guard (green at the head): a card whose group changes is drawn under its new group, once.
+  async aProviderIsListedOnceUnderItsGroup(w, strict) {
+    const state = { personal: { providers: {} }, gets: { '/api/providers': { providers: [lab(), lab({ name: 'other', has_key: true })] } } };
+    const s = await partWorld(w, strict, state, 'Providers', 'Providers');
+    const order = () => s.shown().filter((e) => e.type === 'h3' || e.type === 'h4').map((e) => e.text.trim());
+    assert.deepEqual(order(), ['Ready', 'other', 'Needs setup', 'lab']);
+    await s.typeInto(byId('key-lab'), SUBMITTED, 'the key');
+    await s.submitWith(byId('key-lab'), 'the key form');
+    state.gets['/api/providers'].providers[0].has_key = true;
+    await s.release(s.server.next(writes('PUT', '/api/keys/lab')), (r) => r.answer({ ok: true }));
+    assert.deepEqual(order(), ['Ready', 'lab', 'other']);
+    assert.equal(s.field(byId('key-lab'), 'the key').props.value, '', 'the key saved is cleared');
+  },
+  // r8 pass 1, site 2: Add endpoint is submitted; while its key is stored the form is cancelled, opened again and typed
+  // in; the first form's answer closes the second.
+  async anEarlierAddEndpointDoesNotCloseAReopenedForm(w, strict) {
+    const state = { personal: { providers: {} }, gets: { '/api/providers': { providers: [] } } };
+    const s = await partWorld(w, strict, state, 'Providers', 'Providers');
+    await s.press('Add an endpoint');
+    await s.typeInto(byId('new-provider-name'), 'first', 'name');
+    await s.typeInto(byId('new-provider-url'), 'http://localhost:1/v1', 'address');
+    await s.typeInto(byId('new-provider-key'), SUBMITTED, 'key');
+    await s.submitWith(byId('new-provider-name'), 'the add form');
+    await s.release(s.server.next(writes('PUT', '/api/settings')), (r) => r.answer({ values: { providers: { first: {} } }, hash: 'h2', problems: [] }));
+    const put = s.server.next(writes('PUT', '/api/keys/first'));
+    const cancelled = await pressIfCan(s, 'Cancel');
+    let typed = false;
+    if (cancelled) {
+      await s.press('Add an endpoint');
+      typed = await s.typeInto(byId('new-provider-name'), 'second', 'name');
+      await s.typeInto(byId('new-provider-key'), NEWER, 'key');
+    }
+    state.gets['/api/providers'].providers.push(lab({ name: 'first', has_key: true }));
+    await s.release(put, (r) => r.answer({ ok: true }));
+    assert.ok(s.screen().includes('first'), 'the endpoint added is listed');
+    if (typed) {
+      assert.ok(s.has((e) => e.props.value === 'second'), 'the name typed in the form opened since is gone');
+      assert.ok(s.has((e) => e.props.value === NEWER), 'the key typed in the form opened since is gone');
+    }
+  },
+  // This review, a credential: Cancel pressed while the endpoint's settings are written; its key is stored all the same.
+  async aCancelledAddEndpointStoresNoKey(w, strict) {
+    const state = { personal: { providers: {} }, gets: { '/api/providers': { providers: [] } } };
+    const s = await partWorld(w, strict, state, 'Providers', 'Providers');
+    await s.press('Add an endpoint');
+    await s.typeInto(byId('new-provider-name'), 'first', 'name');
+    await s.typeInto(byId('new-provider-url'), 'http://localhost:1/v1', 'address');
+    await s.typeInto(byId('new-provider-key'), SUBMITTED, 'key');
+    await s.submitWith(byId('new-provider-name'), 'the add form');
+    const write = s.server.next(writes('PUT', '/api/settings'));
+    const cancelled = await pressIfCan(s, 'Cancel');
+    await s.release(write, (r) => r.answer({ values: { providers: { first: {} } }, hash: 'h2', problems: [] }));
+    const stored = s.server.asked.filter(writes('PUT', '/api/keys/first')).length;
+    assert.ok(!cancelled || stored === 0, 'Cancel was pressed, and the key was stored after it');
+  },
+  // r8 pass 1, site 3: an import is submitted; its form is closed and opened again and another path typed; the first
+  // import's answer closes the second form.
+  async anEarlierImportDoesNotCloseAReopenedForm(w, strict) {
+    const state = { gets: { '/api/helper': helper(false) } };
+    const s = await partWorld(w, strict, state, 'LocalHelper', 'LocalHelperSection', { project: null });
+    await s.press('Import a file…');
+    await s.typeInto(inForm, '/first/model.gguf', 'the path');
+    await s.submitWith(inForm, 'the import form');
+    const post = s.server.next(writes('POST', '/api/helper/models/import'));
+    let typed;
+    if (await pressIfCan(s, 'Import a file…')) { // closed
+      await s.press('Import a file…'); // and opened again
+      typed = await s.typeInto(inForm, NEWER, 'the path');
+    } else typed = await s.typeInto(inForm, NEWER, 'the path');
+    state.gets['/api/helper'] = helper(true);
+    await s.release(post, (r) => r.answer(helper(true)));
+    assert.ok(!typed || s.has((e) => e.props.value === NEWER), 'the path typed in the form opened since is gone');
+  },
+  // The same, where it is the status read that says the model is in place (the first import's answer still held): no
+  // callback of the first form runs.
+  async aModelInPlaceDoesNotCloseAFormOpenedSinceItsImport(w, strict) {
+    const state = { gets: { '/api/helper': helper(false) } };
+    const timers = [];
+    const s = await drawn(w, strict, state, 'LocalHelper', 'LocalHelperSection', { project: null },
+      () => { globalThis.setTimeout = (fn) => { timers.push(fn); return timers.length; }; });
+    await s.press('Import a file…');
+    await s.typeInto(inForm, '/first/model.gguf', 'the path');
+    await s.submitWith(inForm, 'the import form');
+    s.server.next(writes('POST', '/api/helper/models/import')); // held: never answered here
+    let typed;
+    if (await pressIfCan(s, 'Import a file…')) { await s.press('Import a file…'); typed = await s.typeInto(inForm, NEWER, 'the path'); }
+    else typed = await s.typeInto(inForm, NEWER, 'the path');
+    state.gets['/api/helper'] = helper(true);
+    await s.act(() => timers.at(-1)()); // the status is read again
+    assert.ok(!s.has(inForm), 'the import is still offered though the model is in place');
+    assert.equal(typed, false, 'a path was typed in a form opened while an import was under way, and went when the model was in place');
+  },
+  // r8's note: Choose stays enabled while the path is read-only, and writes it.
+  async aPathChosenWhileItsImportIsUnderWayChangesNothing(w, strict) {
+    const state = { gets: { '/api/helper': helper(false) } };
+    const s = await drawn(w, strict, state, 'LocalHelper', 'LocalHelperSection', { project: null },
+      () => { globalThis.window.pywebview = { api: { choose_model_file: async () => '/chosen/model.gguf' } }; });
+    await s.press('Import a file…');
+    await s.typeInto(inForm, '/first/model.gguf', 'the path');
+    await s.submitWith(inForm, 'the import form');
+    const chose = await pressIfCan(s, 'Choose…');
+    assert.equal(chose, false, 'Choose could be pressed while the import was under way');
+    assert.equal(s.field(inForm, 'the path').props.value, '/first/model.gguf');
+  },
+  // This review (the census lists the folder field once, for every form that draws it): the data-folder screen's form is
+  // replaced by its request's answer, over a path typed since.
+  async aDataFolderChosenLosesNothingTypedSince(w, strict) {
+    const s = await partWorld(w, strict, {}, 'DataFolderScreen', 'DataFolderScreen', { health: { data_folder: '/old', data_folder_problem: 'missing' } });
+    await s.typeInto(inForm, '/first', 'the folder');
+    await s.submitWith(inForm, 'the folder form');
+    const post = s.server.next(writes('POST', '/api/data-folder'));
+    const typed = await s.typeInto(inForm, NEWER, 'the folder');
+    await s.release(post, (r) => r.answer({ data_folder: '/first' }));
+    assert.ok(s.screen().includes('/first'), 'the folder recorded is shown');
+    assert.equal(typed, false, 'another folder could be typed while the first was recorded, and the form then went');
+  },
+  // This review (the census lists CommitField once, for every form that draws it): the picker's window field is closed
+  // by its own save's answer, over a number typed since.
+  async aWindowSetInThePickerLosesNothingTypedSince(w, strict) {
+    const state = { personal: {}, gets: {
+      '/api/providers': { providers: [lab({ has_key: true })] }, '/api/models/recent': { models: [] },
+      '/api/providers/lab/models': { status: {}, models: [{ id: 'm1', name: 'Model One', offered: true, window: { status: 'needed' }, effort: { steps: [] } }] } } };
+    const s = await partWorld(w, strict, state, 'ModelPicker', 'ModelPicker', { projectId: null });
+    await s.act(() => one(s.shown().filter((e) => e.type === 'button' && e.props.role === 'option' && e.text.includes('Model One')), 'the model').props.onClick());
+    assert.equal(await s.typeInto(byId('picker-window'), '8192', 'the window'), true);
+    await s.act(() => s.field(byId('picker-window'), 'the window').props.onKeyDown({ key: 'Enter', preventDefault() {} }));
+    const put = s.server.next(writes('PUT', '/api/settings'));
+    const typed = await s.typeInto(byId('picker-window'), '16384', 'the window');
+    await s.release(put, (r) => r.answer({ values: {}, hash: 'h2' }));
+    assert.ok(!s.has(byId('picker-window')), 'the window field is closed once its window is set');
+    assert.equal(typed, false, 'another window could be typed while the first was saved, and the field then closed');
+  },
+};
+
+// Design review AF's row vi: when a removal becomes known the projects are read again, and Settings' This project page
+// and the Library are drawn anew, with what was typed there. Kept as todo: they run, and are red by design.
+const limits = {
+  // This review, row vi: the projects are read again after a removal became known; the open project's record is not
+  // known meanwhile, and Settings' This project page is drawn again, with what was typed there. Drawn as the Shell draws
+  // Settings: its project prop undefined, then the record again.
+  async aProjectsRereadKeepsWhatIsTypedInThisProject(w, strict) {
+    const project = { id: 'p1', name: 'Project Alpha', kind: 'research', sensitivity: 'normal' };
+    const state = { personal: { limits: { agent_steps: 1, tool_calls: 1, turn_minutes: 1 } }, gets: {
+      '/api/settings?project_id=p1': { values: { project: {}, limits: {} }, hash: 'h', problems: [] },
+      '/api/instructions?project_id=p1': { text: '', hash: 'i', other_bytes: 0, cap_bytes: 32768 } } };
+    const s = await settingsWorld(w, strict, state, { open: false, startPage: null, project });
+    await s.redraw({ open: true, startPage: 'project' });
+    assert.equal(await s.typeInto(byId('project-instructions'), NEWER, 'the instructions'), true);
+    await s.redraw({ open: true, startPage: 'project', project: undefined }); // the list is read again
+    await s.redraw({ open: true, startPage: 'project' });
+    assert.equal(s.field(byId('project-instructions'), 'the instructions').props.value, NEWER, 'the instructions typed are gone');
+  },
+  // This review, row vi as the window draws it: a project's deletion fails (it may have happened); the projects are read
+  // again, the open project's record is not known meanwhile, and its Library is drawn anew: what was typed in its search
+  // field goes.
+  async aFailedDeletionKeepsTheLibrarysSearchText(w, strict) {
+    const s = await windowWorld(w, strict, start({ papers: [paper('a', 'Paper A')] }));
+    await s.press('Library');
+    const search = (e) => e.type === 'ui:Input' && e.up.some((x) => x.props.role === 'search');
+    assert.equal(await s.typeInto(search, DRAFT, 'the search field'), true);
+    await s.projectMenu(/^Delete Project Alpha/);
+    await s.press('Delete');
+    const del = s.server.next(writes('DELETE', '/api/projects/p1'));
+    s.server.hold('projects');
+    await s.release(del, (r) => r.fail());
+    await s.releaseAll(reads('projects'));
+    assert.ok(s.screen().includes('Paper A'), 'the project is still open, its papers read again');
+    assert.equal(s.field(search, 'the search field').props.value, DRAFT, 'what was typed in the search field is gone');
+  },
 };
 
 const only = process.env.ONLY ? process.env.ONLY.split(',') : null;
-for (const [name, run] of Object.entries(scenarios)) {
+const LIMIT = 'accepted limit row vi (Harold, 2026-11-22)';
+for (const [name, run] of [...Object.entries(scenarios), ...Object.entries(limits)]) {
   if (only && !only.includes(name)) continue;
   for (const strict of [false, true]) {
-    test(`${name}${strict ? ' (StrictMode)' : ''}`, async () => {
+    test(`${name}${strict ? ' (StrictMode)' : ''}`, name in limits ? { todo: LIMIT } : {}, async () => {
       const names = ['fetch', 'FileReader', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
         'requestAnimationFrame', 'window', 'document', 'localStorage'];
       const kept = Object.fromEntries(names.map((n) => [n, Object.getOwnPropertyDescriptor(globalThis, n)]));

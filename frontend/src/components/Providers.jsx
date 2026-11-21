@@ -10,7 +10,7 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, put } from '../api.js';
 import { errorText } from '../text.js';
 import { WINDOW_PRESETS, forgetModels, groupOf, loadModels, onCatalogChange, settingKey, useSettingsFile } from '../settings.js';
-import { CommitField, Field, FileProblems, LoadState, Restore, Section, Segmented } from './fields.jsx';
+import { CommitField, Field, FileProblems, LoadState, Restore, Segmented } from './fields.jsx';
 import { KeyConfirmation, LocalDeclaration } from './Governance.jsx';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -72,20 +72,21 @@ export function Providers() {
       <FileProblems problems={personal.problems} />
       {adding && <AddEndpoint existing={list.map((p) => p.name)} onCancel={() => setAdding(false)}
         onAdded={async () => { setAdding(false); await changed(); }} />}
-      {GROUPS.map((group) => {
-        const members = list.filter((p) => groupOf(p) === group);
-        if (!members.length) return null;
-        return (
-          <Section key={group} title={t(`providers.group.${group}`)}>
-            <div className="space-y-3">
-              {members.map((provider) => (
-                <ProviderCard key={provider.name} provider={provider} table={tables[provider.name] ?? {}}
-                  save={personal.save} onChanged={changed} />
-              ))}
-            </div>
-          </Section>
-        );
-      })}
+      {/* One keyed list, the groups' headings among the cards (design review AF's G): a card whose group changes (its
+        first key saved, turned off or on) moves and is the same card, with what was typed in it and what its save said.
+        The spacing is the sections' as they were: 32 px between groups, 16 px under a heading, 12 px between cards. */}
+      <div className="space-y-3">
+        {GROUPS.flatMap((group) => {
+          const members = list.filter((p) => groupOf(p) === group);
+          return members.length ? [
+            <h3 key={`group:${group}`} className="pb-1 pt-5 text-sm font-semibold first:pt-0">{t(`providers.group.${group}`)}</h3>,
+            ...members.map((provider) => (
+              <ProviderCard key={`card:${provider.name}`} provider={provider} table={tables[provider.name] ?? {}}
+                save={personal.save} onChanged={changed} />
+            )),
+          ] : [];
+        })}
+      </div>
     </div>
   );
 }
@@ -393,7 +394,7 @@ function AddEndpoint({ existing, onCancel, onAdded }) {
       </Field>
       {(problem || personal.problem) && <p role="alert" className="text-sm text-destructive">{errorText(t, problem ?? personal.problem)}</p>}
       <div className="flex justify-end gap-2">
-        <Button type="button" variant="ghost" size="sm" onClick={onCancel}>{t('common.cancel')}</Button>
+        <Button type="button" variant="ghost" size="sm" disabled={busy} onClick={onCancel}>{t('common.cancel')}</Button>
         <Button type="submit" size="sm" disabled={busy || !nameOk || !url.trim() || !key.trim()}>{t('providers.addSubmit')}</Button>
       </div>
     </form>

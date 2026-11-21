@@ -141,6 +141,7 @@ export function ModelPicker({ projectId }) {
   const [catalog, setCatalog, reload] = useCatalog(open, projectId, chosen?.model ? `${chosen.provider}:${chosen.model}` : null);
   const [fixing, setFixing] = useState(null); // a model whose window is asked for before it is chosen
   const [fixProblem, setFixProblem] = useState(null);
+  const [fixBusy, setFixBusy] = useState(false); // the window is saved: its field, which the answer closes, takes nothing meanwhile
   const model = catalog?.models.find((m) => m.provider === chosen?.provider && m.id === chosen?.model);
 
   const results = useMemo(() => {
@@ -184,6 +185,7 @@ export function ModelPicker({ projectId }) {
   async function setWindow(m, value) {
     const asked = picks;
     setFixProblem(null);
+    setFixBusy(true);
     try {
       if (await saveSettings({ [settingKey('providers', m.provider, 'windows', m.id)]: value }) === null) {
         setFixProblem('settings_changed'); // the file changed meanwhile: nothing was written
@@ -192,6 +194,8 @@ export function ModelPicker({ projectId }) {
     } catch (error) {
       setFixProblem(error instanceof ApiError ? error.code : 'internal');
       return; // the field stays, with the reason
+    } finally {
+      setFixBusy(false);
     }
     if (picks === asked) choose(m); // its window is set, so the choice it was asked for completes (unless a newer pick came); the catalog's check confirms it
     await reload();
@@ -241,7 +245,7 @@ export function ModelPicker({ projectId }) {
             <form className="space-y-1.5 border-t p-2" onSubmit={(event) => event.preventDefault()}>
               <label htmlFor="picker-window" className="block text-xs font-medium">{t('picker.setWindow', { model: fixing.name })}</label>
               <CommitField id="picker-window" type="number" min={4096} step={1} inputMode="numeric" suggestions={WINDOW_PRESETS}
-                placeholder={t('providers.window')} onCommit={(value, error) => (error ? null : setWindow(fixing, value))} />
+                placeholder={t('providers.window')} readOnly={fixBusy} onCommit={(value, error) => (error ? null : setWindow(fixing, value))} />
               {fixProblem && <p role="alert" className="text-xs text-destructive">{errorText(t, fixProblem)}</p>}
               <p className="text-[11px] leading-relaxed text-muted-foreground">{t('providers.windowTrust')}</p>
             </form>
