@@ -22,7 +22,7 @@ import zlib
 
 import httpx
 
-from backend.openrouter import classify_error
+from backend.openrouter import classify_error, whole_text
 
 log = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ async def _fetch_catalog_rows(client, url, id_field, key):
                     response.raise_for_status()
                     body = await _bounded(response, MAX_CATALOG_BYTES - total_bytes)  # every page's, together
                     total_bytes += len(body)
-                    payload = json.loads(body)
+                    payload = whole_text(json.loads(body))  # half a surrogate pair: the replacement character
                 if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
                     raise ValueError("invalid catalog shape")
                 page = payload["data"]
@@ -334,7 +334,7 @@ async def endpoints(client, provider, model):
         async with asyncio.timeout(CATALOG_SECONDS):
             async with client.stream("GET", url, headers={"Accept-Encoding": "gzip"}, timeout=10.0) as response:
                 response.raise_for_status()
-                payload = json.loads(await _bounded(response, MAX_CATALOG_BYTES))
+                payload = whole_text(json.loads(await _bounded(response, MAX_CATALOG_BYTES)))
         data = payload.get("data") if isinstance(payload, dict) else None
         rows = data.get("endpoints") if isinstance(data, dict) else None
         if not isinstance(rows, list) or len(rows) > MAX_CATALOG_MODELS:
