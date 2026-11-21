@@ -105,7 +105,7 @@ const scenarios = {
     const before = library.libraryGeneration();
     const ui = await mount([jsx(Sidebar, { projects: [{ id: 'p1', name: 'P', kind: 'research' }], projectId: 'p1',
       conversations: [{ id: 'c1', title: 'T' }], conversationId: 'c1', onProject() {}, onProjectDeleted: () => told.push('projects'),
-      onConversation() {}, onConversationRemoved: (removed, known) => told.push(`conversations ${removed} ${known}`), onNewConversation() {},
+      onConversation() {}, onConversationDeleted: (removed, known) => told.push(`conversations ${removed} ${known}`), onNewConversation() {},
       onSettings() {} })], { strict }).settle();
     const items = ui.find((p, type) => type === 'ui:DropdownMenuItem' && p.onSelect);
     await act(ui, () => items.find((item) => ui.said((p) => p === item.props)[0] === 'Delete').props.onSelect());

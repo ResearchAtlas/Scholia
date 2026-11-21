@@ -11,7 +11,7 @@ import { LeftOff, Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
-import { NOTICES, clear, drain, limitText, send, showing, stop, stopsAt, unsavedAnswer, useLiveTurn } from '../live.js';
+import { NOTICES, clear, deleted, drain, forget, limitText, send, showing, stop, stopsAt, unsavedAnswer, useLiveTurn } from '../live.js';
 import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
@@ -65,6 +65,8 @@ function useConversationAsks(conversationId, watching, projectId) {
   return { asks: known.asks, load };
 }
 
+const NEW = { turns: [], queued: [] }; // a conversation not made yet
+
 export function ConversationView({ conversationId, conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated,
   onLibrary }) {
   const t = useT();
@@ -73,8 +75,11 @@ export function ConversationView({ conversationId, conversation, projectId, pane
   const live = useLiveTurn(id);
   // a turn opens a place only while shown here (live.js), said in the commit that shows it: never a passive effect's delay
   useLayoutEffect(() => showing(projectId, id), [projectId, id]);
-  const [turns, setTurns] = useState(conversationId ? null : []);
-  const [queued, setQueued] = useState([]); // S1-33: messages waiting as the next turn, as last read
+  // What was read of the conversation's record (its turns, and S1-33: the messages waiting as the next turn), held,
+  // shown and dropped together: null until it is read, and from a change until it is read again (design review Z).
+  const [record, setRecord] = useState(conversationId ? null : NEW);
+  const turns = record?.turns ?? null;
+  const queued = record?.queued ?? NEW.queued;
   const [failed, setFailed] = useState(false);
   const [problem, setProblem] = useState(null);
   const [reads, setReads] = useState(0); // each newest read done, failed or not, so polling goes on
@@ -104,13 +109,14 @@ export function ConversationView({ conversationId, conversation, projectId, pane
       // The Markdown renderer loads beside the first read, so answers show formatted with their turns.
       const [read] = await Promise.all([get(`/api/conversations/${id}`), markdownReady()]);
       if (!current() || !settle(true)) return false; // overtaken, or asked before the library changed: never shown
-      setTurns(read.turns);
-      setQueued(read.queued ?? []);
+      setRecord({ turns: read.turns, queued: read.queued ?? NEW.queued });
       setFailed(false);
       setStale(false);
       return true;
-    } catch {
+    } catch (error) {
       if (current() && settle(false)) setFailed(true);
+      // the record is known to be deleted, whatever was asked before: nothing read of it stays, here or in live.js
+      if (deleted(error)) { setRecord(null); forget(id); }
       return false;
     } finally {
       // only the newest read counts as done: one overtaken would start the handoff again, overtaking the read in
@@ -129,7 +135,7 @@ export function ConversationView({ conversationId, conversation, projectId, pane
     const changed = (event) => {
       if ((event.detail !== projectId && event.detail !== null) || !id) return; // a conversation not yet created has read nothing
       guard.current.libraryChanged(); // first: every read asked before this is dropped when it arrives
-      setTurns(null);
+      setRecord(null);
       setStale(true);
       setFailed(false);
       load();
@@ -348,7 +354,8 @@ export function ConversationView({ conversationId, conversation, projectId, pane
       {/* S1-33: outside the message box's form, so the waiting messages' own forms are never nested in it */}
       <div className="mx-auto w-full max-w-3xl shrink-0 px-4">
         <Queued conversationId={id} queued={queued} running={running} onChanged={load} onSend={(item) => sendQueued(item)} />
-        <BudgetBar projectId={projectId} conversationId={id} seen={`${reads}.${live?.budget ?? 0}`} />
+        {/* as the record: not drawn from a change until the record is read again, so no spend read before it is shown */}
+        {record && <BudgetBar projectId={projectId} conversationId={id} seen={`${reads}.${live?.budget ?? 0}`} />}
       </div>
       {/* Stop reaches the turn the record shows running and every stream under way here (live.js stop) */}
       <Composer running={running} problem={problem} onSend={submit} projectId={projectId} onAttach={attach}

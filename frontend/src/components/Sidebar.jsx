@@ -23,7 +23,7 @@ import { memoryChanged } from '../memory.js'; // S1-21a
 import { libraryChanged } from '../library.js';
 
 export function Sidebar({ projects, projectId, conversations, problem, conversationId, onProject, onProjectCreated, onProjectDeleted,
-  onConversation, onConversationsChanged, onConversationRemoved, onNewConversation, onSettings, onHide }) {
+  onConversation, onConversationsChanged, onConversationRemoved, onConversationDeleted, onNewConversation, onSettings, onHide }) {
   const t = useT();
   const [dialog, setDialog] = useState(null); // { kind, conversation? }
   const project = projects.find((p) => p.id === projectId);
@@ -145,7 +145,7 @@ export function Sidebar({ projects, projectId, conversations, problem, conversat
           // a deletion known to have happened leaves what it removed even when the sidebar went: nothing of it can be sent
           // to, and what was typed in it goes with it (design review S); rider W is for what still exists
           if (dialog?.kind === 'deleteProject') onProjectDeleted(id, deleted);
-          else onConversationRemoved(id, deleted);
+          else onConversationDeleted(id, deleted);
         }}
         onDone={() => setDialog(null)} />
     </nav>

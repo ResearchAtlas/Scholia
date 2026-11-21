@@ -10,7 +10,7 @@ import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
 import { DEFAULTS, LIMITS, clamp, columns, fromSettings, panelShareAt, toSettings } from '../layout.js';
 import { errorText } from '../text.js';
-import { places, subscribe } from '../live.js';
+import { forget, places, recheck, subscribe } from '../live.js';
 import { libraryChanged, newest } from '../library.js';
 import { generation, useRead } from '../libraryRead.js';
 import { projectName } from '../projects.js';
@@ -88,6 +88,14 @@ export function Shell({ health, settings, onLanguage }) {
   // what is open only in the visit it was asked in: after any choice of the researcher's since, it changes nothing
   // (design review U). The conversation's view is keyed by the visit, so no answer draws the message box again.
   const answered = (change) => setOpen((now) => (now.visit === open.visit ? change(now) : now));
+  // A deletion known to have happened leaves what it removed if that is open now, whichever visit it was asked in and
+  // whether or not its Sidebar is still drawn: a deleted id is never open again, so the ids are all there is to compare
+  // (design review Z; the visit is for answers about what still exists). live.js forgets a conversation's live turn.
+  const gone = useCallback((kind, id) => {
+    if (kind === 'conversation') forget(id);
+    setOpen((now) => (kind === 'project' ? (now.projectId === id ? { ...now, projectId: undefined, conversationId: undefined } : now)
+      : now.conversationId === id ? { ...now, conversationId: undefined } : now));
+  }, []);
   // The lists, through the Library's read (libraryRead.js): shown only when read since the last removal of something
   // they name (a deletion's request settled, a conversation moved), never one asked before it, and nothing old after
   // a read that failed.
@@ -223,13 +231,19 @@ export function Shell({ health, settings, onLanguage }) {
       onProjectDeleted={(id, removed) => {
         removals.projects.move();
         removals.conversations.move();
-        if (removed) answered((now) => (now.projectId === id ? { ...now, projectId: undefined, conversationId: undefined } : now));
+        recheck(); // live.js: a turn it holds of a conversation that went with the project
+        if (removed) gone('project', id);
       }}
       onConversation={(id) => { openConversation(id); setDrawer(false); }}
       onConversationsChanged={loadConversations}
-      onConversationRemoved={(id, removed) => {
+      onConversationDeleted={(id, removed) => {
         removals.conversations.move();
-        if (removed) answered((now) => (now.conversationId === id ? { ...now, conversationId: undefined } : now));
+        recheck(); // not known (its request failed): live.js asks
+        if (removed) gone('conversation', id);
+      }}
+      onConversationRemoved={(id, asked) => { // moved: it still exists, so it is left only in the visit the move was asked in (rule V, rider W)
+        removals.conversations.move();
+        if (asked) answered((now) => (now.conversationId === id ? { ...now, conversationId: undefined } : now));
       }}
       onNewConversation={newConversation}
       onSettings={() => { setDrawer(false); setSettingsOpen(true); }}

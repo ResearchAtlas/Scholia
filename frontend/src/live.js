@@ -18,11 +18,31 @@ const stops = new Map(); // conversation id -> how many times Stop was pressed i
 const followed = new Set(); // run ids a waiting message was started after here, or refused on its merits (one a turn)
 const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut, notices }, for this window
 const listeners = new Set();
+const gone = new Set(); // conversations known to be deleted: nothing of them is held here again (an id is never reused)
+const unsavedIn = new Map(); // run id -> its conversation, for each answer in unsaved
 
 function set(conversationId, turn, eventType) {
-  if (turn) turns.set(conversationId, turn);
+  if (turn && !gone.has(conversationId)) turns.set(conversationId, turn);
   else turns.delete(conversationId);
   for (const listener of listeners) listener(conversationId, turn, eventType);
+}
+
+// A conversation known to be deleted (its deletion answered, or its record's read answered 404): its live turn and its
+// answers shown but not saved go, its stream is closed, and nothing of it is taken in or sent from here again (design
+// review Z).
+export function forget(conversationId) {
+  gone.add(conversationId);
+  for (const [runId, owner] of unsavedIn) if (owner === conversationId) { unsaved.delete(runId); unsavedIn.delete(runId); }
+  aborts.get(conversationId)?.abort();
+  set(conversationId, null, 'deleted');
+}
+export const deleted = (error) => error instanceof ApiError && error.status === 404 && error.code === 'not_found';
+// As a deletion's request settles (a project's takes its conversations; a failed one may have happened): each
+// conversation held here is asked for, and forgotten if its own record answers 404. Never by a list.
+export function recheck() {
+  for (const id of new Set([...turns.keys(), ...unsavedIn.values()])) {
+    get(`/api/conversations/${encodeURIComponent(id)}`).catch((error) => { if (deleted(error)) forget(id); });
+  }
 }
 
 export function subscribe(listener) {
@@ -68,6 +88,7 @@ export function send(conversationId, path, body, text, since = stopsAt(conversat
     return Promise.reject(new ApiError(409, 'stopped'));
   }
   if (aborts.has(conversationId)) return Promise.reject(new ApiError(409, 'active_run'));
+  if (gone.has(conversationId)) return Promise.reject(new ApiError(404, 'not_found'));
   const abort = new AbortController();
   let turn = { text, runId: null, answer: null, done: false };
   aborts.set(conversationId, abort);
@@ -90,7 +111,8 @@ export function send(conversationId, path, body, text, since = stopsAt(conversat
       if (event.type === 'open_place' && shown?.conversationId === conversationId && shown.projectId === event.project_id) {
         openPlace(event.place);
       }
-      if (event.type === 'chat_response' && event.result_saved === false && turn.runId) {
+      if (event.type === 'chat_response' && event.result_saved === false && turn.runId && !gone.has(conversationId)) {
+        unsavedIn.set(turn.runId, conversationId);
         unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut), ...(event.notices ? { notices: event.notices } : {}) });
       }
       set(conversationId, turn, event.type);
@@ -137,7 +159,8 @@ export async function drain(conversationId) {
     let read;
     try {
       read = await get(`/api/conversations/${encodeURIComponent(conversationId)}`);
-    } catch {
+    } catch (error) {
+      if (deleted(error)) forget(conversationId);
       return; // it waits, as the conversation shows when it is read
     }
     const after = read?.turns?.at(-1)?.run_id;
