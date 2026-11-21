@@ -34,7 +34,7 @@ export function App() {
   const [shown, setShown] = useState({ language: null, failed: null });
   const { language } = shown;
   // The window's language, decided by the first launch step that knows it; later ones (load again
-  // after the setup, a restore or Try again) leave it as it is.
+  // after the setup or Try again) leave it as it is. A restore reloads the window (Backups.jsx).
   const decided = useRef(false);
   const launchLanguage = useCallback(async (setting) => {
     if (decided.current) return;
@@ -99,7 +99,7 @@ export function App() {
       {state.phase === 'loading' && <Splash />}
       {state.phase === 'error' && <Failure code={state.code} onRetry={load} />}
       {state.phase === 'dataFolder' && <DataFolderScreen health={state.health} />}
-      {state.phase === 'damaged' && <DamagedDatabaseScreen onRestored={load} restart={state.health?.limited === 'restart_required'} />}
+      {state.phase === 'damaged' && <DamagedDatabaseScreen restart={state.health?.limited === 'restart_required'} />}
       {state.phase === 'setup' && <FirstRun onDone={load} />}
       {state.phase === 'ready' && <Shell health={state.health} settings={state.settings}
         onLanguage={() => setEnglishUnsaved(false)} />}

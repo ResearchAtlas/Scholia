@@ -4,6 +4,10 @@
 // view shows meanwhile. A new module-level holder fails here until it is listed with its rule; a listed one that no
 // longer exists fails too. This is a declaration check, in the manner of fields.test.mjs: it makes a holder say its
 // rule; it does not prove the rule.
+// Design review AB: a restore replaces the database under every holder here and under every view. However a restore
+// that succeeded is left, the window reloads (Backups.jsx; tests/restore_exits.test.mjs), so none of them outlives one,
+// and none needs a rule of its own for a restore. What outlives a reload is the browser's storage: each use of it says
+// below how a deletion and a restore reach what it keeps.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -17,7 +21,7 @@ const HELD = {
   'live.js: turns': 'a conversation\'s live turn (its message and answer): forget() drops it once the deletion is known; none is taken in after',
   'live.js: unsaved': 'answers shown but not saved, by run: forget() drops its conversation\'s',
   'live.js: unsavedIn': IDS,
-  'live.js: gone': IDS,
+  'live.js: gone': 'ids of conversations known deleted in this window; a restore, which can bring one back, reloads the window (design review AB)',
   'live.js: aborts': 'a conversation\'s open stream: forget() closes it',
   'live.js: routes': IDS, 'live.js: halted': IDS, 'live.js: stops': IDS, 'live.js: followed': IDS, 'live.js: edited': IDS,
   'live.js: listeners': 'functions', 'live.js: shown': IDS,
@@ -56,4 +60,20 @@ test('every holder that outlives the views says how a deletion reaches it', () =
   }
   assert.deepEqual(found.filter((key) => !HELD[key]), [], 'module-level holders with no rule for a deletion');
   assert.deepEqual(Object.keys(HELD).filter((key) => !found.includes(key)), [], 'listed holders that no longer exist');
+});
+
+const STORED = {
+  'api.js: sessionStorage': 'this launch\'s session (session.js): nothing of the database; a restore does not change it',
+  'components/Shell.jsx: localStorage': 'the id of the project last open: opened again only if the projects read after the reload list it',
+};
+const STORES = ['localStorage', 'sessionStorage', 'indexedDB', 'caches', 'cookie'];
+
+test('everything that outlives a reload says how a deletion and a restore reach it', () => {
+  const found = [];
+  for (const file of files(SRC)) {
+    const code = readFileSync(join(SRC, file), 'utf8').replace(/\/\/.*$/gm, '');
+    for (const store of STORES) if (new RegExp(`\\b${store}\\b`).test(code)) found.push(`${file}: ${store}`);
+  }
+  assert.deepEqual(found.filter((key) => !STORED[key]), [], 'browser storage with no rule for a deletion and a restore');
+  assert.deepEqual(Object.keys(STORED).filter((key) => !found.includes(key)), [], 'listed storage that is no longer used');
 });

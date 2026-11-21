@@ -18,7 +18,8 @@ const stops = new Map(); // conversation id -> how many times Stop was pressed i
 const followed = new Set(); // run ids a waiting message was started after here, or refused on its merits (one a turn)
 const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut, notices }, for this window
 const listeners = new Set();
-const gone = new Set(); // conversations known to be deleted: nothing of them is held here again (an id is never reused)
+const gone = new Set(); // conversations known to be deleted: nothing of them is held here again (an id is never reused
+// within a window: a restore, which brings back earlier ids, reloads it: Backups.jsx, design review AB)
 const unsavedIn = new Map(); // run id -> its conversation, for each answer in unsaved
 
 function set(conversationId, turn, eventType) {

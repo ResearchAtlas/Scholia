@@ -6,7 +6,7 @@
 import { useContext, useEffect, useRef, useState } from 'react';
 import { CheckCircle2, DatabaseBackup, History, TriangleAlert } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
-import { get, post } from '../api.js';
+import { ApiError, get, post } from '../api.js';
 import { fileSize, restoreBody, restoreNotes } from '../backups.js';
 import { useAction } from '../action.js';
 import { errorText } from '../text.js';
@@ -16,12 +16,20 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 
-// onRestored runs after a restore, whose state the rest of the interface must load again.
-export function BackupsSection({ onRestored = () => window.location.reload(), restoreOnly = false }) {
+// A restore that succeeded replaced the database under everything this window holds and shows (design review AB): its
+// result is shown here, and however that is left the window reloads: Continue, Settings closed or another page chosen,
+// the window replaced by another screen; at once, if its answer finds this no longer drawn.
+export function BackupsSection({ restoreOnly = false }) {
   const t = useT();
   const [backups, setBackups] = useState(null);
   const [restoring, setRestoring] = useState(null); // the restore request waiting for its confirmation
   const [restored, setRestored] = useState(null);
+  const left = useRef({ drawn: true, restored: false });
+  useEffect(() => { // set again on every setup: StrictMode runs setup, cleanup and setup
+    const state = left.current;
+    state.drawn = true;
+    return () => { state.drawn = false; if (state.restored) window.location.reload(); };
+  }, []);
   const listing = useAction();
   const backingUp = useAction();
 
@@ -33,7 +41,7 @@ export function BackupsSection({ onRestored = () => window.location.reload(), re
     if (await backingUp.run(() => post('/api/backups'))) setListed((n) => n + 1);
   }
 
-  if (restored) return <Restored result={restored} onContinue={onRestored} />;
+  if (restored) return <Restored result={restored} onContinue={() => window.location.reload()} />;
 
   return (
     <div className="grid gap-6">
@@ -64,7 +72,12 @@ export function BackupsSection({ onRestored = () => window.location.reload(), re
       <RestoreFromFile onRestore={(request) => setRestoring(request)} />
 
       <ConfirmRestore request={restoring} damaged={restoreOnly} onClose={() => setRestoring(null)}
-        onDone={(result) => { setRestoring(null); setRestored(result); }} />
+        onDone={(result) => {
+          left.current.restored = true;
+          if (!left.current.drawn) window.location.reload();
+          setRestoring(null);
+          setRestored(result);
+        }} />
     </div>
   );
 }
@@ -72,7 +85,7 @@ export function BackupsSection({ onRestored = () => window.location.reload(), re
 // A database damaged at startup: Scholia changed nothing and offers only a restore. Or, restart: a close of the
 // database failed (backend: close_failed), so nothing may replace its files until Scholia is opened again; it
 // says so and offers nothing else.
-export function DamagedDatabaseScreen({ onRestored, restart = false }) {
+export function DamagedDatabaseScreen({ restart = false }) {
   const t = useT();
   return (
     <main className="grid h-full place-items-center overflow-y-auto p-6">
@@ -82,7 +95,7 @@ export function DamagedDatabaseScreen({ onRestored, restart = false }) {
         <p className="mb-6 mt-2 text-sm leading-relaxed text-muted-foreground">
           {t(restart ? 'backups.restartBody' : 'backups.damagedBody')}
         </p>
-        {!restart && <BackupsSection restoreOnly onRestored={onRestored} />}
+        {!restart && <BackupsSection restoreOnly />}
       </div>
     </main>
   );
@@ -224,8 +237,15 @@ function ConfirmRestore({ request, damaged, onClose, onDone }) {
   const t = useT();
   const { busy, problem, run, reset } = useAction();
   async function confirm() {
-    const result = await run(() => post('/api/backups/restore', restoreBody(request)));
+    let unanswered = false;
+    const result = await run(() => post('/api/backups/restore', restoreBody(request)).catch((error) => {
+      unanswered = error instanceof ApiError && error.status === 0;
+      throw error;
+    }));
     if (result) onDone(result);
+    // rider U: no answer, so it may have happened or be under way still (the backend ends a restore whatever becomes of
+    // its request): if the engine answers, the window reloads and says what it finds
+    else if (unanswered) get('/api/health').then(() => window.location.reload(), () => {});
   }
   return (
     <Dialog open={Boolean(request)} onOpenChange={(next) => { if (!next && !busy) { reset(); onClose(); } }}>
