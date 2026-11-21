@@ -2,7 +2,8 @@
 // or sent from there. Each step waits for the event it names (subscribe); no timer, no sleep.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { clear, forget, recheck, send, subscribe, unsavedAnswer } from '../src/live.js';
+import { ApiError } from '../src/api.js';
+import { clear, deleted, forget, recheck, send, subscribe, unsavedAnswer } from '../src/live.js';
 
 function backend(t) { // a turn's stream the test pushes to; every other request answers 404 not_found
   let controller; const asked = [];
@@ -62,4 +63,24 @@ test('as a deletion settles, a conversation held here whose record answers 404 i
   recheck(); await forgotten;
   assert.equal(unsavedAnswer('rz4'), null);
   assert.equal(held('z4'), false);
+});
+
+test('only a record\'s own 404 not_found counts as deleted', () => { // the whole-batch review (F4)
+  assert.equal(deleted(new ApiError(404, 'not_found')), true);
+  assert.equal(deleted(new ApiError(404, 'http_error')), false);
+  assert.equal(deleted(new ApiError(503, 'not_found')), false);
+});
+
+test('as a deletion settles, an answer held after its live turn was cleared is forgotten too', async (t) => {
+  const server = backend(t); // the turn was handed over (cleared), its answer not saved stays shown by its run
+  const admitted = send('z5', '/api/conversations/z5/message/stream', {}, 'DELETED-QUESTION');
+  server.push({ type: 'run_started', run_id: 'rz5' }); await admitted;
+  const ended = heard('run_finished');
+  server.push({ type: 'chat_response', content: 'DELETED-ANSWER', result_saved: false }, { type: 'run_finished', status: 'succeeded' }); await ended;
+  clear('z5');
+  assert.equal(held('z5'), false);
+  assert.deepEqual(unsavedAnswer('rz5'), { text: 'DELETED-ANSWER', cut: false });
+  const forgotten = heard('deleted');
+  recheck(); await forgotten;
+  assert.equal(unsavedAnswer('rz5'), null);
 });

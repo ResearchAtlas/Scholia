@@ -219,6 +219,7 @@ const scenarios = {
     await s.type(DRAFT);
     await s.act(() => one(s.shown().filter((e) => e.type === 'ui:Button' && e.props['aria-label'] === 'Stop'), 'Stop').props.onClick());
     assert.equal(s.box(), `${FIRST}\n${DRAFT}`);
+    assert.equal(s.says('alert').length, 0, 'a failure was said for a Stop'); // the whole-batch review (F2)
   },
   async aFirstSendStoppedBeforeItsAdmissionIsGivenBack(w, strict) {
     const s = await windowWorld(w, strict, start());
@@ -229,6 +230,7 @@ const scenarios = {
     await s.type(DRAFT);
     await s.act(() => one(s.shown().filter((e) => e.type === 'ui:Button' && e.props['aria-label'] === 'Stop'), 'Stop').props.onClick());
     assert.equal(s.box(), `${FIRST}\n${DRAFT}`);
+    assert.equal(s.says('alert').length, 0, 'a failure was said for a Stop'); // the whole-batch review (F2)
   },
   // Its controls: a message admitted (the run started) was sent, whether its stream is then lost or Stop is pressed: it
   // is not given back, the turn it started stays shown, and no failure is said.

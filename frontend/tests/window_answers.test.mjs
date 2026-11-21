@@ -490,8 +490,8 @@ const scenarios = {
     assert.equal(s.buttons('Remove').length + s.buttons('Edit').length + s.buttons('Send').length, 0, 'a waiting message can be acted on');
     await s.pause(); // the record is read again after a pause
     assert.deepEqual(left(s), [], 'after it was read again');
-    if (s.selected().length) return; // rider N: left once its record answered 404; what was typed there went with it
-    assert.equal(s.draft(), DRAFT, 'what was typed there, while the view stays (S, without rider R)');
+    // the view stays (S without rider R; rider N, which would leave it, is not built)
+    assert.equal(s.draft(), DRAFT, 'what was typed there, while the view stays');
   },
   // This review: in that view (it stays: S, without rider R), once the record has answered 404 nothing leaves for the
   // deleted conversation; what was typed is given back (X).
@@ -501,7 +501,6 @@ const scenarios = {
     deleteConversation(state, 'a');
     await s.release(s.server.next(writes('DELETE')), (r) => r.fail('unreachable', 503));
     await s.closeDialog(); await s.pause();
-    if (s.selected().length) return; // rider N: no view of it is left to send from
     await s.type(DRAFT); await s.send();
     assert.deepEqual(s.server.asked.filter((r) => r.path.includes('/conversations/a/')).map((r) => r.path), []);
     assert.equal(s.draft(), DRAFT);
@@ -682,6 +681,20 @@ const scenarios = {
     assert.ok(s.seen().includes(QUEUED) && s.seen().includes(ASKED), 'read again and shown');
     assert.equal(s.draft(), DRAFT);
     assert.equal(s.meters().length, 1, 'the budget bar is back');
+  },
+  // The whole-batch review (F4): a turn of A is live, B is opened, A is deleted from the Sidebar and the answer is lost:
+  // live.js asks for the conversation it holds, its record answers 404, and its stream is closed.
+  async aDeletedConversationsLiveTurnElsewhereIsForgottenThoughItsAnswerWasLost(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.type(LIVE); await s.send();
+    const request = s.server.next(writes('POST', '/message/stream')); const turn = request.open();
+    await s.act(() => turn.push({ type: 'run_started', run_id: 'r1', conversation_id: 'a', seq: 2 }));
+    await s.open('Title Bravo');
+    await s.menu('Title Alpha', 'Delete'); await s.confirmDelete();
+    deleteConversation(state, 'a');
+    await s.release(s.server.next(writes('DELETE')), (r) => r.fail('unreachable', 503));
+    assert.deepEqual(s.selected(), ['Title Bravo']);
+    assert.equal(request.signal.aborted, true, 'the stream of the deleted conversation is still open here');
   },
 };
 
