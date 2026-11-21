@@ -111,6 +111,17 @@ async function libraryWorld({ mount, jsx, Library }, strict, state) {
   return hands(ui, server);
 }
 
+async function settingsWorld({ mount, jsx }, strict, state, props) {
+  const server = backend(state);
+  const { Settings } = await load.component('Settings');
+  const draw = (more = {}) => jsx(Settings, { open: true, onOpenChange() {}, health: {}, project: null, onLanguage() {}, ...props, ...more });
+  const ui = await mount([draw()], { strict }).settle();
+  const s = hands(ui, server);
+  s.redraw = async (more) => { ui.show([draw(more)]); await ui.settle(); }; // the Shell drawing it again with new props
+  s.page = () => s.shown().filter((e) => e.type === 'button' && e.props['aria-current'] === 'page').map((e) => e.text.trim());
+  return s;
+}
+
 const P1 = { id: 'p1', name: 'Project Alpha', kind: 'research' };
 const conv = (id, title) => ({ id, title, running: false });
 const start = (more = {}) => ({ projects: [P1], conversations: { p1: [conv('a', 'Title Alpha'), conv('b', 'Title Bravo')] }, ...more });
@@ -367,6 +378,24 @@ const scenarios = {
     await s.releaseAll(reads('asks'));
     assert.ok(s.screen().includes('Which year?'), 'the question is shown again once read');
     assert.equal(s.field(mine, 'the answer').props.value, DRAFT);
+  },
+
+  // Rider P (X has no scenario: its harness drew no Settings; this one draws Settings alone, as the Shell draws it): a
+  // running turn's open_place for a Settings page, while Settings is open at another page with something typed there,
+  // leaves the page and what was typed.
+  async aTurnsOpenPlaceLeavesAnOpenSettingsPage(w, strict) {
+    const s = await settingsWorld(w, strict, { personal: { ui: { language: 'en' }, subagents: { models: [] } } }, { open: false, startPage: null });
+    await s.redraw({ open: true, startPage: 'subagents' }); // opened at Subagents (the stand-in's settings answer draws it)
+    assert.equal(await s.typeInto(byId('subagent-add'), NEWER, 'a model to add'), true);
+    await s.redraw({ open: true, startPage: 'project' }); // live.js openPlace('settings.project'): Shell.jsx sets the start page
+    assert.deepEqual(s.page(), ['Subagents'], 'the page the researcher had open was changed');
+    assert.equal(s.field(byId('subagent-add'), 'a model to add').props.value, NEWER);
+  },
+  // Guard (S1-19c, green at the head): Settings opened by open_place opens at the page named.
+  async aClosedSettingsOpenedByATurnOpensAtItsPage(w, strict) {
+    const s = await settingsWorld(w, strict, { personal: { ui: { language: 'en' }, subagents: { models: [] } } }, { open: false, startPage: null });
+    await s.redraw({ open: true, startPage: 'subagents' });
+    assert.deepEqual(s.page(), ['Subagents']);
   },
 };
 
