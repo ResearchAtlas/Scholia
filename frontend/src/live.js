@@ -38,6 +38,8 @@ export function forget(conversationId) {
   aborts.get(conversationId)?.abort();
   set(conversationId, null, 'deleted');
 }
+// Whether a conversation is known deleted here: what would open it, list it or ask for it looks first (design review AE).
+export const forgotten = (conversationId) => gone.has(conversationId);
 export const deleted = (error) => error instanceof ApiError && error.status === 404 && error.code === 'not_found';
 // As a deletion's request settles (a project's takes its conversations; a failed one may have happened): each
 // conversation held here is asked for, and forgotten if its own record answers 404. Never by a list.
@@ -156,7 +158,8 @@ export function editing(conversationId, id, open) {
 
 export async function drain(conversationId) {
   const pressed = stopsAt(conversationId);
-  const free = () => !aborts.has(conversationId) && !halted.has(conversationId) && stopsAt(conversationId) === pressed;
+  // nothing known deleted is asked for again: its 404 would be knowledge the window already has (design review AE)
+  const free = () => !gone.has(conversationId) && !aborts.has(conversationId) && !halted.has(conversationId) && stopsAt(conversationId) === pressed;
   for (let tries = 0; tries < 3 && free(); tries += 1) {
     let read;
     try {

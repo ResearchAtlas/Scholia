@@ -1038,7 +1038,7 @@ test('an older conversation read answering late never restores a waiting message
     const reads = [];
     const shown = { queued: null };
     const env = { id: 'c-c3', guard: { current: readGuard() }, newestRead: newest(), markdownReady: async () => {},
-      get: () => new Promise((resolve) => reads.push(resolve)), NEW: { turns: [], queued: [] }, deleted: () => false,
+      get: () => new Promise((resolve) => reads.push(resolve)), NEW: { turns: [], queued: [] }, deleted: () => false, forgotten: () => false,
       setRecord: (record) => { shown.queued = record.queued; }, setFailed: () => {}, setStale: () => {}, setReads: () => {} };
     const load = new Function(...Object.keys(env), `return (${body});`)(...Object.values(env));
     const older = load(); // asked before the edit or removal, held
@@ -1082,7 +1082,7 @@ test('a read dropped as older never starts the handoff again, so its newest read
   let cleanup = null;
   const env = { id: 'c-cf1', guard: { current: readGuard() }, newestRead: newest(), markdownReady: async () => {},
     get: () => { asked += 1; return new Promise((resolve) => later(() => resolve({ turns: [{ status: 'cancelled' }], queued: [{ id: 'q1', text: 'Next' }] }), 100)); },
-    NEW: { turns: [], queued: [] }, deleted: () => false,
+    NEW: { turns: [], queued: [] }, deleted: () => false, forgotten: () => false,
     setRecord: (record) => shown.push(record.turns), setFailed: () => {}, setStale: () => {},
     setReads: (f) => { const before = reads; reads = f(reads); if (reads !== before) rerun(); } };
   const load = new Function(...Object.keys(env), `return (${loadBody});`)(...Object.values(env));

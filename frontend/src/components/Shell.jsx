@@ -10,7 +10,7 @@ import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
 import { DEFAULTS, LIMITS, clamp, columns, fromSettings, panelShareAt, toSettings } from '../layout.js';
 import { errorText } from '../text.js';
-import { deleted, forget, places, recheck, subscribe } from '../live.js';
+import { deleted, forget, forgotten, places, recheck, subscribe } from '../live.js';
 import { libraryChanged, newest } from '../library.js';
 import { generation, useRead } from '../libraryRead.js';
 import { projectName } from '../projects.js';
@@ -76,14 +76,22 @@ export function Shell({ health, settings, onLanguage }) {
   // what was shown was removed), and then no conversation, so no message box, is drawn; a conversation null: a new
   // one. A list decides only what is not decided; after that only the researcher's own actions change it, never a
   // read (design review S).
-  const [open, setOpen] = useState({ projectId: undefined, conversationId: undefined, visit: 0 });
+  const [lost] = useState(() => new Set()); // the projects this window knows deleted (a conversation's: live.js forgotten)
+  const [open, setRaw] = useState({ projectId: undefined, conversationId: undefined, visit: 0 });
+  // Nothing known deleted is open, whatever chose it and whether the choice or the knowledge came first: every change of
+  // what is open passes here, and knowledge has what is open looked at again (left, below) (design review AE).
+  const setOpen = useCallback((change) => setRaw((now) => {
+    const next = change(now);
+    return lost.has(next.projectId) ? { ...next, projectId: undefined, conversationId: undefined }
+      : forgotten(next.conversationId) ? { ...next, conversationId: undefined } : next;
+  }), [lost]);
   const { projectId, conversationId } = open;
   // The researcher's choice of another project (its conversation not decided yet) or conversation is a new visit; the
   // open one chosen again changes nothing.
   const openProject = useCallback((id) => setOpen((now) => (now.projectId === id ? now
-    : { projectId: id, conversationId: undefined, visit: now.visit + 1 })), []);
+    : { projectId: id, conversationId: undefined, visit: now.visit + 1 })), [setOpen]);
   const openConversation = useCallback((id) => setOpen((now) => (now.conversationId === id ? now
-    : { ...now, conversationId: id, visit: now.visit + 1 })), []);
+    : { ...now, conversationId: id, visit: now.visit + 1 })), [setOpen]);
   // An answer that comes later (a removal known to have happened, a project made, a first message admitted) changes
   // what is open only in the visit it was asked in: after any choice of the researcher's since, it changes nothing
   // (design review U). The conversation's view is keyed by the visit, so no answer draws the message box again.
@@ -95,17 +103,17 @@ export function Shell({ health, settings, onLanguage }) {
   // What is known of a deletion wins over everything read before it was known, and there is one place it lands, however
   // it was learned (its DELETE answered; its own record answered 404, to the Shell, a view or live.js): no list asked
   // before now is shown or chosen from (first: the request may have settled before the engine deleted), every other
-  // reader drops what it read and reads again (the one change event), live.js asks for what it holds, and what was
-  // deleted is left if it is open now, whichever visit asked and whether or not its Sidebar is drawn: a deleted id is
-  // never open again, so the ids are all there is to compare (design reviews Z and AD; rider N).
+  // reader drops what it read and reads again (the one change event), live.js asks for what it holds, and what is open
+  // is looked at again, whichever visit asked and whether or not its Sidebar is drawn: setOpen leaves what is known
+  // deleted, now and at any later choice, so a choice that lands after the knowledge opens nothing deleted either
+  // (design reviews Z, AD and AE; rider N).
   const left = useCallback((kind, id) => {
-    if (kind === 'project') removals.projects.move();
+    if (kind === 'project') { lost.add(id); removals.projects.move(); }
     removals.conversations.move();
     libraryChanged(null);
     recheck();
-    setOpen((now) => (kind === 'project' ? (now.projectId === id ? { ...now, projectId: undefined, conversationId: undefined } : now)
-      : now.conversationId === id ? { ...now, conversationId: undefined } : now));
-  }, [removals]);
+    setOpen((now) => now);
+  }, [removals, lost, setOpen]);
   // A conversation's passes through live.js, which says 'deleted' once for each (below): what live.js learns by its own
   // reads lands in the same place.
   const gone = useCallback((kind, id) => (kind === 'conversation' ? forget(id) : left(kind, id)), [left]);
@@ -124,6 +132,7 @@ export function Shell({ health, settings, onLanguage }) {
     const timers = asking.current;
     clearTimeout(timers.get(id));
     timers.delete(id);
+    if (lost.has(id)) return; // nothing known deleted is asked for again (design review AE)
     get(`/api/projects/${encodeURIComponent(id)}`).catch((error) => {
       if (deleted(error)) gone('project', id);
       else if (timers.drawn && !(error instanceof ApiError && error.status > 0 && error.status < 500)) { // no answer
@@ -134,14 +143,17 @@ export function Shell({ health, settings, onLanguage }) {
         }, RETRY_MS));
       }
     });
-  }, [gone]);
+  }, [gone, lost]);
   const projectsRead = useRead(removals.projects, 'projects', () => get('/api/projects'));
   const conversationsRead = useRead(removals.conversations, projectId ?? null,
     () => get(`/api/conversations?project_id=${encodeURIComponent(projectId)}`));
   useRetry(projectsRead);
   useRetry(conversationsRead);
-  const projects = projectsRead.value?.projects ?? null;
-  const conversations = conversationsRead.value?.conversations ?? null;
+  // and no list names what is known deleted, whenever it was read (a list read since names it only after another
+  // client's restore: limit L4); each knowledge moves the generations, so a read after it is derived anew
+  const projects = useMemo(() => projectsRead.value?.projects.filter((p) => !lost.has(p.id)) ?? null, [projectsRead.value, lost]);
+  const conversations = useMemo(() => conversationsRead.value?.conversations.filter((c) => !forgotten(c.id)) ?? null,
+    [conversationsRead.value]);
   const loadConversations = conversationsRead.reload;
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notice, setNotice] = useState(null);

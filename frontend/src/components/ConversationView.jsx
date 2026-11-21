@@ -11,7 +11,7 @@ import { LeftOff, Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
-import { NOTICES, clear, deleted, drain, forget, limitText, send, showing, stop, stopsAt, unsavedAnswer, useLiveTurn } from '../live.js';
+import { NOTICES, clear, deleted, drain, forget, forgotten, limitText, send, showing, stop, stopsAt, unsavedAnswer, useLiveTurn } from '../live.js';
 import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
@@ -104,7 +104,7 @@ export function ConversationView({ conversationId, conversation, projectId, pane
   // message edited or removed since (PR 52 cycle 5 C3).
   const [newestRead] = useState(newest);
   const load = useCallback(async () => { // whether the conversation was read
-    if (!id) return false;
+    if (!id || forgotten(id)) return false; // nothing known deleted is asked for again (design review AE)
     const settle = guard.current.ask();
     const current = newestRead();
     try {
