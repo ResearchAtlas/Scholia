@@ -155,6 +155,29 @@ async function nothingTypedSinceIsLost(s, test, what, answer) {
   return typed;
 }
 
+// ---- design review AF's scenarios: unsent text against a parent's remount and an earlier form's answer ----
+const button = (s, label) => one(s.shown().filter((e) => (e.type === 'ui:Button' || e.type === 'button') && e.props.onClick && e.text.trim() === label), label);
+// presses as the researcher can: a disabled control takes no press; whether it took it
+const pressIfCan = async (s, label) => { if (button(s, label).props.disabled) return false; await s.press(label); return true; };
+// a part drawn alone, with something done between the world's globals and the first draw (a timer kept, a picker given)
+async function drawn({ mount, jsx }, strict, state, file, name, props, prepare = () => {}) {
+  const server = backend(state);
+  prepare();
+  const part = (await load.component(file))[name];
+  const draw = (more = {}) => jsx(part, { ...props, ...more });
+  const ui = await mount([draw()], { strict }).settle();
+  const s = hands(ui, server);
+  s.redraw = async (more) => { ui.show([draw(more)]); await ui.settle(); };
+  return s;
+}
+const lab = (more = {}) => ({ name: 'lab', kind: 'openai-compatible', base_url: 'https://llm.example.org/v1', enabled: true, has_key: false, ...more });
+const helper = (installed) => ({ models: [{ id: 'm', name: 'Search model', size: 10, license: 'MIT', installed,
+  sources: { huggingface: 'https://hf.example/m' }, sha256: 'ab', folder: '/models', file: 'model.gguf' }], download: null,
+  helper: { state: 'stopped' }, search: installed ? { mode: 'hybrid' } : { mode: 'keyword_only', reason: 'model_missing' } });
+const inForm = (e) => e.type === 'ui:Input' && e.up.some((x) => x.type === 'form');
+const KEY_STORE = 'key store was unavailable';
+
+
 const scenarios = {
   // r3-1 and r3-2, finding 1: a message is sent and its request fails after the researcher typed the next one: the box
   // holds what was typed since, and what was sent is given back.
@@ -579,6 +602,17 @@ const scenarios = {
     }
     assert.deepEqual(rejected, [], 'the drop threw');
     assert.equal(s.server.asked.filter((r) => r.method !== 'GET').length, 0, 'something was sent');
+  },
+  // This review, a credential: a passphrase typed for a Private project's export is sent, and encrypts the export, after
+  // the project became Normal and its field went.
+  async aPassphraseNoLongerShownIsNotSent(w, strict) {
+    const s = await drawn(w, strict, {}, 'ProjectExport', 'ProjectExportSection', { project: { id: 'p1', sensitivity: 'private' } });
+    await s.typeInto((e) => e.type === 'ui:Input' && e.props.type !== 'password', '/exports', 'the folder');
+    await s.typeInto(byId('export-passphrase'), SUBMITTED, 'the passphrase');
+    await s.redraw({ project: { id: 'p1', sensitivity: 'normal' } });
+    assert.ok(!s.has(byId('export-passphrase')), 'a Normal project is asked for no passphrase');
+    await s.submitWith((e) => e.type === 'ui:Input', 'the export form');
+    assert.equal(s.server.next(writes('POST', '/api/projects/p1/export')).body.passphrase, undefined, 'the passphrase no longer shown was sent');
   },
 };
 
