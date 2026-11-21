@@ -22,30 +22,42 @@ def pdf(pages, *, scanned=(), size=(612, 792), rotation=0):
     rotated page does."""
     import pypdfium2 as pdfium
     import pypdfium2.raw as raw
+    from backend.extraction import PDFIUM
 
     width, height = size if rotation in (0, 180) else size[::-1]  # the page as stored
     place = {0: lambda x, y: (1, 0, 0, 1, x, y), 90: lambda x, y: (0, 1, -1, 0, width - y, x),
              180: lambda x, y: (-1, 0, 0, -1, width - x, height - y), 270: lambda x, y: (0, -1, 1, 0, y, height - x)}
-    document = pdfium.PdfDocument.new()
-    for number, lines in enumerate(pages, start=1):
-        page = document.new_page(width, height)
-        page.set_rotation(rotation)
-        if number in scanned:
-            image = pdfium.PdfImage.new(document)
-            bitmap = pdfium.PdfBitmap.new_native(40, 40, raw.FPDFBitmap_BGR)
-            bitmap.fill_rect((180, 180, 180, 255), 0, 0, 40, 40)
-            image.set_bitmap(bitmap)
-            image.set_matrix(pdfium.PdfMatrix().scale(width, height))
-            page.insert_obj(image)
-        for x, y, font_size, text, *font in lines:
-            obj = raw.FPDFPageObj_NewTextObj(document, (font[0] if font else "Helvetica").encode(), font_size)
-            encoded = (text + "\0").encode("utf-16-le")
-            raw.FPDFText_SetText(obj, ctypes.cast(ctypes.c_char_p(encoded), ctypes.POINTER(raw.FPDF_WCHAR)))
-            raw.FPDFPageObj_Transform(obj, *place[rotation](x, y))
-            raw.FPDFPage_InsertObject(page, obj)
-        page.gen_content()
-    out = io.BytesIO()
-    document.save(out)
+    with PDFIUM:  # pdfium is not thread-safe, and a test's app may be reading a PDF meanwhile (CI run 43542906749)
+        document = pdfium.PdfDocument.new()
+        try:
+            for number, lines in enumerate(pages, start=1):
+                page = document.new_page(width, height)
+                page.set_rotation(rotation)
+                if number in scanned:
+                    image = pdfium.PdfImage.new(document)
+                    try:
+                        bitmap = pdfium.PdfBitmap.new_native(40, 40, raw.FPDFBitmap_BGR)
+                        try:
+                            bitmap.fill_rect((180, 180, 180, 255), 0, 0, 40, 40)
+                            image.set_bitmap(bitmap)
+                        finally:
+                            bitmap.close()  # the image keeps its own reference; released inside the lock
+                        image.set_matrix(pdfium.PdfMatrix().scale(width, height))
+                        page.insert_obj(image)
+                    except BaseException:
+                        image.close()  # on no page: released here, inside the lock, however it failed
+                        raise
+                for x, y, font_size, text, *font in lines:
+                    obj = raw.FPDFPageObj_NewTextObj(document, (font[0] if font else "Helvetica").encode(), font_size)
+                    encoded = (text + "\0").encode("utf-16-le")
+                    raw.FPDFText_SetText(obj, ctypes.cast(ctypes.c_char_p(encoded), ctypes.POINTER(raw.FPDF_WCHAR)))
+                    raw.FPDFPageObj_Transform(obj, *place[rotation](x, y))
+                    raw.FPDFPage_InsertObject(page, obj)
+                page.gen_content()
+            out = io.BytesIO()
+            document.save(out)
+        finally:
+            document.close()  # inside the lock, not later by the collector outside it
     return out.getvalue()
 
 

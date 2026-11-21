@@ -4,8 +4,9 @@
 # JSON object, a Markdown fence around it allowed as before; nothing it reads is logged (section 1.5).
 """Reading the model's tool calls."""
 
-import json
 import re
+
+from backend import whole_json as json
 
 from .types import ToolCall
 
@@ -38,7 +39,7 @@ class ToolParser:
         if not text.strip():
             return {}
         fenced = _FENCE.match(text)
-        try:
+        try:  # half a surrogate pair (an escape or raw bytes) is the replacement character (whole_json)
             value = json.loads(fenced.group(1) if fenced else text)
         except (ValueError, RecursionError):  # not JSON, or nested past what the parser follows
             return None

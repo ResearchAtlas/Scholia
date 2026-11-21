@@ -55,7 +55,6 @@ leaves no effect.
 """
 
 import asyncio
-import json
 import logging
 import math
 import sqlite3
@@ -66,6 +65,7 @@ import unicodedata
 from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 
+from backend import whole_json as json
 from backend import (agent, budget_router, citations, compaction, context, credentials, governance, memory, openrouter,
                      openrouter_client, provenance, providers, reach, router, skills, spending)
 from backend.evidence import historical_citations
@@ -1825,7 +1825,7 @@ class Harness:
             if wants_memory:
                 candidates = await self._read(lambda conn: memory.recall_candidates(
                     conn, ctx["project_id"], locked=ctx["policy"].locked))
-                nearest, mode, reason = None, "recency", None
+                nearest, embedded, mode, reason = None, None, "recency", None
                 state = search._STATES.get(self)
                 if candidates and state is not None:
                     try:
@@ -1834,13 +1834,14 @@ class Harness:
                         reason = "unavailable" if nearest is None else None
                         if nearest is not None and not set(nearest) & {r["id"] for r in candidates}:
                             nearest, reason = None, "unembedded"  # no candidate has a vector yet: the newest
+                        if nearest is not None:  # read here too: an index that rebuilds meanwhile is the same fallback
+                            embedded = await search.embedded_memory(state, [r["id"] for r in candidates])
                         mode = "similarity" if nearest is not None else "recency"
                     except TimeoutError:
-                        reason = "deadline"
+                        nearest, reason = None, "deadline"
                     except Exception as error:  # the helper or the index failed: the newest, said
                         log.warning("memory similarity failed (%s)", type(error).__name__)
-                        reason = "unavailable"
-                embedded = await search.embedded_memory(state, [r["id"] for r in candidates]) if nearest else None
+                        nearest, embedded, reason = None, None, "unavailable"
                 chosen = memory.ranked(candidates, nearest, embedded=embedded)
                 sections["user_memory"] += [memory.memory_line(r) for r in chosen]
                 if decision.get("rule") == "earlier_decision":  # missing memory is said, never invented (ticket 31)

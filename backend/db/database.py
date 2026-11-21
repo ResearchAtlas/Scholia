@@ -7,7 +7,6 @@ asyncio event loop; async code uses asyncio.to_thread.
 import asyncio
 import errno
 import fcntl
-import json
 import logging
 import os
 import shutil
@@ -21,6 +20,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from backend import whole_json as json
 from backend import APP_VERSION
 from backend.db.migrations import MIGRATIONS
 
@@ -31,6 +31,9 @@ APPLICATION_ID = 0x5343484C  # "SCHL", written by migration 0001
 DAILY_KEPT = 7
 WEEKLY_KEPT = 4
 KINDS = ("daily", "weekly")  # the automatic backups, by folder under backups/
+# Under backups/: restores and full backups in progress, emptied at launch and by a committed restore. A restore's
+# folder holds RESTORING from the moment its backup is chosen until it has ended (backend.backups).
+STAGING, RESTORING = ".staging", "restore"
 SETTINGS_FILES = ("config.toml", "AGENTS.md")  # copied into each backup: personal and per project
 _STAMP = "%Y%m%dT%H%M%S%fZ"  # backup generation folder names, oldest sorts first
 BUSY_TIMEOUT_MS = 5000  # how long a connection waits for another's lock
@@ -770,8 +773,14 @@ def _rotate(backups, keep, now=None):
     moved back. Age is told by keep's stamp, else now (default the current time):
     nothing under a week old is rotated, however many backups were taken on
     request, before deletions or by restores (design review H, R1). A clock set
-    back makes generations look younger, so it keeps more.
+    back makes generations look younger, so it keeps more. While a restore is in
+    progress (its staging folder holds RESTORING) nothing is moved or removed, by
+    any backup of any process: every generation it may need, its source first, is
+    where it was however it ends, and the next backup or idle check after it
+    catches up (design review R, Option 1).
     """
+    if _restoring(backups):
+        return
     daily, weekly = backups / "daily", backups / "weekly"
     now = _stamp_of(keep) if keep is not None else now or datetime.now(UTC)
     others = [generation for generation in _generations(daily) if generation != keep]
@@ -787,6 +796,24 @@ def _rotate(backups, keep, now=None):
             shutil.rmtree(old)
     for old in _generations(weekly)[:-WEEKLY_KEPT]:
         shutil.rmtree(old)
+
+
+def _restoring(backups):
+    """Whether a restore is in progress: a folder in STAGING holds RESTORING. A folder that cannot be listed raises
+    (Path.glob would read it as empty), so the caller rotates nothing (PR 63's recheck r2; design review R)."""
+    try:
+        with os.scandir(backups / STAGING) as entries:
+            folders = [entry.path for entry in entries if entry.is_dir()]  # a linked folder too: keeping is the safe way
+    except FileNotFoundError:  # no staging folder: no restore
+        return False
+    for folder in folders:
+        try:
+            with os.scandir(folder) as entries:
+                if any(entry.name == RESTORING for entry in entries):
+                    return True
+        except FileNotFoundError:  # removed as it was listed: a restore or backup that has ended
+            continue
+    return False
 
 
 def _settings_folders(data_dir):

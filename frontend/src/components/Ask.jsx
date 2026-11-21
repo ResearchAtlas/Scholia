@@ -22,11 +22,16 @@ function named(t, key, fallback) {
   return text === key ? fallback : text;
 }
 
+// What is typed in a question's text box and not sent, by the question's id: the researcher's own words, kept while the
+// question is dropped and read again after a change (design review X, rider A). It holds nothing of the question.
+const typed = new Map();
+
 export function Ask({ ask, onAnswered }) {
   const t = useT();
   const language = useContext(LanguageContext);
   const textId = useId();
-  const [text, setText] = useState('');
+  const [text, setTyped] = useState(() => typed.get(ask.ask_id) ?? '');
+  const setText = (next) => { if (next) typed.set(ask.ask_id, next); else typed.delete(ask.ask_id); setTyped(next); };
   const { busy, problem, run } = useAction();
   const services = new Intl.ListFormat(language, { type: 'conjunction' })
     .format((ask.params?.services ?? []).map((s) => named(t, `ask.service.${s}`, s)));
@@ -53,7 +58,7 @@ export function Ask({ ask, onAnswered }) {
 
   async function answer(reply) {
     const done = await run(() => post(`/api/runs/${encodeURIComponent(ask.run_id)}/asks/${encodeURIComponent(ask.ask_id)}`, reply));
-    if (done) onAnswered?.(done);
+    if (done) { typed.delete(ask.ask_id); onAnswered?.(done); }
   }
 
   return (

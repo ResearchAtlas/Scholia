@@ -595,3 +595,15 @@ def test_a_folder_of_roots_is_not_recorded(tmp_path, monkeypatch):
         data_folder.choose(tmp_path / "default", str(SYSTEM_EMPTY))
     assert refused.value.code == "data_folder_not_writable"
     assert not (tmp_path / data_folder.LOCATION_FILE).exists()
+
+
+def test_a_recorded_path_holding_bytes_that_are_not_utf8_reads_back_as_it_was(tmp_path):
+    # The batch F part 3 review (F3): the record keeps the standard library's json (tests/test_whole_json.py names it),
+    # so a path whose name holds bytes that are not UTF-8 (Python's surrogateescape: half a pair) is read back as it was,
+    # not with the replacement character; through backend/whole_json.py it would name another folder
+    default = tmp_path / "default"
+    record = default.parent / data_folder.LOCATION_FILE
+    path = "/Volumes/share/caf\udce9 data"
+    record.write_bytes(data_folder.json.dumps({"path": path}).encode())
+    record.chmod(0o600)
+    assert str(data_folder.located(default)) == path

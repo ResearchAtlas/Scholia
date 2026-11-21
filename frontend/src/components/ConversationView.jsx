@@ -11,7 +11,7 @@ import { LeftOff, Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
-import { NOTICES, clear, drain, limitText, send, showing, stop, stopsAt, unsavedAnswer, useLiveTurn } from '../live.js';
+import { NOTICES, clear, deleted, drain, forget, limitText, send, showing, stop, stopsAt, unsavedAnswer, useLiveTurn } from '../live.js';
 import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
@@ -65,16 +65,23 @@ function useConversationAsks(conversationId, watching, projectId) {
   return { asks: known.asks, load };
 }
 
-export function ConversationView({ conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated,
-  onLibrary }) {
+const NEW = { turns: [], queued: [] }; // a conversation not made yet
+
+export function ConversationView({ conversationId, conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated,
+  onLibrary, onGone }) {
   const t = useT();
   const [draft, setDraft] = useState(null); // a new conversation, made at its first message
-  const id = conversation?.id ?? draft;
+  const id = conversationId ?? draft; // the list's row (conversation) gives only its title
   const live = useLiveTurn(id);
   // a turn opens a place only while shown here (live.js), said in the commit that shows it: never a passive effect's delay
   useLayoutEffect(() => showing(projectId, id), [projectId, id]);
-  const [turns, setTurns] = useState(conversation ? null : []);
-  const [queued, setQueued] = useState([]); // S1-33: messages waiting as the next turn, as last read
+  // What was read of the conversation's record (its turns, and S1-33: the messages waiting as the next turn), held as
+  // one: null until it is read, and dropped whole at its own 404 (design review Z). A change drops the turns until the
+  // record is read again; the waiting messages, the researcher's own words with any editor open on them, stay until
+  // that read answers, and go if it fails (batch E's review, F1).
+  const [record, setRecord] = useState(conversationId ? null : NEW);
+  const turns = record?.turns ?? null;
+  const queued = record?.queued ?? NEW.queued;
   const [failed, setFailed] = useState(false);
   const [problem, setProblem] = useState(null);
   const [reads, setReads] = useState(0); // each newest read done, failed or not, so polling goes on
@@ -104,20 +111,24 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       // The Markdown renderer loads beside the first read, so answers show formatted with their turns.
       const [read] = await Promise.all([get(`/api/conversations/${id}`), markdownReady()]);
       if (!current() || !settle(true)) return false; // overtaken, or asked before the library changed: never shown
-      setTurns(read.turns);
-      setQueued(read.queued ?? []);
+      setRecord({ turns: read.turns, queued: read.queued ?? NEW.queued });
       setFailed(false);
       setStale(false);
       return true;
-    } catch {
-      if (current() && settle(false)) setFailed(true);
+    } catch (error) {
+      if (current() && settle(false)) {
+        setFailed(true);
+        setRecord((now) => (now && now.turns === null ? null : now)); // after a change: nothing read before it stays
+      }
+      // the record is known to be deleted, whatever was asked before: nothing read of it stays, here or in live.js
+      if (deleted(error)) { setRecord(null); forget(id); onGone?.(id); } // rider N: the Shell leaves it
       return false;
     } finally {
       // only the newest read counts as done: one overtaken would start the handoff again, overtaking the read in
       // flight, and none would ever be shown (fix batch 1, C-F1); the newer read counts when it ends
       if (current()) setReads((n) => n + 1);
     }
-  }, [id, newestRead]);
+  }, [id, newestRead, onGone]);
 
   useEffect(() => {
     load();
@@ -129,7 +140,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     const changed = (event) => {
       if ((event.detail !== projectId && event.detail !== null) || !id) return; // a conversation not yet created has read nothing
       guard.current.libraryChanged(); // first: every read asked before this is dropped when it arrives
-      setTurns(null);
+      setRecord((now) => now && { turns: null, queued: now.queued });
       setStale(true);
       setFailed(false);
       load();
@@ -197,7 +208,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       await send(target, `/api/conversations/${target}/message/stream`, { content: text, ...messageRoute(currentChoice()),
         ...(papers.length ? { material_ids: papers.map((paper) => paper.id) } : {}) }, text, since);
       if (papers.length) choosePapers(projectId, []); // they went with this message
-      if (!conversation && here.current) onCreated(target);
+      if (!conversationId && here.current) onCreated(target);
       return true;
     } catch (error) {
       if (isActiveRun(error)) return followUp(text); // a turn started meanwhile: the message follows the setting
@@ -229,17 +240,26 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   // Attached files join the project's Library, named as coming from this conversation, so the
   // question their lookup may ask is shown here. Before its first message a conversation does not
   // exist yet: the files are added as from the Library, which opens to show them.
+  // Only the newest attach says how it ended: an earlier one that answers late says nothing over it (design review O's
+  // Option 1, as the Library's own Add); its lookup is still watched while the newer says nothing of one.
+  const [newestAttach] = useState(newest);
   async function attach(files) {
+    const current = newestAttach();
     setProblem(null);
     setAttached(null);
+    if (!id) onLibrary?.(); // now, in the researcher's own action, as a drop on the window: no answer opens a panel
     const notes = [];
     const result = await addTo(projectId, files, t, (text) => notes.push(text), id ? { conversationId: id } : {});
     if (result) {
       libraryChanged(projectId);
       notes.unshift(t('conversation.attached', { count: result.materials.length }));
-      if (!id) onLibrary?.();
     }
-    if (notes.length) setAttached({ text: notes.join(' '), lookup: id && result ? result.lookup_run_id : null });
+    const lookup = id && result ? result.lookup_run_id : null;
+    if (current()) {
+      if (notes.length) setAttached({ text: notes.join(' '), lookup });
+    } else if (lookup) {
+      setAttached((now) => (now && !now.lookup ? { ...now, lookup } : now));
+    }
     if (result && id) asksChanged(id); // the view showing it now reads its questions, this one or its successor
   }
 
@@ -339,7 +359,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       {/* S1-33: outside the message box's form, so the waiting messages' own forms are never nested in it */}
       <div className="mx-auto w-full max-w-3xl shrink-0 px-4">
         <Queued conversationId={id} queued={queued} running={running} onChanged={load} onSend={(item) => sendQueued(item)} />
-        <BudgetBar projectId={projectId} conversationId={id} seen={`${reads}.${live?.budget ?? 0}`} />
+        {/* as the turns: not drawn from a change until the record is read again, so no spend read before it is shown */}
+        {turns && <BudgetBar projectId={projectId} conversationId={id} seen={`${reads}.${live?.budget ?? 0}`} />}
       </div>
       {/* Stop reaches the turn the record shows running and every stream under way here (live.js stop) */}
       <Composer running={running} problem={problem} onSend={submit} projectId={projectId} onAttach={attach}
@@ -509,7 +530,8 @@ function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
     setBusy(true);
     const sent = text;
     setText('');
-    if (!(await onSend(sent))) setText(sent);
+    // not sent: given back in front of what was typed since, never over it (design review X)
+    if (!(await onSend(sent))) setText((now) => (now ? `${sent}\n${now}` : sent));
     setBusy(false);
     box.current?.focus();
   }

@@ -28,7 +28,7 @@ carries, so the set is transitive. That one set is used everywhere:
   dispatch follow them too.
 """
 
-import json
+from backend import whole_json as json
 
 
 def existing(conn, material_ids):

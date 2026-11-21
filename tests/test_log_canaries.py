@@ -368,3 +368,141 @@ async def test_no_steering_queued_or_budget_answer_canary_reaches_the_log(tmp_pa
     for canary in ("CANARY-PROMPT", "CANARY-STEERING", "CANARY-QUEUED", "CANARY-EDITED", "CANARY-LIMIT", "CANARY-DISK"):
         assert canary not in text, canary
         assert not any(canary in record.getMessage() for record in caplog.records), canary
+
+
+async def test_an_exception_the_server_logs_is_written_without_its_message(tmp_path):
+    # PR 57's rechecks (astra 1, P2, privacy): a record poisoned before PR 57 (a steering note holding half a surrogate
+    # pair) makes each read of its conversation raise SQLite's decoding error, whose message quotes the stored text, and
+    # the server logs the exception it answers 500 for. Served as the desktop entry serves the app (log_config=None).
+    import socket
+    import sqlite3
+    import threading
+
+    import fastapi
+    import uvicorn
+
+    from network_guard import register_server
+
+    data = tmp_path / "data"
+    data.mkdir()
+    handler = logs.configure(data)
+    app = fastapi.FastAPI()
+
+    @app.get("/api/conversations/poisoned")
+    def poisoned():
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE run_events (data TEXT)")
+        # '{"text":"CANARY-NOTE ' and the three bytes of half a surrogate pair, as a build before PR 57 could store
+        conn.execute("INSERT INTO run_events VALUES (CAST(X'7B2274657874223A2243414E4152592D4E4F544520EDA0BD227D' AS TEXT))")
+        return conn.execute("SELECT data FROM run_events").fetchall()
+
+    try:
+        with socket.create_server(("127.0.0.1", 0)) as sock:
+            host, port = register_server(sock)
+            server = uvicorn.Server(uvicorn.Config(app, loop="asyncio", http="h11", ws="none", lifespan="off",
+                                                   log_config=None, access_log=False))
+            thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+            thread.start()
+            try:
+                for _ in range(200):
+                    if server.started:
+                        break
+                    await asyncio.sleep(0.05)
+                async with httpx.AsyncClient(base_url=f"http://{host}:{port}", timeout=10) as client:
+                    assert (await client.get("/api/conversations/poisoned")).status_code == 500
+            finally:
+                server.should_exit = True
+                await asyncio.to_thread(thread.join, 10)
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    text = (data / "logs" / "scholia.log").read_text()
+    assert "Exception in ASGI application" in text and "OperationalError" in text  # what failed, and where
+    assert "CANARY-NOTE" not in text
+
+
+def poisoned_read():
+    """SQLite's decoding error for a record a build before PR 57 could store: its message quotes '{"text":"CANARY-NOTE '."""
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE run_events (data TEXT)")
+    conn.execute("INSERT INTO run_events VALUES (CAST(X'7B2274657874223A2243414E4152592D4E4F544520EDA0BD227D' AS TEXT))")
+    return conn.execute("SELECT data FROM run_events").fetchall()
+
+
+@pytest.mark.parametrize("route", ["a failed startup", "a task nobody awaits"])
+async def test_an_exception_written_into_a_message_is_written_without_its_message(tmp_path, route):
+    # PR 63's Fable recheck (F3): the formatter wrote exc_info as type and place, but Starlette sends a failed
+    # lifespan's traceback as text that uvicorn logs as the message, and asyncio writes the task's repr, holding the
+    # exception's, into its message. Both as the desktop entry sets them up (logs.configure, log_config=None)
+    import contextlib
+    import gc
+
+    import fastapi
+    import uvicorn
+    from uvicorn.lifespan.on import LifespanOn
+
+    data = tmp_path / "data"
+    data.mkdir()
+    handler = logs.configure(data)
+    try:
+        if route == "a failed startup":
+            @contextlib.asynccontextmanager
+            async def lifespan(app):
+                poisoned_read()
+                yield
+            config = uvicorn.Config(fastapi.FastAPI(lifespan=lifespan), lifespan="on", log_config=None)
+            starting = LifespanOn(config)
+            await starting.startup()
+            assert starting.should_exit
+        else:
+            async def reads():
+                poisoned_read()
+            task = asyncio.create_task(reads())
+            await asyncio.wait([task])
+            del task  # its exception never retrieved: asyncio logs it as the task goes
+            gc.collect()
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    text = (data / "logs" / "scholia.log").read_text()
+    assert "OperationalError at test_log_canaries.py:" in text, text  # what failed, and where
+    if route == "a task nobody awaits":
+        assert "Task exception was never retrieved" in text
+    assert "CANARY-NOTE" not in text and "Could not decode" not in text, text
+
+
+def test_a_traceback_as_text_is_never_read_so_one_its_message_quotes_cannot_reach_the_log():
+    # The batch's internal review (F1): reading a traceback's text wrote what a quoted one said (a pasted traceback in a
+    # record, quoted by an exception's message: its type and file). The text is not read: written while its exception
+    # is handled, as Starlette sends a failed lifespan's, it is that exception's type and place; otherwise left out
+    import traceback
+
+    def chained():
+        try:
+            raise KeyError("CANARY-CAUSE")
+        except KeyError as error:
+            raise ValueError('pasted:\nTraceback (most recent call last):\n  File "/x/CANARY-FILE.py", line 3, in m\n'
+                             'CanarySecret: x') from error
+
+    def grouped():
+        raise ExceptionGroup("CANARY-GROUP", [OSError("CANARY-MEMBER")])
+
+    def caused_unraised():  # the recheck (F1): a cause never raised has no traceback, so it is printed with no header
+        raise ValueError("CANARY-VALUE") from ExceptionGroup("CANARY-GCAUSE", [KeyError("CANARY-KEY")])
+    formatter = logs.Formatter(logs.FORMAT)
+
+    def written(text):
+        record = logging.LogRecord("uvicorn.error", logging.ERROR, __file__, 1, "%s", (text,), None)
+        line = formatter.format(record)
+        assert "CANARY" not in line and "Canary" not in line, line
+        return [w.split(".py:")[0] + ".py:" if ".py:" in w else w for w in line.split(": ", 1)[1].splitlines()]
+    for raise_it, expected in ((chained, ["ValueError at test_log_canaries.py:", "KeyError at test_log_canaries.py:"]),
+                               (grouped, ["ExceptionGroup at test_log_canaries.py:"]),
+                               (caused_unraised, ["ValueError at test_log_canaries.py:", "ExceptionGroup"])):
+        try:
+            raise_it()
+        except BaseException:
+            text = traceback.format_exc()
+            assert written(text) == expected  # while it is handled
+        assert written(text) == ["a traceback, left out"]  # once it is not

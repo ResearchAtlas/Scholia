@@ -47,7 +47,6 @@ why, and how much of the library meaning search covers.
 """
 
 import asyncio
-import json
 import logging
 import re
 import unicodedata
@@ -57,6 +56,7 @@ from pathlib import Path
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
+from backend import whole_json as json
 from backend import asks, local_helper
 from backend.db import DatabaseClosedError, deletion, new_id, utc_now
 from backend.local_helper import EMBEDDING, HelperUnavailable, InputRefused, Refused
@@ -732,11 +732,12 @@ async def _embed_memory(state, harness, active, project_id, drained):
             if not current:  # forgotten or moved as it was asked for: never sent
                 continue
             raise RunOutcome("failed", unavailable.reason) from None  # Retry, or the next launch, embeds it
-        if len(vector) == DIMENSIONS:
-            # stored only while the record is still of this scope, read as it is written (a move meanwhile queues its
-            # vector's removal; this one is then never written to the old partition)
-            stored += await drained(index.store_memory, [(memory_id, scope, vector)],
-                                    lambda ids: db.read(lambda conn: _active_memory(conn, ids, project_id))) or 0
+        if len(vector) != DIMENSIONS:  # not this model's, as for a passage: nothing would ever be stored (design E, R2)
+            raise RunOutcome("failed", "request_failed")
+        # stored only while the record is still of this scope, read as it is written (a move meanwhile queues its
+        # vector's removal; this one is then never written to the old partition)
+        stored += await drained(index.store_memory, [(memory_id, scope, vector)],
+                                lambda ids: db.read(lambda conn: _active_memory(conn, ids, project_id))) or 0
     return stored
 
 

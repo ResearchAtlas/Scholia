@@ -83,12 +83,100 @@ def _raw_pdf(objects):
     return bytes(out + b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref))
 
 
+@pytest.mark.parametrize("make", ["paper_pdf", "scanned_pdf"])
+def test_the_pdf_helpers_hold_pdfium_while_they_use_it(monkeypatch, make):
+    # CI run 43542906749 (PR 61): the tests' PDF helper used pdfium while a reading thread of the app could hold it;
+    # pdfium is not thread-safe, so every use holds extraction.PDFIUM
+    import sys
+    import pypdfium2.raw as raw
+    if make == "scanned_pdf" and sys.platform != "darwin":
+        pytest.skip("AppKit draws the scanned page")
+    held = []
+
+    def watched(name):  # saving, and releasing what it made: never by the collector, outside the lock
+        real = getattr(raw, name)
+
+        def call(*args):
+            held.append((name, extraction.PDFIUM.locked()))
+            return real(*args)
+        monkeypatch.setattr(raw, name, call)
+
+    for name in ("FPDF_SaveAsCopy", "FPDFBitmap_Destroy", "FPDF_ClosePage", "FPDF_CloseDocument"):
+        watched(name)
+    if make == "paper_pdf":
+        synthetic.paper_pdf(scanned=1)
+    else:
+        from backend.self_test import scanned_pdf
+        scanned_pdf([(72, 700, 14, "A scanned line.")])
+    assert {name for name, _ in held} == {"FPDF_SaveAsCopy", "FPDFBitmap_Destroy", "FPDF_ClosePage", "FPDF_CloseDocument"}
+    assert all(locked for _, locked in held), held
+    assert not extraction.PDFIUM.locked()
+
+
+@pytest.mark.parametrize("make", ["paper_pdf", "scanned_pdf", "render_page"])
+def test_pdfium_is_released_inside_its_lock_when_a_step_fails(monkeypatch, make):
+    # PR 63's first review (pass 1 finding 7, pass 2 finding 3): a helper's image whose bitmap could not be set, and
+    # render_page's bitmap whose pixels could not be copied, were released by the collector, outside PDFIUM
+    import gc
+    import sys
+    import pypdfium2
+    import pypdfium2.raw as raw
+    if make == "scanned_pdf" and sys.platform != "darwin":
+        pytest.skip("AppKit draws the scanned page")
+    data = synthetic.paper_pdf() if make == "render_page" else None
+    released = []
+
+    def watched(name):
+        real = getattr(raw, name)
+
+        def call(*args):
+            released.append((name, extraction.PDFIUM.locked()))
+            return real(*args)
+        monkeypatch.setattr(raw, name, call)
+
+    for name in ("FPDFBitmap_Destroy", "FPDFPageObj_Destroy", "FPDF_ClosePage", "FPDF_CloseDocument"):
+        watched(name)
+    if make == "render_page":
+        real_render = pypdfium2.PdfPage.render
+
+        class Uncopyable:  # the page's bitmap, whose pixels cannot be copied
+            def __init__(self, bitmap):
+                self.bitmap, self.width, self.height = bitmap, bitmap.width, bitmap.height
+                self.stride, self.n_channels = bitmap.stride, bitmap.n_channels
+
+            @property
+            def buffer(self):
+                raise MemoryError()
+
+            def close(self):
+                self.bitmap.close()
+        monkeypatch.setattr(pypdfium2.PdfPage, "render", lambda page, **kw: Uncopyable(real_render(page, **kw)))
+        with pytest.raises(MemoryError):
+            extraction.render_page(data, 1)
+    else:
+        monkeypatch.setattr(raw, "FPDFImageObj_SetBitmap", lambda *args: False)  # as pdfium refusing it
+        with pytest.raises(pypdfium2.PdfiumError):
+            if make == "paper_pdf":
+                synthetic.paper_pdf(scanned=1)
+            else:
+                from backend.self_test import scanned_pdf
+                scanned_pdf([(72, 700, 14, "A scanned line.")])
+    gc.collect()  # what was left to the collector is released now, outside the lock
+    assert ("FPDFBitmap_Destroy", True) in released and ("FPDF_CloseDocument", True) in released
+    assert all(locked for _, locked in released), released
+
+
 def test_a_pdf_page_whose_text_leaves_characters_out_keeps_its_character_ranges_and_boxes():
     import pypdfium2 as pdfium
 
     data = _pdf_leaving_out(b"~~~This paragraph begins~ here and goes on")
-    textpage = pdfium.PdfDocument(data)[0].get_textpage()
-    assert (textpage.count_chars(), len(textpage.get_text_range())) == (42, 38)  # four characters left out
+    with extraction.PDFIUM:  # pdfium is not thread-safe: as the app does, the test holds its lock while it uses it
+        document = pdfium.PdfDocument(data)
+        try:
+            textpage = document[0].get_textpage()
+            assert (textpage.count_chars(), len(textpage.get_text_range())) == (42, 38)  # four characters left out
+        finally:
+            document.close()
     [passage] = extract(data, extraction.PDF).passages
     assert passage.text == "This paragraph begins here and goes on"
     assert (passage.char_start, passage.char_end) == (3, 42)  # PDFium's character indices, the left-out ones counted

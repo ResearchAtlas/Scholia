@@ -43,12 +43,12 @@ import asyncio
 import base64
 import binascii
 import contextlib
-import json
 import unicodedata
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
+from backend import whole_json as json
 from backend import asks, extraction, reading, reference_files
 from backend.db import new_id, utc_now
 from backend.local_guard import MAX_BODY

@@ -10,19 +10,21 @@ Like Database, every call blocks and is refused on an event loop thread.
 
 Collection never removes content held (ContentStore.hold), whatever its age: content stored before the
 record naming it commits (put with hold), and content a reader has listed and reads later (a backup,
-an export, a reading of a paper). The idle window is a second guard, for a put in progress.
+an export, a reading of a paper). A file is removed only inside a write transaction that finds no row naming it
+(or removes that row, nothing referring to it), under the store's lock, unheld (design review Q, Q-A); the idle
+window only delays removing what nothing references.
 """
 
 import collections
 import contextlib
 import hashlib
-import json
 import os
 import re
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 
+from backend import whole_json as json
 from backend.db.database import _fsync, _mkdir_private, _refuse_event_loop
 
 IDLE_AFTER = timedelta(hours=1)  # a file added or added again more recently is never collected
@@ -48,11 +50,6 @@ class ContentStore:
         self._writing = set()  # temporary files of puts in progress, however long they take
         self._held = collections.Counter()  # hashes collection keeps, however old (hold)
         self._listing = 0  # readers between listing content and holding it (listing)
-        # Puts counted in this store, and the count at each hash's last put: a collection's walk over files with no
-        # row removes none put since it began, whatever the clock says (PR 59 batch 2). shortcut: one entry per hash
-        # put while the app runs, never pruned (collections overlap); prune if a session ever puts millions.
-        self._puts = 0
-        self._put_at = {}
 
     @contextlib.contextmanager
     def hold(self, hashes=()):
@@ -105,47 +102,43 @@ class ContentStore:
             self._writing.add(tmp)
         digest, size = hashlib.sha256(), 0
         try:
-            with open(tmp, "xb", opener=lambda name, flags: os.open(name, flags, 0o600)) as file:
-                for chunk in _chunks(data):
-                    digest.update(chunk)
-                    size += len(chunk)
-                    file.write(chunk)
-            _fsync(tmp)
-            sha256 = digest.hexdigest()
-            folder = self.root / sha256[:2]
-            with self._lock:  # collect_garbage removes a file only under this lock
-                created = _mkdir_new(folder)
-                os.utime(tmp)  # written now, however long the copy took
-                if hold is not None and not hold.closed:  # held before the file is in place, under the lock
-                    # collection takes; a put that outlives its block (its caller cancelled) is not held
-                    self._held[sha256] += 1
-                    hold.append(sha256)
-                self._puts += 1
-                self._put_at[sha256] = self._puts
-                self._held[sha256] += 1  # its own hold, until its row is committed (below)
-                own = sha256
-                os.replace(tmp, folder / sha256)
-                _fsync(folder)
-                if created:
-                    _fsync(self.root)
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            if own is not None:  # its file is in place, its row will not be: collected once idle
+            try:
+                with open(tmp, "xb", opener=lambda name, flags: os.open(name, flags, 0o600)) as file:
+                    for chunk in _chunks(data):
+                        digest.update(chunk)
+                        size += len(chunk)
+                        file.write(chunk)
+                _fsync(tmp)
+                sha256 = digest.hexdigest()
+                folder = self.root / sha256[:2]
+                with self._lock:  # collect_garbage removes a file only under this lock
+                    created = _mkdir_new(folder)
+                    os.utime(tmp)  # written now, however long the copy took
+                    if hold is not None and not hold.closed:  # held before the file is in place, under the lock
+                        # collection takes; a put that outlives its block (its caller cancelled) is not held
+                        self._held[sha256] += 1
+                        hold.append(sha256)
+                    self._held[sha256] += 1  # its own hold, until its row is committed (below)
+                    own = sha256
+                    os.replace(tmp, folder / sha256)
+                    _fsync(folder)
+                    if created:
+                        _fsync(self.root)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+            finally:
                 with self._lock:
-                    self._release(own)
-            raise
-        finally:
-            with self._lock:
-                self._writing.discard(tmp)
-        try:
+                    self._writing.discard(tmp)
             self.db.write(lambda conn: conn.execute(
                 "INSERT INTO content_files (sha256, size, media_type) VALUES (?, ?, ?)"
                 " ON CONFLICT (sha256) DO NOTHING",
                 (sha256, size, media_type),
             ))
-        finally:
-            with self._lock:
-                self._release(sha256)
+        finally:  # its own hold ends however the put ends, its cleanup failing included (design review Q)
+            if own is not None:
+                with self._lock:
+                    self._release(own)
         return sha256
 
     def read(self, sha256):
@@ -182,8 +175,6 @@ class ContentStore:
         _refuse_event_loop()
         cutoff = (now or datetime.now(UTC)) - IDLE_AFTER
         released = set(released)
-        with self._lock:
-            began = self._puts
         at_once = 0
 
         def remove_rows(conn):
@@ -210,18 +201,25 @@ class ContentStore:
         self.db.write(remove_rows)
         if not self.root.is_dir():
             return 0
-        # A put renames its file into place, under the lock, before it inserts the
-        # row, so a file with no row here is safe to remove only while it is idle.
+        # This read only chooses which files to look at. Each is decided where it is removed, as at once above: in a
+        # write transaction that finds no row for it, under the lock, unheld. A put holds its hash from before its file
+        # is in place until its row insert ends, so an unheld file's row, if any put is to commit one, is there now
+        # (design review Q, Q-A): no earlier read and no clock decides.
         kept = set(self.db.read(lambda conn: [sha256 for (sha256,) in conn.execute("SELECT sha256 FROM content_files")]))
+        orphans = [path for path in self._stored_files() if path.name not in kept]
         removed = at_once
-        for path in self._stored_files():
-            if path.name in kept:
-                continue
-            with self._lock:
-                if (path.name not in self._held and not self._listing and self._put_at.get(path.name, 0) <= began
-                        and _idle(path, cutoff)):
-                    path.unlink(missing_ok=True)
-                    removed += 1
+
+        def remove_files(conn):
+            nonlocal removed
+            for path in orphans:
+                with self._lock:
+                    if (path.name not in self._held and not self._listing and _idle(path, cutoff)
+                            and not conn.execute("SELECT 1 FROM content_files WHERE sha256 = ?", (path.name,)).fetchone()):
+                        path.unlink(missing_ok=True)
+                        removed += 1
+
+        if orphans:
+            self.db.write(remove_files)
         for path in self.root.glob(".put-*.tmp"):  # left by an interrupted put, not one still running
             with self._lock:
                 if path not in self._writing and _idle(path, cutoff):

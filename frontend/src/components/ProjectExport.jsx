@@ -23,7 +23,7 @@ export function ProjectExportSection({ project }) {
     const sent = passphrase;
     setPassphrase(''); // held by the run in memory only, and not kept in the form either
     if (!(await archive.start(`/api/projects/${encodeURIComponent(project.id)}/export`,
-      { destination: destination.trim(), language, memory, ...(sent ? { passphrase: sent } : {}) }))) setPassphrase(sent);
+      { destination: destination.trim(), language, memory, ...(sent ? { passphrase: sent } : {}) }))) setPassphrase((now) => now || sent);
   }
 
   return (

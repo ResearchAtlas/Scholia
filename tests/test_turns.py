@@ -1295,6 +1295,9 @@ async def test_an_openrouter_model_is_refused_as_unpriced_only_when_its_endpoint
         options = {"model": model} if model else {}
         assert (await send(client, conversation, **options))[-1]["status"] == "succeeded"
         assert provider.answers[-1]["model"] == first  # priced by its endpoints, used
+        # The turn's memory extraction writes its events after the turn ends (CI run 44765434222: its step_started
+        # landed after `before` was read); it has ended before anything is counted.
+        await background_idle(client)
         provider.endpoints[first] = [{"tag": "example", "context_length": 128000, "pricing": {}}]
         openrouter_client.clear_cache()
         if model:

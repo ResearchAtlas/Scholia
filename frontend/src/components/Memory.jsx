@@ -137,7 +137,7 @@ function Row({ record, projectId, onFailed }) {
           }
         }}>
           <label className="sr-only" htmlFor={`memory-${record.id}`}>{t('memory.contentLabel')}</label>
-          <Textarea id={`memory-${record.id}`} value={editing} onChange={(event) => setEditing(event.target.value)} rows={2} />
+          <Textarea id={`memory-${record.id}`} value={editing} onChange={(event) => setEditing(event.target.value)} rows={2} readOnly={busy} />
           <div className="flex gap-2">
             <Button type="submit" size="sm" className="h-7" disabled={busy || !visible(editing)}>{t('memory.save')}</Button>
             <Button type="button" size="sm" variant="ghost" className="h-7" onClick={() => setEditing(null)}>{t('memory.cancel')}</Button>
@@ -185,7 +185,7 @@ export function Proposal({ proposal, projectId, onFailed }) {
       {editing !== null && (
         <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); if (visible(editing)) act({ action: 'edit', content: editing }).then((saved) => { if (saved) setEditing(null); }); }}>
           <label className="sr-only" htmlFor={`proposal-${proposal.id}`}>{t('memory.contentLabel')}</label>
-          <Textarea id={`proposal-${proposal.id}`} value={editing} onChange={(event) => setEditing(event.target.value)} rows={2} />
+          <Textarea id={`proposal-${proposal.id}`} value={editing} onChange={(event) => setEditing(event.target.value)} rows={2} readOnly={busy} />
           <div className="flex gap-2">
             <Button type="submit" size="sm" className="h-7" disabled={busy || !visible(editing)}>{t('memory.save')}</Button>
             <Button type="button" size="sm" variant="ghost" className="h-7" onClick={() => setEditing(null)}>{t('memory.cancel')}</Button>

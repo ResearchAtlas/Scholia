@@ -14,11 +14,12 @@ manifest's order), never by path (`read_skill_file`, final review F06).
 """
 
 import hashlib
-import json
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+from backend import whole_json as json
 
 ROOT = Path(__file__).resolve().parent / "extensions" / "scholia.skills"
 MAX_FILE_BYTES = 1_000_000  # section 11: each file at most 1 MB

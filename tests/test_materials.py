@@ -17,7 +17,7 @@ import backend.materials as materials_module
 from backend import ocr, reading
 import synthetic_materials as synthetic
 from scholia_app import (MockProvider, MockScholarly, background_idle, openalex_work, read_in_process, run_finished,
-                         started)
+                         started, stored_material)
 
 pytestmark = pytest.mark.asyncio
 
@@ -1148,3 +1148,17 @@ async def test_a_markdown_paper_read_by_markdown_2_is_read_once_again_by_markdow
         await asyncio.sleep(0.5)
         await background_idle(client, timeout=10)
         assert await rows(client, outdated) == [("markdown/markdown-3",)]
+
+
+async def test_a_paper_stored_with_half_a_surrogate_pair_is_listed_with_the_replacement_character(tmp_path):
+    # Design review AA: a paper whose stored CSL holds half a pair (the escape, as an earlier build's lookup stored it)
+    # failed the Library's listing; read through backend/whole_json.py and answered by the answer class, it is listed
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await stored_material(client, project, b"%PDF-1.7 a paper", "application/pdf")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE materials SET csl = ?", ('{"type": "article-journal", "author": [{"literal": "Half \\ud83d pair"}]}',)))
+        response = await client.get(f"/api/projects/{project}/materials")
+        assert response.status_code == 200, response.text
+        [paper] = response.json()["materials"]
+        assert paper["csl"]["author"] == [{"literal": "Half \ufffd pair"}]

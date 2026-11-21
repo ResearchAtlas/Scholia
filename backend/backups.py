@@ -24,7 +24,6 @@ import collections
 import contextlib
 import errno
 import hashlib
-import json
 import logging
 import mimetypes
 import os
@@ -38,15 +37,16 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
+from backend import whole_json as json
+from backend.json_answer import WholeJSONResponse
 from backend import APP_VERSION, budgets, i18n
 from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseCloseError, DatabaseClosedError,
                         DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError, close_failed, utc_now)
-from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _generations, _mkdir_private, _open_checked, _stamp_of, \
-    closing_connection, list_generations
+from backend.db.database import KINDS, RESTORING, SETTINGS_FILES, STAGING, _fsync, _generations, _mkdir_private, \
+    _open_checked, _restoring, _stamp_of, closing_connection, list_generations
 from backend.db.content import IDLE_AFTER
 from backend.db.migrations import MIGRATIONS
 from backend.runs import RunOutcome, _event, _through
@@ -56,7 +56,6 @@ log = logging.getLogger(__name__)
 
 IDLE_CHECK_SECONDS = 600
 SENSITIVE = ("private", "local_only")  # a backup or export holding such a project is encrypted
-STAGING = ".staging"  # under backups/: restores and full backups in progress, emptied at launch and by a committed restore
 # Under backups/: damaged databases a restore moved aside. Nothing removes one on its own; only the
 # researcher's "Delete everywhere including backups" does (purge), as a deletion reaches every copy.
 DAMAGED = "damaged"
@@ -86,7 +85,7 @@ class _Route(APIRoute):
             try:
                 return await handler(request)
             except BackupError as error:
-                return JSONResponse({"code": error.code, "message": error.message}, status_code=error.status)
+                return WholeJSONResponse({"code": error.code, "message": error.message}, status_code=error.status)
         return handle
 
 
@@ -184,9 +183,9 @@ class Gate:
 
     def _refused(self):
         if (why := limited(self.state)) is not None:
-            return JSONResponse({"code": why[0], "message": "Scholia can only restore a backup now"}, status_code=503)
+            return WholeJSONResponse({"code": why[0], "message": "Scholia can only restore a backup now"}, status_code=503)
         if self.state.get("restoring"):
-            return JSONResponse({"code": "restoring", "message": "A backup is being restored"}, status_code=503)
+            return WholeJSONResponse({"code": "restoring", "message": "A backup is being restored"}, status_code=503)
         return None
 
 
@@ -219,7 +218,7 @@ async def lifespan(app):
     state["writers"] = Writers()  # see Gate
     opened = state.get("db"), state.get("harness")
     if not await asyncio.to_thread(_replay_pending, state["data_dir"]):  # else a restore is still to be finished
-        await asyncio.to_thread(shutil.rmtree, state["data_dir"] / "backups" / STAGING, ignore_errors=True)
+        await asyncio.to_thread(_empty_staging, state["data_dir"] / "backups")
     idle = asyncio.create_task(_idle_backups(state))
     collector = asyncio.create_task(_collect_content(state))  # S1-19b follow-up (T8)
     try:
@@ -655,14 +654,14 @@ def _daily_names(data_dir):
     return {generation.name for generation in _generations(data_dir / "backups" / "daily")}
 
 
-def _remove_added(data_dir, listed, body):
-    """After a restore rolled back: remove the daily backups it added after listed (the backup its migrations took, of
-    the state that was put back), when the backup restored still holds that state: a file, or one still in daily or
-    weekly. One the safety copy rotated out leaves the added copy as the only backup of its state, which stays. A
-    failure is logged; the backup then stays until rotation."""
-    if body.generation is not None and not any(
-            (data_dir / "backups" / kind / _generation_folder(data_dir, body.generation).name).is_dir()
-            for kind in KINDS):
+def _remove_added(data_dir, listed, generation):
+    """After a restore was put back (_back, at once or at a later launch): remove the daily backups it added after
+    listed (the backups its migrations took, of the state that was put back), when the backup restored, generation
+    (None for a file), still holds that state: a file, or one still in daily or weekly. One a rotation removed leaves
+    the added copy as the only backup of its state, which stays. A failure is logged; the backup then stays until
+    rotation."""
+    if generation is not None and not any(
+            (data_dir / "backups" / kind / _generation_folder(data_dir, generation).name).is_dir() for kind in KINDS):
         return
     for generation in _generations(data_dir / "backups" / "daily"):
         if generation.name not in listed:
@@ -723,7 +722,7 @@ async def _restore(state, body):
             with _file_errors(500, "restore_failed", "The backup could not be put in place; nothing was changed"):
                 staging = await asyncio.to_thread(_staging, data_dir)
             with _file_errors(400, "backup_unreadable", "The backup could not be read"):
-                await asyncio.to_thread(_stage, data_dir, body, staging / "restore")
+                await asyncio.to_thread(_stage, data_dir, body, staging / RESTORING)
         state["restoring"] = True  # from here only health, the backups list and this restore are served
         return await _replace(state, body, staging, purges)
     finally:  # before anything else is served again
@@ -754,7 +753,8 @@ async def _replace(state, body, staging, purges):
                 await asyncio.to_thread(db.hold_writes)
                 if await _purges(state) != purges:  # Delete everywhere purged the backups meanwhile: not this one
                     raise BackupError(404, "not_found", "No such backup")
-                try:  # first a safety copy of the current database, as an automatic backup
+                try:  # first a safety copy of the current database, as an automatic backup (which rotates nothing
+                    # while a restore is in progress: database._rotate)
                     safety = await asyncio.to_thread(db.backup)
                 except DatabaseDamagedError:
                     damaged = True
@@ -794,12 +794,13 @@ async def _replace(state, body, staging, purges):
                 return None
 
         restore_id = str(uuid.uuid4())  # its journal's: only that journal is ever undone for it
-        listed = None
         try:
-            # The daily backups so far, the safety copy included: a rolled-back restore removes what it adds after
-            # them (the backup its migrations take), as nothing else takes a backup meanwhile (design review H, R4)
+            # The daily backups so far, the safety copy included, in its journal: a restore put back removes what it
+            # adds after them (the backups its migrations take), as nothing else takes a backup meanwhile (design
+            # review H, R4), at once or at a later launch
             listed = await asyncio.to_thread(_daily_names, data_dir)
-            journal = await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside, restore_id, earlier)
+            journal = await asyncio.to_thread(_put_in_place, data_dir, staging / RESTORING, aside, restore_id, earlier,
+                                              listed, body.generation)
             # as a launch opens it: a backup before its first migration, which rotates nothing under a week old (R3)
             restored = await asyncio.to_thread(Database, data_dir)  # its checks and migrations
             await state["start"](restored, kick=False)  # recovered; nothing is served or runs on its own yet
@@ -820,10 +821,8 @@ async def _replace(state, body, staging, purges):
             log.warning("a restore failed (%s); the previous state is put back", type(error).__name__)
             if restored is not None and state.get("db") is restored:  # it started: stopped before it served anything
                 await _stop(state, restored)
-            rolled_back = await _roll_back(state, restored, damaged, restore_id)
+            rolled_back = await _roll_back(state, restored, damaged, restore_id)  # its put back removes what it added
             await asyncio.to_thread(_remove_if_empty, aside)  # made before its journal: none, if it failed before
-            if rolled_back and listed is not None:
-                await asyncio.to_thread(_remove_added, data_dir, listed, body)
             if not rolled_back:
                 _limit(state, "restore_interrupted", "A restore could neither be finished nor undone; restore a backup")
                 _forget(state)
@@ -1058,7 +1057,7 @@ SIDECARS = (f"{DB_NAME}-wal", f"{DB_NAME}-shm")
 JOURNAL = "restore.json"  # under backups/: a restore putting a backup in place, until it has ended
 
 
-def _put_in_place(data_dir, staged, aside, restore_id, audits=()):
+def _put_in_place(data_dir, staged, aside, restore_id, audits=(), listed=None, generation=None):
     """Put the staged backup's database, settings files and content files in place of the live ones.
 
     The live database keeps its name until the staged one replaces it in one rename, so a crash
@@ -1068,13 +1067,24 @@ def _put_in_place(data_dir, staged, aside, restore_id, audits=()):
     plan; each move is synced as it is made, and every step can be taken again, so a launch after a
     crash or a power loss finishes what was begun (finish_interrupted_restore). After a failure,
     _back puts back what was moved, from the journal. restore_id names the journal; audits are
-    an earlier restore's rows still to write, which it carries. Returns the journal: the caller
+    an earlier restore's rows still to write, which it carries; listed, the daily backups before it, and generation, the
+    automatic backup restored, let a put back remove what it added (_remove_added). Returns the journal: the caller
     commits it (_commit_journal) once the restored app has started, and ends it once its audit
     rows are written. Refused after a failed close in this process (close_failed), before anything moves.
     """
     _refuse_after_a_failed_close()
     _mkdir_private(aside.parent)
     _mkdir_private(aside)
+    # An earlier restore's journal, neither finished nor undone, which this one's replaces, is kept inside this one, so
+    # a put back of this restore leaves it in place for a launch to finish (design review R's observation). Its list
+    # is this one's, with the backup this restore restores from (the amendment to rider T): one list for as long as a
+    # journal is unfinished, changed only by the one write below, so whichever restore is put back, at once or at a
+    # launch, removes what any of them added and never a backup one of them restores from (design review Y). Until
+    # that write this restore has changed nothing, the earlier journal included.
+    replaced = _read_journal(data_dir)
+    replaced = replaced if replaced and replaced.get("direction") != "done" else None
+    if replaced is not None and "listed" in replaced:
+        listed = {*replaced["listed"], *([_generation_folder(data_dir, generation).name] if generation else [])}
     _sync_tree(staged)
     for folder in (aside, aside.parent, staged.parent, staged.parent.parent, data_dir / "backups"):
         _fsync(folder)
@@ -1087,6 +1097,8 @@ def _put_in_place(data_dir, staged, aside, restore_id, audits=()):
         "live_database": (data_dir / DB_NAME).exists(),
         "live": [name for name in SWAPPED if _exists(data_dir / name)],
         "backup": [name for name in SWAPPED if _exists(staged / name)],
+        **({"listed": sorted(listed), "generation": generation} if listed is not None else {}),
+        **({"replaced": replaced} if replaced is not None else {}),
     }
     write_private(data_dir / "backups" / JOURNAL, json.dumps(journal).encode())
     _forward(data_dir, journal)
@@ -1110,6 +1122,19 @@ def _read_journal(data_dir):
     except (OSError, ValueError):
         return {}
     return journal if isinstance(journal, dict) else {}
+
+
+def _empty_staging(backups):
+    """At launch, clear what a crash left in staging. A restore's folder that stays pauses retention (design R's
+    limit), which is said once here, with no path or file name (PR 63's Fable recheck, F2)."""
+    shutil.rmtree(backups / STAGING, ignore_errors=True)
+    try:
+        paused = _restoring(backups)
+    except OSError:  # cannot be listed: retention logs its own failure at each check, and rotates nothing
+        paused = True
+    if paused:
+        log.warning("A restore's staging folder could not be removed at launch: automatic backup retention is paused"
+                    " until it can be")
 
 
 def _replay_pending(data_dir):
@@ -1156,6 +1181,8 @@ def _forward(data_dir, journal):
         _mkdir_private(aside)
         _fsync(aside.parent)
     if (staged / DB_NAME).exists():  # the backup's database is not in place yet
+        if "replaced" in journal:  # so it took no backup of its own yet: what the restore it replaces added goes, as
+            _remove_what_it_added(data_dir, journal)  # nothing would remove it once this one commits (rider T)
         if live.exists() and not (aside / DB_NAME).exists():
             _keep_aside(live, aside / DB_NAME)
             _fsync(aside)
@@ -1202,13 +1229,37 @@ def _back(data_dir, journal, audit=False):
             _move(aside / sidecar, data_dir / sidecar)
     _fsync(data_dir)
     _remove_if_empty(aside)  # empty now; one that is not is kept
-    audits = [*journal.get("audits", []), *([{"id": journal.get("id"), "interrupted": True, "finished": "back"}]
-                                             if audit else [])]
+    _remove_what_it_added(data_dir, journal)  # however it is put back (design review H, R4)
+    own = [{"id": journal.get("id"), "interrupted": True, "finished": "back"}] if audit else []
+    if "replaced" in journal:  # the folder is the earlier restore's again: its journal back in place, for a launch to
+        # finish or undo it with its audit row (its own rows carried, then those this one carried from a later restore
+        # put back onto it, then this one's: recheck r4, pass 2, finding 2), each once
+        carried, seen = [], set()
+        for audit in [*journal["replaced"].get("audits", []), *journal.get("audits", []), *own]:
+            if audit.get("id") not in seen:  # this one's journal began with the earlier one's rows
+                seen.add(audit.get("id"))
+                carried.append(audit)
+        earlier = {**journal["replaced"], "audits": carried}
+        if "listed" in earlier and "listed" in journal:  # the one list goes back with it
+            earlier["listed"] = journal["listed"]
+        write_private(data_dir / "backups" / JOURNAL, json.dumps(earlier).encode())
+        return earlier
+    audits = [*journal.get("audits", []), *own]
     if audits:  # rows still to write, its own at launch or an earlier restore's it carried: kept for them
         _commit_journal(data_dir, journal, audits)
         return {**journal, "direction": "done", "audits": audits}
     end_journal(data_dir)
     return None
+
+
+def _remove_what_it_added(data_dir, journal):
+    """_remove_added for a restore's journal that is put back, or that replaces an unfinished one. One written
+    without the list removes nothing; a failure is logged, and an added backup then stays until rotation."""
+    if "listed" in journal:
+        try:
+            _remove_added(data_dir, set(journal["listed"]), journal.get("generation"))
+        except Exception as error:  # the files are back: an added backup then stays until rotation
+            log.warning("removing the backups a failed restore took failed (%s)", type(error).__name__)
 
 
 def _move(source, target):
@@ -1260,6 +1311,8 @@ def finish_interrupted_restore(data_dir) -> dict | None:
         return journal
     journal = _back(data_dir, journal, audit=True)
     log.warning("a restore interrupted by a crash was undone at launch")
+    if journal is not None and journal.get("direction") != "done":  # an earlier restore's, back in place: finished now
+        return finish_interrupted_restore(data_dir)
     return journal
 
 
@@ -1305,6 +1358,10 @@ async def open_at_launch(state, maintenance):
             except Exception as failure:
                 log.error("putting the previous state back failed (%s)", type(failure).__name__)
                 _limit(state, "restore_interrupted", "A restore interrupted by a crash could not be undone; restore a backup")
+                return None
+            if journal is not None and journal.get("direction") != "done":  # an earlier restore's, back in place: the
+                # next launch finishes it (finish_interrupted_restore); nothing runs on its half state meanwhile
+                _limit(state, "restore_interrupted", "A restore interrupted by a crash could not be finished; restore a backup")
                 return None
         else:  # its background runs start with the launch's, once the launch backup has checked it (app.py)
             await _finish_journal(db, audits)
@@ -1567,8 +1624,9 @@ def _turn_records(conn, turn, rows, project_id):
     running, not read yet (pending); one its turn ended without reading is queued by that end in the same transaction,
     so it is a waiting message instead, and never both (budgets.queue_unread_notes; PR 59 batch 1). Its asks
     and their answers: an agent's own question and option labels are model text kept only while its run runs, so an
-    ask of a finished turn names its options by number. Its answer's citations, as recorded, so each marker resolves
-    to its paper (materials.json, by id), version, passage, quote and page, with its existence and support checks; of
+    ask of a finished turn names its options by number. Its answer's citations, as its chips read them now (one
+    removed since is removed), so each marker resolves to its paper (materials.json, by id), version, passage, quote and
+    page, with its existence and support checks; of
     another project's paper (a conversation moved here may cite one) only its id and the checks, as the export carries
     nothing of another project's."""
     run_id, carried = turn["run_id"], budgets.carried_notes(conn, turn["run_id"])
@@ -1598,6 +1656,13 @@ def _turn_records(conn, turn, rows, project_id):
         " LEFT JOIN materials m ON m.id = c.material_id"
         " LEFT JOIN material_versions v ON v.id = c.material_version_id LEFT JOIN passages p ON p.id = c.passage_id"
         " WHERE c.owner_kind = 'answer' AND c.owner_id = ?2 ORDER BY c.rowid", project_id, run_id)
+    # as its chip reads now (the conversation read's overlay, T7): one removed since is removed, with no verdict, quote
+    # or passage shown as current (PR 63's phase B internal review)
+    from backend import answers  # it imports what imports this module
+    now = answers.resolve_now(conn, [c["id"] for c in turn["citations"]])
+    for c in turn["citations"]:
+        if c["existence"] == "ok" and now.get(c["id"]) == "source_removed":
+            c.update(existence="source_removed", support="unchecked", quote=None, passage_id=None, passage=None)
 
 
 def _conversation_markdown(conversation, language="en", titles=None):
@@ -1642,7 +1707,7 @@ def _conversation_markdown(conversation, language="en", titles=None):
         lines += [f"## {text('waiting')}", ""]
         for queued in conversation["queued"]:
             lines += [queued["text"], ""]
-    return "\n".join(lines).encode("utf-8")
+    return _utf8("\n".join(lines))
 
 
 def _artifact_markdown(artifact):
@@ -1657,11 +1722,17 @@ def _artifact_markdown(artifact):
             stack.extend(reversed(node.get("content") or []))
         elif isinstance(node, list):
             stack.extend(reversed(node))
-    return "\n\n".join([f"# {artifact['title']}", *blocks]).encode("utf-8") + b"\n"
+    return _utf8("\n\n".join([f"# {artifact['title']}", *blocks])) + b"\n"
 
 
 def _json(value):
-    return json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+    return _utf8(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _utf8(text):
+    """An export's text as UTF-8, each half of a surrogate pair the replacement character: a record a build before PR
+    57 stored with one (its JSON's escape) failed its project's export whole (PR 63's Fable recheck)."""
+    return re.sub("[\ud800-\udfff]", "\ufffd", text).encode("utf-8")
 
 
 # Files

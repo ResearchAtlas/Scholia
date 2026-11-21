@@ -31,7 +31,6 @@ import asyncio
 import contextlib
 import errno
 import hashlib
-import json
 import logging
 import math
 import os
@@ -48,10 +47,11 @@ from typing import Literal
 
 import httpx
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
+from backend import whole_json as json
+from backend.json_answer import WholeJSONResponse
 from backend.db import DatabaseClosedError
 from backend.outbound_gate import MODEL_FILE_HOSTS, OutboundDenied
 from backend.runs import _through
@@ -459,7 +459,8 @@ class Helper:
         try:
             async with await self.local.client(project_id, timeout=REQUEST_TIMEOUT,
                                                **({"admit": admit} if admit is not None else {})) as http:
-                response = await http.post(url + path, json=body, headers={"Authorization": f"Bearer {key}"})
+                response = await http.post(url + path, content=json.dumps(body, separators=(",", ":")).encode(),
+                                           headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
             if response.status_code != 200:
                 raise InputRefused() if 400 <= response.status_code < 500 and response.status_code not in _UNAVAILABLE \
                     else HelperUnavailable("request_failed")
@@ -1078,7 +1079,7 @@ class _Route(APIRoute):
             try:
                 return await handler(request)
             except Refused as refused:
-                return JSONResponse({"code": refused.code, "message": refused.message}, status_code=refused.status)
+                return WholeJSONResponse({"code": refused.code, "message": refused.message}, status_code=refused.status)
         return handle
 
 

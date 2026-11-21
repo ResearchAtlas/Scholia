@@ -17,7 +17,7 @@ import { BackupsSection } from './Backups.jsx';
 import { ProjectExportSection } from './ProjectExport.jsx';
 import { Ask } from './Ask.jsx';
 import { fraction, retryRun, runOutcome } from '../runs.js';
-import { libraryChanged } from '../library.js';
+import { libraryChanged, libraryEvents, readGuard } from '../library.js';
 import { LocalHelperSection, LocalOnlySearchNote } from './LocalHelper.jsx';
 import { IndexSection } from './SearchIndex.jsx'; // S1-17
 import { offerOutcome, runCounts, runReason } from '../search.js'; // S1-17
@@ -44,9 +44,9 @@ const MAX_SUBAGENT_MODELS = 5;
 export function Settings({ open, onOpenChange, health, project, onLanguage, onProjectChanged, startPage }) {
   const t = useT();
   const [page, setPage] = useState('general');
-  useEffect(() => { // S1-19c: opened at a page by the help skill's open_place
+  useEffect(() => { // S1-19c: opened at a page by the help skill's open_place; one already open keeps its page
     if (open && PAGES.includes(startPage)) setPage(startPage);
-  }, [open, startPage]);
+  }, [open]);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex h-[min(88vh,820px)] max-w-4xl flex-col gap-0 p-0 sm:flex-row">
@@ -235,6 +235,7 @@ function Subagents() {
   const remove = (id) => change((base) => base.filter((m) => m !== id));
   function add() {
     const id = adding.trim();
+    if (busy) return; // nothing is added while another change is saved: what was typed stays
     change((base) => (!id || base.includes(id) || base.length >= MAX_SUBAGENT_MODELS ? null : [...base, id]));
     setAdding('');
   }
@@ -451,18 +452,27 @@ function BackgroundRuns() {
   const [problem, setProblem] = useState(null); // a cancel that failed; the next cancel clears it
   const [polled, setPolled] = useState(null); // the last read's error; a read that succeeds clears it
 
-  const load = useCallback(() => get('/api/activity').then((data) => {
-    setRuns(data.runs);
-    setPolled(null);
-  }).catch((error) => {
-    setPolled(error instanceof ApiError ? error.code : 'internal');
-  }), []);
+  // The list names each run's project and its papers: after a change (a deletion settled, here or in the Sidebar) what
+  // was read before is dropped at once and no read asked before it is shown, as every other view (library.js readGuard).
+  const [guard] = useState(readGuard);
+  const load = useCallback(() => {
+    const settle = guard.ask();
+    return get('/api/activity').then((data) => {
+      if (!settle(true)) return;
+      setRuns(data.runs);
+      setPolled(null);
+    }).catch((error) => {
+      if (settle(false)) setPolled(error instanceof ApiError ? error.code : 'internal');
+    });
+  }, [guard]);
 
   useEffect(() => {
     load();
     const timer = setInterval(load, POLL_MS);
-    return () => clearInterval(timer);
-  }, [load]);
+    const changed = () => { guard.libraryChanged(); setRuns(null); load(); };
+    libraryEvents.addEventListener('changed', changed);
+    return () => { clearInterval(timer); libraryEvents.removeEventListener('changed', changed); };
+  }, [load, guard]);
 
   // A run tried again or stopped here changes its project's papers too: the Library open on that
   // project reads them again, and follows the new reading until it ends (S1-20's retried OCR).

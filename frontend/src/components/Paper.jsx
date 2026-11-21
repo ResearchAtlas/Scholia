@@ -123,16 +123,16 @@ function Details({ material, saved, onAction, afterSave }) {
   return (
     <form onSubmit={save} className="grid gap-3" aria-label={t('paper.details')}>
       <h4 className="text-sm font-semibold">{t('paper.details')}</h4>
-      {field('title', t('paper.field.title'), <Textarea id={`${id}-title`} rows={2} value={form.title} onChange={set('title')} />)}
+      {field('title', t('paper.field.title'), <Textarea id={`${id}-title`} rows={2} value={form.title} onChange={set('title')} readOnly={busy} />)}
       {field('authors', t('paper.field.authors'), <Textarea id={`${id}-authors`} rows={3} value={form.authors}
-        placeholder={t('paper.field.authorsPlaceholder')} onChange={set('authors')} />)}
+        placeholder={t('paper.field.authorsPlaceholder')} onChange={set('authors')} readOnly={busy} />)}
       <div className="grid gap-3 sm:grid-cols-[8rem_1fr]">
-        {field('year', t('paper.field.year'), <Input id={`${id}-year`} inputMode="numeric" value={form.year} onChange={set('year')}
+        {field('year', t('paper.field.year'), <Input id={`${id}-year`} inputMode="numeric" value={form.year} onChange={set('year')} readOnly={busy}
           aria-invalid={!validYear(form.year) || undefined} />)}
-        {field('venue', t('paper.field.venue'), <Input id={`${id}-venue`} value={form.venue} onChange={set('venue')} />)}
+        {field('venue', t('paper.field.venue'), <Input id={`${id}-venue`} value={form.venue} onChange={set('venue')} readOnly={busy} />)}
       </div>
       {field('doi', t('paper.field.doi'), <Input id={`${id}-doi`} value={form.doi} spellCheck={false} className="font-mono text-xs md:text-xs"
-        placeholder={t('paper.field.doiPlaceholder')} onChange={set('doi')} />)}
+        placeholder={t('paper.field.doiPlaceholder')} onChange={set('doi')} readOnly={busy} />)}
       {!visible(form.title) && <p className="text-xs text-destructive">{t('paper.titleNeeded')}</p>}
       {!validYear(form.year) && <p className="text-xs text-destructive">{t('paper.yearInvalid')}</p>}
       {saved?.problem && <p role="alert" className="text-sm text-destructive">{saved.problem}</p>}

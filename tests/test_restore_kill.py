@@ -225,6 +225,33 @@ async def test_putting_the_previous_state_back_twice_keeps_its_wal(tmp_path):
     assert (data / "config.toml").read_text() == "previous"
 
 
+@pytest.mark.parametrize("given", ["none", "listed", "listing fails"])
+async def test_a_put_back_removes_only_the_daily_backups_its_restore_added(tmp_path, monkeypatch, given):
+    # The internal review of the last follow-up PR: a journal written without the backups listed before the restore
+    # (as by an earlier build) removes none; one with them removes only those added after; a listing that fails once
+    # the files are back is logged, never raised
+    from backend.db import DB_NAME
+    data, staged, aside = tmp_path / "data", tmp_path / "data/backups/.staging/x/restore", \
+        tmp_path / "data/backups/.staging/x/replaced"
+    staged.mkdir(parents=True)
+    daily = data / "backups" / "daily"
+    for name in ("20261101T000000000000Z", "20261102T000000000000Z"):
+        (daily / name).mkdir(parents=True)
+    (data / DB_NAME).write_bytes(b"the previous database")
+    (staged / DB_NAME).write_bytes(b"the backup's database")
+    listed = None if given == "none" else {"20261101T000000000000Z"}
+    journal = backups_module._put_in_place(data, staged, aside, "x", listed=listed)
+    assert ("listed" in journal) == (given != "none")
+    if given == "listing fails":
+        def failing(folder):
+            raise OSError("cannot list")
+        monkeypatch.setattr(backups_module, "_generations", failing)
+    backups_module._back(data, journal)
+    assert (data / DB_NAME).read_bytes() == b"the previous database"
+    assert sorted(path.name for path in daily.iterdir()) == (
+        ["20261101T000000000000Z"] if given == "listed" else ["20261101T000000000000Z", "20261102T000000000000Z"])
+
+
 async def test_a_journal_that_cannot_be_read_leaves_the_folder_unopened_and_offers_only_a_restore(tmp_path):
     from backend.db import DB_NAME
     data = tmp_path / "data"

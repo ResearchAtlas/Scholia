@@ -24,13 +24,13 @@ import calendar
 import functools
 import hashlib
 import hmac
-import json
 import secrets
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from backend import whole_json as json
 from backend.db import new_id, utc_now
 from backend.openrouter_client import catalog_status, get_model_metadata
 from backend.outbound_gate import is_openrouter, local_origin

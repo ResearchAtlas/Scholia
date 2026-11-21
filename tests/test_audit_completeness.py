@@ -378,3 +378,21 @@ async def test_a_merge_answer_is_audited_by_its_kind_and_option_only(tmp_path):
                     for name in ("en.json", "zh-CN.json")}
         for catalog in catalogs.values():
             assert {"ask.kindName.merge", "ask.answer.merge", "ask.answer.keep_both"} <= set(catalog)
+
+
+async def test_an_audit_row_stored_with_half_a_surrogate_pair_is_listed_and_exported(tmp_path):
+    # Design review AA: an audit row whose data holds half a pair (the escape) failed the audit list and its export;
+    # read through backend/whole_json.py, answered by the answer class and written through it, it is the
+    # replacement character
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "P"})).json()["id"]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "INSERT INTO audit_log (event, project_id, data) VALUES ('project_renamed', ?, ?)",
+            (project, '{"name": "Half \\ud83d pair"}')))
+        listed = await client.get("/api/audit", params={"project_id": project})
+        assert listed.status_code == 200, listed.text
+        assert {"name": "Half \ufffd pair"} in [entry["data"] for entry in listed.json()["entries"]]
+        exported = await client.post("/api/audit/export", json={"project_id": project})
+        assert exported.status_code == 200, exported.text
+        path = tmp_path / "data" / "exports" / exported.json()["path"].rsplit("/", 1)[1]
+        assert {"name": "Half \ufffd pair"} in [entry["data"] for entry in json.loads(path.read_text())["entries"]]

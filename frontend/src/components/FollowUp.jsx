@@ -6,6 +6,7 @@ import { useContext, useEffect, useState } from 'react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { del, get, put } from '../api.js';
 import { useAction } from '../action.js';
+import { editing as holds } from '../live.js';
 import { budgetBar } from '../followup.js';
 import { money, visible } from '../text.js';
 import { Button } from '@/components/ui/button';
@@ -56,6 +57,12 @@ function QueuedItem({ conversationId, item, running, onChanged, onSend }) {
   const t = useT();
   const [editing, setEditing] = useState(null);
   const { busy, problem, run } = useAction();
+  const open = editing !== null;
+  useEffect(() => { // while its editor is open it does not start on its own
+    if (!open) return undefined;
+    holds(conversationId, item.id, true);
+    return () => holds(conversationId, item.id, false);
+  }, [open, conversationId, item.id]);
   const path = `/api/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(item.id)}`;
   const changed = async (action) => {
     if ((await run(action)) !== undefined) { setEditing(null); onChanged(); } else onChanged();
@@ -67,14 +74,15 @@ function QueuedItem({ conversationId, item, running, onChanged, onSend }) {
         <form className="flex gap-2" onSubmit={(event) => { event.preventDefault();
           if (visible(editing)) changed(() => put(path, { content: editing })); }}>
           <label htmlFor={`queued-${item.id}`} className="sr-only">{t('followUp.editLabel')}</label>
-          <Input id={`queued-${item.id}`} value={editing} onChange={(event) => setEditing(event.target.value)} className="h-8" />
+          <Input id={`queued-${item.id}`} value={editing} onChange={(event) => setEditing(event.target.value)} className="h-8"
+            readOnly={busy} />
           <Button type="submit" size="sm" variant="outline" disabled={busy || !visible(editing)}>{t('followUp.save')}</Button>
         </form>
       )}
       {problem && <p role="alert" className="text-xs text-destructive">{problem}</p>}
       <div className="flex flex-wrap gap-2">
         {!running && <Button type="button" size="sm" className="h-7 bg-brand text-brand-foreground hover:bg-brand/90"
-          disabled={busy} onClick={() => run(() => onSend(item))}>{t('followUp.send')}</Button>}
+          disabled={busy || open} onClick={() => run(() => onSend(item))}>{t('followUp.send')}</Button>}
         <Button type="button" size="sm" variant="ghost" className="h-7" disabled={busy}
           onClick={() => setEditing(editing === null ? item.text : null)}>{t(editing === null ? 'followUp.edit' : 'followUp.cancelEdit')}</Button>
         <Button type="button" size="sm" variant="ghost" className="h-7" disabled={busy}
