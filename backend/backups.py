@@ -46,7 +46,7 @@ from backend import APP_VERSION, budgets, i18n
 from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseCloseError, DatabaseClosedError,
                         DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError, close_failed, utc_now)
 from backend.db.database import KINDS, RESTORING, SETTINGS_FILES, STAGING, _fsync, _generations, _mkdir_private, \
-    _open_checked, _stamp_of, closing_connection, list_generations
+    _open_checked, _restoring, _stamp_of, closing_connection, list_generations
 from backend.db.content import IDLE_AFTER
 from backend.db.migrations import MIGRATIONS
 from backend.runs import RunOutcome, _event, _through
@@ -218,7 +218,7 @@ async def lifespan(app):
     state["writers"] = Writers()  # see Gate
     opened = state.get("db"), state.get("harness")
     if not await asyncio.to_thread(_replay_pending, state["data_dir"]):  # else a restore is still to be finished
-        await asyncio.to_thread(shutil.rmtree, state["data_dir"] / "backups" / STAGING, ignore_errors=True)
+        await asyncio.to_thread(_empty_staging, state["data_dir"] / "backups")
     idle = asyncio.create_task(_idle_backups(state))
     collector = asyncio.create_task(_collect_content(state))  # S1-19b follow-up (T8)
     try:
@@ -1124,6 +1124,19 @@ def _read_journal(data_dir):
     except (OSError, ValueError):
         return {}
     return journal if isinstance(journal, dict) else {}
+
+
+def _empty_staging(backups):
+    """At launch, clear what a crash left in staging. A restore's folder that stays pauses retention (design R's
+    limit), which is said once here, with no path or file name (PR 63's Fable recheck, F2)."""
+    shutil.rmtree(backups / STAGING, ignore_errors=True)
+    try:
+        paused = _restoring(backups)
+    except OSError:  # cannot be listed: retention logs its own failure at each check, and rotates nothing
+        paused = True
+    if paused:
+        log.warning("A restore's staging folder could not be removed at launch: automatic backup retention is paused"
+                    " until it can be")
 
 
 def _replay_pending(data_dir):

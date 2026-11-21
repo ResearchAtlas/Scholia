@@ -328,3 +328,32 @@ async def test_a_staging_entry_that_links_to_a_restoring_folder_is_a_restore(tmp
     (tmp_path / "backups" / STAGING).mkdir(parents=True)
     (tmp_path / "backups" / STAGING / "linked").symlink_to(elsewhere, target_is_directory=True)
     assert _restoring(tmp_path / "backups")
+
+
+@pytest.mark.parametrize("removable", [False, True])
+async def test_a_launch_that_cannot_empty_a_restores_staging_says_retention_is_paused(tmp_path, caplog, removable):
+    # PR 63's Fable recheck (F2): design R's limit (a staging folder that cannot be removed pauses retention) held with
+    # nothing logged; the launch now says so once, naming no path or file. A removable one is the control
+    import logging
+    from backend.db.database import RESTORING, STAGING
+    data = tmp_path / "data"
+    await asyncio.to_thread(lambda: Database(data).close())
+    left = data / "backups" / STAGING / "a-restore-id"
+    (left / RESTORING).mkdir(parents=True)
+    (left / RESTORING / "a-staged-file.db").write_bytes(b"x")
+    if not removable:
+        left.chmod(0o500)  # its restore folder cannot be unlinked from it
+    try:
+        with caplog.at_level(logging.WARNING, logger="backend.backups"):
+            async with started(data, setup=False):
+                pass
+    finally:
+        if left.exists():
+            left.chmod(0o700)
+    said = [r for r in caplog.records if r.name == "backend.backups" and r.levelno == logging.WARNING]
+    if removable:
+        assert not said and not (data / "backups" / STAGING).exists()
+        return
+    assert len(said) == 1 and "retention" in said[0].getMessage() and "paused" in said[0].getMessage()
+    text = said[0].getMessage() + repr(said[0].args)
+    assert not any(name in text for name in ("a-restore-id", "a-staged-file", STAGING, str(tmp_path)))
