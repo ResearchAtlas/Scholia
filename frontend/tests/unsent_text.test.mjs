@@ -353,6 +353,21 @@ const scenarios = {
     assert.equal(s.server.asked.filter(writes('POST', '/queue/q1/send')).length, 1, 'started once its editor closed');
     assert.ok(s.screen().includes(NEWER), 'with the words saved');
   },
+
+  // This review: an answer typed to a question of the agent's, and a change to the papers or to memory (an attach
+  // ending, a turn's memory event) drops the questions shown and reads them again: the typed answer goes with them.
+  async anAnswerTypedToAQuestionIsKeptWhenThePapersChange(w, strict) {
+    const ask = { ask_id: 'k1', run_id: 'r9', kind: 'agent', text_box: true, options: ['1'], params: { question: 'Which year?' },
+      project_kind: 'research', project_name: 'Project Alpha' };
+    const s = await windowWorld(w, strict, start({ asks: { a: [ask] } }));
+    const mine = (e) => e.type === 'ui:Input' && e.up.some((x) => x.props.role === 'group');
+    assert.equal(await s.typeInto(mine, DRAFT, 'the answer'), true);
+    s.server.hold('asks');
+    await s.act(() => w.library.libraryChanged('p1'));
+    await s.releaseAll(reads('asks'));
+    assert.ok(s.screen().includes('Which year?'), 'the question is shown again once read');
+    assert.equal(s.field(mine, 'the answer').props.value, DRAFT);
+  },
 };
 
 const only = process.env.ONLY ? process.env.ONLY.split(',') : null;
