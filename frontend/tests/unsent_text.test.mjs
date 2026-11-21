@@ -230,7 +230,8 @@ const scenarios = {
     await s.act(() => one(s.shown().filter((e) => e.type === 'ui:Button' && e.props['aria-label'] === 'Stop'), 'Stop').props.onClick());
     assert.equal(s.box(), `${FIRST}\n${DRAFT}`);
   },
-  // Its control: a message admitted (the run started) whose stream is then lost was sent: it is not given back.
+  // Its controls: a message admitted (the run started) was sent, whether its stream is then lost or Stop is pressed: it
+  // is not given back, the turn it started stays shown, and no failure is said.
   async anAdmittedSendWhoseStreamIsLostIsNotGivenBack(w, strict) {
     const s = await windowWorld(w, strict, start());
     await s.type(FIRST); await s.send();
@@ -239,6 +240,20 @@ const scenarios = {
     await s.act(() => stream.push({ type: 'run_started', run_id: 'r1', conversation_id: 'a', seq: 1 }));
     await s.act(() => stream.lose());
     assert.equal(s.box(), DRAFT);
+    assert.ok(s.screen().includes(FIRST), 'the turn it started is no longer shown');
+    assert.equal(s.says('alert').length, 0);
+  },
+  async anAdmittedSendStoppedIsNotGivenBack(w, strict) {
+    const s = await windowWorld(w, strict, start());
+    await s.type(FIRST); await s.send();
+    const stream = s.server.next(writes('POST', '/message/stream')).open();
+    await s.type(DRAFT);
+    await s.act(() => stream.push({ type: 'run_started', run_id: 'r1', conversation_id: 'a', seq: 1 }));
+    await s.act(() => one(s.shown().filter((e) => e.type === 'ui:Button' && e.props['aria-label'] === 'Stop'), 'Stop').props.onClick());
+    assert.ok(s.server.asked.some(writes('POST', '/api/runs/r1/cancel')), 'Stop asked the run to stop');
+    await s.act(() => { stream.push({ type: 'run_finished', status: 'cancelled' }); stream.end(); });
+    assert.equal(s.box(), DRAFT);
+    assert.equal(s.says('alert').length, 0);
   },
 
   // r3-2, finding 1, first site: a waiting message's edit is saved, and more is typed while the save is under way.
