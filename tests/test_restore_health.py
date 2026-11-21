@@ -122,9 +122,12 @@ async def test_health_says_a_restore_is_under_way_after_its_request_is_cancelled
         restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
         try:
             assert await asyncio.to_thread(staging.wait, 10)
-            restore.cancel()
-            assert (await client.get("/api/health")).json().get("restoring") is True
+            restore.cancel()  # the request's task wakes with it next: its wakeup is queued now (recheck r8, pass 2)
+            delivered = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(delivered.set_result, None)  # queued after it, so run after it
+            await delivered  # the request's task has had the cancellation, and staging is still held
             assert not restore.done() and client.state["restore_lock"].locked()
+            assert (await client.get("/api/health")).json().get("restoring") is True
         finally:
             release.set()
         with pytest.raises(asyncio.CancelledError):
