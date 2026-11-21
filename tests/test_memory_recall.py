@@ -200,6 +200,55 @@ async def test_an_index_that_goes_unavailable_after_the_nearest_lookup_falls_bac
         assert (trace["mode"], trace["reason"], trace["records"][0]) == ("recency", "unavailable", wages["id"])
 
 
+async def test_an_index_held_during_the_read_of_which_records_have_vectors_falls_back_to_the_newest_by_the_deadline(
+        tmp_path, monkeypatch):
+    # PR 63's recheck r8 (pass 1, finding 2): the nearest lookup answers, then the second read waits for the index's
+    # own lock; spec section 13's memory lookup deadline bounds both reads, so recall takes the newest, said, in time
+    from cited import cited
+    from test_search import idle, setting
+    async with cited(tmp_path) as client:
+        project = await project_of(client)
+        for i in range(11):
+            await entered(client, project, f"Unrelated item {i} about scheduling")
+        wages = await entered(client, project, "Wage floors raise the earnings of low-paid workers")
+        await idle(client, project)
+        await background_idle(client, timeout=20)
+        index, question = client.state["index"], "Last time we decided what about wage floors and earnings?"
+        answer = await search.nearest_memory(search._STATES[client.state["harness"]], project, question)
+        assert answer and wages["id"] in answer  # what the lookup answers, known before the turn
+        await setting(client, "retrieval.memory_ms", 500)
+        held, times, ranked = [], {}, memory.ranked
+        loop = asyncio.get_running_loop()
+
+        def release():
+            if held:
+                held.pop().release()
+
+        async def at_once(*args):  # the lookup answers at once; from here, the index's lock is held
+            assert index._lock.acquire(timeout=5)
+            held.append(index._lock)
+            times["answered"] = loop.time()
+            loop.call_later(10, release)  # only if recall never stops waiting: the test then fails on its mode
+            return answer
+
+        def ranking(*args, **kwargs):  # recall has stopped waiting for the index
+            times["ranked"] = loop.time()
+            release()
+            return ranked(*args, **kwargs)
+        monkeypatch.setattr(search, "nearest_memory", at_once)
+        monkeypatch.setattr(memory, "ranked", ranking)
+        try:
+            stream = await send(client, await conversation_in(client, project), question)
+        finally:
+            release()
+        assert stream[-1]["status"] == "succeeded", stream[-1]
+        assert times["ranked"] - times["answered"] < 5  # by the 500 ms deadline, not the 10 s release
+        [(trace,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'retrieval_trace'"
+                                        " AND json_extract(data, '$.memory') IS NOT NULL", stream[0]["run_id"])
+        trace = json.loads(trace)["memory"]
+        assert (trace["mode"], trace["reason"], trace["records"][0]) == ("recency", "deadline", wages["id"])
+
+
 async def test_an_earlier_decision_memory_lacks_is_said_missing_never_invented(tmp_path):
     # R3: the missing-information section says so; that the answer never invents one is [PAID]
     provider = MockProvider()

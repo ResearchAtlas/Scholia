@@ -1828,17 +1828,20 @@ class Harness:
                 nearest, embedded, mode, reason = None, None, "recency", None
                 state = search._STATES.get(self)
                 if candidates and state is not None:
+                    async def similar():  # both of the index's reads, so the one deadline bounds them both (recheck r8)
+                        found = await search.nearest_memory(state, ctx["project_id"], ctx["message"])
+                        if found is None:
+                            return None, None, "unavailable"
+                        if not set(found) & {r["id"] for r in candidates}:
+                            return None, None, "unembedded"  # no candidate has a vector yet: the newest
+                        # read here too: an index that rebuilds meanwhile is the same fallback
+                        return found, await search.embedded_memory(state, [r["id"] for r in candidates]), None
                     try:
-                        nearest = await asyncio.wait_for(search.nearest_memory(state, ctx["project_id"], ctx["message"]),
-                                                         ctx["personal"].values["retrieval"]["memory_ms"] / 1000)
-                        reason = "unavailable" if nearest is None else None
-                        if nearest is not None and not set(nearest) & {r["id"] for r in candidates}:
-                            nearest, reason = None, "unembedded"  # no candidate has a vector yet: the newest
-                        if nearest is not None:  # read here too: an index that rebuilds meanwhile is the same fallback
-                            embedded = await search.embedded_memory(state, [r["id"] for r in candidates])
+                        nearest, embedded, reason = await asyncio.wait_for(
+                            similar(), ctx["personal"].values["retrieval"]["memory_ms"] / 1000)
                         mode = "similarity" if nearest is not None else "recency"
                     except TimeoutError:
-                        nearest, reason = None, "deadline"
+                        nearest, embedded, reason = None, None, "deadline"
                     except Exception as error:  # the helper or the index failed: the newest, said
                         log.warning("memory similarity failed (%s)", type(error).__name__)
                         nearest, embedded, reason = None, None, "unavailable"
