@@ -65,6 +65,8 @@ function tags(source, names) {
   }
   return found;
 }
+// A shared field component (one that draws a text field for others) is named here, so each use is checked: a new one
+// that forwards readOnly to its Input passes at its definition, and must be added (the batch I review).
 const FIELDS = 'Input|Textarea|textarea|input|CommitField|FolderField|Passphrase';
 const files = () => readdirSync(DIR).filter((name) => name.endsWith('.jsx')).map((file) => [file, readFileSync(join(DIR, file), 'utf8')]);
 const text = (tag) => !/type="(file|checkbox|radio|range)"/.test(tag);
@@ -92,8 +94,8 @@ test('a form whose field goes read-only while its request is under way is closed
     for (const open of source.matchAll(/<form\b/g)) {
       const form = source.slice(open.index, source.indexOf('</form>', open.index));
       if (!tags(form, `${FIELDS}|HoldsChoice`).some(({ tag }) => text(tag) && locked(tag))) continue;
-      for (const { tag, after, at } of tags(form, 'Button')) {
-        if (/\bdisabled=/.test(tag)) continue;
+      for (const { tag, after, at } of tags(form, 'Button|button')) {
+        if (/\bdisabled=(?!\{false\})/.test(tag)) continue; // the batch I review: a plain button counts, and disabled={false} is not busy
         const key = `${file}: ${/t\('([^']+)'/.exec(after)?.[1] ?? tag.slice(0, 40)}`;
         if (NOT_BUSY[key]) { used.add(key); continue; }
         pressable.push(`${file}:${source.slice(0, open.index + at).split('\n').length} ${key}`);

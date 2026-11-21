@@ -52,6 +52,10 @@ export function LocalHelperSection({ project }) {
   const importAction = useAction(); // the import's, held here: while it is under way only its answer closes its form
   const model = status?.models?.[0];
   const offered = downloadOffered(project);
+  const needed = Boolean(model) && needsModel(status);
+  // The model is in place (an import's answer, or a status read): the form is closed, so it comes back only by its
+  // toggle, which clears what an earlier import in it said (the batch I review)
+  useEffect(() => { if (!needed) setImporting(false); }, [needed]);
 
   return (
     <Section title={t('helper.title')} hint={t('helper.hint')}>

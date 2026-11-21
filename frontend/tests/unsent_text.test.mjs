@@ -827,6 +827,38 @@ const scenarios = {
     const windows = s.server.asked.filter((r) => writes('PUT', '/api/settings')(r) && Object.keys(r.body.updates).some((k) => k.includes('windows')));
     assert.equal(windows.length, 0, 'the window was saved again after it was saved'); // saves wait their turn (api.js saveSettings)
   },
+  // The batch I review (P3): the import's action is the section's, so a form that went when the status said the model
+  // was in place, and comes back when a later status says it is needed again, said the failure of an import made in
+  // the form before. The form now closes when the model is in place; opening it again clears that line.
+  async aFormThatComesBackSaysNoEarlierImportsFailure(w, strict) {
+    const state = { gets: { '/api/helper': helper(false) } };
+    const timers = [];
+    const s = await drawn(w, strict, state, 'LocalHelper', 'LocalHelperSection', { project: null },
+      () => { globalThis.setTimeout = (fn) => { timers.push(fn); return timers.length; }; });
+    await s.press('Import a file…');
+    await s.typeInto(inForm, '/first/model.gguf', 'the path');
+    await s.submitWith(inForm, 'the import form');
+    const post = s.server.next(writes('POST', '/api/helper/models/import'));
+    state.gets['/api/helper'] = helper(true);
+    await s.act(() => timers.at(-1)()); // the status is read again: the model is in place
+    await s.release(post, (r) => r.fail('file_mismatch', 409)); // the import made in the form fails after it went
+    state.gets['/api/helper'] = helper(false);
+    await s.act(() => timers.at(-1)()); // and a later status says the model is needed again
+    assert.deepEqual(s.says('alert'), [], 'an import made in a form that went is said to have failed');
+  },
+  // The batch I review (P2): a window whose save fails leaves its field to take typing again, with the reason.
+  async aWindowWhoseSaveFailedCanBeTypedAgain(w, strict) {
+    const state = { personal: {}, gets: {
+      '/api/providers': { providers: [lab({ has_key: true })] }, '/api/models/recent': { models: [] },
+      '/api/providers/lab/models': { status: {}, models: [{ id: 'm1', name: 'Model One', offered: true, window: { status: 'needed' }, effort: { steps: [] } }] } } };
+    const s = await partWorld(w, strict, state, 'ModelPicker', 'ModelPicker', { projectId: null });
+    await s.act(() => one(s.shown().filter((e) => e.type === 'button' && e.props.role === 'option' && e.text.includes('Model One')), 'the model').props.onClick());
+    await s.typeInto(byId('picker-window'), '8192', 'the window');
+    await s.act(() => s.field(byId('picker-window'), 'the window').props.onKeyDown({ key: 'Enter', preventDefault() {} }));
+    await s.release(s.server.next(writes('PUT', '/api/settings')), (r) => r.fail('internal'));
+    assert.equal(s.says('alert').length, 1, 'the failure is said');
+    assert.equal(await s.typeInto(byId('picker-window'), '16384', 'the window'), true, 'the field takes nothing after its save failed');
+  },
 };
 
 // Design review AF's row vi: when a removal becomes known the projects are read again, and Settings' This project page
