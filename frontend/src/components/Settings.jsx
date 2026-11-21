@@ -235,6 +235,7 @@ function Subagents() {
   const remove = (id) => change((base) => base.filter((m) => m !== id));
   function add() {
     const id = adding.trim();
+    if (busy) return; // nothing is added while another change is saved: what was typed stays
     change((base) => (!id || base.includes(id) || base.length >= MAX_SUBAGENT_MODELS ? null : [...base, id]));
     setAdding('');
   }

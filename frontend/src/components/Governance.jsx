@@ -311,7 +311,8 @@ export function PrivateAllowlist() {
       </ul>
       <form className="space-y-1.5" onSubmit={async (event) => {
         event.preventDefault();
-        if (await change(`${MODEL}${adding.trim()}`, { enabled: true })) setAdding('');
+        const sent = adding; // cleared only if it is still what was added
+        if (await change(`${MODEL}${sent.trim()}`, { enabled: true })) setAdding((now) => (now === sent ? '' : now));
       }}>
         <label htmlFor="allowlist-add" className="text-sm font-medium">{t('allowlist.addLabel')}</label>
         <div className="mt-1.5 flex gap-2">

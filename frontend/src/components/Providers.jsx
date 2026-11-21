@@ -107,7 +107,7 @@ function ProviderCard({ provider, table, save, onChanged }) {
     setKeyProblem(null);
     try {
       const saved = await put(`/api/keys/${encodeURIComponent(provider.name)}`, { key });
-      setKey('');
+      setKey((now) => (now === key ? '' : now)); // cleared only if it is still the key saved
       setNotice(saved.warning ? t('setup.storeWarning') : null);
       await onChanged();
     } catch (error) {
@@ -380,16 +380,16 @@ function AddEndpoint({ existing, onCancel, onAdded }) {
       <p className="text-xs leading-relaxed text-muted-foreground">{t('providers.addHint')}</p>
       <div className="grid gap-4 sm:grid-cols-2">
         <Field label={t('providers.name')} htmlFor="new-provider-name" hint={t('providers.nameHint')}>
-          <Input id="new-provider-name" value={name} onChange={(event) => setName(event.target.value.toLowerCase())} className="h-9 font-mono" />
+          <Input id="new-provider-name" value={name} onChange={(event) => setName(event.target.value.toLowerCase())} className="h-9 font-mono" readOnly={busy} />
         </Field>
         <Field label={t('providers.address')} htmlFor="new-provider-url" hint={t('providers.addressHint')}>
           <Input id="new-provider-url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder={t('providers.addressPlaceholder')}
-            className="h-9 font-mono" spellCheck={false} />
+            className="h-9 font-mono" spellCheck={false} readOnly={busy} />
         </Field>
       </div>
       <Field label={t('providers.key')} htmlFor="new-provider-key" hint={t('providers.keyHint')}>
         <Input id="new-provider-key" type="password" autoComplete="off" value={key} onChange={(event) => setKey(event.target.value)}
-          className="h-9 font-mono" />
+          className="h-9 font-mono" readOnly={busy} />
       </Field>
       {(problem || personal.problem) && <p role="alert" className="text-sm text-destructive">{errorText(t, problem ?? personal.problem)}</p>}
       <div className="flex justify-end gap-2">

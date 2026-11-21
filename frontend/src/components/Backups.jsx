@@ -175,7 +175,7 @@ function FullBackup() {
     const sent = passphrase;
     setPassphrase(''); // held by the run in memory only, and not kept in the form either
     if (!(await archive.start('/api/backups/full', { destination: destination.trim(), ...(sent ? { passphrase: sent } : {}) }))) {
-      setPassphrase(sent);
+      setPassphrase((now) => now || sent); // given back, unless another was typed since
     }
   }
 

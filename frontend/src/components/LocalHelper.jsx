@@ -288,7 +288,7 @@ function ImportForm({ model, onDone }) {
         <div className="flex gap-2">
           <Input id={id} value={path} spellCheck={false} autoComplete="off" className="font-mono text-xs md:text-xs"
             placeholder={t('helper.importPlaceholder')} aria-describedby={`${id}-hint`}
-            onChange={(event) => setPath(event.target.value)} />
+            onChange={(event) => setPath(event.target.value)} readOnly={busy} />
           {pick && (
             <Button type="button" variant="outline" className="shrink-0" onClick={async () => {
               const chosen = await pick().catch(() => null);

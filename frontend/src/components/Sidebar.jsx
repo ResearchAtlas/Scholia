@@ -176,9 +176,9 @@ function NewProjectDialog({ open, onClose, onCreated }) {
           <div className="grid gap-1.5">
             <label htmlFor="new-project" className="text-sm font-medium">{t('project.nameLabel')}</label>
             <Input id="new-project" value={name} maxLength={200} autoFocus placeholder={t('project.namePlaceholder')}
-              onChange={(event) => setName(event.target.value)} />
+              onChange={(event) => setName(event.target.value)} readOnly={busy} />
           </div>
-          <HoldsChoice value={holds} onChange={setHolds} venue={venue} onVenue={setVenue} name="new-project-holds" />
+          <HoldsChoice value={holds} onChange={setHolds} venue={venue} onVenue={setVenue} name="new-project-holds" disabled={busy} />
           {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
           {busy && <p role="status" className="text-sm text-muted-foreground">{t('backups.working')}</p>}
           <DialogFooter>
@@ -211,7 +211,7 @@ function RenameDialog({ conversation, onClose, onDone }) {
           <DialogHeader><DialogTitle>{t('conversation.renameTitle')}</DialogTitle></DialogHeader>
           <div className="grid gap-1.5">
             <label htmlFor="rename" className="text-sm font-medium">{t('conversation.titleLabel')}</label>
-            <Input id="rename" value={title} maxLength={200} onChange={(event) => setTitle(event.target.value)} />
+            <Input id="rename" value={title} maxLength={200} onChange={(event) => setTitle(event.target.value)} readOnly={busy} />
           </div>
           {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
           {busy && <p role="status" className="text-sm text-muted-foreground">{t('backups.working')}</p>}

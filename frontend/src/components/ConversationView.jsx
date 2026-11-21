@@ -518,7 +518,8 @@ function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
     setBusy(true);
     const sent = text;
     setText('');
-    if (!(await onSend(sent))) setText(sent);
+    // not sent: given back in front of what was typed since, never over it (design review X)
+    if (!(await onSend(sent))) setText((now) => (now ? `${sent}\n${now}` : sent));
     setBusy(false);
     box.current?.focus();
   }
