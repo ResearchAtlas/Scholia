@@ -233,8 +233,9 @@ async def test_a_second_restore_put_back_after_one_that_could_not_be_leaves_the_
         assert rows == [(1, "forward")]
 
 
+@pytest.mark.parametrize("unlistable", ["staging", "a restore's folder"])
 @pytest.mark.parametrize("error", ["EACCES", "EIO"])
-async def test_a_staging_folder_that_cannot_be_listed_rotates_nothing(tmp_path, monkeypatch, caplog, error):
+async def test_a_staging_folder_that_cannot_be_listed_rotates_nothing(tmp_path, monkeypatch, caplog, error, unlistable):
     # PR 63's recheck r2 (pass 1 F5, pass 2 F1): the guard asked Path.glob, which swallows a listing's error, so an
     # unlistable staging folder read as no restore and retention deleted; design R says nothing is rotated then
     import errno
@@ -258,7 +259,9 @@ async def test_a_staging_folder_that_cannot_be_listed_rotates_nothing(tmp_path, 
             real = os.scandir
 
             def failing(path="."):
-                if not isinstance(path, int) and os.path.basename(os.fspath(path)) in (STAGING, "a-restore"):
+                # staging itself, or (the second Fable recheck, F2) only the restore's own folder inside it
+                if not isinstance(path, int) and os.path.basename(os.fspath(path)) == (
+                        STAGING if unlistable == "staging" else "a-restore"):
                     raise OSError(getattr(errno, error), os.strerror(getattr(errno, error)))
                 return real(path)
             monkeypatch.setattr(database_module.os, "scandir", failing)
@@ -340,33 +343,36 @@ async def test_a_staging_entry_that_links_to_a_restoring_folder_is_a_restore(tmp
     assert _restoring(tmp_path / "backups")
 
 
-@pytest.mark.parametrize("removable", [False, True])
-async def test_a_launch_that_cannot_empty_a_restores_staging_says_retention_is_paused(tmp_path, caplog, removable):
+@pytest.mark.parametrize("left_as", ["cannot be removed", "cannot be listed", "removable"])
+async def test_a_launch_that_cannot_empty_a_restores_staging_says_retention_is_paused(tmp_path, caplog, left_as):
     # PR 63's Fable recheck (F2): design R's limit (a staging folder that cannot be removed pauses retention) held with
-    # nothing logged; the launch now says so once, naming no path or file. A removable one is the control
+    # nothing logged; the launch now says so once, naming no path or file. A removable one is the control. The second
+    # Fable recheck (F2): staging that cannot even be listed is paused and said too
     import logging
     from backend.db.database import RESTORING, STAGING
-    if not removable and os.geteuid() == 0:
+    if left_as != "removable" and os.geteuid() == 0:
         pytest.skip("a folder's mode keeps nothing from root")
     data = tmp_path / "data"
     await asyncio.to_thread(lambda: Database(data).close())
-    left = data / "backups" / STAGING / "a-restore-id"
+    staging = data / "backups" / STAGING
+    left = staging / "a-restore-id"
     (left / RESTORING).mkdir(parents=True)
     (left / RESTORING / "a-staged-file.db").write_bytes(b"x")
-    if not removable:
-        left.chmod(0o500)  # its restore folder cannot be unlinked from it
+    locked = {"cannot be removed": left, "cannot be listed": staging}.get(left_as)
+    if locked is not None:
+        locked.chmod(0o500 if locked == left else 0o000)  # its restore folder cannot be unlinked; or nothing is read
     try:
         with caplog.at_level(logging.WARNING, logger="backend.backups"):
             async with started(data, setup=False):
                 pass
     finally:
-        if left.exists():
-            left.chmod(0o700)
+        if locked is not None:
+            locked.chmod(0o700)
     said = [r for r in caplog.records if r.name == "backend.backups" and r.levelno == logging.WARNING]
-    if removable:
-        assert not said and not (data / "backups" / STAGING).exists()
+    if left_as == "removable":
+        assert not said and not staging.exists()
         return
-    assert len(said) == 1 and "retention" in said[0].getMessage() and "paused" in said[0].getMessage()
+    assert len(said) == 1 and "retention" in said[0].getMessage() and "paused" in said[0].getMessage(), said
     text = said[0].getMessage() + repr(said[0].args)
     assert not any(name in text for name in ("a-restore-id", "a-staged-file", STAGING, str(tmp_path)))
 
