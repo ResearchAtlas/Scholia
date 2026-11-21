@@ -550,6 +550,36 @@ const scenarios = {
     assert.equal(s.server.asked.filter((r) => r.method !== 'GET').length, 1, 'a second save was asked');
     assert.equal(s.field(byId('subagent-add'), 'a model to add').props.value, NEWER, 'what was typed was cleared');
   },
+  // Found on the way (not this class; new with design S's "not decided" window): a project is deleted while its Library
+  // panel is open. The Library is drawn for no project, and its effect throws (library.js takeOpening reads a null).
+  async aProjectDeletedWithItsLibraryOpenLeavesTheWindowDrawn(w, strict) {
+    const state = start({ projects: [P1, { id: 'p2', name: 'Project Beta', kind: 'research' }], papers: [paper('a', 'Paper A')] });
+    const s = await windowWorld(w, strict, state);
+    await s.press('Library');
+    await s.projectMenu(/^Delete Project Alpha/);
+    await s.press('Delete');
+    const del = s.server.next(writes('DELETE', '/api/projects/p1'));
+    state.projects = [state.projects[1]];
+    s.server.hold('projects');
+    await s.release(del, (r) => r.answer({ ok: true })); // throws here at the head: the Library's effect
+    await s.releaseAll(reads('projects'));
+    assert.ok(s.screen().includes('Project Beta'), 'another project is open');
+  },
+  // AF's note beside T, the same state: a file dropped on a Library drawn for no project was added to project.id of
+  // undefined, a TypeError in the drop's handler. Nothing is added, and nothing throws.
+  async aFileDroppedOnALibraryForNoProjectAddsNothing(w, strict) {
+    const s = await partWorld(w, strict, {}, 'Library', 'Library', { project: undefined });
+    const rejected = []; const note = (error) => rejected.push(String(error));
+    process.on('unhandledRejection', note);
+    try {
+      await s.act(() => one(s.shown().filter((e) => e.props.onDrop), 'the drop zone').props.onDrop({ preventDefault() {}, stopPropagation() {},
+        dataTransfer: { files: [{ name: 'a.pdf', type: 'application/pdf', size: 1, data: '' }] } }));
+    } finally {
+      process.off('unhandledRejection', note);
+    }
+    assert.deepEqual(rejected, [], 'the drop threw');
+    assert.equal(s.server.asked.filter((r) => r.method !== 'GET').length, 0, 'something was sent');
+  },
 };
 
 const only = process.env.ONLY ? process.env.ONLY.split(',') : null;
