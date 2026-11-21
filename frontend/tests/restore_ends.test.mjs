@@ -174,6 +174,12 @@ const scenarios = {
     assert.deepEqual(s.reads(), [], 'nothing but health was asked');
     assert.ok(s.says('Scholia is restoring a backup'));
   },
+  async tryAgainOnTheRestoringScreenReloadsTheWindow(w, strict) {
+    const s = await appWorld(w, strict, { ok: true, restoring: true });
+    await s.press('Try again');
+    assert.equal(s.seen.reloads, 1);
+    assert.deepEqual(s.reads(), []);
+  },
   // Guard: with no restore under way the window reads its launch reads and reloads nothing.
   async aWindowLoadedWithNoRestoreUnderWayReadsItsLaunchReads(w, strict) {
     const s = await appWorld(w, strict, { ok: true });

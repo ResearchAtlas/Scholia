@@ -48,7 +48,7 @@ export function App() {
     try {
       const health = await get('/api/health');
       // design review AC: a restore is under way (from its request to its end): nothing of a database that is about to
-      // be replaced is read; the window says so
+      // be replaced is read; the window says so, and Try again reloads it
       if (health.restoring) throw new ApiError(503, 'restoring');
       if (health.data_folder_problem || health.database_damaged) {
         const settings = await get('/api/settings').catch(() => null); // a limited app may not serve it
@@ -100,7 +100,7 @@ export function App() {
     <LanguageContext.Provider value={language}>
       {englishUnsaved && <EnglishNotSaved onRetry={retryEnglish} onClose={() => setEnglishUnsaved(false)} />}
       {state.phase === 'loading' && <Splash />}
-      {state.phase === 'error' && <Failure code={state.code} onRetry={load} />}
+      {state.phase === 'error' && <Failure code={state.code} onRetry={state.code === 'restoring' ? () => window.location.reload() : load} />}
       {state.phase === 'dataFolder' && <DataFolderScreen health={state.health} />}
       {state.phase === 'damaged' && <DamagedDatabaseScreen restart={state.health?.limited === 'restart_required'} />}
       {state.phase === 'setup' && <FirstRun onDone={load} />}
