@@ -373,6 +373,16 @@ const scenarios = {
     await s.act(() => s.server.resize(1400));
     assert.deepEqual(s.selected(), ['Title Zulu']);
   },
+  // The same for the open conversation (the recheck of the phase C review's fixes).
+  async aDeletedOpenConversationIsLeftThoughTheSidebarWent(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    await s.menu('Title Alpha', 'Delete'); await s.confirmDelete();
+    state.conversations.p1 = state.conversations.p1.filter((c) => c.id !== 'a');
+    await s.act(() => s.server.resize(800));
+    await s.release(s.server.next(writes('DELETE')));
+    await s.act(() => s.server.resize(1400));
+    assert.deepEqual(s.selected(), ['Title Bravo']);
+  },
   async typedAfterAMovesDialogWentWithTheSidebar(w, strict) {
     const state = start(); const s = await world(w, strict, state);
     await moveTo(s, 'Title Alpha', 'p2');
