@@ -23,6 +23,8 @@ function backend(state) {
       settings: { values: { ui: { panel: state.panels?.[new URLSearchParams(path.split('?')[1]).get('project_id')] ?? 'none' } } },
     }[kind] ?? { ok: true });
     if (kind === 'other') return new Promise(() => {});
+    // a deleted conversation's own record answers 404, as backend/app.py does (rider N reads it so)
+    if (kind === 'conversation' && state.gone?.has(path.split('/').pop())) return Promise.resolve(response(404, { code: 'not_found' }));
     if (method === 'GET' && !held.has(kind)) return Promise.resolve(response(200, now()));
     return new Promise((resolve) => asked.push({ method, path, kind,
       answer: (body = now(), status = 200) => resolve(response(status, body)),
@@ -282,16 +284,18 @@ const scenarios = {
     if (typed) assert.equal(s.draft(), DRAFT);
     assert.ok(!s.selected().includes('Title Alpha'));
   },
-  // A deletion that happened though its request failed (its answer lost): the title is gone once the list is read, and
-  // what was typed is still in its box.
-  async aLostAnswerLosesNothingTyped(w, strict) {
-    const state = start(); const s = await world(w, strict, state);
+  // A deletion that happened though its request failed (its answer lost): the title is gone once the list is read.
+  async aLostAnswerWhoseRecordIsGoneLeavesIt(w, strict) {
+    // rewritten for rider N (Harold, 2026-11-21; design review Z): the deletion happened and its answer was lost; the
+    // record's own read answers 404, and the window leaves it; what was typed there goes with the view
+    const state = { ...start(), gone: new Set() }; const s = await world(w, strict, state);
     await s.type(DRAFT);
     await s.menu('Title Alpha', 'Delete'); await s.confirmDelete();
-    state.conversations.p1 = state.conversations.p1.filter((c) => c.id !== 'a');
+    state.conversations.p1 = state.conversations.p1.filter((c) => c.id !== 'a'); state.gone.add('a');
     await s.release(s.server.next(writes('DELETE')), (r) => r.fail('unreachable', 503));
     assert.ok(!s.screen().includes('Title Alpha'));
-    assert.equal(s.box() && s.draft(), DRAFT);
+    assert.deepEqual(s.selected(), ['Title Bravo']);
+    assert.notEqual(s.draft(), DRAFT);
   },
   // The weaker property (the brief's second example): what was typed is there again on returning to its conversation.
   async typedIsThereOnReturning(w, strict) {

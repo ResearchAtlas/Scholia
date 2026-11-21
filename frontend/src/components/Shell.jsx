@@ -10,7 +10,7 @@ import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
 import { DEFAULTS, LIMITS, clamp, columns, fromSettings, panelShareAt, toSettings } from '../layout.js';
 import { errorText } from '../text.js';
-import { forget, places, recheck, subscribe } from '../live.js';
+import { deleted, forget, places, recheck, subscribe } from '../live.js';
 import { libraryChanged, newest } from '../library.js';
 import { generation, useRead } from '../libraryRead.js';
 import { projectName } from '../projects.js';
@@ -100,6 +100,9 @@ export function Shell({ health, settings, onLanguage }) {
   // they name (a deletion's request settled, a conversation moved), never one asked before it, and nothing old after
   // a read that failed.
   const [removals] = useState(() => ({ projects: generation(), conversations: generation() }));
+  // rider N (Harold, 2026-11-21): a conversation whose own record answers 404 is known to be deleted: its list is read
+  // again and it is left (design review Z, A6)
+  const conversationGone = useCallback((id) => { removals.conversations.move(); gone('conversation', id); }, [removals, gone]);
   const projectsRead = useRead(removals.projects, 'projects', () => get('/api/projects'));
   const conversationsRead = useRead(removals.conversations, projectId ?? null,
     () => get(`/api/conversations?project_id=${encodeURIComponent(projectId)}`));
@@ -233,6 +236,8 @@ export function Shell({ health, settings, onLanguage }) {
         removals.conversations.move();
         recheck(); // live.js: a turn it holds of a conversation that went with the project
         if (removed) gone('project', id);
+        // not known (its request failed; it may have happened): asked once, and left if it is gone (rider N)
+        else get(`/api/projects/${encodeURIComponent(id)}`).catch((error) => { if (deleted(error)) gone('project', id); });
       }}
       onConversation={(id) => { openConversation(id); setDrawer(false); }}
       onConversationsChanged={loadConversations}
@@ -314,6 +319,7 @@ export function Shell({ health, settings, onLanguage }) {
               onPanel={togglePanel}
               onCreated={(id) => { answered((now) => ({ ...now, conversationId: id })); loadConversations(); }}
               onLibrary={() => panel !== 'library' && togglePanel('library')}
+              onGone={conversationGone}
             />}
           </div>
           {panel !== 'none' && !view.overlay && (

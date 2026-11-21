@@ -23,9 +23,9 @@ function backend(state) {
     const kind = method !== 'GET' ? 'write' : path === '/api/projects' ? 'projects'
       : path.startsWith('/api/conversations?') ? 'list' : /^\/api\/conversations\/[^/?]+$/.test(path) ? 'conversation'
         : path.startsWith('/api/asks') ? 'asks' : path.startsWith('/api/settings?') ? 'settings'
-          : path === '/api/settings' ? 'choice' : /\/spend\?/.test(path) ? 'spend' : 'other';
+          : path === '/api/settings' ? 'choice' : /\/spend\?/.test(path) ? 'spend' : /^\/api\/projects\/[^/?]+$/.test(path) ? 'project' : 'other';
     const id = kind === 'conversation' ? path.split('/').pop() : kind === 'spend' || kind === 'asks' ? query(path, 'conversation_id') : null;
-    const project = kind === 'settings' ? query(path) : kind === 'spend' ? path.split('/')[3] : null;
+    const project = kind === 'settings' ? query(path) : kind === 'spend' ? path.split('/')[3] : kind === 'project' ? path.split('/').pop() : null;
     const missing = () => (id && state.gone.has(id)) || (project && state.gone.has(project));
     const now = () => ({ projects: { projects: clone(state.projects) },
       list: { conversations: clone(state.conversations[query(path)] ?? []) },
@@ -34,6 +34,7 @@ function backend(state) {
       choice: { values: clone(state.personal ?? {}), hash: 'h' },
       settings: { hash: 'h', values: { ui: { panel: state.panels?.[query(path)] ?? 'none' } } },
       spend: clone(state.spend?.[id] ?? {}),
+      project: clone(state.projects.find((p) => p.id === project) ?? {}),
     }[kind] ?? { ok: true });
     const answer = () => (failing.has(kind) ? response(failing.get(kind)[1], { code: failing.get(kind)[0] })
       : kind !== 'asks' && missing() ? response(404, { code: 'not_found' }) : response(200, now()));
@@ -490,20 +491,21 @@ const scenarios = {
     assert.equal(s.buttons('Remove').length + s.buttons('Edit').length + s.buttons('Send').length, 0, 'a waiting message can be acted on');
     await s.pause(); // the record is read again after a pause
     assert.deepEqual(left(s), [], 'after it was read again');
-    // the view stays (S without rider R; rider N, which would leave it, is not built)
-    assert.equal(s.draft(), DRAFT, 'what was typed there, while the view stays');
+    // rider N (Harold, 2026-11-21): left once its record answered 404; what was typed there went with it
+    assert.deepEqual(s.selected(), ['Title Bravo'], 'the deleted conversation is still open');
+    assert.notEqual(s.draft(), DRAFT);
   },
-  // This review: in that view (it stays: S, without rider R), once the record has answered 404 nothing leaves for the
-  // deleted conversation; what was typed is given back (X).
+  // This review: once the record has answered 404 nothing leaves for the deleted conversation (rider N: no view of it
+  // is left).
   async nothingLeavesForAConversationKnownToBeDeleted(w, strict) {
     const state = withRecord(); const s = await world(w, strict, state);
     await s.menu('Title Alpha', 'Delete'); await s.confirmDelete();
     deleteConversation(state, 'a');
     await s.release(s.server.next(writes('DELETE')), (r) => r.fail('unreachable', 503));
     await s.closeDialog(); await s.pause();
+    assert.deepEqual(s.selected(), ['Title Bravo'], 'rider N: no view of it is left to send from');
     await s.type(DRAFT); await s.send();
     assert.deepEqual(s.server.asked.filter((r) => r.path.includes('/conversations/a/')).map((r) => r.path), []);
-    assert.equal(s.draft(), DRAFT);
   },
   // The same when the reread fails otherwise (the backend cannot be reached): nothing old after a failed read.
   async nothingOfADeletedConversationStaysWhileItCannotBeRead(w, strict) {
@@ -713,6 +715,60 @@ const scenarios = {
     s.server.failing('conversation', 'unreachable', 503);
     await s.release(s.server.next(writes('DELETE', '/queue/')), (r) => r.answer({ ok: true })); // then read again: it fails
     assert.ok(s.seen().includes(ASKED), 'the turns read before were dropped at a failed read with no change');
+  },
+  // Rider N, its project half (Harold, 2026-11-21): the open project's deletion fails but happened; the Shell asks for
+  // the project once, it answers 404, and the window leaves it.
+  async aProjectWhoseFailedDeletionHappenedIsLeft(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.type(DRAFT);
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    deleteProject(state, 'p1');
+    await s.release(s.server.next(writes('DELETE')), (r) => r.fail('unreachable', 503));
+    await s.closeDialog();
+    assert.deepEqual(s.selected(), ['Title Zulu'], 'the deleted project is still open');
+    assert.ok(!/Project Alpha|Title (Alpha|Bravo|Charlie)/.test(s.seen()));
+  },
+  // Its guard (S's point 4): the project's deletion fails and did not happen: it answers, and the window stays, with
+  // its record and what was typed.
+  async aProjectWhoseFailedDeletionDidNotHappenStays(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.type(DRAFT);
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    await s.release(s.server.next(writes('DELETE')), (r) => r.fail('backup_failed', 503));
+    await s.closeDialog();
+    assert.deepEqual(s.selected(), ['Title Alpha']);
+    assert.ok(s.seen().includes(QUEUED) && s.seen().includes(ASKED), 'read again and shown');
+    assert.equal(s.draft(), DRAFT);
+  },
+  // Rider N with batch E's 1cc9511 and its recorded limit R2: after a deletion whose answer was lost, the waiting
+  // messages stay while the record is read again (an open editor keeps its text through any change); when that read
+  // answers 404 the window leaves the conversation.
+  async aDeletedConversationsWaitingMessagesStayOnlyUntilItsRereadAnswers(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.menu('Title Alpha', 'Delete'); await s.confirmDelete();
+    deleteConversation(state, 'a');
+    s.server.hold('conversation');
+    await s.release(s.server.next(writes('DELETE')), (r) => r.fail('unreachable', 503));
+    await s.closeDialog();
+    assert.ok(s.seen().includes(QUEUED), 'R2: shown until the record is read again');
+    assert.ok(!s.seen().includes(ASKED), 'the turns go at the change');
+    s.server.free('conversation');
+    await s.releaseAll((r) => r.method === 'GET' && r.kind === 'conversation');
+    assert.deepEqual(s.selected(), ['Title Bravo'], 'left once its record answered 404 (rider N)');
+    assert.deepEqual(left(s), []);
+  },
+  // Rider N before the deletion's answer: its record answers 404 (a waiting message's Remove reads it again) while the
+  // deletion is still under way and its dialog went with the Sidebar: the window leaves it, and the list is read again,
+  // so the deleted conversation is not offered to be opened again.
+  async aConversationWhoseRecordAnswers404BeforeItsDeletionAnswersIsLeftAndUnlisted(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.menu('Title Alpha', 'Delete'); await s.confirmDelete();
+    await goes(s);
+    deleteConversation(state, 'a');
+    await s.press('Remove');
+    await s.release(s.server.next(writes('DELETE', '/queue/')), (r) => r.fail('not_found', 404));
+    assert.deepEqual(s.selected(), ['Title Bravo']);
+    assert.deepEqual(left(s), [], 'the deleted conversation is still listed');
   },
 };
 
