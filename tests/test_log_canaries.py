@@ -487,6 +487,9 @@ def test_a_traceback_as_text_is_never_read_so_one_its_message_quotes_cannot_reac
 
     def grouped():
         raise ExceptionGroup("CANARY-GROUP", [OSError("CANARY-MEMBER")])
+
+    def caused_unraised():  # the recheck (F1): a cause never raised has no traceback, so it is printed with no header
+        raise ValueError("CANARY-VALUE") from ExceptionGroup("CANARY-GCAUSE", [KeyError("CANARY-KEY")])
     formatter = logs.Formatter(logs.FORMAT)
 
     def written(text):
@@ -495,7 +498,8 @@ def test_a_traceback_as_text_is_never_read_so_one_its_message_quotes_cannot_reac
         assert "CANARY" not in line and "Canary" not in line, line
         return [w.split(".py:")[0] + ".py:" if ".py:" in w else w for w in line.split(": ", 1)[1].splitlines()]
     for raise_it, expected in ((chained, ["ValueError at test_log_canaries.py:", "KeyError at test_log_canaries.py:"]),
-                               (grouped, ["ExceptionGroup at test_log_canaries.py:"])):
+                               (grouped, ["ExceptionGroup at test_log_canaries.py:"]),
+                               (caused_unraised, ["ValueError at test_log_canaries.py:", "ExceptionGroup"])):
         try:
             raise_it()
         except BaseException:

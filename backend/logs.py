@@ -46,12 +46,11 @@ class Formatter(logging.Formatter):
         message = record.getMessage()
         if record.name.split(".")[0] == "asyncio":  # past its leading words, reprs: a task's holds its exception's
             message = re.match(r"[A-Za-z' ]*", message).group().strip() or "asyncio reported an error"
-        sent = TRACEBACK.search(message)
-        if sent:  # a traceback sent as text, as Starlette sends a failed lifespan's for uvicorn to log: never read, as a
-            # message in it can quote another; the exception being handled is written, if any
+        if TRACEBACK.search(message):  # a traceback sent as text, as Starlette sends a failed lifespan's for uvicorn to
+            # log: none of it is read or kept, as a message in it can quote another and a cause never raised is printed
+            # before the first header; the exception being handled is written, if any
             handled = sys.exc_info() if record.exc_info is None else (None, None, None)
-            message = message[:sent.start()] + (
-                self.formatException(handled) if handled[1] is not None else "a traceback, left out")
+            message = self.formatException(handled) if handled[1] is not None else "a traceback, left out"
         record.msg, record.args = message, None
         return super().format(record)
 
