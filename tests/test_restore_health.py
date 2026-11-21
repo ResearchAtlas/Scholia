@@ -85,13 +85,13 @@ async def test_health_says_a_restore_is_under_way_while_it_waits_for_a_backup_be
             restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
             try:
                 await asyncio.wait_for(waiting.wait(), 10)  # waits for that event, never for a length of time
-            except BaseException:
-                restore.cancel()  # the request; the restore it began ends once the lock is free
+                assert client.state["restore_lock"].locked() and not restore.done()
+                assert not client.state.get("restoring")  # the gate refuses nothing yet
+                assert await names(client) == (200, {"General", "Made after the backup"})
+                assert (await client.get("/api/health")).json().get("restoring") is True
+            except BaseException:  # whatever fails in here: the request goes (its restore ends once the lock is free)
+                restore.cancel()
                 raise
-            assert client.state["restore_lock"].locked() and not restore.done()
-            assert not client.state.get("restoring")  # the gate refuses nothing yet
-            assert await names(client) == (200, {"General", "Made after the backup"})
-            assert (await client.get("/api/health")).json().get("restoring") is True
         assert (await restore).status_code == 200
         assert "restoring" not in (await client.get("/api/health")).json()
 

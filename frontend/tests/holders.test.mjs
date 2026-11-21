@@ -82,12 +82,35 @@ test('everything that outlives a reload says how a deletion and a restore reach 
 // conversation's through live.js forget(), which says 'deleted' once and which the Shell hears; a project's through the
 // Shell's gone(); a refusal that only suggests the project went asks for it. A new place that reads a 404 as a deletion
 // fails here until it hands it on in the same statement. A declaration check, as the two above.
-test('every 404 taken as a deletion is handed to where knowledge lands', () => {
-  const stray = [];
-  for (const file of files(SRC)) {
-    for (const line of readFileSync(join(SRC, file), 'utf8').split('\n')) {
-      if (/\bdeleted\(error\)/.test(line) && !/\b(forget|gone)\(|\bonNoProject\?\.\(\)/.test(line)) stray.push(`${file}: ${line.trim()}`);
-    }
+// From a test to the end of what it governs: its statement's `;`, or the block it opens.
+const through = (code, start) => {
+  let depth = 0; let opened = false;
+  for (let i = start; i < code.length; i += 1) {
+    const c = code[i];
+    if (c === '{') { depth += 1; opened = true; } else if (c === '}') { depth -= 1; if (depth <= 0) return code.slice(start, i + 1); } // its block's end, or its enclosing one's
+    else if (c === ';' && depth === 0) return code.slice(start, i + 1);
   }
-  assert.deepEqual(stray, []);
+  return code.slice(start);
+};
+
+test('every 404 taken as a deletion is handed to where knowledge lands', () => {
+  // The batch H review: by the statement, not the line (what a test of deleted(...) governs, across lines), and a 404
+  // read directly, not through deleted(), is listed with why it is not a deletion's knowledge.
+  const RAW_404 = {
+    'live.js': 'deleted() itself, and send()\'s refusal of a conversation forgotten here',
+    'settings.js': 'a provider no longer set up lists no models: not a project\'s or a conversation\'s deletion',
+  };
+  const stray = []; const raw = new Set();
+  for (const file of files(SRC)) {
+    const code = readFileSync(join(SRC, file), 'utf8').replace(/(^|\s)\/\/.*$/gm, '$1');
+    for (const match of code.matchAll(/\bdeleted\(/g)) {
+      if (code.slice(Math.max(0, match.index - 6), match.index) === 'const ') continue; // its definition
+      const statement = through(code, match.index);
+      if (!/\b(forget|gone)\(|\bonNoProject\?\.\(\)/.test(statement)) stray.push(`${file}: ${statement.split('\n')[0].trim()}`);
+    }
+    if (/\b(status\s*===?\s*404|404\s*===?\s*\w*\.?status)\b|ApiError\(404/.test(code)) raw.add(file);
+  }
+  assert.deepEqual(stray, [], 'a 404 taken as a deletion and kept to itself');
+  assert.deepEqual([...raw].filter((file) => !RAW_404[file]).sort(), [], 'a 404 read directly, not through deleted()');
+  assert.deepEqual(Object.keys(RAW_404).filter((file) => !raw.has(file)), [], 'listed 404 readers that no longer read one');
 });
