@@ -80,7 +80,9 @@ test('as a deletion settles, an answer held after its live turn was cleared is f
   clear('z5');
   assert.equal(held('z5'), false);
   assert.deepEqual(unsavedAnswer('rz5'), { text: 'DELETED-ANSWER', cut: false });
-  const forgotten = heard('deleted');
-  recheck(); await forgotten;
+  const asked = server.asked.length;
+  recheck(); // its one read is asked and answered (404) at once: waited for so a regression fails, never hangs
+  assert.equal(server.asked.length, asked + 1, 'its conversation was not asked for');
+  for (let n = 0; n < 5; n += 1) await new Promise((resolve) => setImmediate(resolve));
   assert.equal(unsavedAnswer('rz5'), null);
 });

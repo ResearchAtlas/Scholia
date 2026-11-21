@@ -696,6 +696,24 @@ const scenarios = {
     assert.deepEqual(s.selected(), ['Title Bravo']);
     assert.equal(request.signal.aborted, true, 'the stream of the deleted conversation is still open here');
   },
+  // The recheck of the whole-batch review (F3): the budget bar is drawn with the turns, so not while the record is read
+  // again after a change; and a failed read that follows no change keeps what was shown.
+  async theBudgetBarWaitsForTheTurnsAfterAChange(w, strict) {
+    const state = withRecord(); state.records.a.queued = []; const s = await world(w, strict, state);
+    assert.equal(s.meters().length, 1);
+    s.server.hold('conversation');
+    await s.act(() => w.library.libraryChanged('p1'));
+    assert.equal(s.meters().length, 0, 'a spend read before the change is shown while the record is read again');
+    await s.releaseAll((r) => r.method === 'GET' && r.kind === 'conversation');
+    assert.equal(s.meters().length, 1);
+  },
+  async aFailedReadWithNoChangeKeepsWhatWasShown(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.press('Remove');
+    s.server.failing('conversation', 'unreachable', 503);
+    await s.release(s.server.next(writes('DELETE', '/queue/')), (r) => r.answer({ ok: true })); // then read again: it fails
+    assert.ok(s.seen().includes(ASKED), 'the turns read before were dropped at a failed read with no change');
+  },
 };
 
 
