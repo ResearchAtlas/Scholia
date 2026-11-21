@@ -31,6 +31,7 @@ function backend(state) {
       memory: clone(state.memory ?? { personal: [], project: [] }),
       materials: { materials: clone(state.papers ?? []), asks: [] },
     }[kind] ?? { ok: true });
+    if (method === 'GET' && state.gets && path in state.gets) return Promise.resolve(response(200, clone(state.gets[path])));
     if (kind === 'other') return new Promise(() => {});
     if (method === 'GET' && !held.has(kind)) return Promise.resolve(response(200, now()));
     return new Promise((resolve) => asked.push({ method, path, kind, body: init.body ? JSON.parse(init.body) : null,
@@ -120,6 +121,13 @@ async function settingsWorld({ mount, jsx }, strict, state, props) {
   s.redraw = async (more) => { ui.show([draw(more)]); await ui.settle(); }; // the Shell drawing it again with new props
   s.page = () => s.shown().filter((e) => e.type === 'button' && e.props['aria-current'] === 'page').map((e) => e.text.trim());
   return s;
+}
+
+async function partWorld({ mount, jsx }, strict, state, file, name, props = {}) {
+  const server = backend(state);
+  const part = (await load.component(file))[name];
+  const ui = await mount([jsx(part, props)], { strict }).settle();
+  return hands(ui, server);
 }
 
 const P1 = { id: 'p1', name: 'Project Alpha', kind: 'research' };
@@ -396,6 +404,74 @@ const scenarios = {
     const s = await settingsWorld(w, strict, { personal: { ui: { language: 'en' }, subagents: { models: [] } } }, { open: false, startPage: null });
     await s.redraw({ open: true, startPage: 'subagents' });
     assert.deepEqual(s.page(), ['Subagents']);
+  },
+
+  // The batch's internal review (F2), rider Q's other statement: a waiting message's own Send (which sends the text the
+  // record holds, not the edit) cannot be pressed while its editor is open.
+  async aWaitingMessagesSendWaitsForItsEditor(w, strict) {
+    const s = await windowWorld(w, strict, start({ records: { a: { turns: [], queued: [{ id: 'q1', text: 'Waiting message' }] } } }));
+    const send = () => s.shown().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Send' && e.props.className?.includes('h-7'));
+    assert.equal(send().length, 1);
+    assert.ok(!send()[0].props.disabled);
+    await s.press('Edit');
+    await s.typeInto(byId('queued-q1'), NEWER, 'the edit');
+    assert.ok(send()[0].props.disabled, 'the row\'s Send would send the unedited text and discard the edit');
+  },
+
+  // The batch's internal review (F2): the form K fields and the Subagents add, which only the census held. Each: the
+  // text sent, then something newer typed while its request is under way, then the answer: the newer text stays.
+  async aProviderKeySavedKeepsAKeyTypedSince(w, strict) {
+    const state = { personal: { providers: {} }, gets: { '/api/providers': { providers: [
+      { name: 'lab', kind: 'openai-compatible', base_url: 'https://llm.example.org/v1', enabled: true, has_key: false }] } } };
+    const s = await partWorld(w, strict, state, 'Providers', 'Providers');
+    await s.typeInto(byId('key-lab'), SUBMITTED, 'the key');
+    await s.submitWith(byId('key-lab'), 'the key form');
+    const put = s.server.next(writes('PUT', '/api/keys/lab'));
+    assert.equal(await s.typeInto(byId('key-lab'), NEWER, 'the key'), true);
+    await s.release(put, (r) => r.answer({}));
+    assert.equal(s.field(byId('key-lab'), 'the key').props.value, NEWER);
+  },
+  async anAllowlistAddKeepsAModelTypedSince(w, strict) {
+    const routes = { routes: [], checked_on: '2026-01-01' };
+    const s = await partWorld(w, strict, { gets: { '/api/private-routes': routes } }, 'Governance', 'PrivateAllowlist');
+    await s.typeInto(byId('allowlist-add'), 'model/submitted', 'the model');
+    await s.submitWith(byId('allowlist-add'), 'the add form');
+    const put = s.server.next(writes('PUT', '/api/private-routes/'));
+    assert.equal(await s.typeInto(byId('allowlist-add'), NEWER, 'the model'), true);
+    await s.release(put, (r) => r.answer(routes));
+    assert.equal(s.field(byId('allowlist-add'), 'the model').props.value, NEWER);
+  },
+  async aRefusedBackupKeepsAPassphraseTypedSince(w, strict) {
+    const s = await partWorld(w, strict, { gets: { '/api/backups': { backups: [] } } }, 'Backups', 'BackupsSection');
+    const folder = (e) => e.type === 'ui:Input' && e.props.type !== 'password' && e.up.some((x) => x.type === 'form' && x.text.includes('Full backup'));
+    await s.typeInto(folder, '/backups', 'the folder');
+    await s.typeInto(byId('full-backup-passphrase'), SUBMITTED, 'the passphrase');
+    await s.submitWith(byId('full-backup-passphrase'), 'the full backup form');
+    const start = s.server.next(writes('POST', '/api/backups/full'));
+    assert.equal(await s.typeInto(byId('full-backup-passphrase'), NEWER, 'the passphrase'), true);
+    await s.release(start, (r) => r.fail('destination_invalid', 400));
+    assert.equal(s.field(byId('full-backup-passphrase'), 'the passphrase').props.value, NEWER);
+  },
+  async aRefusedExportKeepsAPassphraseTypedSince(w, strict) {
+    const s = await partWorld(w, strict, {}, 'ProjectExport', 'ProjectExportSection', { project: { id: 'p1', sensitivity: 'private' } });
+    await s.typeInto((e) => e.type === 'ui:Input' && e.props.type !== 'password', '/exports', 'the folder');
+    await s.typeInto(byId('export-passphrase'), SUBMITTED, 'the passphrase');
+    await s.submitWith(byId('export-passphrase'), 'the export form');
+    const start = s.server.next(writes('POST', '/api/projects/p1/export'));
+    assert.equal(await s.typeInto(byId('export-passphrase'), NEWER, 'the passphrase'), true);
+    await s.release(start, (r) => r.fail('destination_invalid', 400));
+    assert.equal(s.field(byId('export-passphrase'), 'the passphrase').props.value, NEWER);
+  },
+  async aSubagentAddedWhileAChangeIsSavedKeepsWhatWasTyped(w, strict) {
+    const s = await settingsWorld(w, strict, { personal: { ui: { language: 'en' }, subagents: { models: [] } } }, { open: false, startPage: null });
+    await s.redraw({ open: true, startPage: 'subagents' });
+    await s.typeInto(byId('subagent-add'), 'model/submitted', 'a model to add');
+    await s.submitWith(byId('subagent-add'), 'the add form');
+    assert.equal(s.server.asked.filter((r) => r.method !== 'GET').length, 1, 'the first add is saved');
+    await s.typeInto(byId('subagent-add'), NEWER, 'a model to add');
+    await s.submitWith(byId('subagent-add'), 'the add form'); // while the first is saved: nothing is added
+    assert.equal(s.server.asked.filter((r) => r.method !== 'GET').length, 1, 'a second save was asked');
+    assert.equal(s.field(byId('subagent-add'), 'a model to add').props.value, NEWER, 'what was typed was cleared');
   },
 };
 

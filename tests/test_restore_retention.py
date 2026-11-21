@@ -346,6 +346,8 @@ async def test_a_launch_that_cannot_empty_a_restores_staging_says_retention_is_p
     # nothing logged; the launch now says so once, naming no path or file. A removable one is the control
     import logging
     from backend.db.database import RESTORING, STAGING
+    if not removable and os.geteuid() == 0:
+        pytest.skip("a folder's mode keeps nothing from root")
     data = tmp_path / "data"
     await asyncio.to_thread(lambda: Database(data).close())
     left = data / "backups" / STAGING / "a-restore-id"
