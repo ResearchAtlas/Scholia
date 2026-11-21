@@ -96,11 +96,12 @@ export function send(conversationId, path, body, text, since = stopsAt(conversat
       set(conversationId, turn, event.type);
       if (turn.runId) admitted();
     }, abort.signal).catch((error) => {
-      if (turn.runId) return;
-      if (error.name === 'AbortError') return; // stopped before it was admitted: it ends done, starting nothing
+      if (turn.runId) return; // admitted, its stream lost: it was sent, and the record says what followed
       release();
       set(conversationId, null, 'refused');
-      refused(error);
+      // Stop pressed before it was admitted: not sent, as one Stop refuses before its request (recheck r4, against
+      // design review X: what was not sent is given back)
+      refused(error.name === 'AbortError' ? new ApiError(409, 'stopped') : error);
     }).finally(() => {
       if (!turn.done) turn = { ...turn, done: true };
       if (release() && turns.get(conversationId) && turns.get(conversationId) !== turn) set(conversationId, turn, 'run_finished');

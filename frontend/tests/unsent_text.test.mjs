@@ -11,6 +11,7 @@ const load = await loader();
 after(() => load.close());
 
 const clone = (value) => structuredClone(value);
+const one = (found, what) => { if (found.length !== 1) throw new Error(`${what}: ${found.length} found`); return found[0]; };
 function backend(state) {
   const asked = []; const held = new Set();
   const response = (status, body) => ({ ok: status < 400, status, json: async () => body });
@@ -34,13 +35,14 @@ function backend(state) {
     if (method === 'GET' && state.gets && path in state.gets) return Promise.resolve(response(200, clone(state.gets[path])));
     if (kind === 'other') return new Promise(() => {});
     if (method === 'GET' && !held.has(kind)) return Promise.resolve(response(200, now()));
-    return new Promise((resolve) => asked.push({ method, path, kind, body: init.body ? JSON.parse(init.body) : null,
+    return new Promise((resolve, reject) => { init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))); // as fetch does
+      asked.push({ method, path, kind, body: init.body ? JSON.parse(init.body) : null,
       answer: (body = now(), status = 200) => resolve(response(status, body)),
       fail: (code = 'internal', status = 500) => resolve(response(status, { code })),
       // a turn's stream, opened: push(...events) sends them, end() closes it (the turn's stream ended)
       open() { let controller; resolve({ ok: true, status: 200, body: new ReadableStream({ start(c) { controller = c; } }) });
         return { push: (...events) => { for (const event of events) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`)); },
-          end: () => controller.close() }; } }));
+          end: () => controller.close(), lose: () => controller.error(new TypeError('network')) }; } }); });
   };
   globalThis.FileReader = class { readAsDataURL(file) { this.result = `data:;base64,${file.data ?? ''}`; queueMicrotask(() => this.onload()); } };
   globalThis.setTimeout = () => 0; globalThis.clearTimeout = () => {}; globalThis.setInterval = () => 0; globalThis.clearInterval = () => {};
@@ -204,6 +206,38 @@ const scenarios = {
     assert.equal(await s.type(DRAFT), true, 'the message box takes typing while a message is admitted');
     const stream = s.server.next(writes('POST', '/message/stream')).open();
     await s.act(() => stream.push({ type: 'run_started', run_id: 'r1', conversation_id: 'a', seq: 1 }));
+    assert.equal(s.box(), DRAFT);
+  },
+
+  // Recheck r4 (pass 2, finding 1), against X's decided text ("the same when Stop was pressed since the send"): a message
+  // whose request Stop aborted before it was admitted resolved as admitted, so it left the box and was never recorded.
+  // Now it is not sent: the box holds it, a line break, then what was typed since. In an existing and a new conversation.
+  async aSendStoppedBeforeItsAdmissionIsGivenBack(w, strict) {
+    const s = await windowWorld(w, strict, start());
+    await s.type(FIRST); await s.send();
+    s.server.next(writes('POST', '/message/stream')); // asked, never answered: not admitted
+    await s.type(DRAFT);
+    await s.act(() => one(s.shown().filter((e) => e.type === 'ui:Button' && e.props['aria-label'] === 'Stop'), 'Stop').props.onClick());
+    assert.equal(s.box(), `${FIRST}\n${DRAFT}`);
+  },
+  async aFirstSendStoppedBeforeItsAdmissionIsGivenBack(w, strict) {
+    const s = await windowWorld(w, strict, start());
+    await s.newConversation();
+    await s.type(FIRST); await s.send();
+    await s.release(s.server.next(writes('POST', '/api/conversations')), (r) => r.answer({ id: 'n1' }));
+    s.server.next(writes('POST', '/api/conversations/n1/message/stream'));
+    await s.type(DRAFT);
+    await s.act(() => one(s.shown().filter((e) => e.type === 'ui:Button' && e.props['aria-label'] === 'Stop'), 'Stop').props.onClick());
+    assert.equal(s.box(), `${FIRST}\n${DRAFT}`);
+  },
+  // Its control: a message admitted (the run started) whose stream is then lost was sent: it is not given back.
+  async anAdmittedSendWhoseStreamIsLostIsNotGivenBack(w, strict) {
+    const s = await windowWorld(w, strict, start());
+    await s.type(FIRST); await s.send();
+    const stream = s.server.next(writes('POST', '/message/stream')).open();
+    await s.type(DRAFT);
+    await s.act(() => stream.push({ type: 'run_started', run_id: 'r1', conversation_id: 'a', seq: 1 }));
+    await s.act(() => stream.lose());
     assert.equal(s.box(), DRAFT);
   },
 
