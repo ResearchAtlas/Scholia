@@ -1700,7 +1700,7 @@ def _conversation_markdown(conversation, language="en", titles=None):
         lines += [f"## {text('waiting')}", ""]
         for queued in conversation["queued"]:
             lines += [queued["text"], ""]
-    return "\n".join(lines).encode("utf-8")
+    return _utf8("\n".join(lines))
 
 
 def _artifact_markdown(artifact):
@@ -1715,11 +1715,17 @@ def _artifact_markdown(artifact):
             stack.extend(reversed(node.get("content") or []))
         elif isinstance(node, list):
             stack.extend(reversed(node))
-    return "\n\n".join([f"# {artifact['title']}", *blocks]).encode("utf-8") + b"\n"
+    return _utf8("\n\n".join([f"# {artifact['title']}", *blocks])) + b"\n"
 
 
 def _json(value):
-    return json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+    return _utf8(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _utf8(text):
+    """An export's text as UTF-8, each half of a surrogate pair the replacement character: a record a build before PR
+    57 stored with one (its JSON's escape) failed its project's export whole (PR 63's Fable recheck)."""
+    return re.sub("[\ud800-\udfff]", "\ufffd", text).encode("utf-8")
 
 
 # Files

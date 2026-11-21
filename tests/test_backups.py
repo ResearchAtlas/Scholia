@@ -2097,3 +2097,19 @@ async def test_a_project_export_holds_its_memory_unless_left_out_and_never_perso
     assert not any(b"I prefer tables" in read(with_memory, name) for name in names(with_memory))
     without = destination / left.result["file"].rsplit("/", 1)[1]
     assert "memory.json" not in names(without) and left.result["memory"] == 0
+
+
+async def test_a_message_stored_with_half_a_surrogate_pair_exports_with_the_replacement_character(tmp_path):
+    # PR 63's Fable recheck (a note outside the PR): a record a build before PR 57 stored with half a pair (the M2
+    # audit's note A: a message's JSON holding the escape \ud83d) failed its project's export whole
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    async with started(tmp_path / "data") as client:
+        project = await new_project(client)
+        conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
+        await send(client, conversation, "How large a sample do I need?")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE turns SET user_message = replace(user_message, 'How large', '\\ud83d How large')"))
+        exported, markdown = await exported_conversation(client, project, conversation, destination)
+    assert "� How large" in json.dumps(exported["turns"][0]["message"], ensure_ascii=False)
+    assert "� How large a sample do I need?" in markdown
