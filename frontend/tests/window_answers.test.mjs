@@ -39,6 +39,10 @@ function backend(state) {
     const answer = () => (failing.has(kind) ? response(failing.get(kind)[1], { code: failing.get(kind)[0] })
       : kind !== 'asks' && missing() ? response(404, { code: 'not_found' }) : response(200, now()));
     if (kind === 'other' || (kind === 'spend' && !state.spend)) return new Promise(() => {});
+    if (state.answerAtMost?.[path] !== undefined) { // a cap: past it the path is never answered, so a loop stops
+      state.answered ??= {}; state.answered[path] = (state.answered[path] ?? 0) + 1;
+      if (state.answered[path] > state.answerAtMost[path]) return new Promise(() => {});
+    }
     if (method === 'GET' && !held.has(kind)) return Promise.resolve(answer());
     return new Promise((resolve, reject) => { init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
       asked.push({ method, path, kind, signal: init.signal, body: init.body ? JSON.parse(init.body) : null,
@@ -177,6 +181,10 @@ const deleteProject = (state, id) => { state.gone.add(id); for (const c of state
   state.projects = state.projects.filter((p) => p.id !== id); delete state.conversations[id]; };
 const goes = async (s) => { await s.act(() => s.server.resize(800)); assert.equal(s.dialogs().length, 0, 'the dialog went with the sidebar'); await s.act(() => s.server.resize(1400)); };
 
+
+// Design review AD (deletion knowledge against reads taken before it; PR 63's recheck r7, pass 2)
+const GONE = /Project Alpha|Title (Alpha|Bravo|Charlie)/;
+const noAnswer = async (s) => { await s.release(s.server.next(writes('DELETE')), (r) => r.fail('unreachable', 0)); await s.closeDialog(); };
 
 const scenarios = {
   // r2-1 finding 1: A is moved to the other project and the answer is late; A is opened there and a message typed; the
@@ -829,6 +837,149 @@ const scenarios = {
     await s.act(() => s.ui.show([])); // the window is replaced (App.jsx's limited state): the Shell goes
     await s.pause(); await s.pause();
     assert.equal(reads().length, 0, 'asked again after the Shell went');
+  },
+  // Design review AD's scenarios.
+  // r7-2 finding 1, first order: the lists read as the request settled still name the project; the engine then finishes;
+  // the project's own read answers 404.
+  async aProjectKnownDeletedIsNotChosenFromAListReadBeforeIt(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    s.server.hold('project');
+    await noAnswer(s);
+    assert.ok(s.seen().includes('Project Alpha'), 'the list read as the request settled names it still');
+    deleteProject(state, 'p1'); s.server.free('project');
+    await s.releaseAll((r) => r.path === '/api/projects/p1'); // its own read: 404
+    assert.deepEqual(s.selected(), ['Title Zulu'], 'the deleted project was chosen again from the list read before');
+    assert.ok(!GONE.test(s.seen()));
+  },
+  // r7-2 finding 1, second order: the 404 first, then the answer of the list that was asked before the engine finished.
+  async aProjectKnownDeletedIsNotChosenFromAListAnsweredAfterIt(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    s.server.hold('project'); s.server.hold('projects');
+    await noAnswer(s);
+    const list = s.server.next((r) => r.kind === 'projects'); // asked as the request settled
+    deleteProject(state, 'p1'); s.server.free('project'); s.server.free('projects');
+    await s.releaseAll((r) => r.path === '/api/projects/p1'); // 404
+    await s.release(list, (r) => r.answer({ projects: [P1, P2] })); // the list as the engine read it before it deleted
+    assert.deepEqual(s.selected(), ['Title Zulu'], 'the deleted project was chosen from a list answered after its 404');
+    assert.ok(!GONE.test(s.seen()));
+  },
+  // The same through rider N's chain: the project's first read gets no answer, the second answers 404.
+  async aProjectKnownDeletedAtItsSecondAskIsNotChosenAgain(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    s.server.failing('project', 'unreachable', 503);
+    await noAnswer(s);
+    assert.ok(s.seen().includes('Project Alpha'));
+    deleteProject(state, 'p1'); s.server.working('project');
+    await s.pause(); // asked again: 404
+    assert.deepEqual(s.selected(), ['Title Zulu']);
+    assert.ok(!GONE.test(s.seen()));
+  },
+  // This review: what the other readers took between the settle and the engine's deletion is read again when the
+  // deletion is known (the one change event: the run list, the memory views, another conversation's record).
+  async whatWasReadBeforeAProjectsDeletionWasKnownIsReadAgain(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    let changes = 0; w.library.libraryEvents.addEventListener('changed', () => { changes += 1; });
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    s.server.hold('project');
+    await noAnswer(s);
+    const before = changes;
+    assert.ok(before > 0, 'the settle says so');
+    deleteProject(state, 'p1'); s.server.free('project');
+    await s.releaseAll((r) => r.path === '/api/projects/p1');
+    assert.ok(changes > before, 'nothing told the other readers when the deletion was known');
+  },
+  // This review: knowledge that reaches live.js alone. A turn of A is live, B is open, A's deletion gets no answer and
+  // the engine finishes after the settle's reads; live.js's own read of A answers 404. A is not listed, and what B's
+  // record showed of a memory record that went with A is read again.
+  async aConversationKnownDeletedToLiveIsUnlistedAndWhatRestedOnItIsReadAgain(w, strict) {
+    const state = withRecord(); state.records.a.turns[0].memory = [];
+    const turnB = (memory) => ({ run_id: 'rb', status: 'succeeded', result_saved: true, message: { text: 'asked in B' }, answer: { text: 'an answer' },
+      citations: [], cost_usd: 0, memory });
+    state.records.b = { queued: [], turns: [turnB([{ action: 'saved', count: 1, records: [{ id: 'm1', type: 'fact', status: 'confirmed', content: MEMORY, scope: 'project' }] }])] };
+    const s = await world(w, strict, state);
+    await s.type(LIVE); await s.send();
+    const turn = s.server.next(writes('POST', '/message/stream')).open();
+    await s.act(() => turn.push({ type: 'run_started', run_id: 'r1', conversation_id: 'a', seq: 2 }));
+    await s.open('Title Bravo');
+    assert.ok(s.seen().includes(MEMORY));
+    await s.menu('Title Alpha', 'Delete'); await s.confirmDelete();
+    s.server.hold('conversation');
+    await noAnswer(s);
+    await s.releaseAll((r) => r.method === 'GET' && r.path === '/api/conversations/b'); // B, read again as the request settled
+    assert.ok(s.seen().includes('Title Alpha') && s.seen().includes(MEMORY), 'as read before the engine deleted');
+    deleteConversation(state, 'a'); state.records.b = { queued: [], turns: [turnB([])] }; // the engine finishes
+    s.server.free('conversation');
+    await s.releaseAll((r) => r.method === 'GET' && r.path === '/api/conversations/a'); // live.js's read of A: 404
+    assert.deepEqual(s.selected(), ['Title Bravo']);
+    assert.ok(!s.seen().includes('Title Alpha'), 'a conversation live.js knows deleted is listed still');
+    assert.ok(!s.seen().includes(MEMORY), 'what rested on it, read before it was known, is shown still');
+  },
+  // This review (memory only): a turn of A is live and B is open when the project's deletion gets no answer; live.js
+  // asks for A as the request settles and A is there still; the engine finishes; the project's own read answers 404:
+  // live.js is asked again, A's record answers 404, and its stream is closed from here.
+  async aProjectKnownDeletedByItsRecordClosesItsConversationsStream(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.type(LIVE); await s.send();
+    const request = s.server.next(writes('POST', '/message/stream')); const turn = request.open();
+    await s.act(() => turn.push({ type: 'run_started', run_id: 'r1', conversation_id: 'a', seq: 2 }));
+    await s.open('Title Bravo');
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    s.server.hold('project');
+    await noAnswer(s);
+    assert.equal(request.signal.aborted, false, 'it is there still');
+    deleteProject(state, 'p1'); s.server.free('project');
+    await s.releaseAll((r) => r.path === '/api/projects/p1');
+    assert.deepEqual(s.selected(), ['Title Zulu']);
+    assert.equal(request.signal.aborted, true, 'the stream of a conversation that went with the project is open still');
+  },
+  // The limit every option leaves (kept as a scenario so it is not found again as new): the same order with nothing of
+  // the window's naming the project afterwards: the window does not know, and stays.
+  async aProjectDeletedAfterItWasAskedStaysUntilSomethingNamesIt(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    await noAnswer(s);
+    deleteProject(state, 'p1');
+    await s.pause(); await s.pause(); await s.pause();
+    assert.deepEqual(s.selected(), ['Title Alpha']);
+    assert.ok(s.seen().includes('Project Alpha'));
+  },
+  // Guards, green at the head. An ordinary deletion of a conversation leaves its project open (the rider asks, and the
+  // project answers).
+  async aConversationsDeletionLeavesItsProjectOpen(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.menu('Title Alpha', 'Delete'); await s.confirmDelete();
+    deleteConversation(state, 'a');
+    await s.release(s.server.next(writes('DELETE')), (r) => r.answer({ ok: true }));
+    await s.pause();
+    assert.deepEqual(s.selected(), ['Title Bravo']);
+    assert.ok(s.seen().includes('Project Alpha') && !s.seen().includes('Title Alpha'));
+  },
+  // A project's deletion that failed and did not happen: nothing is known, and a first message refused for another
+  // reason leaves nothing.
+  async aRefusedFirstMessageInAProjectThatExistsLeavesNothing(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.newConversation(); await s.type(DRAFT); await s.send();
+    await s.release(s.server.next(writes('POST', '/api/conversations')), (r) => r.fail('internal', 500));
+    assert.ok(s.seen().includes('Project Alpha'));
+    assert.equal(s.draft(), DRAFT);
+  },
+  // This review: 'deleted' is said once. A new conversation's first message makes it; it is gone before its first read
+  // (another client's deletion); its record answers 404. The view stays (it is not what the Shell has open by id) and
+  // hears the change event the knowledge fires: its next 404 must not be new knowledge, or the two ask each other for good.
+  async aRecordAnswering404AgainIsNotKnownAgain(w, strict) {
+    // the record's reads are answered at most 20 times: a chain that does not end stops there and fails, never hangs
+    const state = { ...withRecord(), answerAtMost: { '/api/conversations/x': 20 } }; const s = await world(w, strict, state);
+    let changes = 0; w.library.libraryEvents.addEventListener('changed', () => { changes += 1; });
+    await s.newConversation(); await s.type(DRAFT); await s.send();
+    state.gone.add('x');
+    await s.release(s.server.next(writes('POST', '/api/conversations')), (r) => r.answer({ id: 'x' }));
+    await s.pause(); await s.pause();
+    assert.ok(changes <= 2, `the change event fired ${changes} times`);
+    assert.ok((state.answered?.['/api/conversations/x'] ?? 0) < 20, 'its record was read until the cap: the chain does not end');
+    assert.ok(s.seen().includes('Project Alpha'));
   },
 };
 

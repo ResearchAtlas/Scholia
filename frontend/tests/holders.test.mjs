@@ -77,3 +77,17 @@ test('everything that outlives a reload says how a deletion and a restore reach 
   assert.deepEqual(found.filter((key) => !STORED[key]), [], 'browser storage with no rule for a deletion and a restore');
   assert.deepEqual(Object.keys(STORED).filter((key) => !found.includes(key)), [], 'listed storage that is no longer used');
 });
+
+// Design review AD: a 404 taken as a deletion is knowledge, and knowledge has one landing place (Shell.jsx left()): a
+// conversation's through live.js forget(), which says 'deleted' once and which the Shell hears; a project's through the
+// Shell's gone(); a refusal that only suggests the project went asks for it. A new place that reads a 404 as a deletion
+// fails here until it hands it on in the same statement. A declaration check, as the two above.
+test('every 404 taken as a deletion is handed to where knowledge lands', () => {
+  const stray = [];
+  for (const file of files(SRC)) {
+    for (const line of readFileSync(join(SRC, file), 'utf8').split('\n')) {
+      if (/\bdeleted\(error\)/.test(line) && !/\b(forget|gone)\(|\bonNoProject\?\.\(\)/.test(line)) stray.push(`${file}: ${line.trim()}`);
+    }
+  }
+  assert.deepEqual(stray, []);
+});

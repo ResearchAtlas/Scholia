@@ -32,6 +32,7 @@ function set(conversationId, turn, eventType) {
 // answers shown but not saved go, its stream is closed, and nothing of it is taken in or sent from here again (design
 // review Z).
 export function forget(conversationId) {
+  if (gone.has(conversationId)) return; // known already: nothing of it is held here, and it was said
   gone.add(conversationId);
   for (const [runId, owner] of unsavedIn) if (owner === conversationId) { unsaved.delete(runId); unsavedIn.delete(runId); }
   aborts.get(conversationId)?.abort();

@@ -86,3 +86,13 @@ test('as a deletion settles, an answer held after its live turn was cleared is f
   for (let n = 0; n < 5; n += 1) await new Promise((resolve) => setImmediate(resolve));
   assert.equal(unsavedAnswer('rz5'), null);
 });
+
+// Design review AD (its mutation M5): knowledge lands in the Shell when live.js says 'deleted', and the reads it starts
+// can answer 404 again; 'deleted' is said once for each id, or the two ask each other for good.
+test('a conversation forgotten twice is said deleted once', () => {
+  const said = [];
+  const stop = subscribe((id, turn, event) => { if (event === 'deleted') said.push(id); });
+  forget('z6'); forget('z6'); forget('z7');
+  stop();
+  assert.deepEqual(said, ['z6', 'z7']);
+});

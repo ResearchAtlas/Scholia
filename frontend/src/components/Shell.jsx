@@ -88,21 +88,27 @@ export function Shell({ health, settings, onLanguage }) {
   // what is open only in the visit it was asked in: after any choice of the researcher's since, it changes nothing
   // (design review U). The conversation's view is keyed by the visit, so no answer draws the message box again.
   const answered = (change) => setOpen((now) => (now.visit === open.visit ? change(now) : now));
-  // A deletion known to have happened leaves what it removed if that is open now, whichever visit it was asked in and
-  // whether or not its Sidebar is still drawn: a deleted id is never open again, so the ids are all there is to compare
-  // (design review Z; the visit is for answers about what still exists). live.js forgets a conversation's live turn.
-  const gone = useCallback((kind, id) => {
-    if (kind === 'conversation') forget(id);
+  // The lists, through the Library's read (libraryRead.js): shown only when read since the last removal of something
+  // they name (a deletion's request settled or became known, a conversation moved), never one asked before it, and
+  // nothing old after a read that failed.
+  const [removals] = useState(() => ({ projects: generation(), conversations: generation() }));
+  // What is known of a deletion wins over everything read before it was known, and there is one place it lands, however
+  // it was learned (its DELETE answered; its own record answered 404, to the Shell, a view or live.js): no list asked
+  // before now is shown or chosen from (first: the request may have settled before the engine deleted), every other
+  // reader drops what it read and reads again (the one change event), live.js asks for what it holds, and what was
+  // deleted is left if it is open now, whichever visit asked and whether or not its Sidebar is drawn: a deleted id is
+  // never open again, so the ids are all there is to compare (design reviews Z and AD; rider N).
+  const left = useCallback((kind, id) => {
+    if (kind === 'project') removals.projects.move();
+    removals.conversations.move();
+    libraryChanged(null);
+    recheck();
     setOpen((now) => (kind === 'project' ? (now.projectId === id ? { ...now, projectId: undefined, conversationId: undefined } : now)
       : now.conversationId === id ? { ...now, conversationId: undefined } : now));
-  }, []);
-  // The lists, through the Library's read (libraryRead.js): shown only when read since the last removal of something
-  // they name (a deletion's request settled, a conversation moved), never one asked before it, and nothing old after
-  // a read that failed.
-  const [removals] = useState(() => ({ projects: generation(), conversations: generation() }));
-  // rider N (Harold, 2026-11-21): a conversation whose own record answers 404 is known to be deleted: its list is read
-  // again and it is left (design review Z, A6)
-  const conversationGone = useCallback((id) => { removals.conversations.move(); gone('conversation', id); }, [removals, gone]);
+  }, [removals]);
+  // A conversation's passes through live.js, which says 'deleted' once for each (below): what live.js learns by its own
+  // reads lands in the same place.
+  const gone = useCallback((kind, id) => (kind === 'conversation' ? forget(id) : left(kind, id)), [left]);
   // and a project whose deletion failed is asked for, and left if it answers 404; a read that gets no answer (the
   // backend down, or failing) is asked again while that project is open, so a lost answer cannot leave the window in a
   // project that is gone (the rider N review, P2)
@@ -166,6 +172,7 @@ export function Shell({ health, settings, onLanguage }) {
   useEffect(() => { // the list shows which conversations run
     const timers = new Set();
     const unsubscribe = subscribe((id, turn, type) => {
+      if (type === 'deleted') left('conversation', id);
       if (type !== 'run_started' && type !== 'run_finished') return;
       loadConversations();
       // ponytail: a title run follows a first answer; one later look shows its title, poll if titles lag
@@ -175,7 +182,7 @@ export function Shell({ health, settings, onLanguage }) {
       }
     });
     return () => { unsubscribe(); timers.forEach(clearTimeout); };
-  }, [loadConversations]);
+  }, [loadConversations, left]);
 
   useEffect(() => {
     if (!projectId) return undefined;
@@ -344,7 +351,6 @@ export function Shell({ health, settings, onLanguage }) {
               onPanel={togglePanel}
               onCreated={(id) => { answered((now) => ({ ...now, conversationId: id })); loadConversations(); }}
               onLibrary={() => panel !== 'library' && togglePanel('library')}
-              onGone={conversationGone}
             />}
           </div>
           {panel !== 'none' && !view.overlay && (

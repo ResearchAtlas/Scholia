@@ -68,7 +68,7 @@ function useConversationAsks(conversationId, watching, projectId) {
 const NEW = { turns: [], queued: [] }; // a conversation not made yet
 
 export function ConversationView({ conversationId, conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated,
-  onLibrary, onGone }) {
+  onLibrary }) {
   const t = useT();
   const [draft, setDraft] = useState(null); // a new conversation, made at its first message
   const id = conversationId ?? draft; // the list's row (conversation) gives only its title
@@ -121,14 +121,14 @@ export function ConversationView({ conversationId, conversation, projectId, pane
         setRecord((now) => (now && now.turns === null ? null : now)); // after a change: nothing read before it stays
       }
       // the record is known to be deleted, whatever was asked before: nothing read of it stays, here or in live.js
-      if (deleted(error)) { setRecord(null); forget(id); onGone?.(id); } // rider N: the Shell leaves it
+      if (deleted(error)) { setRecord(null); forget(id); } // rider N: live.js says so, and the Shell leaves it
       return false;
     } finally {
       // only the newest read counts as done: one overtaken would start the handoff again, overtaking the read in
       // flight, and none would ever be shown (fix batch 1, C-F1); the newer read counts when it ends
       if (current()) setReads((n) => n + 1);
     }
-  }, [id, newestRead, onGone]);
+  }, [id, newestRead]);
 
   useEffect(() => {
     load();
