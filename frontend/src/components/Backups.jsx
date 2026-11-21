@@ -75,7 +75,7 @@ export function BackupsSection({ restoreOnly = false }) {
 
       <ConfirmRestore request={restoring} damaged={restoreOnly} onClose={() => setRestoring(null)}
         onDone={(result) => { leave(); setRestoring(null); setRestored(result); }}
-        onUnknown={() => get('/api/health').then(() => window.location.reload(), () => {})} />
+        onUnknown={() => get('/api/health').then(() => window.location.reload(), leave)} />
     </div>
   );
 }
@@ -244,7 +244,7 @@ function ConfirmRestore({ request, damaged, onClose, onDone, onUnknown }) {
     // design review AC (rider U widened): any other end (no answer, an answer whose body was lost, an error the engine
     // did not state) may be a restore that happened or is under way still (the backend ends a restore whatever becomes
     // of its request): the engine is asked once; if it answers, the window reloads and says what it finds (App.jsx
-    // reads nothing while a restore is under way)
+    // reads nothing while a restore is under way); if it does not, leaving this reloads
     else if (!refused) onUnknown();
   }
   return (

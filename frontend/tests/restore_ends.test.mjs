@@ -109,6 +109,43 @@ const scenarios = {
     assert.equal(s.seen.reloads, 1);
     assert.ok(!s.says('Restored.'));
   },
+  // This review, rider R2: no answer, and health got none either. The restore may still have happened or be under way
+  // (whatever lost one answer can lose the next): the dialog says so, as today, and leaving reloads.
+  async aRestoreThatGotNoAnswerFromAnEngineThatDoesNotAnswerReloadsWhenSettingsIsClosed(w, strict) {
+    const s = await settingsWorld(w, strict);
+    s.seen.health = 0;
+    await s.restore(); await s.ends((r) => r.reject(new TypeError('Failed to fetch')));
+    assert.ok(s.says('not responding'));
+    assert.equal(s.seen.reloads, 0, 'not before it is left');
+    await s.cancel(); await s.close();
+    assert.equal(s.seen.reloads, 1);
+  },
+  async aRestoreThatGotNoAnswerFromAnEngineThatDoesNotAnswerReloadsWhenAnotherPageIsChosen(w, strict) {
+    const s = await settingsWorld(w, strict);
+    s.seen.health = 0;
+    await s.restore(); await s.ends((r) => r.reject(new TypeError('Failed to fetch')));
+    await s.cancel(); await s.page('General');
+    assert.equal(s.seen.reloads, 1);
+  },
+  // Rider R2, the second request: asked again while the first is still under way, the engine refuses it by name
+  // (409 restoring). That refusal says nothing of the first: leaving still reloads.
+  async aSecondRestoreRefusedWhileTheFirstGotNoAnswerStillReloadsWhenLeft(w, strict) {
+    const s = await settingsWorld(w, strict);
+    s.seen.health = 0;
+    await s.restore(); await s.ends((r) => r.reject(new TypeError('Failed to fetch')));
+    await s.again(); await s.ends((r) => r.resolve(response(409, { code: 'restoring' })));
+    assert.equal(s.seen.reloads, 0);
+    await s.cancel(); await s.close();
+    assert.equal(s.seen.reloads, 1);
+  },
+  // Rider R2: no answer of either kind, and its screen had gone already.
+  async aRestoreThatGotNoAnswerOfAnyKindAfterItsScreenWentReloadsTheWindow(w, strict) {
+    const s = await settingsWorld(w, strict);
+    s.seen.health = 0;
+    await s.restore(); await s.replaced();
+    await s.ends((r) => r.reject(new TypeError('Failed to fetch')));
+    assert.equal(s.seen.reloads, 1);
+  },
   // Guard: an answer of no kind, the engine answers: one reload, not two when its screen then goes.
   async aRestoreThatGotNoAnswerReloadsOnceIfTheEngineAnswers(w, strict) {
     const s = await settingsWorld(w, strict);
