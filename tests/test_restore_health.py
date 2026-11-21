@@ -70,15 +70,24 @@ async def test_health_says_a_restore_is_under_way_before_it_takes_its_lock(tmp_p
 
 
 # While it waits for a backup or an export that is being written (backups_lock): as long as that takes.
-async def test_health_says_a_restore_is_under_way_while_it_waits_for_a_backup_being_written(tmp_path):
+async def test_health_says_a_restore_is_under_way_while_it_waits_for_a_backup_being_written(tmp_path, monkeypatch):
     async with started(tmp_path / "data") as client:
         backup = await a_backup_then_a_project(client)
-        async with client.state["backups_lock"]:  # a full backup or an export holds it while it writes (backups.py:570)
+        lock, waiting = client.state["backups_lock"], asyncio.Event()
+        acquire = lock.acquire
+
+        async def announced():  # the restore asks for the lock while a backup holds it: the state this test means
+            if lock.locked():
+                waiting.set()
+            return await acquire()
+        monkeypatch.setattr(lock, "acquire", announced)
+        async with lock:  # a full backup or an export holds it while it writes (backups.py:570)
             restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
-            for _ in range(10_000):  # bounded: a restore that ended before it took its lock fails here, never hangs
-                if client.state["restore_lock"].locked():
-                    break
-                await asyncio.sleep(0)
+            try:
+                await asyncio.wait_for(waiting.wait(), 10)  # waits for that event, never for a length of time
+            except BaseException:
+                restore.cancel()  # the request; the restore it began ends once the lock is free
+                raise
             assert client.state["restore_lock"].locked() and not restore.done()
             assert not client.state.get("restoring")  # the gate refuses nothing yet
             assert await names(client) == (200, {"General", "Made after the backup"})
@@ -102,6 +111,26 @@ async def test_health_says_a_restore_is_under_way_during_the_swap_whatever_a_sec
         assert (await restore).status_code == 200
         assert "restoring" not in (await client.get("/api/health")).json()
 
+
+
+# The request goes away while the backup is staged: the restore it began goes on, and health says so until it has
+# ended (the fifth Fable recheck, finding 1: nothing pinned the count against a cancelled request, or _to_end).
+async def test_health_says_a_restore_is_under_way_after_its_request_is_cancelled(tmp_path, monkeypatch):
+    async with started(tmp_path / "data") as client:
+        backup = await a_backup_then_a_project(client)
+        staging, release = hold(monkeypatch, backups_module, "_stage")
+        restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
+        try:
+            assert await asyncio.to_thread(staging.wait, 10)
+            restore.cancel()
+            assert (await client.get("/api/health")).json().get("restoring") is True
+            assert not restore.done() and client.state["restore_lock"].locked()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await restore
+        assert "restoring" not in (await client.get("/api/health")).json()
+        assert await names(client) == (200, {"General"})
 
 # A restore the engine refused has ended too.
 async def test_health_no_longer_says_so_after_a_refused_restore(tmp_path):
