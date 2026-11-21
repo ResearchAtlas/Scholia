@@ -1075,18 +1075,16 @@ def _put_in_place(data_dir, staged, aside, restore_id, audits=(), listed=None, g
     _refuse_after_a_failed_close()
     _mkdir_private(aside.parent)
     _mkdir_private(aside)
-    # An earlier restore's journal, neither finished nor undone, which this one's replaces: what it added goes now, as
-    # nothing would remove it afterwards (design review R, rider T), and it is kept, with no list, inside this one, so
-    # a put back of this restore leaves it in place for a launch to finish (design review R's observation)
+    # An earlier restore's journal, neither finished nor undone, which this one's replaces, is kept inside this one, so
+    # a put back of this restore leaves it in place for a launch to finish (design review R's observation). Its list
+    # is this one's, with the backup this restore restores from (the amendment to rider T): one list for as long as a
+    # journal is unfinished, changed only by the one write below, so whichever restore is put back, at once or at a
+    # launch, removes what any of them added and never a backup one of them restores from (design review Y). Until
+    # that write this restore has changed nothing, the earlier journal included.
     replaced = _read_journal(data_dir)
     replaced = replaced if replaced and replaced.get("direction") != "done" else None
-    if replaced is not None:  # the backup this restore restores from stays, though that one added it (an ordinary
-        # backup, rotated as any; the coordinator's amendment to rider T, PR 63's recheck r2)
-        _remove_what_it_added(data_dir, replaced, _generation_folder(data_dir, generation).name if generation else None)
-        # and its journal no longer lists what it added, so its own put back, if this restore fails before its journal
-        # replaces that one, removes nothing more (the phase C internal review, F1)
-        replaced = {k: v for k, v in replaced.items() if k not in ("listed", "generation")}
-        write_private(data_dir / "backups" / JOURNAL, json.dumps(replaced).encode())
+    if replaced is not None and "listed" in replaced:
+        listed = {*replaced["listed"], *([_generation_folder(data_dir, generation).name] if generation else [])}
     _sync_tree(staged)
     for folder in (aside, aside.parent, staged.parent, staged.parent.parent, data_dir / "backups"):
         _fsync(folder)
@@ -1183,6 +1181,8 @@ def _forward(data_dir, journal):
         _mkdir_private(aside)
         _fsync(aside.parent)
     if (staged / DB_NAME).exists():  # the backup's database is not in place yet
+        if "replaced" in journal:  # so it took no backup of its own yet: what the restore it replaces added goes, as
+            _remove_what_it_added(data_dir, journal)  # nothing would remove it once this one commits (rider T)
         if live.exists() and not (aside / DB_NAME).exists():
             _keep_aside(live, aside / DB_NAME)
             _fsync(aside)
@@ -1234,6 +1234,8 @@ def _back(data_dir, journal, audit=False):
     if "replaced" in journal:  # the folder is the earlier restore's again: its journal back in place, for a launch to
         # finish or undo it with its audit row (its own rows carried, this one's added)
         earlier = {**journal["replaced"], "audits": [*journal["replaced"].get("audits", []), *own]}
+        if "listed" in earlier and "listed" in journal:  # the one list goes back with it
+            earlier["listed"] = journal["listed"]
         write_private(data_dir / "backups" / JOURNAL, json.dumps(earlier).encode())
         return earlier
     audits = [*journal.get("audits", []), *own]
@@ -1244,13 +1246,12 @@ def _back(data_dir, journal, audit=False):
     return None
 
 
-def _remove_what_it_added(data_dir, journal, keeping=None):
-    """_remove_added for a restore's journal that is put back or replaced, never keeping (a generation's name: the
-    backup a restore that replaces it restores from). One written without the list removes nothing; a failure is
-    logged, and an added backup then stays until rotation."""
+def _remove_what_it_added(data_dir, journal):
+    """_remove_added for a restore's journal that is put back, or that replaces an unfinished one. One written
+    without the list removes nothing; a failure is logged, and an added backup then stays until rotation."""
     if "listed" in journal:
         try:
-            _remove_added(data_dir, {*journal["listed"], *([keeping] if keeping else [])}, journal.get("generation"))
+            _remove_added(data_dir, set(journal["listed"]), journal.get("generation"))
         except Exception as error:  # the files are back: an added backup then stays until rotation
             log.warning("removing the backups a failed restore took failed (%s)", type(error).__name__)
 

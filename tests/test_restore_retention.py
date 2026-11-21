@@ -3,18 +3,24 @@ review): a backup a restore needs is where it was, however the restore ends; and
 is settled. Synthetic data; every wait is an event."""
 
 import asyncio
+import errno
+import json
+import os
 import threading
 import zipfile
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 import backend.backups as backups_module
-from backend.db import Database
+import backend.db.database as database_module
+from backend.db import DB_NAME, Database
 from backend.db.migrations import MIGRATIONS
 from backend.runs import Harness
 from scholia_app import started
 from test_backups import hold
+from test_restore_kill import restore_audits
 
 pytestmark = pytest.mark.asyncio
 
@@ -276,7 +282,8 @@ async def test_a_restore_after_one_that_could_not_be_put_back_keeps_the_backup_i
         tmp_path, monkeypatch, first_source, second_source, failure, launch):
     # PR 63's recheck r2 (pass 1 F4, pass 2 F2): rider T removed what the unfinished restore added, the backup the second
     # restore restores from included (the first one's backup before its migrations). That one is kept (the
-    # coordinator's amendment to T), as an ordinary backup; the safety copy is the control
+    # coordinator's amendment to T), as an ordinary backup; the safety copy is the control. Design review Y's boundary:
+    # a second restore that fails before its journal is written has changed nothing (the two shapes it flips, below)
     data = tmp_path / "data"
     await asyncio.to_thread(older, data, tmp_path / "m1.zip")
     automatic = sorted((data / "backups" / "daily").iterdir())[0].name  # the schema 3 backup the M1 folder took
@@ -294,7 +301,7 @@ async def test_a_restore_after_one_that_could_not_be_put_back_keeps_the_backup_i
             raise OSError("the files cannot be put back now")
         return back(*args)
 
-    def sync_but_the_second(*args):  # the second restore fails after rider T, before its journal is written
+    def sync_but_the_second(*args):  # the second restore fails before its journal is written, so before rider T runs
         syncs.append(args)
         if len(syncs) == 2 and failure == "before its journal":
             raise OSError("the staged files cannot be synced")
@@ -315,8 +322,11 @@ async def test_a_restore_after_one_that_could_not_be_put_back_keeps_the_backup_i
         assert response.status_code == 500, response.text
         assert source in await listed(client)  # the backup it restores, where it was
     fail[0] = launch == "puts back"  # the launch's replay forward commits, or fails and puts the first restore back
-    async with started(data, setup=False) as client:  # the launch finishes or undoes what is left: it is kept there too
-        assert source in await listed(client)
+    async with started(data, setup=False) as client:  # the launch finishes or undoes what is left: it is kept there too,
+        # except at design Y's boundary: a restore that fails before its journal is written has changed nothing, so the
+        # first restore still owns its backup before its migrations, and its put back removes it with what else it added
+        boundary = second_source == "migration copy" and failure == "before its journal" and launch == "puts back"
+        assert (source in await listed(client)) is not boundary
 
 
 async def test_a_staging_entry_that_links_to_a_restoring_folder_is_a_restore(tmp_path):
@@ -357,3 +367,258 @@ async def test_a_launch_that_cannot_empty_a_restores_staging_says_retention_is_p
     assert len(said) == 1 and "retention" in said[0].getMessage() and "paused" in said[0].getMessage()
     text = said[0].getMessage() + repr(said[0].args)
     assert not any(name in text for name in ("a-restore-id", "a-staged-file", STAGING, str(tmp_path)))
+
+
+# Design review Y (PR 63's recheck r3 finding 2; the Fable recheck's findings 1 and 4): one list of the backups to keep,
+# carried by every journal; a restore that replaces an unfinished one changes nothing before its own journal is written.
+# Its ten cases (its appendix B), each fault armed by a flag before the request that meets it.
+LATEST = len(MIGRATIONS)
+
+
+class Faults:
+    """The faults a scenario arms. commit: the restores' own commits and a launch's forward commit fail, a launch's put
+    back commits. back: what the next call of _back_from_journal does ("entry": fails before anything is written;
+    "midway": fails at its first move, after direction back is written; None: works)."""
+
+    def __init__(self, monkeypatch):
+        self.stop_at_8 = self.sync = self.journal_full = self._moving = False
+        self.back = None
+        real = {name: getattr(backups_module, name) for name in (
+            "_commit_journal", "_back_from_journal", "_sync_tree", "_move", "write_private")}
+        usable = database_module._usable_state
+
+        def usable_state(conn, latest):  # the restored database's ninth migration cannot run
+            found = usable(conn, latest)
+            if self.stop_at_8 and found[0] == 8:
+                raise OSError("the ninth migration cannot run")
+            return found
+
+        def commit(data_dir, journal, audits):
+            if not audits or audits[-1].get("finished") != "back":  # its own row is the last; earlier ones are carried
+                raise OSError("the journal cannot be written")
+            return real["_commit_journal"](data_dir, journal, audits)
+
+        def back(*args):
+            how, self.back = self.back, None
+            if how == "entry":
+                raise OSError("the files cannot be put back now")
+            self._moving = how == "midway"
+            try:
+                return real["_back_from_journal"](*args)
+            finally:
+                self._moving = False
+
+        def move(*args):
+            if self._moving:
+                raise OSError("a file cannot be moved back now")
+            return real["_move"](*args)
+
+        def sync(*args):
+            if self.sync:
+                raise OSError("the staged files cannot be synced")
+            return real["_sync_tree"](*args)
+
+        def write(path, data):
+            if self.journal_full and Path(path).name == backups_module.JOURNAL:
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+            return real["write_private"](path, data)
+
+        monkeypatch.setattr(database_module, "_usable_state", usable_state)
+        for name, stand_in in (("_commit_journal", commit), ("_back_from_journal", back), ("_sync_tree", sync),
+                               ("_move", move), ("write_private", write)):
+            monkeypatch.setattr(backups_module, name, stand_in)
+
+
+async def restore(client, expected, **body):
+    response = await client.post("/api/backups/restore", json=body)
+    assert (response.status_code, response.json()["code"]) == expected, response.text
+
+
+async def added(client, before):
+    after = await listed(client)
+    return {i: after[i]["schema_version"] for i in set(after) - before}
+
+
+async def first_restore(client, tmp_path, faults, migrating, back="entry"):
+    """A project made, then an older-schema file restored: it fails (while its database migrates, at schema 8, or at
+    its commit, migrated) and cannot be put back. Returns (the backups before it, its safety copy, its backup before
+    its migrations)."""
+    assert (await client.post("/api/projects", json={"name": "Before"})).status_code == 201
+    before = set(await listed(client))
+    faults.stop_at_8, faults.back = migrating, back
+    await restore(client, (500, "restore_interrupted"), file=str(tmp_path / "m1.zip"))
+    faults.stop_at_8 = False
+    took = await added(client, before)
+    assert sorted(took.values()) == [3, LATEST]
+    return before, *(next(i for i in took if took[i] == schema) for schema in (LATEST, 3))
+
+
+@pytest.mark.parametrize("second", ["before its journal", "after its swap"])
+async def test_a_restore_put_back_at_a_launch_after_a_second_one_was_tried_leaves_no_backup_it_added(
+        tmp_path, monkeypatch, second):
+    # Y1 (the Fable recheck's finding 1, its probe T1): the first restore fails while its database migrates and cannot
+    # be put back; a second restore fails; the launch replays the first, whose database takes a backup before its
+    # remaining migrations, cannot commit it and puts the previous state back
+    data = tmp_path / "data"
+    await asyncio.to_thread(older, data, tmp_path / "m1.zip")
+    faults = Faults(monkeypatch)
+    async with started(data) as client:
+        before, safety, _ = await first_restore(client, tmp_path, faults, migrating=True)
+        faults.sync = second == "before its journal"
+        await restore(client, (500, "restore_failed"), generation=safety)
+        faults.sync = False
+    async with started(data, setup=False) as client:
+        assert "Before" in {p["name"] for p in (await client.get("/api/projects")).json()["projects"]}
+        assert sorted((await added(client, before)).values()) == [LATEST]  # its safety copy; the head: [8, LATEST]
+        assert backups_module._read_journal(data) is None
+
+
+@pytest.mark.parametrize("source", ["safety copy", "file"])
+async def test_a_second_restore_that_cannot_write_its_journal_changes_nothing(tmp_path, monkeypatch, source):
+    # Y2 (recheck r3's finding, its write failure): the second restore's first write of the journal fails (ENOSPC). It
+    # answers "nothing was changed": the backups listed and the journal are as it found them
+    data = tmp_path / "data"
+    await asyncio.to_thread(older, data, tmp_path / "m1.zip")
+    faults = Faults(monkeypatch)
+    async with started(data) as client:
+        _, safety, _ = await first_restore(client, tmp_path, faults, migrating=False)
+        found = set(await listed(client)), (data / "backups" / backups_module.JOURNAL).read_bytes()
+        faults.journal_full = True
+        await restore(client, (500, "restore_failed"),
+                      **({"generation": safety} if source == "safety copy" else {"file": str(tmp_path / "m1.zip")}))
+        faults.journal_full = False
+        assert (set(await listed(client)), (data / "backups" / backups_module.JOURNAL).read_bytes()) == found
+
+
+@pytest.mark.parametrize("launch", ["finishes", "puts back"])
+async def test_a_restore_that_fails_before_its_journal_is_written_leaves_its_source_to_the_first(tmp_path, monkeypatch,
+                                                                                                  launch):
+    # Design Y's boundary, for Harold's word (r3's literal case): the second restore chose the backup the first one's migrations took
+    # and failed before any journal of its own was written. The first restore still owns that backup: finished at the
+    # launch, it stays (its backup before its migrations); put back, it goes with what else the first one added
+    data = tmp_path / "data"
+    await asyncio.to_thread(older, data, tmp_path / "m1.zip")
+    faults = Faults(monkeypatch)
+    async with started(data) as client:
+        before, _, copy = await first_restore(client, tmp_path, faults, migrating=False)
+        faults.journal_full = True
+        await restore(client, (500, "restore_failed"), generation=copy)
+        faults.journal_full = False
+        assert copy in await listed(client)
+        if launch == "finishes":
+            monkeypatch.setattr(backups_module, "_commit_journal", lambda data_dir, journal, audits: (
+                backups_module.write_private(data_dir / "backups" / backups_module.JOURNAL, json.dumps(
+                    {**journal, "direction": "done", "audits": audits}).encode())))
+    async with started(data, setup=False) as client:
+        assert sorted((await added(client, before)).values()) == ([3, LATEST] if launch == "finishes" else [LATEST])
+
+
+async def test_three_restores_each_from_the_backup_the_one_before_took_keep_those_backups(tmp_path, monkeypatch):
+    # Y3 (the case a per-journal list creates): the second restore restores from the first one's backup before its
+    # migrations, the third from the second one's; none can commit; the third is put back at once, the second at the
+    # next launch, the first at the one after. The backups the second and the third restored from stay
+    data = tmp_path / "data"
+    await asyncio.to_thread(older, data, tmp_path / "m1.zip")
+    faults = Faults(monkeypatch)
+    async with started(data) as client:
+        before, safety, first_copy = await first_restore(client, tmp_path, faults, migrating=False)
+        faults.back = "entry"
+        await restore(client, (500, "restore_interrupted"), generation=first_copy)
+        took = await added(client, before)
+        [second_copy] = [i for i in took if took[i] == 3 and i != first_copy]
+        await restore(client, (500, "restore_failed"), generation=second_copy)
+        assert {first_copy, second_copy, safety} == set(await added(client, before))
+    async with started(data, setup=False) as client:  # the second is replayed, cannot commit and is put back
+        assert (await client.get("/api/projects")).json()["code"] == "restore_interrupted"
+        assert {first_copy, second_copy, safety} == set(await added(client, before))
+    async with started(data, setup=False) as client:  # the first is replayed, cannot commit and is put back
+        assert "Before" in {p["name"] for p in (await client.get("/api/projects")).json()["projects"]}
+        assert {first_copy, second_copy, safety} == set(await added(client, before))
+        assert backups_module._read_journal(data) is None
+
+
+async def test_a_second_restore_whose_put_back_a_launch_finishes_has_the_first_one_finished_too(tmp_path, monkeypatch):
+    # F4, backups.py:1294-1295 (the Fable recheck's probe T2): both put backs are interrupted after their direction
+    # is written. The launch finishes the second one's, which writes the first one's journal back, and then that one
+    # too: the previous state, both audit rows, no journal. Without the two lines it runs on the first file's database
+    data = tmp_path / "data"
+    await asyncio.to_thread(older, data, tmp_path / "m1.zip")
+    faults = Faults(monkeypatch)
+    async with started(data) as client:
+        before, safety, _ = await first_restore(client, tmp_path, faults, migrating=True, back="midway")
+        faults.back = "midway"
+        await restore(client, (500, "restore_interrupted"), generation=safety)
+        assert backups_module._read_journal(data)["direction"] == "back"
+    async with started(data, setup=False) as client:
+        assert "Before" in {p["name"] for p in (await client.get("/api/projects")).json()["projects"]}
+        assert [(a["interrupted"], a["finished"]) for a in await restore_audits(client)] == [(True, "back")] * 2
+        assert sorted((await added(client, before)).values()) == [LATEST]
+        assert backups_module._read_journal(data) is None
+
+
+async def test_a_replay_whose_put_back_leaves_an_earlier_restore_keeps_the_app_limited_until_that_one_ends(
+        tmp_path, monkeypatch):
+    # F4, backups.py:1342-1345 (the Fable recheck's probe T3), and Y1 through the journal written back: the second
+    # restore is left to replay; the launch's replay cannot commit and its put back writes the first one's journal
+    # back, so the app stays limited; the next launch replays the first (its database takes a backup before its
+    # remaining migrations), cannot commit and puts the previous state back, removing what the first one added
+    data = tmp_path / "data"
+    await asyncio.to_thread(older, data, tmp_path / "m1.zip")
+    faults = Faults(monkeypatch)
+    async with started(data) as client:
+        before, safety, _ = await first_restore(client, tmp_path, faults, migrating=True)
+        first = backups_module._read_journal(data)["id"]
+        faults.back = "entry"
+        await restore(client, (500, "restore_interrupted"), generation=safety)
+        assert backups_module._read_journal(data)["replaced"]["id"] == first
+    async with started(data, setup=False) as client:
+        assert (await client.get("/api/projects")).json()["code"] == "restore_interrupted"  # not the half state
+        assert backups_module._read_journal(data)["id"] == first
+    async with started(data, setup=False) as client:
+        assert "Before" in {p["name"] for p in (await client.get("/api/projects")).json()["projects"]}
+        assert [(a["interrupted"], a["finished"]) for a in await restore_audits(client)] == [(True, "back")] * 2
+        assert sorted((await added(client, before)).values()) == [LATEST]  # the head: [8, LATEST]
+        assert backups_module._read_journal(data) is None
+
+
+async def test_a_crash_after_the_replacing_journal_is_written_removes_at_the_replay_what_the_replaced_restore_added(
+        tmp_path, monkeypatch):
+    # Option 1's own step: rider T runs from the written journal, in _forward, before the backup's database is in
+    # place; a crash between the write and the removal is finished by the replay, and a later replay removes nothing
+    # the replacing restore took itself
+    data = tmp_path / "data"
+    daily = data / "backups" / "daily"
+    kept, first_added, second_added = "20261101T000000000000Z", "20261102T000000000000Z", "20261103T000000000000Z"
+    for name in (kept, first_added):
+        (daily / name).mkdir(parents=True)
+    (data / DB_NAME).write_bytes(b"the previous database")
+
+    def staged(name, content):
+        folder = data / "backups" / ".staging" / name / "restore"
+        folder.mkdir(parents=True)
+        (folder / DB_NAME).write_bytes(content)
+        return folder
+
+    backups_module._put_in_place(data, staged("a", b"the first backup"), data / "backups/.staging/a/replaced", "a",
+                                 listed={kept})
+    forward = backups_module._forward
+
+    def crash(*args):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(backups_module, "_forward", crash)
+    with pytest.raises(KeyboardInterrupt):
+        backups_module._put_in_place(data, staged("b", b"the second backup"), data / "backups/damaged/s", "b",
+                                     listed={kept, first_added})
+    monkeypatch.setattr(backups_module, "_forward", forward)
+    journal = backups_module._read_journal(data)
+    assert (journal["id"], journal["replaced"]["id"], journal["listed"]) == ("b", "a", [kept])
+    assert (daily / first_added).is_dir()  # the crash came before the removal
+    backups_module.finish_interrupted_restore(data)
+    assert (data / DB_NAME).read_bytes() == b"the second backup" and not (daily / first_added).exists()
+    (daily / second_added).mkdir()  # the second one's own backup before its migrations
+    backups_module.finish_interrupted_restore(data)  # replayed again: its own backup stays
+    assert (daily / second_added).is_dir()
+    earlier = backups_module._back(data, backups_module._read_journal(data))  # put back: it goes, the first one's is back
+    assert not (daily / second_added).exists() and (daily / kept).is_dir()
+    assert (earlier["id"], earlier["listed"], backups_module._read_journal(data)) == ("a", [kept], earlier)
+    assert (data / DB_NAME).read_bytes() == b"the first backup"
