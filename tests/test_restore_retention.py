@@ -639,3 +639,24 @@ async def test_a_crash_after_the_replacing_journal_is_written_removes_at_the_rep
     assert not (daily / second_added).exists() and (daily / kept).is_dir()
     assert (earlier["id"], earlier["listed"], backups_module._read_journal(data)) == ("a", [kept], earlier)
     assert (data / DB_NAME).read_bytes() == b"the first backup"
+
+
+async def test_a_journal_written_back_carries_each_audit_row_once(tmp_path):
+    # Recheck r4 (pass 2, finding 2) as fixed: a journal begins with the rows of the one it replaced (a restore takes
+    # them from the journal it finds), so the earlier journal written back gets those rows once, then this one's own
+    data = tmp_path / "data"
+    (data / "backups" / "daily").mkdir(parents=True)
+    (data / DB_NAME).write_bytes(b"the previous database")
+
+    def staged(name):
+        folder = data / "backups" / ".staging" / name / "restore"
+        folder.mkdir(parents=True)
+        (folder / DB_NAME).write_bytes(f"the {name} backup".encode())
+        return folder
+    carried = {"id": "an-earlier-committed-restore", "interrupted": False, "finished": "forward"}
+    backups_module._put_in_place(data, staged("a"), data / "backups/.staging/a/replaced", "a", [carried], listed=set())
+    backups_module._put_in_place(data, staged("b"), data / "backups/damaged/s", "b",
+                                 backups_module._audits_to_write(data), listed=set())
+    earlier = backups_module._back(data, backups_module._read_journal(data), audit=True)
+    assert [audit["id"] for audit in earlier["audits"]] == ["an-earlier-committed-restore", "b"]
+    assert (data / DB_NAME).read_bytes() == b"the a backup"
