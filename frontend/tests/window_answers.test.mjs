@@ -770,6 +770,33 @@ const scenarios = {
     assert.deepEqual(s.selected(), ['Title Bravo']);
     assert.deepEqual(left(s), [], 'the deleted conversation is still listed');
   },
+  // The rider N review (P2, P3): the project's read after its failed deletion gets no answer at first (the backend is
+  // still down): it is asked again while the project is open, and the window leaves it once that read answers 404.
+  async aProjectWhoseFailedDeletionHappenedIsLeftOnceItCanBeAsked(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    deleteProject(state, 'p1');
+    for (const kind of ['project', 'conversation']) s.server.failing(kind, 'unreachable', 503);
+    await s.release(s.server.next(writes('DELETE')), (r) => r.fail('unreachable', 503));
+    await s.closeDialog(); await s.pause();
+    for (const kind of ['project', 'conversation']) s.server.working(kind);
+    await s.pause(); await s.pause();
+    assert.deepEqual(s.selected(), ['Title Zulu'], 'the deleted project stays open once the backend answers again');
+  },
+  // Its guard: the project exists and its read fails at first: the window stays in it, with its record and what was
+  // typed, however many times it is asked.
+  async aProjectWhoseFailedDeletionDidNotHappenStaysThoughItCouldNotBeAsked(w, strict) {
+    const state = withRecord(); const s = await world(w, strict, state);
+    await s.type(DRAFT);
+    await s.projectMenu(/^Delete /); await s.confirmDelete();
+    s.server.failing('project', 'unreachable', 503);
+    await s.release(s.server.next(writes('DELETE')), (r) => r.fail('backup_failed', 503));
+    await s.closeDialog(); await s.pause();
+    s.server.working('project'); await s.pause();
+    assert.deepEqual(s.selected(), ['Title Alpha']);
+    assert.ok(s.seen().includes(QUEUED) && s.seen().includes(ASKED));
+    assert.equal(s.draft(), DRAFT);
+  },
 };
 
 

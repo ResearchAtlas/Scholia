@@ -103,6 +103,19 @@ export function Shell({ health, settings, onLanguage }) {
   // rider N (Harold, 2026-11-21): a conversation whose own record answers 404 is known to be deleted: its list is read
   // again and it is left (design review Z, A6)
   const conversationGone = useCallback((id) => { removals.conversations.move(); gone('conversation', id); }, [removals, gone]);
+  // and a project whose deletion failed is asked for, and left if it answers 404; a read that gets no answer (the
+  // backend down, or failing) is asked again while that project is open, so a lost answer cannot leave the window in a
+  // project that is gone (the rider N review, P2)
+  const openNow = useRef(open);
+  openNow.current = open;
+  const askProject = useCallback(function ask(id) {
+    get(`/api/projects/${encodeURIComponent(id)}`).catch((error) => {
+      if (deleted(error)) gone('project', id);
+      else if (!(error instanceof ApiError && error.status > 0 && error.status < 500) && openNow.current.projectId === id) {
+        setTimeout(() => ask(id), RETRY_MS);
+      }
+    });
+  }, [gone]);
   const projectsRead = useRead(removals.projects, 'projects', () => get('/api/projects'));
   const conversationsRead = useRead(removals.conversations, projectId ?? null,
     () => get(`/api/conversations?project_id=${encodeURIComponent(projectId)}`));
@@ -236,8 +249,7 @@ export function Shell({ health, settings, onLanguage }) {
         removals.conversations.move();
         recheck(); // live.js: a turn it holds of a conversation that went with the project
         if (removed) gone('project', id);
-        // not known (its request failed; it may have happened): asked once, and left if it is gone (rider N)
-        else get(`/api/projects/${encodeURIComponent(id)}`).catch((error) => { if (deleted(error)) gone('project', id); });
+        else askProject(id); // not known (its request failed; it may have happened): asked, and left if it is gone (rider N)
       }}
       onConversation={(id) => { openConversation(id); setDrawer(false); }}
       onConversationsChanged={loadConversations}
