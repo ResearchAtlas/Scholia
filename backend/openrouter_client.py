@@ -14,7 +14,7 @@ configured base URL, and provider-supplied links are never followed.
 
 import asyncio
 import hashlib
-import json
+from backend import whole_json as json
 import logging
 import math
 import time

@@ -17,7 +17,7 @@ import ctypes
 import errno
 import fcntl
 import functools
-import json
+from backend import whole_json as json
 import logging
 import os
 import secrets

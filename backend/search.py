@@ -47,7 +47,7 @@ why, and how much of the library meaning search covers.
 """
 
 import asyncio
-import json
+from backend import whole_json as json
 import logging
 import re
 import unicodedata

@@ -24,7 +24,7 @@ primary commit with the answer.
 """
 
 import hashlib
-import json
+from backend import whole_json as json
 import re
 
 from backend import provenance

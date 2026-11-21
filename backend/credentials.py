@@ -6,7 +6,7 @@ the caller shows a warning. Reading takes the store's key when it has one, and
 the file's otherwise.
 """
 
-import json
+from backend import whole_json as json
 import logging
 import threading
 from pathlib import Path

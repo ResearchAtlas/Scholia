@@ -18,7 +18,7 @@ window only delays removing what nothing references.
 import collections
 import contextlib
 import hashlib
-import json
+from backend import whole_json as json
 import os
 import re
 import threading

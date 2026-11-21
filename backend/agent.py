@@ -24,7 +24,7 @@ its non-text arguments and its result's ids and counts, never the text (section 
 import asyncio
 import hashlib
 import itertools
-import json
+from backend import whole_json as json
 
 from fastapi import APIRouter
 

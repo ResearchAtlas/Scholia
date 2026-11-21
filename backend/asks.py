@@ -14,13 +14,13 @@ endpoint; a turn's asks (the agent's, S1-19c) only in their conversation, where 
 
 import asyncio
 import contextlib
-import json
+from backend import whole_json as json
 import logging
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from backend.json_answer import WholeJSONResponse
 from backend import governance
 from backend.db import new_id
 from backend.runs import _budget_unread, _event, derived_status
@@ -249,7 +249,7 @@ async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
         try:
             answered = await asyncio.to_thread(state["db"].write, written)
         except AskRefused as refused:
-            return JSONResponse({"code": refused.code, "message": refused.message, **(
+            return WholeJSONResponse({"code": refused.code, "message": refused.message, **(
                 {"needed_usd": refused.needed_usd} if getattr(refused, "needed_usd", None) else {})},
                 status_code=refused.status)
         if (decided := answered.pop("project_budget", None)) is not None:

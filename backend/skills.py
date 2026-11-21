@@ -14,7 +14,7 @@ manifest's order), never by path (`read_skill_file`, final review F06).
 """
 
 import hashlib
-import json
+from backend import whole_json as json
 import os
 import sys
 from dataclasses import dataclass

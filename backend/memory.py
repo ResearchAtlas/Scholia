@@ -21,7 +21,7 @@ caps a candidate at proposed unless the words it rests on are in the researcher'
 an existing record only under section 8's three conditions (`apply_extraction`).
 """
 
-import json
+from backend import whole_json as json
 import re
 import unicodedata
 from datetime import UTC, datetime, timedelta
@@ -556,7 +556,7 @@ def parse(text):
     and writes nothing). A reply in one code fence is read inside it."""
     body = (text or "").strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", body, re.S)
-    try:  # half a surrogate pair its escapes give is the replacement character (openrouter.whole_text)
+    try:  # half a surrogate pair (an escape or raw bytes) is the replacement character (whole_json)
         found = whole_text(json.loads(fenced.group(1) if fenced else body))
     except (ValueError, TypeError, RecursionError):
         return None
@@ -944,7 +944,7 @@ import sqlite3  # noqa: E402
 from typing import Literal  # noqa: E402
 
 from fastapi import APIRouter, Request  # noqa: E402
-from fastapi.responses import JSONResponse  # noqa: E402
+from backend.json_answer import WholeJSONResponse  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
 router = APIRouter()
@@ -980,7 +980,7 @@ class Refused(Exception):
 
 
 def _refused(error):
-    return JSONResponse({"code": error.code, "message": error.message}, status_code=error.status)
+    return WholeJSONResponse({"code": error.code, "message": error.message}, status_code=error.status)
 
 
 _CHANGE_ERRORS = {"changed": (409, "version_changed", "This record changed since it was shown; look again"),

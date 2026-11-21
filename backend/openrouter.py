@@ -21,9 +21,8 @@ prompt, an answer, a key, a URL or a provider's error body.
 
 import asyncio
 import hashlib
-import json
+from backend import whole_json as json
 import logging
-import re
 import sys
 import time
 from collections import OrderedDict
@@ -32,6 +31,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from backend import reasoning_capability
+from backend.whole_json import whole_text  # kept here for its importers (memory, tools.parser, openrouter_client)
 from backend.outbound_gate import DISPATCHED, NO_RESPONSE_CACHE, OutboundDenied
 from backend.reasoning_control import resolve_reasoning_payload
 from backend.settings import visible
@@ -383,18 +383,6 @@ def _json(response):
         return whole_text(response.json())
     except Exception:  # not JSON, or nested deeper than the decoder follows (RecursionError): malformed (PR 52 cycle 4)
         return None
-
-
-_HALF_PAIR = re.compile("[\ud800-\udfff]")
-
-
-def whole_text(value):
-    """A decoded JSON value with each half of a surrogate pair in its text, which only a JSON escape can give (as
-    "\\ud83d"), the replacement character, as a file's text gets (S1-13, S1-14). A model's text is stored and sent
-    on, and neither the database nor a JSON answer can hold half a pair (PR 57's Fable recheck: a title run left
-    running, an agent's ask that could not be listed). May raise RecursionError, as decoding does."""
-    text = json.dumps(value, ensure_ascii=False)
-    return value if not _HALF_PAIR.search(text) else json.loads(_HALF_PAIR.sub("\ufffd", text))
 
 
 def _answer(body):

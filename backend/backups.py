@@ -24,7 +24,7 @@ import collections
 import contextlib
 import errno
 import hashlib
-import json
+from backend import whole_json as json
 import logging
 import mimetypes
 import os
@@ -38,10 +38,10 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
+from backend.json_answer import WholeJSONResponse
 from backend import APP_VERSION, budgets, i18n
 from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseCloseError, DatabaseClosedError,
                         DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError, close_failed, utc_now)
@@ -85,7 +85,7 @@ class _Route(APIRoute):
             try:
                 return await handler(request)
             except BackupError as error:
-                return JSONResponse({"code": error.code, "message": error.message}, status_code=error.status)
+                return WholeJSONResponse({"code": error.code, "message": error.message}, status_code=error.status)
         return handle
 
 
@@ -183,9 +183,9 @@ class Gate:
 
     def _refused(self):
         if (why := limited(self.state)) is not None:
-            return JSONResponse({"code": why[0], "message": "Scholia can only restore a backup now"}, status_code=503)
+            return WholeJSONResponse({"code": why[0], "message": "Scholia can only restore a backup now"}, status_code=503)
         if self.state.get("restoring"):
-            return JSONResponse({"code": "restoring", "message": "A backup is being restored"}, status_code=503)
+            return WholeJSONResponse({"code": "restoring", "message": "A backup is being restored"}, status_code=503)
         return None
 
 

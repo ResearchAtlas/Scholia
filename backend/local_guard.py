@@ -40,7 +40,7 @@ other programs running as the same user.
 """
 
 import hmac
-import json
+from backend import whole_json as json
 
 CLIENT_HEADER = b"x-scholia-client"
 CLIENT_VALUE = b"local"

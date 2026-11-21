@@ -55,7 +55,7 @@ leaves no effect.
 """
 
 import asyncio
-import json
+from backend import whole_json as json
 import logging
 import math
 import sqlite3

@@ -22,7 +22,7 @@ result or fallback, the evidence selected, the mode and why, and the time each s
 """
 
 import asyncio
-import json
+from backend import whole_json as json
 import time
 import unicodedata
 

@@ -1630,3 +1630,27 @@ async def test_a_reference_files_merge_into_a_zotero_paper_queues_no_lookup(tmp_
         assert (paper["source"], paper["csl"]["DOI"]) == ("zotero", DOI)  # merged into the Zotero paper
         assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(0,)]
         assert client.provider.scholarly.requests == []
+
+
+async def test_a_zotero_item_type_holding_half_a_surrogate_pair_still_lists(tmp_path):
+    # Design review AA: Zotero's item type (the one text field its reader does not clean) reached the items answer as
+    # it came, and half a pair in it failed the list. Decoded through backend/whole_json.py, it is the replacement
+    # character
+    import json
+
+    import httpx
+
+    class Escaping(MockZotero):  # sends its JSON with escapes, as a server can send half a pair
+        def _answer(self, status, body=None, total=None):
+            response = super()._answer(status, None if isinstance(body, (dict, list)) else body, total)
+            if not isinstance(body, (dict, list)):
+                return response
+            return httpx.Response(status, content=json.dumps(body).encode(),
+                                  headers={**dict(response.headers), "content-type": "application/json"})
+
+    mock = Escaping()
+    mock.item("ITM00000", "Item 0", item_type="journal\ud83dArticle")
+    async with started(tmp_path / "data", provider(mock)) as client:
+        response = await client.get("/api/zotero/items", params={"library": "users/0"})
+        assert response.status_code == 200, response.text
+        assert [item["type"] for item in response.json()["items"]] == ["journal\ufffdArticle"]

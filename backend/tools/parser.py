@@ -4,7 +4,7 @@
 # JSON object, a Markdown fence around it allowed as before; nothing it reads is logged (section 1.5).
 """Reading the model's tool calls."""
 
-import json
+from backend import whole_json as json
 import re
 
 from backend.openrouter import whole_text
@@ -40,7 +40,7 @@ class ToolParser:
         if not text.strip():
             return {}
         fenced = _FENCE.match(text)
-        try:  # half a surrogate pair its escapes give is the replacement character (openrouter.whole_text)
+        try:  # half a surrogate pair (an escape or raw bytes) is the replacement character (whole_json)
             value = whole_text(json.loads(fenced.group(1) if fenced else text))
         except (ValueError, RecursionError):  # not JSON, or nested past what the parser follows
             return None

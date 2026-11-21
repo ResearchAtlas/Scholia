@@ -18,7 +18,7 @@ recorded in `cuts`, for the step's trace. Tokens are counted with `count`, a con
 estimate, since AAB has no route's own tokenizer.
 """
 
-import json
+from backend import whole_json as json
 import math
 from dataclasses import dataclass, field
 

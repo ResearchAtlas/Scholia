@@ -31,7 +31,7 @@ import asyncio
 import contextlib
 import errno
 import hashlib
-import json
+from backend import whole_json as json
 import logging
 import math
 import os
@@ -48,10 +48,10 @@ from typing import Literal
 
 import httpx
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
+from backend.json_answer import WholeJSONResponse
 from backend.db import DatabaseClosedError
 from backend.outbound_gate import MODEL_FILE_HOSTS, OutboundDenied
 from backend.runs import _through
@@ -1078,7 +1078,7 @@ class _Route(APIRoute):
             try:
                 return await handler(request)
             except Refused as refused:
-                return JSONResponse({"code": refused.code, "message": refused.message}, status_code=refused.status)
+                return WholeJSONResponse({"code": refused.code, "message": refused.message}, status_code=refused.status)
         return handle
 
 

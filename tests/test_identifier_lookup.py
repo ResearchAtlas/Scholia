@@ -1263,3 +1263,55 @@ async def test_a_local_only_lookup_cancelled_while_it_asks_closes_its_ask(tmp_pa
         assert (await listing(client, project))["asks"] == [] and client.provider.scholarly.requests == []
         [paper] = (await listing(client, project))["materials"]
         assert (paper["lookup"]["status"], paper["lookup"]["reason"]) == ("cancelled", None)  # stopped, not skipped
+
+
+HALF = "\ud83d"
+
+
+@pytest.mark.parametrize("source, field", [("openalex", "author"), ("openalex", "venue"), ("openalex", "volume"),
+                                           ("openalex", "pages"), ("openalex", "title"),
+                                           ("openalex", "author as raw bytes"), ("crossref", "family name"),
+                                           ("crossref", "venue"), ("crossref", "title")])
+async def test_a_lookups_answer_holding_half_a_surrogate_pair_is_kept_with_the_replacement_character(tmp_path, source,
+                                                                                                     field):
+    # The third Fable recheck (finding 1) and design review AA: half a pair in a field OpenAlex or Crossref sends, as a
+    # JSON escape or as raw bytes, reached materials.csl, and the Library could not be listed (or a title's lookup
+    # failed). Decoded through backend/whole_json.py, it is the replacement character
+    marked = f"Half {HALF} pair"
+    if source == "openalex":
+        record = openalex_work(DOI, TITLE)
+        if field.startswith("author"):
+            record["authorships"] = [{"author": {"display_name": marked}}]
+        elif field == "venue":
+            record["primary_location"] = {"source": {"display_name": marked}}
+        elif field == "volume":
+            record["biblio"]["volume"] = marked
+        elif field == "pages":
+            record["biblio"]["first_page"] = marked
+        else:
+            record["title"] = record["display_name"] = marked
+        body = json.dumps(record).encode()  # its escapes, as JSON sends half a pair
+        if field == "author as raw bytes":
+            body = body.replace(b"\\ud83d", HALF.encode("utf-8", "surrogatepass"))
+    else:
+        record = crossref_work(DOI, TITLE)
+        if field == "family name":
+            record["author"] = [{"given": "Ana", "family": marked}]
+        elif field == "venue":
+            record["container-title"] = [marked]
+        else:
+            record["title"] = [marked]
+        body = json.dumps({"status": "ok", "message": record}).encode()
+    host = "api.openalex.org" if source == "openalex" else "api.crossref.org"
+
+    async def answer(request):
+        if request.url.host == host:
+            return httpx.Response(200, content=body, headers={"content-type": "application/json"})
+        return httpx.Response(404, json={"error": "Not found"})
+
+    async with started(tmp_path / "data", MockProvider(scholarly=answer)) as client:
+        project = await project_of(client)
+        await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["lookup"]["outcome"] == "resolved" and paper["lookup"]["source"] == source
+        assert "Half \ufffd pair" in json.dumps(paper, ensure_ascii=False)

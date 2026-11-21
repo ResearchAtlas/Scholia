@@ -55,7 +55,7 @@ the next item; deleting a Zotero paper revokes every running import of its item 
 import asyncio
 import ctypes
 import errno
-import json
+from backend import whole_json as json
 import os
 import platform
 import re

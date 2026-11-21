@@ -55,7 +55,7 @@ Nothing here logs text, a title, a query or a path.
 
 import concurrent.futures
 import hashlib
-import json
+from backend import whole_json as json
 import logging
 import os
 import queue

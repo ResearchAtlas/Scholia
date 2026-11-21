@@ -23,7 +23,7 @@ bodies it sent; and an answer's citations, resolved again or checked again.
 """
 
 import asyncio
-import json
+from backend import whole_json as json
 
 from fastapi import APIRouter, Request
 from fastapi.responses import Response

@@ -7,7 +7,7 @@ asyncio event loop; async code uses asyncio.to_thread.
 import asyncio
 import errno
 import fcntl
-import json
+from backend import whole_json as json
 import logging
 import os
 import shutil

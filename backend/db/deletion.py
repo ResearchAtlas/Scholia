@@ -16,7 +16,7 @@ not stay in old WAL frames, and unreferenced content files are collected.
 """
 
 import contextlib
-import json
+from backend import whole_json as json
 import logging
 import weakref
 

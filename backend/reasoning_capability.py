@@ -27,7 +27,7 @@ Design rules (execution corrections #2, #5, #6, #7):
 from __future__ import annotations
 
 import hashlib
-import json
+from backend import whole_json as json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
