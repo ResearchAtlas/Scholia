@@ -92,7 +92,7 @@ export function Shell({ health, settings, onLanguage }) {
     : { projectId: id, conversationId: undefined, visit: now.visit + 1 })), [setOpen]);
   const openConversation = useCallback((id) => setOpen((now) => (now.conversationId === id ? now
     : { ...now, conversationId: id, visit: now.visit + 1 })), [setOpen]);
-  // An answer that comes later (a removal known to have happened, a project made, a first message admitted) changes
+  // An answer that comes later (a removal known to have happened, a project made, a first message's conversation made) changes
   // what is open only in the visit it was asked in: after any choice of the researcher's since, it changes nothing
   // (design review U). The conversation's view is keyed by the visit, so no answer draws the message box again.
   const answered = (change) => setOpen((now) => (now.visit === open.visit ? change(now) : now));

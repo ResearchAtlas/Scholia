@@ -1045,6 +1045,55 @@ const scenarios = {
     assert.ok((state.answered?.['/api/conversations/x'] ?? 0) < 20, 'its record was read until the cap: the chain does not end');
     assert.ok(s.seen().includes('Project Alpha'));
   },
+  // The plain order, every request answered: a first message is refused (its conversation x was made), the list is read
+  // again and shows x's row, and the researcher deletes that row.
+  async aDraftDeletedFromItsRowIsLeft(w, strict) {
+    const state = counted(); const s = await world(w, strict, state);
+    await first(s);
+    state.conversations.p1 = [conv('x', null), ...state.conversations.p1];
+    await s.release(s.server.next(writes('POST', '/message/stream')), (r) => r.fail('internal', 500));
+    await listReadAgain(s);
+    await deleteRowX(s, state);
+    await notInX(s, state);
+  },
+  // The same deletion with no answer (the engine deleted it): the view's own reread answers 404.
+  async aDraftWhoseDeletionGotNoAnswerIsLeft(w, strict) {
+    const state = counted(); const s = await world(w, strict, state);
+    await first(s);
+    state.conversations.p1 = [conv('x', null), ...state.conversations.p1];
+    await s.release(s.server.next(writes('POST', '/message/stream')), (r) => r.fail('internal', 500));
+    await listReadAgain(s);
+    await s.menu('New conversation', 'Delete'); await s.confirmDelete();
+    deleteConversation(state, 'x');
+    await noAnswer(s);
+    await notInX(s, state);
+  },
+  // The same deletion answered after the window was narrowed and widened (its Sidebar and dialog went).
+  async aDraftDeletedFromItsRowIsLeftThoughTheSidebarWent(w, strict) {
+    const state = counted(); const s = await world(w, strict, state);
+    await first(s);
+    state.conversations.p1 = [conv('x', null), ...state.conversations.p1];
+    await s.release(s.server.next(writes('POST', '/message/stream')), (r) => r.fail('internal', 500));
+    await listReadAgain(s);
+    await s.menu('New conversation', 'Delete'); await s.confirmDelete();
+    await goes(s);
+    deleteConversation(state, 'x');
+    await s.release(s.server.next(writes('DELETE')), (r) => r.answer({ ok: true }));
+    await notInX(s, state);
+  },
+  // The same, and New conversation is pressed: a new conversation is made by the next message.
+  async aNewConversationAfterADeletedDraftIsNew(w, strict) {
+    const state = counted(); const s = await world(w, strict, state);
+    await first(s);
+    state.conversations.p1 = [conv('x', null), ...state.conversations.p1];
+    await s.release(s.server.next(writes('POST', '/message/stream')), (r) => r.fail('internal', 500));
+    await listReadAgain(s);
+    await deleteRowX(s, state);
+    await s.newConversation();
+    s.server.asked.length = 0;
+    await s.type(AFTER); await s.send();
+    assert.ok(s.server.asked.some(writes('POST', '/api/conversations')) && !s.server.asked.some((r) => r.path.includes('/x/')), 'New conversation did nothing: the view is still the deleted one\'s');
+  },
   // r8-2 finding 1, as it can be made on the stand-in: x's record answers 404 while its first message's stream is open;
   // the stand-in's stream goes on after it is closed here, and the admission comes.
   async aFirstMessageAdmittedAfterItsConversationWasKnownDeletedOpensNothing(w, strict) {
@@ -1055,6 +1104,28 @@ const scenarios = {
     state.gone.add('x'); s.server.free('conversation');
     await s.releaseAll((r) => r.method === 'GET' && r.path === X); // 404: known
     await s.act(() => turn.push({ type: 'run_started', run_id: 'r1', conversation_id: 'x', seq: 1 }));
+    await notInX(s, state);
+  },
+  // The same with a stream that ends when it is closed here, as a browser's does: the message is not admitted.
+  async aFirstMessageWhoseConversationBecameKnownDeletedBeforeItsAdmissionIsLeft(w, strict) {
+    const state = counted(); const s = await world(w, strict, state);
+    s.server.hold('conversation');
+    await first(s);
+    s.server.next(writes('POST', '/message/stream')).open(true);
+    state.gone.add('x'); s.server.free('conversation');
+    await s.releaseAll((r) => r.method === 'GET' && r.path === X); // 404: known; its stream is closed
+    await notInX(s, state);
+  },
+  // Knowledge first, the choice after: x is made, its creation's answer is late, the list is read again and shows its
+  // row, the researcher deletes it, and the creation's answer comes.
+  async aConversationKnownDeletedBeforeItsCreationAnsweredIsNotChosen(w, strict) {
+    const state = counted(); const s = await world(w, strict, state);
+    await s.newConversation(); await s.type(DRAFT); await s.send();
+    const made = s.server.next(writes('POST', '/api/conversations'));
+    state.conversations.p1 = [conv('x', null), ...state.conversations.p1];
+    await listReadAgain(s);
+    await deleteRowX(s, state);
+    await s.release(made, (r) => r.answer({ id: 'x' }));
     await notInX(s, state);
   },
   // An admitted first message, then its conversation deleted from its row (guard: green at the head).
@@ -1115,6 +1186,24 @@ const scenarios = {
     assert.equal(state.answered['/api/projects/p1'] - before, 0, 'the project is asked for after it is known deleted');
     assert.deepEqual(s.selected(), ['Title Zulu']);
   },
+  // What the riders change on screen (not defects at the head; each says what it sees). After a refused first message
+  // whose conversation the list names: which row is the open one, and what New conversation then does.
+  async seenAfterARefusedFirstMessage(w, strict) {
+    const state = counted(); const s = await world(w, strict, state);
+    await s.newConversation(); await s.type(DRAFT); await s.send();
+    state.conversations.p1 = [conv('x', null), ...state.conversations.p1]; // the engine makes it, then answers
+    await s.release(s.server.next(writes('POST', '/api/conversations')), (r) => r.answer({ id: 'x' }));
+    await s.release(s.server.next(writes('POST', '/message/stream')), (r) => r.fail('internal', 500));
+    const rowsAtOnce = s.elements().filter((e) => e.type === 'li' && e.text.includes('New conversation')).length;
+    await listReadAgain(s);
+    const seen = { rowShownAtOnce: rowsAtOnce === 1, openRow: s.selected(), box: s.draft() };
+    await s.newConversation();
+    seen.boxAfterNewConversation = s.draft();
+    s.server.asked.length = 0; await s.type(AFTER); await s.send();
+    seen.nextMessageMakes = s.server.asked.some((r) => r.method === 'POST' && r.path === '/api/conversations') ? 'another conversation' : 'none: it goes to x';
+    // rider L, as AE saw it: the row at once, and the open one; the box keeps the message; New conversation empties it
+    assert.deepEqual(seen, { rowShownAtOnce: true, openRow: ['New conversation'], box: DRAFT, boxAfterNewConversation: '', nextMessageMakes: 'another conversation' });
+  },
   // Limit L4 (another client's restore brings back a conversation this window knows deleted), as Option 2 shows it:
   // not listed here until the window is reloaded. (At the head it is listed, opens, and cannot be sent to: the limit as
   // accepted. This scenario pins the lists' derivation, without which a click on its row leaves no message box.)
@@ -1131,6 +1220,19 @@ const scenarios = {
         seen.send = s.seen().includes('no longer exists') ? 'refused "This item no longer exists", no request' : s.server.asked.some(writes('POST')) ? 'sent' : 'nothing'; }
     }
     assert.deepEqual(seen, { listed: false });
+  },
+  // After a refused first message's conversation is deleted from its row: where the window is and what its box holds.
+  async seenAfterADraftIsDeletedFromItsRow(w, strict) {
+    const state = counted(); const s = await world(w, strict, state);
+    await first(s);
+    state.conversations.p1 = [conv('x', null), ...state.conversations.p1];
+    await s.release(s.server.next(writes('POST', '/message/stream')), (r) => r.fail('internal', 500));
+    await listReadAgain(s);
+    await deleteRowX(s, state);
+    await s.pause();
+    const seen = { openRow: s.selected(), box: s.box() ? s.draft() : 'no box', says: s.elements().filter((e) => e.props.role === 'alert' || e.props.role === 'status').map((e) => e.text).filter(Boolean) };
+    // rider L, as AE saw it: the project's first conversation is open, and the box went with x's view (N)
+    assert.deepEqual({ openRow: seen.openRow, box: seen.box }, { openRow: ['Title Alpha'], box: '' });
   },
   // Guards, green at the head. A refused first message is sent again to the conversation it made, and no other is made.
   async aRefusedFirstMessageIsSentAgainToTheConversationItMade(w, strict) {

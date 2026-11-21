@@ -70,8 +70,9 @@ const NEW = { turns: [], queued: [] }; // a conversation not made yet
 export function ConversationView({ conversationId, conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated,
   onLibrary, onNoProject }) {
   const t = useT();
-  const [draft, setDraft] = useState(null); // a new conversation, made at its first message
-  const id = conversationId ?? draft; // the list's row (conversation) gives only its title
+  // The Shell's alone (rider L): null is a new conversation, which its first message makes and the Shell then holds; the
+  // list's row (conversation) gives only its title
+  const id = conversationId;
   const live = useLiveTurn(id);
   // a turn opens a place only while shown here (live.js), said in the commit that shows it: never a passive effect's delay
   useLayoutEffect(() => showing(projectId, id), [projectId, id]);
@@ -87,9 +88,9 @@ export function ConversationView({ conversationId, conversation, projectId, pane
   const [reads, setReads] = useState(0); // each newest read done, failed or not, so polling goes on
   const end = useRef(null);
   const [attached, setAttached] = useState(null); // what the last attach said, and the lookup it started
-  // Read for the conversation attach() tags its files with: a draft's too, before the window knows it.
+  // Read for the conversation attach() tags its files with: a new one's too, from when it is made.
   const { asks, load: loadAsks } = useConversationAsks(id, attached?.lookup, projectId);
-  const here = useRef(false); // still shown: a draft admitted after the researcher left selects nothing
+  const here = useRef(false); // still shown: a conversation made after the researcher left selects nothing
   useEffect(() => {
     here.current = true;
     return () => { here.current = false; };
@@ -202,13 +203,14 @@ export function ConversationView({ conversationId, conversation, projectId, pane
     if (running) return followUp(text);
     try {
       const target = id ?? (await post('/api/conversations', { project_id: projectId })).id;
-      setDraft(target); // shown here from now on, so Stop works while it is admitted
+      // made: the window's from now on if it is still shown here (rider L), so Stop works while it is admitted, its row
+      // is the one open, and its deletion is the deletion of what is open (design review AE)
+      if (!id && here.current) onCreated(target);
       await readChoice(); // the model chosen at an earlier launch, before anything is sent
       const papers = chosenPapers(projectId);
       await send(target, `/api/conversations/${target}/message/stream`, { content: text, ...messageRoute(currentChoice()),
         ...(papers.length ? { material_ids: papers.map((paper) => paper.id) } : {}) }, text, since);
       if (papers.length) choosePapers(projectId, []); // they went with this message
-      if (!conversationId && here.current) onCreated(target);
       return true;
     } catch (error) {
       if (isActiveRun(error)) return followUp(text); // a turn started meanwhile: the message follows the setting
