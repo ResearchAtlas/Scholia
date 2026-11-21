@@ -114,3 +114,14 @@ test('every 404 taken as a deletion is handed to where knowledge lands', () => {
   assert.deepEqual([...raw].filter((file) => !RAW_404[file]).sort(), [], 'a 404 read directly, not through deleted()');
   assert.deepEqual(Object.keys(RAW_404).filter((file) => !raw.has(file)), [], 'listed 404 readers that no longer read one');
 });
+
+// Design review AE: what is open changes in one place, which refuses what is known deleted (Shell.jsx setOpen): the
+// state's own setter is called there and nowhere else; and the conversation's view holds no conversation of its own (the
+// one a first message makes is the Shell's from when it is made: rider L). A declaration check, as the ones above.
+test('what is open changes in one place, and no view holds a conversation of its own', () => {
+  const shell = readFileSync(join(SRC, 'components/Shell.jsx'), 'utf8');
+  assert.match(shell, /const \[open, setRaw\] = useState\(/, 'the state of what is open');
+  assert.equal(shell.match(/\bsetRaw\(/g)?.length, 1, 'what is open is set outside setOpen');
+  const view = readFileSync(join(SRC, 'components/ConversationView.jsx'), 'utf8');
+  assert.match(view, /\n {2}const id = conversationId;\n/, 'the view takes its conversation from the Shell alone');
+});
