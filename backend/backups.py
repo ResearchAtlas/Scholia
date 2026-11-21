@@ -1232,8 +1232,14 @@ def _back(data_dir, journal, audit=False):
     _remove_what_it_added(data_dir, journal)  # however it is put back (design review H, R4)
     own = [{"id": journal.get("id"), "interrupted": True, "finished": "back"}] if audit else []
     if "replaced" in journal:  # the folder is the earlier restore's again: its journal back in place, for a launch to
-        # finish or undo it with its audit row (its own rows carried, this one's added)
-        earlier = {**journal["replaced"], "audits": [*journal["replaced"].get("audits", []), *own]}
+        # finish or undo it with its audit row (its own rows carried, then those this one carried from a later restore
+        # put back onto it, then this one's: recheck r4, pass 2, finding 2), each once
+        carried, seen = [], set()
+        for audit in [*journal["replaced"].get("audits", []), *journal.get("audits", []), *own]:
+            if audit.get("id") not in seen:  # this one's journal began with the earlier one's rows
+                seen.add(audit.get("id"))
+                carried.append(audit)
+        earlier = {**journal["replaced"], "audits": carried}
         if "listed" in earlier and "listed" in journal:  # the one list goes back with it
             earlier["listed"] = journal["listed"]
         write_private(data_dir / "backups" / JOURNAL, json.dumps(earlier).encode())

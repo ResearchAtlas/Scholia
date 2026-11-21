@@ -539,21 +539,30 @@ async def test_three_restores_each_from_the_backup_the_one_before_took_keep_thos
         assert backups_module._read_journal(data) is None
 
 
-async def test_a_second_restore_whose_put_back_a_launch_finishes_has_the_first_one_finished_too(tmp_path, monkeypatch):
+@pytest.mark.parametrize("restores", [2, 3, 4])
+async def test_a_second_restore_whose_put_back_a_launch_finishes_has_the_first_one_finished_too(tmp_path, monkeypatch,
+                                                                                               restores):
     # F4, backups.py:1294-1295 (the Fable recheck's probe T2): both put backs are interrupted after their direction
     # is written. The launch finishes the second one's, which writes the first one's journal back, and then that one
-    # too: the previous state, both audit rows, no journal. Without the two lines it runs on the first file's database
+    # too: the previous state, both audit rows, no journal. Without the two lines it runs on the first file's database.
+    # Recheck r4 (pass 2, finding 2): with three or four, each one's row too, newest first (the earlier journal written
+    # back dropped the rows carried from the later restores)
     data = tmp_path / "data"
     await asyncio.to_thread(older, data, tmp_path / "m1.zip")
     faults = Faults(monkeypatch)
     async with started(data) as client:
         before, safety, _ = await first_restore(client, tmp_path, faults, migrating=True, back="midway")
-        faults.back = "midway"
-        await restore(client, (500, "restore_interrupted"), generation=safety)
-        assert backups_module._read_journal(data)["direction"] == "back"
+        ids = [backups_module._read_journal(data)["id"]]
+        for _ in range(restores - 1):
+            faults.back = "midway"
+            await restore(client, (500, "restore_interrupted"), generation=safety)
+            assert backups_module._read_journal(data)["direction"] == "back"
+            ids.append(backups_module._read_journal(data)["id"])
     async with started(data, setup=False) as client:
         assert "Before" in {p["name"] for p in (await client.get("/api/projects")).json()["projects"]}
-        assert [(a["interrupted"], a["finished"]) for a in await restore_audits(client)] == [(True, "back")] * 2
+        rows = await restore_audits(client)
+        assert [(a["interrupted"], a["finished"]) for a in rows] == [(True, "back")] * restores
+        assert [a["id"] for a in rows] == ids[::-1]
         assert sorted((await added(client, before)).values()) == [LATEST]
         assert backups_module._read_journal(data) is None
 
