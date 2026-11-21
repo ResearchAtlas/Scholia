@@ -75,8 +75,11 @@ async def test_health_says_a_restore_is_under_way_while_it_waits_for_a_backup_be
         backup = await a_backup_then_a_project(client)
         async with client.state["backups_lock"]:  # a full backup or an export holds it while it writes (backups.py:570)
             restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
-            while not client.state["restore_lock"].locked():
+            for _ in range(10_000):  # bounded: a restore that ended before it took its lock fails here, never hangs
+                if client.state["restore_lock"].locked():
+                    break
                 await asyncio.sleep(0)
+            assert client.state["restore_lock"].locked() and not restore.done()
             assert not client.state.get("restoring")  # the gate refuses nothing yet
             assert await names(client) == (200, {"General", "Made after the backup"})
             assert (await client.get("/api/health")).json().get("restoring") is True

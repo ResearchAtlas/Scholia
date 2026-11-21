@@ -180,6 +180,14 @@ const scenarios = {
     assert.equal(s.seen.reloads, 1);
     assert.deepEqual(s.reads(), []);
   },
+  // The batch G review (P3-1): a restore from the damaged screen is under way and a window loads: the restoring screen,
+  // not the damaged screen with its Restore, and nothing of the database is read.
+  async aWindowLoadedWhileARestoreFromADamagedDatabaseIsUnderWaySaysRestoring(w, strict) {
+    const s = await appWorld(w, strict, { ok: true, restoring: true, database_damaged: 'integrity', limited: 'database_damaged' });
+    assert.deepEqual(s.reads(), [], 'nothing but health was asked');
+    assert.ok(s.says('Scholia is restoring a backup'));
+    assert.ok(!s.says('Restore…'), 'the damaged screen offers a restore');
+  },
   // Guard: with no restore under way the window reads its launch reads and reloads nothing.
   async aWindowLoadedWithNoRestoreUnderWayReadsItsLaunchReads(w, strict) {
     const s = await appWorld(w, strict, { ok: true });
