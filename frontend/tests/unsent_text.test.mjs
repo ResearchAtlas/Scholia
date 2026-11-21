@@ -305,6 +305,54 @@ const scenarios = {
     await s.release(post, (r) => r.answer({ id: 'p3', name: SUBMITTED, kind: 'research' }));
     assert.equal(typed, false, 'the name could be changed while the project was made, and the dialog then closed over it');
   },
+
+  // This review: a waiting message is being edited when the turn before it ends; the window starts the message on its
+  // own, as it was, and the edit goes with its row.
+  async aQueuedEditIsNotLostWhenItsMessageStartsOnItsOwn(w, strict) {
+    const state = start({ personal: { ui: { follow_up: 'queue' } }, records: { a: { turns: [], queued: [] } } });
+    const s = await windowWorld(w, strict, state);
+    await s.type('First question'); await s.send();
+    const first = s.server.next(writes('POST', '/message/stream')).open();
+    state.records.a = { queued: [], turns: [{ run_id: 'r1', status: 'running', message: { text: 'First question' }, answer: null }] };
+    await s.act(() => first.push({ type: 'run_started', run_id: 'r1', conversation_id: 'a', seq: 1 }));
+    await s.type('Waiting message'); await s.send(); // it waits as the next turn
+    state.records.a.queued = [{ id: 'q1', text: 'Waiting message' }];
+    await s.release(s.server.next(writes('POST', '/queue')), (r) => r.answer({ id: 'q1', text: 'Waiting message' }));
+    await s.press('Edit');
+    assert.equal(await s.typeInto(byId('queued-q1'), NEWER, 'the edit'), true);
+    // the turn ends well; the window reads the record and starts the oldest waiting message
+    state.records.a.turns[0] = { ...state.records.a.turns[0], status: 'succeeded', answer: { text: 'An answer' }, result_saved: true };
+    await s.act(() => { first.push({ type: 'run_finished', status: 'succeeded' }); first.end(); });
+    const started = s.server.asked.filter(writes('POST', '/queue/q1/send'));
+    if (started.length) { // started on its own, with the words it had before the edit
+      const second = s.server.next(writes('POST', '/queue/q1/send')).open();
+      state.records.a = { queued: [], turns: [...state.records.a.turns, { run_id: 'r2', status: 'running', message: { text: 'Waiting message' }, answer: null }] };
+      await s.act(() => second.push({ type: 'run_started', run_id: 'r2', conversation_id: 'a', seq: 1 }));
+    }
+    assert.ok(s.has((e) => e.props.value === NEWER), `the edit typed is gone${started.length ? ', and its message was started as it was before the edit' : ''}`);
+  },
+  // Rider Q's other half: the message held by its open editor starts, as the record then says, once the editor closes.
+  async aHeldMessageStartsOnceItsEditorCloses(w, strict) {
+    const state = start({ personal: { ui: { follow_up: 'queue' } }, records: { a: { turns: [], queued: [] } } });
+    const s = await windowWorld(w, strict, state);
+    await s.type('First question'); await s.send();
+    const first = s.server.next(writes('POST', '/message/stream')).open();
+    state.records.a = { queued: [], turns: [{ run_id: 'r1', status: 'running', message: { text: 'First question' }, answer: null }] };
+    await s.act(() => first.push({ type: 'run_started', run_id: 'r1', conversation_id: 'a', seq: 1 }));
+    await s.type('Waiting message'); await s.send();
+    state.records.a.queued = [{ id: 'q1', text: 'Waiting message' }];
+    await s.release(s.server.next(writes('POST', '/queue')), (r) => r.answer({ id: 'q1', text: 'Waiting message' }));
+    await s.press('Edit');
+    await s.typeInto(byId('queued-q1'), NEWER, 'the edit');
+    state.records.a.turns[0] = { ...state.records.a.turns[0], status: 'succeeded', answer: { text: 'An answer' }, result_saved: true };
+    await s.act(() => { first.push({ type: 'run_finished', status: 'succeeded' }); first.end(); });
+    assert.equal(s.server.asked.filter(writes('POST', '/queue/q1/send')).length, 0, 'started while its editor was open');
+    await s.submitWith(byId('queued-q1'), 'the edit form'); // saved: the editor closes
+    state.records.a.queued = [{ id: 'q1', text: NEWER }];
+    await s.release(s.server.next(writes('PUT', '/queue/q1')), (r) => r.answer({ id: 'q1', text: NEWER }));
+    assert.equal(s.server.asked.filter(writes('POST', '/queue/q1/send')).length, 1, 'started once its editor closed');
+    assert.ok(s.screen().includes(NEWER), 'with the words saved');
+  },
 };
 
 const only = process.env.ONLY ? process.env.ONLY.split(',') : null;

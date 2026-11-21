@@ -123,6 +123,12 @@ export function send(conversationId, path, body, text, since = stopsAt(conversat
 // (not_queued) gives way to the next, read again. The backend starts it only while that turn is still the latest,
 // succeeded and not stopped from any window (nor its stream closed before its end was recorded), and once. After any
 // other ending it waits with Send.
+const edited = new Set(); // waiting messages whose editor is open here: none starts on its own meanwhile (design review X, rider Q)
+export function editing(conversationId, id, open) {
+  if (open) edited.add(id);
+  else if (edited.delete(id)) drain(conversationId); // closed: it may start now, if the record still says so
+}
+
 export async function drain(conversationId) {
   const pressed = stopsAt(conversationId);
   const free = () => !aborts.has(conversationId) && !halted.has(conversationId) && stopsAt(conversationId) === pressed;
@@ -135,7 +141,7 @@ export async function drain(conversationId) {
     }
     const after = read?.turns?.at(-1)?.run_id;
     const next = routes.has(after) ? nextQueued(read, after) : null; // a turn sent elsewhere: that window starts it
-    if (!next || !free() || followed.has(after)) return;
+    if (!next || edited.has(next.id) || !free() || followed.has(after)) return;
     try {
       await send(conversationId, `/api/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(next.id)}/send`,
         { after }, next.text, pressed, true);
