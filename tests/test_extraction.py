@@ -13,7 +13,7 @@ import zlib
 
 import pytest
 
-from backend import extraction
+from backend import extraction, search_index
 from backend.extraction import Passage, extract, identifiers, media_type
 import synthetic_materials as synthetic
 
@@ -342,21 +342,45 @@ def _pdfium_text(data):
             document.close()
 
 
-def test_a_line_end_hyphen_pdfium_gives_as_u_fffe_joins_a_broken_word_and_stays_a_compounds_hyphen():
-    page = [(72, 750, 18, "A Synthetic Paper"), (72, 720, 14, "2 Retrieval-Aug-"), (72, 704, 14, "mented Generation"),
-            (72, 680, 10, "Minimum wages raise the earnings of workers who de-"), (72, 668, 10, "cide to stay, as the Self-"),
-            (72, 656, 10, "CheckGPT method and Llama-"), (72, 644, 10, "7B show for the panel.")]
+def _hyphen_page(*lines, size=10):
+    """A page whose title is followed by lines at the body's size, 12 points apart."""
+    return synthetic.pdf([[(72, 750, 18, "A Synthetic Paper"), *[(72, 720 - 12 * n, size, line) for n, line in enumerate(lines)]]])
+
+
+def test_a_word_broken_at_a_line_end_is_one_word():  # H1
+    data = _hyphen_page("We de-", "cide the documents.")
+    assert "de\ufffecide" in _pdfium_text(data)[0]  # PDFium's mark, its two lines joined into one
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.text == "We decide the documents."
+    assert "decide" in [t[2] for t in search_index.tokens(passage.text)]
+
+
+def test_a_heading_broken_at_a_line_end_is_one_heading_in_its_section_path():  # H2
+    page = [(72, 750, 18, "A Synthetic Paper"), (72, 720, 14, "2 Retrieval-Augmented Gen-"), (72, 704, 14, "eration Results"),
+            (72, 680, 10, "Minimum wages raise the earnings of low-paid workers in the panel.")]
     data = synthetic.pdf([page])
+    assert "Gen\ufffeeration" in _pdfium_text(data)[0]
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.section_path == ["2 Retrieval-Augmented Generation Results"]
+
+
+def test_a_joined_passage_keeps_pdfiums_range_with_the_mark_and_a_rectangle_a_line():  # H3
+    data = _hyphen_page("Minimum wages raise the earnings of workers who de-", "cide to stay in the panel, and",
+                        "the rest move.")
     text, count = _pdfium_text(data)
-    assert text.count("\ufffe") == 4 and len(text) == count  # each line-end hyphen, its line joined to the next
-    [title, passage] = extract(data, extraction.PDF).passages
-    assert passage.text == ("Minimum wages raise the earnings of workers who decide to stay, as the Self-CheckGPT method"
-                            " and Llama-7B show for the panel.")
-    assert passage.section_path == ["2 Retrieval-Augmented Generation"]
-    # Its range is still of PDFium's characters, the dropped hyphen's among them, and its box the lines'.
-    assert (passage.char_start, passage.char_end) == (text.index("Minimum"), count)
-    [[left, top, right, bottom]] = passage.boxes["rects"]
-    assert 0.11 < left < 0.13 and 0.13 < top < bottom < 0.2 and 0.5 < right < 0.52
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.text == "Minimum wages raise the earnings of workers who decide to stay in the panel, and the rest move."
+    assert (passage.char_start, passage.char_end) == (text.index("Minimum"), count)  # the dropped mark's index inside
+    assert len(passage.boxes["rects"]) == text[text.index("Minimum"):].count("\n") + 1  # one for each of PDFium's lines
+
+
+def test_a_compounds_own_hyphen_at_a_line_end_is_kept_and_a_name_broken_before_a_capital_is_joined():  # H4
+    data = _hyphen_page("This is state-of-the-", "art work, run with GPT-", "4 and Self-", "CheckGPT here.")
+    assert _pdfium_text(data)[0].count("\ufffe") == 3
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.text == "This is state-of-the-art work, run with GPT-4 and SelfCheckGPT here."
+    tokens = [t[2] for t in search_index.tokens(passage.text)]
+    assert "selfcheckgpt" in tokens and "gpt" in tokens
 
 
 def test_a_table_piece_starting_on_a_wrapped_cell_has_its_range_in_order_over_all_its_characters():

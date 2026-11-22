@@ -622,11 +622,12 @@ def _pdf_page(page, raw, measure=False):
         aligned = len(text) == count
         mapped = unmapped = 0
         lines, chars, boxes = [], [], []
+        hyphened = False  # whether the line's word so far, back to its last space, holds a hyphen
         for index, char in enumerate(text):
             if char in "\r\n":
                 if chars:
                     lines.append((chars, boxes))
-                chars, boxes = [], []
+                chars, boxes, hyphened = [], [], False
                 continue
             box = None
             at = index if aligned else raw.FPDFText_GetCharIndexFromTextIndex(textpage, index)
@@ -640,10 +641,14 @@ def _pdf_page(page, raw, measure=False):
                     box = (left, bottom, right, top, at, len(lines), raw.FPDFText_GetFontSize(textpage, at))
             elif not char.isspace():
                 mapped += 1
-            if char == "\ufffe":  # PDFium's line-end hyphen, its line joined to the next: dropped as _join drops "-"
-                if text[index + 1:index + 2].islower():
+            # PDFium's line-end hyphen, its line joined to the next: dropped with its box (the word joined),
+            # but kept as "-" where it is the word's own, in a word already hyphened (TeX breaks such a word
+            # only at its hyphen: state-of-the-art) or before a digit (GPT-4).
+            if char == "\ufffe":
+                if not (hyphened or text[index + 1:index + 2].isdigit()):
                     continue
-                char = "-"  # before a capital or a digit, a compound's (Self-CheckGPT, Llama-7B)
+                char = "-"
+            hyphened = (hyphened or char == "-") and not char.isspace()
             chars.append(char)
             boxes.append(box)
         if chars:
