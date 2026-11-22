@@ -138,6 +138,27 @@ async def test_a_new_version_that_only_drops_a_hyphen_past_the_quote_finds_the_c
         assert (chip["existence"], chip["support"]) == ("ok", "unchecked")
 
 
+async def test_a_pdf_3_passage_marked_only_past_its_quote_keeps_its_verdict_after_the_reread(tmp_path, monkeypatch):
+    # the old passage text holds the mark and the quote (its first QUOTE_CHARS) does not: compared bare all the same
+    read_in_process(monkeypatch)
+    real = extraction.extract
+    long = OLD + " " + "Regional prices adjust slowly after a wage floor is raised in the panel. " * 7 + "Hours fell by a little."
+    assert long.index("Hours") > citations.QUOTE_CHARS
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+        rewording(monkeypatch, real, {"a little": "a lit\ufffetle"})  # as pdf-3 read a broken word
+        project, [material] = await with_papers(client, paper("Wage Floors", long))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        before = await chip_of(client, conversation)
+        assert (before["existence"], before["support"]) == ("ok", "supported") and "\ufffe" not in before["quote"]
+        monkeypatch.setattr(extraction, "extract", real)
+        await read_as(client, monkeypatch, material, "markdown-1")
+        await idle(client, project)
+        chip = await chip_of(client, conversation)
+        assert chip["passage_id"] != before["passage_id"] and (chip["existence"], chip["support"]) == ("ok", "supported")
+
+
 async def test_a_reread_takes_the_new_passages_page(tmp_path, monkeypatch):
     # round 3, the open row: page = coalesce(new, old) in supersede and the null-passage loop
     read_in_process(monkeypatch)
