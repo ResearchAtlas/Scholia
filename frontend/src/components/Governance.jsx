@@ -347,8 +347,16 @@ export function AuditLog({ project }) {
     setExported(done.path);
     return done;
   });
-  const clear = () => run(() => confirmedChange('DELETE', '/api/audit', undefined,
-    () => ask(t('audit.clearTitle'), t('audit.clearBody'), t('audit.clearConfirm'))));
+  const clear = () => run(async () => {
+    let confirmed = false;
+    try {
+      return await confirmedChange('DELETE', '/api/audit', undefined,
+        async () => (confirmed = await ask(t('audit.clearTitle'), t('audit.clearBody'), t('audit.clearConfirm'))));
+    } catch (error) { // a confirmed clearing that failed may have happened: the log is read anew too (rider L, AG)
+      if (confirmed) setChanges((n) => n + 1);
+      throw error;
+    }
+  });
   return (
     <Section title={t('audit.title')} hint={t('audit.hint')}>
       <div className="flex flex-wrap items-center gap-2">

@@ -219,6 +219,19 @@ const scenarios = {
     assert.ok(s.screen().includes('Fact Alpha'), 'the project\'s memory is not shown: a read for no project answered last');
     assert.equal(late.length, 0, 'memory was read for no project while one is open');
   },
+  // This review: a clearing whose answer is lost (the engine cleared the log): it may have happened, so nothing read
+  // before it stays; the log is read anew, and the failure is said.
+  async aClearingWhoseAnswerIsLostShowsNothingReadBeforeIt(w, strict) {
+    const state = { log: rows(), held: ['clear'] };
+    const s = await auditWorld(w, strict, state, P1);
+    assert.equal(await s.press('Clear the log'), true);
+    assert.equal(await s.press('Clear'), true);
+    state.log = [{ seq: 121, at: '2026-11-02T00:00:00Z', event: 'audit_cleared', project_id: null, data: { rows: 120 } }];
+    await s.releaseAll((r) => r.kind === 'clear', (r) => r.fail('unavailable', 503));
+    assert.equal(s.of('p1'), 0, 'entries read before a clearing that happened stay on screen');
+    assert.equal(s.rows().length, 1, 'the cleared log is not read');
+    assert.equal(s.says('alert').length, 1, 'the failed request is not said');
+  },
 };
 
 // Green at the head: the behavior kept.
