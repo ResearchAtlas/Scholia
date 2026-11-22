@@ -40,7 +40,9 @@ const stubs = {
   load(id) {
     if (id === '\0cn') return 'export const cn = (...a) => a.filter((x) => typeof x === "string").join(" ");';
     if (id === '\0parts') return `export { Paper } from ${JSON.stringify(path.join(src, 'components', 'Paper.jsx'))};\n`
-      + 'export const ZoteroBrowser = () => null; export const Settings = () => null; export const LeftOff = () => null; export const Trace = () => null;\n'
+      + `import { jsx } from ${JSON.stringify(standin)};\n`
+      // Settings as a host element with its props, drawing nothing: what the Shell gives it can be asserted (recheck r9)
+      + 'export const ZoteroBrowser = () => null; export const Settings = (props) => jsx("parts:Settings", props); export const LeftOff = () => null; export const Trace = () => null;\n'
       + 'export const Markdown = ({ children }) => children ?? null; export const markdownReady = async () => {};';
     if (id === '\0drawer') return `import { jsx } from ${JSON.stringify(standin)};\n`
       + ['Root', 'Portal', 'Overlay', 'Content', 'Title'].map((name) => `export const ${name} = (props) => jsx('drawer:${name}', props);`).join('\n');

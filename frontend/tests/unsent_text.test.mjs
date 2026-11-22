@@ -921,6 +921,27 @@ const scenarios = {
     assert.ok(!s.has(byId('new-provider-name')), 'the add form closed');
     assert.ok(s.says('status').some((text) => text.includes(KEY_STORE)), 'the key store warning is not shown');
   },
+  // PR 63's recheck r9 (pass 2 finding 1, P3; frozen ticket 71, "A Local only project offers no download"): a Local only
+  // project's deletion fails and the projects' reread is held, so the open project's record is not known. The Shell
+  // gives Settings no record then (undefined: a project is open, not known), and Settings, Advanced offers no download
+  // for it, so none is asked without its project. Fails closed. (Settings is drawn by Parts.jsx, a host element here.)
+  async aLocalOnlyProjectWhoseRecordIsNotKnownOffersNoDownload(w, strict) {
+    const state = start({ projects: [{ ...P1, sensitivity: 'local_only' }] });
+    const s = await windowWorld(w, strict, state);
+    const given = () => one(s.elements().filter((e) => e.type === 'parts:Settings'), 'Settings').props.project;
+    assert.equal(given()?.sensitivity, 'local_only');
+    await s.projectMenu(/^Delete Project Alpha/); await s.press('Delete');
+    const del = s.server.next(writes('DELETE', '/api/projects/p1'));
+    s.server.hold('projects');
+    await s.release(del, (r) => r.fail());
+    const unknown = given();
+    assert.ok(unknown === undefined && s.screen().includes('Title Alpha'), 'the project is open, its record not known');
+    const advanced = await partWorld(w, strict, { gets: { '/api/helper': helper(false) } }, 'LocalHelper', 'LocalHelperSection', { project: unknown });
+    assert.equal(advanced.shown().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Download…').length, 0,
+      'a download is offered while the open project\'s record is not known');
+    assert.ok(advanced.has((e) => e.type === 'ui:Button' && e.text.trim() === 'Import a file…') || advanced.screen().includes('Import a file'),
+      'the import is still offered');
+  },
 };
 
 // Design review AF's row vi: when a removal becomes known the projects are read again, and Settings' This project page
