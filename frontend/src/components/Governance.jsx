@@ -395,10 +395,9 @@ function AuditPages({ projectId }) {
     fetchPage().then(setPage, (error) => setRead(codeOf(error)));
   }, [fetchPage]);
   useEffect(() => { load(); }, [load]);
-  const older = () => run(async () => {
-    const from = page.next;
-    const next = await fetchPage(from);
-    setPage((current) => (current?.next === from ? { ...next, entries: [...current.entries, ...next.entries] } : current));
+  const older = () => run(async () => { // one at a time (busy), and only this log's: it continues the page shown
+    const next = await fetchPage(page.next);
+    setPage((current) => ({ ...next, entries: [...current.entries, ...next.entries] }));
   });
   const dates = new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' });
   if (!page) return <LoadState problem={read} onRetry={load} />;

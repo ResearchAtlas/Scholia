@@ -245,6 +245,18 @@ const scenarios = {
     await s.releaseAll((r) => r.kind === 'instructions');
     assert.ok(s.screen().includes('21 of 32 KiB'), 'the size shown leaves the project\'s file out: a read without the project answered last');
   },
+  // The writer's mutation run (batch K): the pages keyed by the scope's project too, not only by the changes. This
+  // project's first page is still under way when Everything is chosen and read; it answers last: Everything stays whole.
+  async aProjectsPageAnsweringAfterEverythingWasChosenIsNotShown(w, strict) {
+    const s = await auditWorld(w, strict, { held: ['audit'] }, P1);
+    const first = s.server.next(audits);
+    assert.equal(await s.choose('Everything'), true);
+    await s.releaseAll(audits); // Everything's read
+    assert.ok(s.of('p2') > 0);
+    await s.release(first); // This project's, last
+    assert.deepEqual(s.chosen(), ['Everything']);
+    assert.ok(s.of('p2') > 0, 'This project\'s page is shown under Everything');
+  },
 };
 
 // Green at the head: the behavior kept.
