@@ -942,6 +942,15 @@ const scenarios = {
     assert.ok(advanced.has((e) => e.type === 'ui:Button' && e.text.trim() === 'Import a file…') || advanced.screen().includes('Import a file'),
       'the import is still offered');
   },
+  // With it: no project open is not a project unknown. The Shell gives Settings null then, and Advanced offers the
+  // download, as it does outside any project (ticket 71 limits only a Local only project's).
+  async aWindowWithNoProjectOpenStillOffersTheDownload(w, strict) {
+    const s = await windowWorld(w, strict, start({ projects: [], conversations: {} }));
+    const given = one(s.elements().filter((e) => e.type === 'parts:Settings'), 'Settings').props.project;
+    assert.equal(given, null, 'no project open is given as a project not known');
+    const advanced = await partWorld(w, strict, { gets: { '/api/helper': helper(false) } }, 'LocalHelper', 'LocalHelperSection', { project: given });
+    assert.equal(advanced.shown().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Download…').length, 1, 'no download is offered');
+  },
 };
 
 // Design review AF's row vi: when a removal becomes known the projects are read again, and Settings' This project page

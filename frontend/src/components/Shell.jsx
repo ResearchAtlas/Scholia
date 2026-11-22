@@ -307,9 +307,9 @@ export function Shell({ health, settings, onLanguage }) {
   const conversation = useMemo(() => conversations?.find((c) => c.id === conversationId) ?? null,
     [conversations, conversationId]);
 
-  // null: no project open; undefined: one is open and its record is not known (read again, or not read yet), which
-  // what a project's protection decides treats as the strictest (recheck r9)
-  const project = projectId === undefined ? null : projects?.find((p) => p.id === projectId);
+  // null: no project open (none decided yet, or none to open); undefined: one is open and its record is not known
+  // (read again, or not read yet), which what a project's protection decides treats as the strictest (recheck r9)
+  const project = projectId == null ? null : projects?.find((p) => p.id === projectId);
   return (
     <div className="relative flex h-full"
       onDragOver={(event) => { if (hasFiles(event)) { event.preventDefault(); setDropping(true); } }}
