@@ -3,7 +3,7 @@
 // protection, the OpenRouter key's data-settings confirmation, declared model servers on this
 // Mac, the Private allowlist and the audit log. Scholia cannot verify a confirmation or a
 // declaration, and says so where each is made.
-import { useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useState } from 'react';
 import { ExternalLink, Lock, ShieldCheck } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, confirmedChange, del, get, post, put } from '../api.js';
@@ -332,44 +332,15 @@ const PAGE = 50;
 // clearing, which asks first and leaves a record.
 export function AuditLog({ project }) {
   const t = useT();
-  const language = useContext(LanguageContext);
   // An open project, known or not (undefined: its record is read again), is its own default; while its record is not
   // known nothing is read or exported in its name, nor for no project (the batch J review; recheck r9's class)
   const [scope, setScope] = useState(project === null ? 'all' : 'project');
   const waiting = scope === 'project' && project === undefined; // null: no project open now, so the whole log
-  const [page, setPage] = useState(null); // { entries, next, allowed_off_this_mac }
-  const [read, setRead] = useState(null);
+  const projectId = scope === 'project' ? project?.id ?? null : null;
+  const [changes, setChanges] = useState(0); // each export or clearing that went ahead: the log is read anew
   const [exported, setExported] = useState(null);
   const [ask, dialog] = useConfirm();
-  const projectId = scope === 'project' ? project?.id : null;
-  const fetchPage = useCallback((before) => {
-    const query = new URLSearchParams({ limit: String(PAGE), ...(projectId ? { project_id: projectId } : {}),
-      ...(before ? { before: String(before) } : {}) });
-    return get(`/api/audit?${query}`);
-  }, [projectId]);
-  const reads = useRef(0); // each fresh read of the log; a page asked for under an earlier one is dropped
-  const load = useCallback(() => {
-    if (waiting) return Promise.resolve();
-    const mine = ++reads.current;
-    return fetchPage().then((data) => {
-      if (mine !== reads.current) return;
-      setPage(data);
-      setRead(null);
-    }).catch((error) => { if (mine === reads.current) setRead(codeOf(error)); });
-  }, [fetchPage, waiting]);
-  const { busy, problem, run } = useChange(load);
-  useEffect(() => {
-    setPage(null);
-    load();
-  }, [load]);
-  const older = () => run(async () => {
-    const mine = reads.current;
-    const next = await fetchPage(page.next);
-    if (mine === reads.current) { // still the same scope and read: the older page continues it
-      setPage((current) => current && ({ ...next, entries: [...current.entries, ...next.entries] }));
-    }
-    return false; // nothing changed to read again
-  });
+  const { busy, problem, run } = useChange(() => setChanges((n) => n + 1));
   const exportLog = () => run(async () => {
     const done = await post('/api/audit/export', projectId ? { project_id: projectId } : {});
     setExported(done.path);
@@ -377,7 +348,6 @@ export function AuditLog({ project }) {
   });
   const clear = () => run(() => confirmedChange('DELETE', '/api/audit', undefined,
     () => ask(t('audit.clearTitle'), t('audit.clearBody'), t('audit.clearConfirm'))));
-  const dates = new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' });
   return (
     <Section title={t('audit.title')} hint={t('audit.hint')}>
       <div className="flex flex-wrap items-center gap-2">
@@ -393,20 +363,48 @@ export function AuditLog({ project }) {
       </div>
       <Problem code={problem} />
       {exported && <p role="status" className="break-all text-xs text-muted-foreground">{t('audit.exported', { path: exported })}</p>}
-      {!page ? <LoadState problem={read} onRetry={load} /> : (
-        <div className="space-y-2">
-          {page.allowed_off_this_mac != null && <p className="text-xs">{t('audit.sent', { count: page.allowed_off_this_mac })}</p>}
-          {page.entries.length === 0 && <p className="text-sm text-muted-foreground">{t('audit.empty')}</p>}
-          {page.entries.length > 0 && (
-            <ol className="scroll-thin max-h-96 divide-y overflow-y-auto rounded-lg border">
-              {page.entries.map((entry) => <AuditEntry key={entry.seq} entry={entry} dates={dates} />)}
-            </ol>
-          )}
-          {page.next && <Button variant="ghost" size="sm" disabled={busy} onClick={older}>{t('audit.more')}</Button>}
-        </div>
-      )}
+      {/* One reader per log shown (this project's, or the whole log) and per change to it (rule K): what is read,
+          continued or said for one is never another's, and after a clearing nothing read before it is shown; while the
+          open project's record is not known no reader is drawn (design review AG). */}
+      {waiting ? <LoadState /> : <AuditPages key={`${projectId ?? ''}\n${changes}`} projectId={projectId} />}
       {dialog}
     </Section>
+  );
+}
+
+// One log's pages, newest first. projectId never changes under it (AuditLog keys it), so it counts no reads.
+function AuditPages({ projectId }) {
+  const t = useT();
+  const language = useContext(LanguageContext);
+  const [page, setPage] = useState(null); // { entries, next, allowed_off_this_mac }
+  const [read, setRead] = useState(null);
+  const { busy, problem, run } = useChange();
+  const fetchPage = useCallback((before) => get(`/api/audit?${new URLSearchParams({ limit: String(PAGE),
+    ...(projectId ? { project_id: projectId } : {}), ...(before ? { before: String(before) } : {}) })}`), [projectId]);
+  const load = useCallback(() => {
+    setRead(null);
+    fetchPage().then(setPage, (error) => setRead(codeOf(error)));
+  }, [fetchPage]);
+  useEffect(() => { load(); }, [load]);
+  const older = () => run(async () => {
+    const from = page.next;
+    const next = await fetchPage(from);
+    setPage((current) => (current?.next === from ? { ...next, entries: [...current.entries, ...next.entries] } : current));
+  });
+  const dates = new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' });
+  if (!page) return <LoadState problem={read} onRetry={load} />;
+  return (
+    <div className="space-y-2">
+      {page.allowed_off_this_mac != null && <p className="text-xs">{t('audit.sent', { count: page.allowed_off_this_mac })}</p>}
+      {page.entries.length === 0 && <p className="text-sm text-muted-foreground">{t('audit.empty')}</p>}
+      {page.entries.length > 0 && (
+        <ol className="scroll-thin max-h-96 divide-y overflow-y-auto rounded-lg border">
+          {page.entries.map((entry) => <AuditEntry key={entry.seq} entry={entry} dates={dates} />)}
+        </ol>
+      )}
+      <Problem code={problem} />
+      {page.next && <Button variant="ghost" size="sm" disabled={busy} onClick={older}>{t('audit.more')}</Button>}
+    </div>
   );
 }
 

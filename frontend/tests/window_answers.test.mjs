@@ -1282,6 +1282,26 @@ const scenarios = {
     assert.deepEqual(s.selected(), ['Title Xray']);
     assert.equal(s.draft(), AFTER);
   },
+  // Design review AG: what the Shell gives Settings as a project is made while Settings is open (opened by a turn's open_place
+  // over the New project dialog whose request is under way): the open project's record, then undefined, then the new one.
+  async agWhatSettingsIsGivenAsAProjectIsMade(w, strict) {
+    const state = start(); const s = await world(w, strict, state);
+    const given = () => s.elements().filter((e) => e.type === 'parts:Settings')[0].props;
+    const seen = [given().project?.id ?? given().project];
+    await s.projectMenu(/^New project$/); await s.field('new-project', 'Project Gamma'); await s.submit('new project');
+    // opened behind the dialog here (the stand-in calls handlers a modal dialog covers); in the app a turn's open_place does it
+    await s.act(() => s.elements().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Settings')[0].props.onClick());
+    assert.equal(given().open, true, 'Settings is open over the dialog');
+    s.server.hold('projects');
+    state.projects = [P1, P2, P3]; state.conversations.p3 = [];
+    await s.release(s.server.next(writes('POST', '/api/projects')), (r) => r.answer(P3));
+    seen.push(given().project === undefined ? 'undefined' : given().project?.id ?? given().project);
+    s.server.free('projects');
+    await s.releaseAll((r) => r.kind === 'projects');
+    seen.push(given().project?.id ?? given().project);
+    assert.deepEqual(seen, ['p1', 'undefined', 'p3']);
+    assert.equal(given().open, true);
+  },
 };
 
 

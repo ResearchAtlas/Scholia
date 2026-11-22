@@ -15,7 +15,12 @@ import { DeleteDialog } from './DeleteDialog.jsx';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 
+// One view per project (rule K, design review AG): nothing read for one project, or for none, is shown under another.
 export function MemorySection({ project }) {
+  return <MemoryViews key={project?.id ?? ''} project={project} />;
+}
+
+function MemoryViews({ project }) {
   const t = useT();
   const [found, setFound] = useState(null);
   const [problem, setProblem] = useState(null);
