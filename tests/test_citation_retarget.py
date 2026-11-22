@@ -152,6 +152,8 @@ async def test_a_pdf_3_passage_marked_only_past_its_quote_keeps_its_verdict_afte
         await send(client, conversation, QUESTION)
         before = await chip_of(client, conversation)
         assert (before["existence"], before["support"]) == ("ok", "supported") and "\ufffe" not in before["quote"]
+        assert await rows(client, "SELECT instr(text, char(65534)) > 0 FROM passages WHERE id = ?",
+                          before["passage_id"]) == [(1,)]  # the old passage text holds the mark
         monkeypatch.setattr(extraction, "extract", real)
         await read_as(client, monkeypatch, material, "markdown-1")
         await idle(client, project)
