@@ -454,6 +454,23 @@ def test_a_two_line_title_whose_second_line_begins_like_a_numbered_heading_stays
     assert all(p.section_path == [] for p in read)
 
 
+def test_a_word_broken_twice_after_a_kept_hyphen_keeps_both_and_a_new_line_starts_a_new_word():  # H5
+    data = _hyphen_page("We read the well-known", "de-", "cide on GPT-", "4o-", "mini today.")
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.text == "We read the well-known decide on GPT-4o-mini today."  # the flag is cleared at a line break
+
+
+def test_a_line_after_a_known_heading_never_joins_it():  # 1.0, its other half
+    read = _sections((12, "Abstract", BOLD), (12, "Synthetic Evidence on Wages", None),
+                     (None, "We study minimum wages in a synthetic panel.", None))
+    assert [p for _, p, t in read if t.startswith("We study")] == [["Synthetic Evidence on Wages"]]
+
+
+def test_a_bold_sentence_beginning_like_a_numbered_heading_is_text():  # G4
+    read = _sections((14, "2 Method", None), (None, "3 Regions report their wages in the panel.", BOLD))
+    assert [(k, p) for k, p, t in read if t.startswith("3 Regions")] == [("paragraph", ["2 Method"])]
+
+
 def test_a_table_piece_starting_on_a_wrapped_cell_has_its_range_in_order_over_all_its_characters():
     def row(y, *cells):
         return [(x, y, 10, cell) for x, cell in zip((72, 330, 430), cells)]

@@ -260,9 +260,10 @@ def retarget(conn, material_id):
     """Every citation of the paper, whatever an earlier reading or commit left it as, computed again from its quote
     and the paper's reading now (locate): its passage, version and that passage's page, found (ok), its verdict kept
     only when that passage's text is its old passage's, compared bare (B18 read through the join, Harold 2026-11-23;
-    with no old passage, the quote's when the quote is a whole passage). One no passage holds is left as it is: it reads as removed (answers.resolve_now) until a later
-    reading holds it. Called wherever a paper's reading changes (backend/materials.py: a reading's commit, and a
-    version added on a reading made already); nowhere else is a citation pointed (design review J, Option 1)."""
+    with no old passage, the quote's when the quote is a whole passage). One no passage holds is left as it is: it
+    reads as removed (answers.resolve_now) until a later reading holds it. Called wherever a paper's reading changes
+    (backend/materials.py: a reading's commit, and a version added on a reading made already); nowhere else is a
+    citation pointed (design review J, Option 1)."""
     for cid, quote, page, pid, text, ordinal in conn.execute(
             "SELECT c.id, c.quote, c.page, c.passage_id, p.text, p.ordinal FROM citations c"
             " LEFT JOIN passages p ON p.id = c.passage_id WHERE c.material_id = ?", (material_id,)).fetchall():

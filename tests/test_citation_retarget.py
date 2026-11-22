@@ -299,7 +299,7 @@ async def test_the_chooser_takes_the_citations_own_passage_then_its_text_then_it
         [(a, oa), (b, _), (c, oc), (d, _), (e, oe)] = passages
 
         def shape(conn):
-            conn.execute("UPDATE passages SET text = ? WHERE id = ?", (f"The old text, with {quote}.", b))
+            conn.execute("UPDATE passages SET text = ? WHERE id = ?", (f"The old te-xt, with {quote}.", b))  # bare: old
             conn.execute("UPDATE passages SET page = 7 WHERE id IN (?, ?)", (d, e))
         await asyncio.to_thread(db.write, shape)
 
@@ -312,6 +312,30 @@ async def test_the_chooser_takes_the_citations_own_passage_then_its_text_then_it
         assert await chosen(text="Gone.", page=7, passage_id=None, ordinal=oe) == e
         assert await chosen(text="Gone.", page=None, passage_id=None, ordinal=oe) == c  # with no page: pageless first,
         assert await chosen(text="Gone.", page=None, passage_id=None, ordinal=oa) == a  # then nearest its place
+        # pdf-4: texts and quotes are compared with U+FFFE, U+FFFF and hyphens set aside
+        assert await chosen(text=f"The ol\ufffed text, with {quote}.", page=7, passage_id=None, ordinal=oe) == b
+        assert await asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, "the\uffff quo-te")) is not None
+        assert await asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, "-\ufffe")) is None  # bare: empty
+        await asyncio.to_thread(db.write, lambda conn: conn.execute(
+            "UPDATE passages SET text = ? WHERE id = ?", ("Paragraph 0 holds the\uffff quote.", a)))
+        found = await asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, "Paragraph 0 holds the quote"))
+        assert found is not None and found[0] == a  # the passage's own marks set aside too
+
+
+async def test_a_citation_with_no_passage_keeps_its_verdict_when_its_quote_is_a_passage_but_for_the_mark(tmp_path):
+    # retarget's quote branch (no old passage), compared bare as its text branch is
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        assert await rows(client, "SELECT support FROM citations") == [("supported",)]
+
+        def removed_then_retargeted(conn):
+            conn.execute("UPDATE citations SET passage_id = NULL, existence = 'source_removed', quote = ?",
+                         (OLD.replace("earnings", "earn\ufffeings"),))
+            citations.retarget(conn, material)
+        await asyncio.to_thread(client.state["db"].write, removed_then_retargeted)
+        assert await rows(client, "SELECT existence, support FROM citations") == [("ok", "supported")]
 
 
 async def test_a_papers_reading_changes_only_where_its_citations_are_pointed_again():
