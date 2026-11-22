@@ -654,7 +654,7 @@ async def test_a_child_that_fails_fails_its_reading_cleanly_and_retry_reads_it(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("mode", "kind"), [
     *((("frame", name), extraction.PDF) for name in (
-        "long-passage", "empty-passage", "page-zero", "page-out-of-order", "no-page-in-a-pdf", "one-offset",
+        "long-passage", "empty-passage", "page-zero", "page-out-of-order", "no-page-in-a-pdf", "reversed-pdf-offsets", "one-offset",
         "confidence-past-one", "rectangle-backwards", "more-rectangles-than-characters", "progress-past-total")),
     *((("done", name), extraction.PDF)
       for name in ("page-past-pages", "scanned-past-pages", "ocr-needed-without-scans")),
@@ -663,7 +663,7 @@ async def test_a_child_that_fails_fails_its_reading_cleanly_and_retry_reads_it(
 ])
 async def test_a_value_outside_what_the_extraction_promises_is_a_wrong_frame(tmp_path, reading_stub, mode, kind):
     """Section 7.1 and backend/extraction.py: a passage of 1 to 2,000 characters; a PDF's passages on its
-    pages from 1, in order; offsets both there or neither, a text's start at most its end; rectangles in
+    pages from 1, in order; offsets both there or neither, the start at most the end (a PDF's too); rectangles in
     order, at most one a character; a confidence from 0 to 1; scanned pages at most the pages; none of
     these in a text."""
     reading_stub(*mode)
