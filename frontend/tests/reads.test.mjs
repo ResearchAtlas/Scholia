@@ -75,7 +75,8 @@ const READ = /(?<![.\w])(?:get|getBlob)\(|\bread = get\b/; // a GET asked, or ha
 // reload is the hook's (rule H). A new one, or a new dependency of a listed one, fails until it is looked at. What this
 // does not see: a callback that is a plain function of its draw (asked in the press that drew it, or carrying what it
 // asks for: ZoteroBrowser's more, AuditLog's export), a read asked through a function not named in READS or WRAPPED,
-// and a callback not assigned to a const; it counts parentheses, so an unbalanced one in a string would mislead it.
+// and a callback not assigned to a const; it counts parentheses, so an unbalanced one in a string or a comment fails it
+// (saying so) where the parentheses do not balance, and could mislead it where they still do.
 const WRAPPED = ['readGuardedAsks', 'searchProject']; // functions that ask a read named in READS
 const CALLBACKS = {
   'App.jsx: App: load': ['launchLanguage'],
@@ -113,7 +114,10 @@ test('every read says why another key\'s answer is not shown under it', () => {
   for (const [file, text] of Object.entries(sources)) {
     for (const made of text.matchAll(/const (\w+) = use(?:Callback|Memo)\(/g)) {
       let end = made.index + made[0].length;
-      for (let depth = 1; depth > 0; end += 1) depth += { '(': 1, ')': -1 }[text[end]] ?? 0;
+      for (let depth = 1; depth > 0; end += 1) {
+        assert.ok(end < text.length, `${file}: ${made[1]}: its parentheses do not balance (one in a string or a comment?)`);
+        depth += { '(': 1, ')': -1 }[text[end]] ?? 0;
+      }
       const call = text.slice(made.index + made[0].length, end - 1).split('\n').filter((line) => !/^\s*\/\//.test(line)).join('\n');
       const depends = /,\s*\[([^[\]]*)\]\s*$/.exec(call)?.[1].split(',').map((name) => name.trim()).filter(Boolean);
       assert.ok(depends, `${file}: ${made[1]} has no dependency list`);
