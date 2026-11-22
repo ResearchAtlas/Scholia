@@ -205,6 +205,20 @@ const scenarios = {
     assert.equal(s.of('p1'), 50);
     assert.equal(s.of('p2'), 0);
   },
+  // This review: the memory views. The record becomes not known and known again; the two reads answer in the other
+  // order. The project's memory is shown, and nothing was read for no project while one is open.
+  async memoryReadWithoutTheProjectIsNotShownOnceItIsKnown(w, strict) {
+    const s = await world(w, strict, memoryState(), 'Memory', 'MemorySection', { project: P1 });
+    assert.ok(s.screen().includes('Fact Alpha'));
+    s.server.hold('memory');
+    await s.redraw({ project: undefined });
+    await s.redraw({ project: P1 });
+    const late = s.server.asked.filter((r) => memories(r) && !r.path.includes('project_id'));
+    await s.releaseAll((r) => memories(r) && r.path.includes('project_id'));
+    await s.releaseAll(memories);
+    assert.ok(s.screen().includes('Fact Alpha'), 'the project\'s memory is not shown: a read for no project answered last');
+    assert.equal(late.length, 0, 'memory was read for no project while one is open');
+  },
 };
 
 // Green at the head: the behavior kept.

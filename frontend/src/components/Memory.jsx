@@ -16,7 +16,10 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 
 // One view per project (rule K, design review AG): nothing read for one project, or for none, is shown under another.
+// While the open project's record is not known (undefined) nothing is read for no project (rider M).
 export function MemorySection({ project }) {
+  const t = useT();
+  if (project === undefined) return <Section title={t('memory.title')} hint={t('memory.hint')}><LoadState /></Section>;
   return <MemoryViews key={project?.id ?? ''} project={project} />;
 }
 
