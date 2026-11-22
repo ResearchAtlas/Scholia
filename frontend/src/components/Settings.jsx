@@ -67,7 +67,7 @@ export function Settings({ open, onOpenChange, health, project, onLanguage, onPr
           {open && page === 'general' && <General onLanguage={onLanguage} projectId={project?.id} />}
           {open && page === 'providers' && <Providers />}
           {open && page === 'subagents' && <Subagents />}
-          {open && page === 'project' && project && <ThisProject project={project} onProjectChanged={onProjectChanged}
+          {open && page === 'project' && project && <ThisProject key={project.id} project={project} onProjectChanged={onProjectChanged}
             onOpenAdvanced={() => setPage('advanced')} />}
           {open && page === 'advanced' && <Advanced health={health} project={project} />}
         </div>
