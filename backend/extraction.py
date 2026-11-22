@@ -453,9 +453,9 @@ def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None,
         rects = _rects(char_boxes[a:b], page_size) if char_boxes and page_size else None
         if rects and (reading := _READING.get()) is not None:  # at most a piece's lines, counted as made
             reading.rectangles(len(rects))
-        if char_boxes is not None:  # a PDF piece: PDFium's characters it is made of
-            chars = [i for i in char_boxes[a:b] if i is not None]
-            first, last = (chars[0][4], chars[-1][4] + 1) if chars else (start, end)
+        if char_boxes is not None:  # a PDF piece: the span of PDFium's characters it is made of
+            chars = [i[4] for i in char_boxes[a:b] if i is not None]  # out of order in a wrapped table cell
+            first, last = (min(chars), max(chars) + 1) if chars else (start, end)
         elif located is not None:
             first, last = located[n], located[n + 1] if n + 1 < len(located) else end
         else:
@@ -640,6 +640,10 @@ def _pdf_page(page, raw, measure=False):
                     box = (left, bottom, right, top, at, len(lines), raw.FPDFText_GetFontSize(textpage, at))
             elif not char.isspace():
                 mapped += 1
+            if char == "\ufffe":  # PDFium's line-end hyphen, its line joined to the next: dropped as _join drops "-"
+                if text[index + 1:index + 2].islower():
+                    continue
+                char = "-"  # before a capital or a digit, a compound's (Self-CheckGPT, Llama-7B)
             chars.append(char)
             boxes.append(box)
         if chars:

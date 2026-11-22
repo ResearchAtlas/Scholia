@@ -1120,8 +1120,8 @@ async def test_every_synthetic_material_reads_in_its_child_as_in_process(tmp_pat
 
 def wrapped_table_pdf(rows=24, pad=8):
     """A PDF table past MAX_PASSAGE whose rows' first cells wrap onto a line of their own: a piece of it
-    begins on a wrapped line, whose characters PDFium numbers after its row's later cells, so its
-    char_start (its first character's index) is past its char_end (its last's)."""
+    begins on a wrapped line, whose characters PDFium numbers after its row's later cells (its range
+    the span of its characters, not its first's index to its last's, which would run backwards)."""
     y, page = 1900, []
     for r in range(rows):
         page += [(72, y, 10, f"Employment rate group {r:02d}" + "x" * pad),
@@ -1132,10 +1132,11 @@ def wrapped_table_pdf(rows=24, pad=8):
 
 
 @pytest.mark.asyncio
-async def test_a_pdf_table_whose_pieces_offsets_run_backwards_reads_the_same_in_its_child(tmp_path):
+async def test_a_pdf_table_piece_beginning_on_a_wrapped_line_reads_the_same_in_its_child(tmp_path):
     data = wrapped_table_pdf()
     expected = extraction.extract(data, extraction.PDF)
-    assert any(p.char_start > p.char_end for p in expected.passages if p.char_start is not None)  # the case
+    assert expected.passages[1].text.startswith("aged 25 | ")  # the case
+    assert all(p.char_start <= p.char_end for p in expected.passages)
     path, sha256 = stored(tmp_path, data)
     assert await asyncio.to_thread(reading.read, path, sha256, extraction.PDF) == expected and gone()
 

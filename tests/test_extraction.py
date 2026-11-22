@@ -330,6 +330,53 @@ def test_a_wrapped_cell_in_a_tables_last_row_joins_its_row():
     assert "Text after the table, further down." in [p.text for p in read.passages]
 
 
+def _pdfium_text(data):
+    import pypdfium2 as pdfium
+
+    with extraction.PDFIUM:
+        document = pdfium.PdfDocument(data)
+        try:
+            textpage = document[0].get_textpage()
+            return textpage.get_text_range(), textpage.count_chars()
+        finally:
+            document.close()
+
+
+def test_a_line_end_hyphen_pdfium_gives_as_u_fffe_joins_a_broken_word_and_stays_a_compounds_hyphen():
+    page = [(72, 750, 18, "A Synthetic Paper"), (72, 720, 14, "2 Retrieval-Aug-"), (72, 704, 14, "mented Generation"),
+            (72, 680, 10, "Minimum wages raise the earnings of workers who de-"), (72, 668, 10, "cide to stay, as the Self-"),
+            (72, 656, 10, "CheckGPT method and Llama-"), (72, 644, 10, "7B show for the panel.")]
+    data = synthetic.pdf([page])
+    text, count = _pdfium_text(data)
+    assert text.count("\ufffe") == 4 and len(text) == count  # each line-end hyphen, its line joined to the next
+    [title, passage] = extract(data, extraction.PDF).passages
+    assert passage.text == ("Minimum wages raise the earnings of workers who decide to stay, as the Self-CheckGPT method"
+                            " and Llama-7B show for the panel.")
+    assert passage.section_path == ["2 Retrieval-Augmented Generation"]
+    # Its range is still of PDFium's characters, the dropped hyphen's among them, and its box the lines'.
+    assert (passage.char_start, passage.char_end) == (text.index("Minimum"), count)
+    [[left, top, right, bottom]] = passage.boxes["rects"]
+    assert 0.11 < left < 0.13 and 0.13 < top < bottom < 0.2 and 0.5 < right < 0.52
+
+
+def test_a_table_piece_starting_on_a_wrapped_cell_has_its_range_in_order_over_all_its_characters():
+    def row(y, *cells):
+        return [(x, y, 10, cell) for x, cell in zip((72, 330, 430), cells)]
+
+    page = row(750, "Region", "Workers", "Share")
+    for n in range(35):  # rows enough that the table is cut in two at the last row's sentence end
+        page += row(738 - 12 * n, f"Synthetic district number {n:02d} of the panel", str(100 + n), "0.40")
+    page += [*row(318, "Districts named in the notes.", "88", "0.30"), (72, 306, 10, "synthetic panel")]  # wrapped
+    data = synthetic.pdf([page])
+    text, count = _pdfium_text(data)
+    first, last = extract(data, extraction.PDF).passages
+    assert (first.kind, last.kind, last.text) == ("table", "table", "synthetic panel | 88 | 0.30")
+    # PDFium numbers the wrapped line after the row's later cells: the piece spans from "88" to "panel".
+    assert text.index("88") < text.index("synthetic panel")
+    assert (last.char_start, last.char_end) == (text.index("88"), text.index("synthetic panel") + len("synthetic panel"))
+    assert (first.char_start, first.char_end) == (0, text.index("notes.") + len("notes."))
+
+
 def pixels(image):
     """A PNG from render_page as rows of darkness (0 white to 255 black), from its unfiltered rows."""
     width, height = struct.unpack(">II", image[16:24])
