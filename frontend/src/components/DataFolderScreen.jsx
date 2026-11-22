@@ -48,7 +48,7 @@ export function DataFolderScreen({ health }) {
         ) : (
           <form onSubmit={submit} className="mt-6 grid gap-3 border-t pt-5">
             <h2 className="text-sm font-semibold">{t('dataFolder.chooseTitle')}</h2>
-            <FolderField label={t('folder.label')} hint={t('dataFolder.chooseHint')} value={path} onChange={setPath} />
+            <FolderField label={t('folder.label')} hint={t('dataFolder.chooseHint')} value={path} onChange={setPath} readOnly={busy} />
             {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
             <Button type="submit" className="justify-self-start" disabled={busy || !path.trim()}>{t('dataFolder.use')}</Button>
           </form>

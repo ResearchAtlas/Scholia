@@ -181,6 +181,22 @@ async def test_a_failed_title_call_fails_only_the_title_run(tmp_path):
         assert (found["title"], found["turns"][0]["status"]) == (None, "succeeded")
 
 
+async def test_a_title_reply_holding_half_a_surrogate_pair_ends_its_run_with_the_replacement_character(tmp_path):
+    # PR 57's Fable recheck (P3): a provider's JSON escape gave half a pair, the terminal write could not store it, and
+    # the title run stayed running for good. A model's text gets the replacement character, as a file's text does.
+    provider = MockProvider()
+    provider.title_replies.append((200, b'{"choices": [{"message": {"role": "assistant", "content": "Wage \\ud83d floors"}}],'
+                                        b' "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5,'
+                                        b' "cost": 0.0003}}'))
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        assert (await send(client, conversation_id))[-1]["status"] == "succeeded"
+        await background_idle(client)
+        assert await rows(client, "SELECT status FROM runs WHERE kind = 'background' AND workflow = 'title'") == [
+            ("succeeded",)]
+        assert (await conversation(client, conversation_id))["title"] == "Wage \ufffd floors"
+
+
 # The recovery rules, applied when the app starts
 
 
@@ -364,18 +380,22 @@ async def test_a_stop_that_comes_while_the_title_commits_is_told_the_title_was_w
         real = runs_module.Harness._finish_background
 
         def paused_after_the_check(self, conn, active, *args, **kwargs):
+            # the title run only: the turn's memory extraction, another background run, may finish first (CI run
+            # 44790842779, where it took this pause and the title run then met the cancel)
+            title_run = conn.execute("SELECT workflow FROM runs WHERE id = ?", (active.run_id,)).fetchone()[0] == "title"
             running = active.cancel_requested.is_set()
             real(self, conn, active, *args, **kwargs)  # checks, writes the title, then pauses before COMMIT
-            if not running:
+            if title_run and not running:
                 checked.set()
-                resume.wait(5)
+                assert resume.wait(10)
 
         monkeypatch.setattr(runs_module.Harness, "_finish_background", paused_after_the_check)
         await send(client, conversation_id)
-        await asyncio.to_thread(checked.wait, 5)
+        assert await asyncio.to_thread(checked.wait, 10)
         title = await title_run(client)
+        active = client.state["harness"].registry.runs[title]
         cancel = asyncio.create_task(client.post(f"/api/runs/{title}/cancel"))
-        await asyncio.sleep(0.1)
+        await wait_for(active.cancel_requested.is_set)  # the stop has come while the title commits (PR 63's recheck r2)
         resume.set()
         assert (await cancel).json()["status"] == "succeeded"  # the reply says how it ended
         await background_idle(client)

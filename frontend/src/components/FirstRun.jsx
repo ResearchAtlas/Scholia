@@ -66,7 +66,7 @@ export function FirstRun({ onDone }) {
             <div className="relative mt-1.5">
               <KeyRound className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
               <Input id="key" type="password" autoComplete="off" spellCheck={false} value={key} required
-                onChange={(event) => setKey(event.target.value)} className="h-10 pl-9 font-mono" autoFocus />
+                onChange={(event) => setKey(event.target.value)} className="h-10 pl-9 font-mono" autoFocus readOnly={busy} />
             </div>
             <div className="mt-2 flex flex-wrap justify-between gap-2 text-xs text-muted-foreground">
               <a href={KEY_HELP} target="_blank" rel="noreferrer noopener" className="text-brand underline-offset-2 hover:underline">
@@ -85,9 +85,9 @@ export function FirstRun({ onDone }) {
             {warning && <p role="status" className="mt-3 rounded-lg bg-warning/10 px-3 py-2 text-sm text-warning">{warning}</p>}
             <label htmlFor="project" className="mt-5 block text-sm font-medium">{t('project.nameLabel')}</label>
             <Input id="project" value={name} maxLength={200} onChange={(event) => setName(event.target.value)}
-              placeholder={t('project.namePlaceholder')} className="mt-1.5 h-10" autoFocus />
+              placeholder={t('project.namePlaceholder')} className="mt-1.5 h-10" autoFocus readOnly={busy} />
             <div className="mt-5">
-              <HoldsChoice value={holds} onChange={setHolds} venue={venue} onVenue={setVenue} name="first-project-holds" />
+              <HoldsChoice value={holds} onChange={setHolds} venue={venue} onVenue={setVenue} name="first-project-holds" disabled={busy} />
             </div>
             {problem && <p role="alert" className="mt-4 text-sm text-destructive">{problem}</p>}
             <div className="mt-6 flex gap-2">

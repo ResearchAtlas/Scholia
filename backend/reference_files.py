@@ -50,9 +50,10 @@ is never refused for a macro; one whose title is a macro has no title (no_title)
 """
 
 import io
-import json
 import logging
 import re
+
+from backend import whole_json as json
 from backend.extraction import ARXIV, DOI_CHARS, Unreadable
 from backend.settings import visible
 
@@ -94,7 +95,7 @@ _SPACES_AROUND = " \t\r\n"  # all an identifier's value may have around it
 _UNREADABLE = object()  # a field's value that is not one: continued, given twice differently, or not text
 _LATEX = re.compile(r"[\\{}$~]")
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")  # Unicode's control characters (Cc)
-_SURROGATE = re.compile("[\ud800-\udfff]")  # half a pair, which only JSON's escapes can give: no text holds one
+_SURROGATE = re.compile("[\ud800-\udfff]")  # half a pair: JSON's escapes, or its raw bytes (surrogatepass), give one
 # bibtexparser's block start (splitter._BLOCK_START, `@[\w]*( |\t)*(?=[{(])`, a test holds them equal), its
 # run of spaces a plain repeat here: the parser's group keeps state for each space it passes.
 _BLOCK_START = re.compile(r"@\w*[ \t]*(?=[{(])")
@@ -702,7 +703,7 @@ def _list(value):
 
 def _text(value, limit):
     """A field's text: cut before it is worked on, its control characters made spaces and half a
-    surrogate pair (JSON's escapes can give one) the replacement character, its whitespace collapsed,
+    surrogate pair (JSON's escapes or raw bytes can give one) the replacement character, its whitespace collapsed,
     cut to limit characters; None when nothing visible is left."""
     if isinstance(value, int) and not isinstance(value, bool):  # a volume or page CSL JSON gives as a number
         value = str(value)

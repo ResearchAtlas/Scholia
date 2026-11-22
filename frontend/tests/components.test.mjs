@@ -503,8 +503,8 @@ test('a paper\'s new file, saved details and deletion are library changes', () =
   // and a page's notice and Saved line are not carried to the next page opened (review F2)
   assert.match(library, /function openPaper\(found\) \{\s*setFeedback\(\{\}\);\s*setOpen\(found\);/);
   assert.equal([...library.matchAll(/setOpen\(/g)].length, 1); // only through openPaper
-  // a project's deletion in the Sidebar moves the papers' generation (rider 2: a memory change does not)
-  assert.match(source('Sidebar.jsx'), /if \(kind === 'deleteProject'\) libraryChanged\(null\);/);
+  // a project's deletion in the Sidebar moves the papers' generation (rider 2: a memory change does not): drawn, as its
+  // request settles, in tests/window_scenarios.test.mjs (deleteProjectFailed, deleteConversation)
   // a chosen paper whose title is being read again (library.js) is named, never blank
   assert.match(source('ConversationView.jsx'), /chosen\.map\(\(paper\) => \(\{ \.\.\.paper, title: paper\.title \?\? t\('composer\.chosenPaper'\) \}\)\)/);
 });

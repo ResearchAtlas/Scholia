@@ -18,11 +18,35 @@ const stops = new Map(); // conversation id -> how many times Stop was pressed i
 const followed = new Set(); // run ids a waiting message was started after here, or refused on its merits (one a turn)
 const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut, notices }, for this window
 const listeners = new Set();
+const gone = new Set(); // conversations known to be deleted: nothing of them is held here again (an id is never reused
+// within a window: a restore, which brings back earlier ids, reloads it: Backups.jsx, design review AB)
+const unsavedIn = new Map(); // run id -> its conversation, for each answer in unsaved
 
 function set(conversationId, turn, eventType) {
-  if (turn) turns.set(conversationId, turn);
+  if (turn && !gone.has(conversationId)) turns.set(conversationId, turn);
   else turns.delete(conversationId);
   for (const listener of listeners) listener(conversationId, turn, eventType);
+}
+
+// A conversation known to be deleted (its deletion answered, or its record's read answered 404): its live turn and its
+// answers shown but not saved go, its stream is closed, and nothing of it is taken in or sent from here again (design
+// review Z).
+export function forget(conversationId) {
+  if (gone.has(conversationId)) return; // known already: nothing of it is held here, and it was said
+  gone.add(conversationId);
+  for (const [runId, owner] of unsavedIn) if (owner === conversationId) { unsaved.delete(runId); unsavedIn.delete(runId); }
+  aborts.get(conversationId)?.abort();
+  set(conversationId, null, 'deleted');
+}
+// Whether a conversation is known deleted here: what would open it, list it or ask for it looks first (design review AE).
+export const forgotten = (conversationId) => gone.has(conversationId);
+export const deleted = (error) => error instanceof ApiError && error.status === 404 && error.code === 'not_found';
+// As a deletion's request settles (a project's takes its conversations; a failed one may have happened): each
+// conversation held here is asked for, and forgotten if its own record answers 404. Never by a list.
+export function recheck() {
+  for (const id of new Set([...turns.keys(), ...unsavedIn.values()])) {
+    get(`/api/conversations/${encodeURIComponent(id)}`).catch((error) => { if (deleted(error)) forget(id); });
+  }
 }
 
 export function subscribe(listener) {
@@ -68,6 +92,7 @@ export function send(conversationId, path, body, text, since = stopsAt(conversat
     return Promise.reject(new ApiError(409, 'stopped'));
   }
   if (aborts.has(conversationId)) return Promise.reject(new ApiError(409, 'active_run'));
+  if (gone.has(conversationId)) return Promise.reject(new ApiError(404, 'not_found'));
   const abort = new AbortController();
   let turn = { text, runId: null, answer: null, done: false };
   aborts.set(conversationId, abort);
@@ -90,17 +115,19 @@ export function send(conversationId, path, body, text, since = stopsAt(conversat
       if (event.type === 'open_place' && shown?.conversationId === conversationId && shown.projectId === event.project_id) {
         openPlace(event.place);
       }
-      if (event.type === 'chat_response' && event.result_saved === false && turn.runId) {
+      if (event.type === 'chat_response' && event.result_saved === false && turn.runId && !gone.has(conversationId)) {
+        unsavedIn.set(turn.runId, conversationId);
         unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut), ...(event.notices ? { notices: event.notices } : {}) });
       }
       set(conversationId, turn, event.type);
       if (turn.runId) admitted();
     }, abort.signal).catch((error) => {
-      if (turn.runId) return;
-      if (error.name === 'AbortError') return; // stopped before it was admitted: it ends done, starting nothing
+      if (turn.runId) return; // admitted, its stream lost: it was sent, and the record says what followed
       release();
       set(conversationId, null, 'refused');
-      refused(error);
+      // Stop pressed before it was admitted: not sent, as one Stop refuses before its request (recheck r4, against
+      // design review X: what was not sent is given back)
+      refused(error.name === 'AbortError' ? new ApiError(409, 'stopped') : error);
     }).finally(() => {
       if (!turn.done) turn = { ...turn, done: true };
       if (release() && turns.get(conversationId) && turns.get(conversationId) !== turn) set(conversationId, turn, 'run_finished');
@@ -123,19 +150,27 @@ export function send(conversationId, path, body, text, since = stopsAt(conversat
 // (not_queued) gives way to the next, read again. The backend starts it only while that turn is still the latest,
 // succeeded and not stopped from any window (nor its stream closed before its end was recorded), and once. After any
 // other ending it waits with Send.
+const edited = new Set(); // waiting messages whose editor is open here: none starts on its own meanwhile (design review X, rider Q)
+export function editing(conversationId, id, open) {
+  if (open) edited.add(id);
+  else if (edited.delete(id)) drain(conversationId); // closed: it may start now, if the record still says so
+}
+
 export async function drain(conversationId) {
   const pressed = stopsAt(conversationId);
-  const free = () => !aborts.has(conversationId) && !halted.has(conversationId) && stopsAt(conversationId) === pressed;
+  // nothing known deleted is asked for again: its 404 would be knowledge the window already has (design review AE)
+  const free = () => !gone.has(conversationId) && !aborts.has(conversationId) && !halted.has(conversationId) && stopsAt(conversationId) === pressed;
   for (let tries = 0; tries < 3 && free(); tries += 1) {
     let read;
     try {
       read = await get(`/api/conversations/${encodeURIComponent(conversationId)}`);
-    } catch {
+    } catch (error) {
+      if (deleted(error)) forget(conversationId);
       return; // it waits, as the conversation shows when it is read
     }
     const after = read?.turns?.at(-1)?.run_id;
     const next = routes.has(after) ? nextQueued(read, after) : null; // a turn sent elsewhere: that window starts it
-    if (!next || !free() || followed.has(after)) return;
+    if (!next || edited.has(next.id) || !free() || followed.has(after)) return;
     try {
       await send(conversationId, `/api/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(next.id)}/send`,
         { after }, next.text, pressed, true);

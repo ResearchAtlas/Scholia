@@ -51,7 +51,6 @@ committed, and Needs attention otherwise, with its reason.
 import asyncio
 import base64
 import binascii
-import json
 import logging
 import time
 from typing import Annotated
@@ -60,6 +59,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from backend import whole_json as json
 from backend import asks, backups, extraction, lookup, memory, reading, search
 from backend.db import ContentCorruptError, delete, new_id, utc_now
 from backend.db.deletion import supersede
@@ -67,7 +67,7 @@ from backend.outbound_gate import OutboundDenied
 from backend.runs import (AdmissionError, RunOutcome, _event, _revoked, _running, _through, derived_status,
                           may_dispatch)
 from backend.settings import visible
-from backend.citations import QUOTE_CHARS  # S1-19b: a quote's cap
+from backend import citations  # design review J: a reading's commit points its papers' citations again
 from backend import reference_files  # S1-14: a reference file's paper is identified by its record
 
 log = logging.getLogger(__name__)
@@ -271,7 +271,7 @@ def add_version(conn, harness, project_id, material, sha256, kind, origin, recor
     if shared is not None:  # read already, for another project or version: shared, not read again
         if indexed := _queue_adds(conn, shared[0], project_id):  # a reading with passages: indexed, offered for
             search.queued(conn, harness, project_id, origin, recorded)
-        _resolve(conn, sha256, (extractor, extractor_version), shared[0])  # its citations follow the file, as at a reading
+        citations.retarget(conn, material)  # its citations follow the file, as at a reading
     else:
         run = recorded(conn, project_id, "extract", {"material_ids": [material], "version_id": version,
                                                      "origin": origin})
@@ -503,8 +503,8 @@ def _serve(conn, sha256, extractor, extraction_id, record, gives=False, harness=
     conversation shows its ask). A lookup made for that version since, or one that has still to read
     its identifiers, covers it. record(conn, project id, workflow, inputs) records those runs. The
     earlier readings are then removed through the deletion service (deletion.supersede): they do not
-    stay. The citations without a passage of any version it reads are resolved again through their
-    quotes (_resolve)."""
+    stay. Before that, the citations of every paper it is the reading of are pointed again from their quotes
+    (citations.retarget, design review J's one chooser)."""
     # Readings of the file by another version of the extractor are no version's reading now: their
     # passages leave the index of every project whose current version reads the file (a replaced
     # version's left it at its replacement), and then the readings go.
@@ -516,6 +516,7 @@ def _serve(conn, sha256, extractor, extraction_id, record, gives=False, harness=
             " JOIN projects p ON p.id = m.project_id WHERE v.file_sha256 = ? AND v.is_current = 1", (sha256,)).fetchall():
         if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
             continue
+        citations.retarget(conn, material)  # before the earlier readings go: each still has its old passage's text
         removing = False
         for earlier in older:
             removing = _queue_removes(conn, earlier, project) or removing
@@ -537,58 +538,6 @@ def _serve(conn, sha256, extractor, extraction_id, record, gives=False, harness=
                                              "origin": json.loads(latest[1]) if latest[1] else None})
     for earlier in older:  # each project's index has its removal queued now (above, or when its paper left)
         supersede(conn, earlier, extraction_id)
-    _resolve(conn, sha256, extractor, extraction_id)
-
-
-def _resolve(conn, sha256, extractor, extraction_id):
-    """Citations of a version this reading is the reading of that have no passage (left unresolved by
-    an earlier reading, or so from the start) are resolved again through their quotes (section 7.1):
-    each points at the first of its passages holding its quote, on the citation's page first, and
-    one that was not found exists again (ok). A citation of a removed source (source_removed) has no
-    version to go by and is left as it is."""
-    for citation, quote, page, kind in conn.execute(
-            "SELECT c.id, c.quote, c.page, coalesce(v.media_type, f.media_type) FROM citations c"
-            " JOIN material_versions v ON v.id = c.material_version_id LEFT JOIN content_files f ON f.sha256 = v.file_sha256"
-            " WHERE c.passage_id IS NULL AND c.existence != 'source_removed' AND c.quote != '' AND v.file_sha256 = ?",
-            (sha256,)).fetchall():
-        if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
-            continue
-        found = conn.execute("SELECT id, page, text FROM passages WHERE extraction_id = ? AND instr(text, ?) > 0"
-                             " ORDER BY page IS NOT ?, ordinal LIMIT 1", (extraction_id, quote, page)).fetchone()
-        if found is not None:
-            # S1-19b: a support verdict was given for the passage's whole text; it stands only when the passage
-            # found is that text, which the quote shows only when it held the whole passage (shorter than its
-            # cap), else the citation is unchecked until checked again.
-            conn.execute("UPDATE citations SET passage_id = ?, page = coalesce(?, page),"
-                         " existence = CASE existence WHEN 'not_found' THEN 'ok' ELSE existence END,"
-                         " support = CASE WHEN ? THEN support ELSE 'unchecked' END,"
-                         " support_run_id = CASE WHEN ? THEN support_run_id END WHERE id = ?",
-                         (found[0], found[1], *[found[2] == quote and len(quote) < QUOTE_CHARS] * 2, citation))
-    # M2 audit: a citation of a paper whose current file this reading reads, still on a passage of another reading (its
-    # file replaced, or the same bytes read as another format), points at this reading's passage holding its quote,
-    # never a reference passage (section 7.1: not evidence), its old passage's text first, then its page, so its chip
-    # opens and highlights it there, at that passage's page (none for a file without pages). Its verdict stands only
-    # when that passage's text is its old passage's (B18). One stored removed while its quote was gone (an answer
-    # committed during a replacement) exists again, on this reading's passage, even one it already points at (its own
-    # file restored, whose reading is shared again). One whose quote is not here keeps its passage, and reads as
-    # removed (answers.resolve_now).
-    for citation, quote, page, text, version, kind in conn.execute(
-            f"SELECT d.id, d.quote, d.page, p.text, v.id, {_VERSION_TYPE} FROM citations d"
-            " JOIN passages p ON p.id = d.passage_id"
-            " JOIN material_versions v ON v.material_id = d.material_id AND v.is_current = 1"
-            " LEFT JOIN content_files c ON c.sha256 = v.file_sha256"
-            " WHERE v.file_sha256 = ? AND (p.extraction_id != ? OR d.existence = 'source_removed')"
-            " AND d.existence IN ('ok', 'source_removed') AND d.quote != ''", (sha256, extraction_id)).fetchall():
-        if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
-            continue
-        found = conn.execute("SELECT id, page, text FROM passages WHERE extraction_id = ? AND kind != 'reference'"
-                             " AND instr(text, ?) > 0 ORDER BY text IS NOT ?, page IS NOT ?, ordinal LIMIT 1",
-                             (extraction_id, quote, text, page)).fetchone()
-        if found is not None:
-            conn.execute("UPDATE citations SET passage_id = ?, material_version_id = ?, page = ?, existence = 'ok',"
-                         " support = CASE WHEN ? THEN support ELSE 'unchecked' END,"
-                         " support_run_id = CASE WHEN ? THEN support_run_id END WHERE id = ?",
-                         (found[0], version, found[1], *[found[2] == text] * 2, citation))
 
 
 async def read_outdated(harness):
@@ -1172,6 +1121,8 @@ async def change_material(material_id: str, body: MaterialChange, request: Reque
         row = conn.execute("SELECT title, csl, project_id FROM materials WHERE id = ?", (material_id,)).fetchone()
         if row is None:
             raise _refused(404, "not_found", "No such material")
+        if not changes:  # a change of nothing is no edit: the paper is not marked as the researcher's
+            return _describe(conn, _material_row(conn, material_id), harness.registry), []
         csl = json.loads(row[1]) if row[1] else {}
         moved = "doi" in changes and doi != (csl.get("DOI") or None)  # changed or cleared
         if moved:

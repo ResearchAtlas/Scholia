@@ -224,7 +224,7 @@ export function openPaperAt(projectId, materialId, target) {
   libraryEvents.dispatchEvent(new Event('open'));
 }
 export function takeOpening(projectId) {
-  if (opening?.projectId !== projectId) return null;
+  if (!opening || opening.projectId !== projectId) return null; // none waiting: a Library drawn for no project takes none
   const found = opening;
   opening = null;
   return { id: found.id, target: found.target };

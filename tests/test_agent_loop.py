@@ -196,6 +196,22 @@ async def test_the_route_and_effort_stay_the_turns_through_its_steps_and_a_wait(
         assert answer["content"] == "The researcher answered: Jobs"
 
 
+@pytest.mark.asyncio
+async def test_an_ask_holding_half_a_surrogate_pair_is_listed_with_the_replacement_character(tmp_path):
+    # PR 57's Fable recheck (P3): a tool call's arguments gave half a pair by a JSON escape, and its ask could not be
+    # listed while open (a 500). A model's text gets the replacement character, as a file's text does.
+    provider = Scripted([call("ask", question="Which outcome \ud83d?", options=["Earnings \udc00", "Jobs"])], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        assert (ask["params"]["question"], ask["params"]["labels"]["1"]) == ("Which outcome \ufffd?", "Earnings \ufffd")
+        answered = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "1"})
+        assert answered.status_code == 200
+        assert (await sending)[-1]["status"] == "succeeded"
+
+
 async def asked(client, conversation, timeout=10.0):
     deadline = asyncio.get_running_loop().time() + timeout
     while True:

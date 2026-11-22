@@ -24,11 +24,12 @@ primary commit with the answer.
 """
 
 import hashlib
-import json
 import re
 
+from backend import whole_json as json
 from backend import provenance
 from backend.context import MESSAGE_FRAMING, REPLY_FRAMING, count
+from backend.db.deletion import _reads_now
 from backend.evidence import CITATION
 from backend.search_index import readings, still_read
 
@@ -194,7 +195,6 @@ def check_existence(conn, project_id, text, numbered):
     spans = sentences(text)
     cited = [n for _, _, n in markers(text) if n in numbered]
     current = still_read(conn, project_id, {(numbered[n]["passage_id"], numbered[n]["material_id"]) for n in cited})
-    by_material = {}
     out = []
     for offset, marker, number in markers(text):
         sentence = _sentence_of(spans, text, offset)
@@ -213,15 +213,11 @@ def check_existence(conn, project_id, text, numbered):
             continue
         # Re-read since: a current reading of its paper that holds its quote still supports it (status.md,
         # decided 2026-10-17 (8)); otherwise the source was removed.
-        if record["material_id"] not in by_material:
-            by_material[record["material_id"]] = readings(conn, project_id, references=False,
-                                                          materials=[record["material_id"]])
-        holder = next((pid for pid, r in by_material[record["material_id"]].items() if quote and quote in r[4]), None)
+        holder = locate(conn, record["material_id"], quote, record["text"], record.get("page")) if quote else None
         if holder is not None:
-            r = by_material[record["material_id"]][holder]
             # the judge is shown what the passage says now, never the old text (a verdict belongs to the text judged)
-            out.append({**row, **found, "passage_id": holder, "material_version_id": r[7], "page": r[5],
-                        "judged_text": r[4], "existence": "ok"})
+            out.append({**row, **found, "passage_id": holder[0], "material_version_id": holder[3], "page": holder[1],
+                        "judged_text": holder[2], "existence": "ok"})
         else:  # its paper or passage may be gone: the row keeps only what still exists (foreign keys), no quote
             kept = {k: v for k, v, table in (("material_id", found["material_id"], "materials"),
                                              ("material_version_id", found["material_version_id"], "material_versions"),
@@ -232,6 +228,40 @@ def check_existence(conn, project_id, text, numbered):
                         # its quote only while its paper is there, so a later reading holding it can resolve it
                         **({} if kept else {"quote": None, "sentence": None}), "existence": "source_removed"})
     return out
+
+
+def locate(conn, material_id, quote, text=None, page=None, passage_id=None, ordinal=None):
+    """The one choice of the passage a citation of this paper points at (section 7.1: citations re-resolve through
+    their quotes; design review J, Option 1): in the paper's reading now (deletion._reads_now, as every reader takes
+    it), never a reference passage (not evidence), one holding the quote (a row with no quote: its old passage's
+    text): the passage it is on first, then one with its old passage's text, then on its page, then nearest its place.
+    (id, page, text, version id), or None: no passage holds it, or the paper is not read now."""
+    if not (quote or text):
+        return None
+    return conn.execute(
+        f"SELECT p.id, p.page, p.text, w.id FROM material_versions w JOIN extractions e ON {_reads_now('w', 'e')}"
+        " JOIN passages p ON p.extraction_id = e.id WHERE w.material_id = ? AND p.kind != 'reference'"
+        " AND instr(p.text, ?) > 0 ORDER BY p.id IS NOT ?, p.text IS NOT ?, p.page IS NOT ?,"
+        " abs(p.ordinal - coalesce(?, 0)) LIMIT 1", (material_id, quote or text, passage_id, text, page, ordinal)).fetchone()
+
+
+def retarget(conn, material_id):
+    """Every citation of the paper, whatever an earlier reading or commit left it as, computed again from its quote
+    and the paper's reading now (locate): its passage, version and that passage's page, found (ok), its verdict kept
+    only when that passage's text is its old passage's (B18; with no old passage, the quote's when the quote is a
+    whole passage). One no passage holds is left as it is: it reads as removed (answers.resolve_now) until a later
+    reading holds it. Called wherever a paper's reading changes (backend/materials.py: a reading's commit, and a
+    version added on a reading made already); nowhere else is a citation pointed (design review J, Option 1)."""
+    for cid, quote, page, pid, text, ordinal in conn.execute(
+            "SELECT c.id, c.quote, c.page, c.passage_id, p.text, p.ordinal FROM citations c"
+            " LEFT JOIN passages p ON p.id = c.passage_id WHERE c.material_id = ?", (material_id,)).fetchall():
+        found = locate(conn, material_id, quote, text, page, pid, ordinal)
+        if found is not None:
+            same = found[2] == text if text is not None else found[2] == quote and len(quote) < QUOTE_CHARS
+            conn.execute("UPDATE citations SET passage_id = ?, material_version_id = ?, page = ?, existence = 'ok',"
+                         " support = CASE WHEN ? THEN support ELSE 'unchecked' END,"
+                         " support_run_id = CASE WHEN ? THEN support_run_id END WHERE id = ?",
+                         (found[0], found[3], found[1], same, same, cid))
 
 
 def pairs(checked):

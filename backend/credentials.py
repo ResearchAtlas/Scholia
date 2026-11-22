@@ -6,13 +6,13 @@ the caller shows a warning. Reading takes the store's key when it has one, and
 the file's otherwise.
 """
 
-import json
 import logging
 import threading
 from pathlib import Path
 
 import keyring
 
+from backend import whole_json as json
 from backend.settings import write_private
 
 SERVICE = "io.github.researchatlas.scholia"  # the Keychain service, the same as the bundle id

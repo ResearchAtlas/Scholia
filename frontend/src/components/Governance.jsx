@@ -3,7 +3,7 @@
 // protection, the OpenRouter key's data-settings confirmation, declared model servers on this
 // Mac, the Private allowlist and the audit log. Scholia cannot verify a confirmation or a
 // declaration, and says so where each is made.
-import { useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useState } from 'react';
 import { ExternalLink, Lock, ShieldCheck } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, confirmedChange, del, get, post, put } from '../api.js';
@@ -311,7 +311,8 @@ export function PrivateAllowlist() {
       </ul>
       <form className="space-y-1.5" onSubmit={async (event) => {
         event.preventDefault();
-        if (await change(`${MODEL}${adding.trim()}`, { enabled: true })) setAdding('');
+        const sent = adding; // cleared only if it is still what was added
+        if (await change(`${MODEL}${sent.trim()}`, { enabled: true })) setAdding((now) => (now === sent ? '' : now));
       }}>
         <label htmlFor="allowlist-add" className="text-sm font-medium">{t('allowlist.addLabel')}</label>
         <div className="mt-1.5 flex gap-2">
@@ -331,77 +332,87 @@ const PAGE = 50;
 // clearing, which asks first and leaves a record.
 export function AuditLog({ project }) {
   const t = useT();
-  const language = useContext(LanguageContext);
-  const [scope, setScope] = useState(project ? 'project' : 'all');
-  const [page, setPage] = useState(null); // { entries, next, allowed_off_this_mac }
-  const [read, setRead] = useState(null);
+  // An open project, known or not (undefined: its record is read again), is its own default; while its record is not
+  // known nothing is read or exported in its name, nor for no project (the batch J review; recheck r9's class).
+  // Everything needs no project: it can be chosen, read, paged and exported whenever one is open (design review AG, c).
+  const [scope, setScope] = useState(project === null ? 'all' : 'project');
+  const waiting = scope === 'project' && project === undefined; // null: no project open now, so the whole log
+  const projectId = scope === 'project' ? project?.id ?? null : null;
+  const [changes, setChanges] = useState(0); // each export or clearing that went ahead: the log is read anew
   const [exported, setExported] = useState(null);
   const [ask, dialog] = useConfirm();
-  const projectId = scope === 'project' ? project?.id : null;
-  const fetchPage = useCallback((before) => {
-    const query = new URLSearchParams({ limit: String(PAGE), ...(projectId ? { project_id: projectId } : {}),
-      ...(before ? { before: String(before) } : {}) });
-    return get(`/api/audit?${query}`);
-  }, [projectId]);
-  const reads = useRef(0); // each fresh read of the log; a page asked for under an earlier one is dropped
-  const load = useCallback(() => {
-    const mine = ++reads.current;
-    return fetchPage().then((data) => {
-      if (mine !== reads.current) return;
-      setPage(data);
-      setRead(null);
-    }).catch((error) => { if (mine === reads.current) setRead(codeOf(error)); });
-  }, [fetchPage]);
-  const { busy, problem, run } = useChange(load);
-  useEffect(() => {
-    setPage(null);
-    load();
-  }, [load]);
-  const older = () => run(async () => {
-    const mine = reads.current;
-    const next = await fetchPage(page.next);
-    if (mine === reads.current) { // still the same scope and read: the older page continues it
-      setPage((current) => current && ({ ...next, entries: [...current.entries, ...next.entries] }));
-    }
-    return false; // nothing changed to read again
-  });
+  const { busy, problem, run } = useChange(() => setChanges((n) => n + 1));
   const exportLog = () => run(async () => {
     const done = await post('/api/audit/export', projectId ? { project_id: projectId } : {});
     setExported(done.path);
     return done;
   });
-  const clear = () => run(() => confirmedChange('DELETE', '/api/audit', undefined,
-    () => ask(t('audit.clearTitle'), t('audit.clearBody'), t('audit.clearConfirm'))));
-  const dates = new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' });
+  const clear = () => run(async () => {
+    let confirmed = false;
+    try {
+      return await confirmedChange('DELETE', '/api/audit', undefined,
+        async () => (confirmed = await ask(t('audit.clearTitle'), t('audit.clearBody'), t('audit.clearConfirm'))));
+    } catch (error) { // a confirmed clearing that failed may have happened: the log is read anew too (rider L, AG)
+      if (confirmed) setChanges((n) => n + 1);
+      throw error;
+    }
+  });
   return (
     <Section title={t('audit.title')} hint={t('audit.hint')}>
       <div className="flex flex-wrap items-center gap-2">
-        {project && (
+        {project !== null && (
           <Segmented label={t('audit.show')} value={scope} onChange={setScope}
             options={[{ value: 'project', label: t('audit.thisProject') }, { value: 'all', label: t('audit.everything') }]} />
         )}
         <div className="ml-auto flex gap-2">
-          <Button size="sm" variant="outline" className="h-8" disabled={busy} onClick={exportLog}>{t('audit.export')}</Button>
+          <Button size="sm" variant="outline" className="h-8" disabled={busy || waiting} onClick={exportLog}>{t('audit.export')}</Button>
           <Button size="sm" variant="outline" className="h-8 text-destructive hover:text-destructive" disabled={busy}
             onClick={clear}>{t('audit.clear')}</Button>
         </div>
       </div>
       <Problem code={problem} />
       {exported && <p role="status" className="break-all text-xs text-muted-foreground">{t('audit.exported', { path: exported })}</p>}
-      {!page ? <LoadState problem={read} onRetry={load} /> : (
-        <div className="space-y-2">
-          {page.allowed_off_this_mac != null && <p className="text-xs">{t('audit.sent', { count: page.allowed_off_this_mac })}</p>}
-          {page.entries.length === 0 && <p className="text-sm text-muted-foreground">{t('audit.empty')}</p>}
-          {page.entries.length > 0 && (
-            <ol className="scroll-thin max-h-96 divide-y overflow-y-auto rounded-lg border">
-              {page.entries.map((entry) => <AuditEntry key={entry.seq} entry={entry} dates={dates} />)}
-            </ol>
-          )}
-          {page.next && <Button variant="ghost" size="sm" disabled={busy} onClick={older}>{t('audit.more')}</Button>}
-        </div>
-      )}
+      {/* One reader per log shown (this project's, or the whole log) and per change to it (rule K): what is read,
+          continued or said for one is never another's, and after a clearing nothing read before it is shown; while the
+          open project's record is not known no reader is drawn (design review AG). */}
+      {waiting ? <LoadState /> : <AuditPages key={`${projectId ?? ''}\n${changes}`} projectId={projectId} />}
       {dialog}
     </Section>
+  );
+}
+
+// One log's pages, newest first. projectId never changes under it (AuditLog keys it), so it counts no reads.
+function AuditPages({ projectId }) {
+  const t = useT();
+  const language = useContext(LanguageContext);
+  const [page, setPage] = useState(null); // { entries, next, allowed_off_this_mac }
+  const [read, setRead] = useState(null);
+  const { busy, problem, run } = useChange();
+  const fetchPage = useCallback((before) => get(`/api/audit?${new URLSearchParams({ limit: String(PAGE),
+    ...(projectId ? { project_id: projectId } : {}), ...(before ? { before: String(before) } : {}) })}`), [projectId]);
+  const load = useCallback(() => {
+    setRead(null);
+    fetchPage().then(setPage, (error) => setRead(codeOf(error)));
+  }, [fetchPage]);
+  useEffect(() => { load(); }, [load]);
+  const older = () => run(async () => { // one at a time (busy), and only this log's: it continues the page shown
+    const next = await fetchPage(page.next);
+    setPage((current) => ({ ...next, entries: [...current.entries, ...next.entries] }));
+  });
+  const dates = new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' });
+  if (!page) return <LoadState problem={read} onRetry={load} />;
+  return (
+    <div className="space-y-2">
+      {page.allowed_off_this_mac != null && <p className="text-xs">{t('audit.sent', { count: page.allowed_off_this_mac })}</p>}
+      {page.entries.length === 0 && <p className="text-sm text-muted-foreground">{t('audit.empty')}</p>}
+      {page.entries.length > 0 && (
+        <ol className="scroll-thin max-h-96 divide-y overflow-y-auto rounded-lg border">
+          {page.entries.map((entry) => <AuditEntry key={entry.seq} entry={entry} dates={dates} />)}
+        </ol>
+      )}
+      <Problem code={problem} />
+      {page.next && <Button variant="ghost" size="sm" disabled={busy} onClick={older}>{t('audit.more')}</Button>}
+    </div>
   );
 }
 

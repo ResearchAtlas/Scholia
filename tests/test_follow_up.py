@@ -1482,3 +1482,18 @@ async def test_a_request_whose_client_left_before_its_body_was_read_is_answered_
                  "headers": [(b"host", b"127.0.0.1:8765"), (b"x-scholia-client", b"local")]}
         await asyncio.wait_for(client.app(scope, receive, send_), 10)
         assert sent[0]["type"] == "http.response.start" and sent[0]["status"] == 200
+
+
+async def test_a_conversation_stored_with_half_a_surrogate_pair_is_read_and_takes_its_next_turn(tmp_path):
+    # Design review AA: a message stored with half a pair (the escape in its JSON, as a build before PR 57 stored it)
+    # failed its conversation's read and every later turn (the history sent on could not be encoded). Read and sent
+    # through backend/whole_json.py, it is the replacement character
+    async with started(tmp_path / "data") as client:
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        await send(client, conversation, "How large a sample do I need?")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE turns SET user_message = replace(user_message, 'How large', 'Half \\ud83d pair, how large')"))
+        response = await client.get(f"/api/conversations/{conversation}")
+        assert response.status_code == 200, response.text
+        assert response.json()["turns"][0]["message"]["text"].startswith("Half \ufffd pair")
+        assert (await send(client, conversation, "And a second question?"))[-1]["status"] == "succeeded"

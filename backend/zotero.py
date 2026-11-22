@@ -55,7 +55,6 @@ the next item; deleting a Zotero paper revokes every running import of its item 
 import asyncio
 import ctypes
 import errno
-import json
 import os
 import platform
 import re
@@ -69,6 +68,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
+from backend import whole_json as json
 from backend import extraction, reference_files, references, search
 from backend.data_folder import _StatFS
 from backend.db import new_id, utc_now

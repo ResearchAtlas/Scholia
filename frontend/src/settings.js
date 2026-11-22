@@ -2,8 +2,9 @@
 // section 4.4). Each change is saved on its own against the file as the page last read or
 // saved it: a file changed on disk since then is never overwritten; it is read again and the
 // researcher is told, so the change is made again on what the file now holds (ticket 14).
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, get, put } from './api.js';
+import { generation, useRead } from './libraryRead.js';
 
 // Saves updates against `read`, the file as it was last read or saved: the backend refuses
 // (409 settings_changed) if the file changed since, and then nothing is written.
@@ -88,19 +89,24 @@ export function useSettingsFile(projectId) {
   return { values: file?.values ?? null, problems: file?.problems ?? [], problem, save: saver.save, reload: saver.reload };
 }
 
-// An AGENTS.md file: the personal one, or a project's.
-export function useInstructions(projectId, withProject) {
+// An AGENTS.md file: the personal one, or a project's (drawn for one project: ThisProject's key). It asks for nothing
+// that changes under it, so its reads are its editor's own (the first, the one after its save, Try again): no other read
+// replaces what is typed, and a reload a save under way keeps is this file's (design reviews X and AH).
+export function useInstructions(projectId) {
   const [file, setFile] = useState(null); // { text, hash, combined_bytes, cap_bytes, warnings }
   const [problem, setProblem] = useState(null);
-  const query = projectId ? `?project_id=${encodeURIComponent(projectId)}`
-    : withProject ? `?with_project=${encodeURIComponent(withProject)}` : '';
+  const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
 
+  const reads = useRef(0); // only the newest read is shown (design review AG, rider I)
   const reload = useCallback(async ({ keep = false } = {}) => {
+    const mine = ++reads.current;
     try {
-      setFile(await get(`/api/instructions${query}`));
+      const read = await get(`/api/instructions${query}`);
+      if (mine !== reads.current) return;
+      setFile(read);
       if (!keep) setProblem(null); // a read that succeeds clears an earlier error, not a conflict's
     } catch (error) {
-      setProblem(error instanceof ApiError ? error.code : 'internal');
+      if (mine === reads.current) setProblem(error instanceof ApiError ? error.code : 'internal');
     }
   }, [query]);
 
@@ -127,6 +133,17 @@ export function useInstructions(projectId, withProject) {
   }, [file?.hash, projectId, reload]);
 
   return { file, problem, save, reload };
+}
+
+// The size of a project's AGENTS.md, which the cap counts with the personal one, through the read hook: a size read for
+// one project is never said under another, a reload kept from another reads nothing (rule H), and it is null until it
+// is read and while projectId is null (design review AH). Its generation is its own and moves never: read once per
+// project while the editor is drawn.
+export function useInstructionsBeside(projectId) {
+  const [once] = useState(generation);
+  const read = useRead(once, projectId ?? null, () => get(`/api/instructions?with_project=${encodeURIComponent(projectId)}`));
+  return { bytes: read.value?.other_bytes ?? null, reload: read.reload,
+    problem: read.error && (read.error instanceof ApiError ? read.error.code : 'internal') };
 }
 
 // The bytes a text takes in UTF-8, as the 32 KiB instructions cap counts them.

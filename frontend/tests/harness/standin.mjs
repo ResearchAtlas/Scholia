@@ -35,13 +35,26 @@ export const forwardRef = (fn) => (props) => fn(props, props.ref); export const 
 
 export function mount(element, options = {}) {
   strict = Boolean(options.strict);
+  // A bound no timer can be (recheck r8): answers that are already there, read again and again, starve the event loop,
+  // so no test timeout ends them. Past `requests` (1000; no scenario asks more than 114) none is answered, which ends
+  // the loop, and the next settle fails, saying so.
+  const limit = options.requests ?? 1000; const answering = globalThis.fetch; let asked = 0; let runaway = null;
+  if (answering) {
+    globalThis.fetch = (...args) => {
+      asked += 1;
+      if (asked <= limit) return answering(...args);
+      runaway ??= `more than ${limit} requests (the last: ${args[1]?.method ?? 'GET'} ${args[0]}): answers that do not end`;
+      return new Promise(() => {});
+    };
+  }
   const instances = new Map();
   let hosts = [];
   function visit(node, path) {
     if (node === null || node === undefined || typeof node === 'boolean') return;
     if (typeof node === 'string' || typeof node === 'number') { hosts.push({ text: String(node) }); return; }
     if (Array.isArray(node)) { node.forEach((child, i) => visit(child, `${path}/${child?.key ?? i}`)); return; }
-    const at = `${path}<${idOf(node.type === Fragment ? 'Fragment' : node.type)}>`;
+    // a keyed element is another instance when its key changes, as in React (an array's child has its key in its path already)
+    const at = `${path}<${idOf(node.type === Fragment ? 'Fragment' : node.type)}${node.key != null ? `#${node.key}` : ''}>`;
     if (node.type === Fragment) { visit(node.props.children, at); return; }
     if (typeof node.type === 'string') { hosts.push({ type: node.type, props: node.props }); visit(node.props.children, at); hosts.push({ end: node.type }); return; }
     let instance = instances.get(at);
@@ -72,7 +85,10 @@ export function mount(element, options = {}) {
   const ui = {
     draw() { for (let n = 0; n === 0 || dirty; n += 1) { if (n > 50) throw new Error('renders do not settle'); dirty = false; once(); } return ui; },
     // every answer released so far is taken in and drawn: no timer runs, only the microtasks and immediates queued
-    async settle() { for (let n = 0; n < 8; n += 1) { await new Promise((resolve) => setImmediate(resolve)); if (dirty) ui.draw(); } return ui; },
+    async settle() {
+      for (let n = 0; n < 8; n += 1) { await new Promise((resolve) => setImmediate(resolve)); if (runaway) throw new Error(runaway); if (dirty) ui.draw(); }
+      return ui;
+    },
     show(next) { element = next; dirty = true; return ui.draw(); },
     hosts: () => hosts,
     find: (test) => hosts.filter((h) => h.props && test(h.props, h.type)),

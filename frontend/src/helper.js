@@ -20,8 +20,10 @@ export const downloading = (status) => status?.download?.state === 'running';
 
 // Whether Settings, Advanced offers the search model's download while `project` is the current
 // project. A Local only project offers none, only the import (ticket 71); any other project, the
-// General project among them, or none offers it. Downloads are app-wide either way.
-export const downloadOffered = (project) => project?.sensitivity !== 'local_only';
+// General project among them, or none (null) offers it. Downloads are app-wide either way. undefined is a
+// project open whose record is not known (read again after a removal): it offers none, so nothing is
+// asked without the project it would be refused for (recheck r9: fails closed).
+export const downloadOffered = (project) => project === null || (project !== undefined && project.sensitivity !== 'local_only');
 
 // What the section says of the last download once it ended without installing the model (failed or
 // cancelled), as a catalog key, or null. Downloads are app-wide, so one that ended in another project

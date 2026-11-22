@@ -71,6 +71,24 @@ async def test_a_successful_call_reports_its_attempt_and_cost():
     assert sent[0].headers["authorization"] == "Bearer key"
 
 
+@pytest.mark.parametrize("usage, cost, charge", [
+    # Harold, 2026-11-14 (the BYOK status row): a request OpenRouter marks bring-your-own-key costs its fee (cost)
+    # and what the upstream provider charged (cost_details.upstream_inference_cost)
+    ({"is_byok": True, "cost": 0.001, "cost_details": {"upstream_inference_cost": 0.02}}, 0.021, "reported"),
+    ({"is_byok": False, "cost": 0.001, "cost_details": {"upstream_inference_cost": 0.02}}, 0.001, "reported"),
+    ({"cost": 0.001, "cost_details": {"upstream_inference_cost": 0.02}}, 0.001, "reported"),
+    # marked BYOK with no valid upstream cost: what it cost is not reported, so it is estimated from its tokens
+    ({"is_byok": True, "cost": 0.001}, None, "estimated"),
+    ({"is_byok": True, "cost": 0.001, "cost_details": {"upstream_inference_cost": -1}}, None, "estimated"),
+    ({"is_byok": True, "cost": 0.001, "cost_details": {"upstream_inference_cost": "0.02"}}, None, "estimated"),
+])
+async def test_a_bring_your_own_key_request_costs_its_fee_and_the_upstream_cost(usage, cost, charge):
+    client, _ = client_for(ok("Hello.", prompt_tokens=3, completion_tokens=2, **usage))
+    result = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES)
+    [attempt] = result.attempts
+    assert (result.reported_cost, attempt.record()["charge"], attempt.record().get("cost_usd")) == (cost, charge, cost)
+
+
 async def test_an_openai_compatible_provider_gets_no_openrouter_fields():
     client, sent = client_for(ok())
     await openrouter.query_model(client, LOCAL, "key", MESSAGES, effort="high")

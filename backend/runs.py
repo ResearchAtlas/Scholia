@@ -55,7 +55,6 @@ leaves no effect.
 """
 
 import asyncio
-import json
 import logging
 import math
 import sqlite3
@@ -66,6 +65,7 @@ import unicodedata
 from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 
+from backend import whole_json as json
 from backend import (agent, budget_router, citations, compaction, context, credentials, governance, memory, openrouter,
                      openrouter_client, provenance, providers, reach, router, skills, spending)
 from backend.evidence import historical_citations
@@ -1825,22 +1825,26 @@ class Harness:
             if wants_memory:
                 candidates = await self._read(lambda conn: memory.recall_candidates(
                     conn, ctx["project_id"], locked=ctx["policy"].locked))
-                nearest, mode, reason = None, "recency", None
+                nearest, embedded, mode, reason = None, None, "recency", None
                 state = search._STATES.get(self)
                 if candidates and state is not None:
+                    async def similar():  # both of the index's reads, so the one deadline bounds them both (recheck r8)
+                        found = await search.nearest_memory(state, ctx["project_id"], ctx["message"])
+                        if found is None:
+                            return None, None, "unavailable"
+                        if not set(found) & {r["id"] for r in candidates}:
+                            return None, None, "unembedded"  # no candidate has a vector yet: the newest
+                        # read here too: an index that rebuilds meanwhile is the same fallback
+                        return found, await search.embedded_memory(state, [r["id"] for r in candidates]), None
                     try:
-                        nearest = await asyncio.wait_for(search.nearest_memory(state, ctx["project_id"], ctx["message"]),
-                                                         ctx["personal"].values["retrieval"]["memory_ms"] / 1000)
-                        reason = "unavailable" if nearest is None else None
-                        if nearest is not None and not set(nearest) & {r["id"] for r in candidates}:
-                            nearest, reason = None, "unembedded"  # no candidate has a vector yet: the newest
+                        nearest, embedded, reason = await asyncio.wait_for(
+                            similar(), ctx["personal"].values["retrieval"]["memory_ms"] / 1000)
                         mode = "similarity" if nearest is not None else "recency"
                     except TimeoutError:
-                        reason = "deadline"
+                        nearest, embedded, reason = None, None, "deadline"
                     except Exception as error:  # the helper or the index failed: the newest, said
                         log.warning("memory similarity failed (%s)", type(error).__name__)
-                        reason = "unavailable"
-                embedded = await search.embedded_memory(state, [r["id"] for r in candidates]) if nearest else None
+                        nearest, embedded, reason = None, None, "unavailable"
                 chosen = memory.ranked(candidates, nearest, embedded=embedded)
                 sections["user_memory"] += [memory.memory_line(r) for r in chosen]
                 if decision.get("rule") == "earlier_decision":  # missing memory is said, never invented (ticket 31)

@@ -9,7 +9,7 @@ import { ApiError, get, patch, post } from '../api.js';
 import { useAction } from '../action.js';
 import { errorText, money } from '../text.js';
 import { projectName } from '../projects.js';
-import { BUDGET_SUGGESTIONS, loadModels, useInstructions, useSettingsFile, utf8Bytes, valueAt } from '../settings.js';
+import { BUDGET_SUGGESTIONS, loadModels, useInstructions, useInstructionsBeside, useSettingsFile, utf8Bytes, valueAt } from '../settings.js';
 import { CommitField, Field, FileProblems, LoadState, Problem, Restore, Section, Segmented } from './fields.jsx';
 import { AuditLog, PrivateAllowlist, ProjectProtection } from './Governance.jsx';
 import { Providers } from './Providers.jsx';
@@ -17,7 +17,7 @@ import { BackupsSection } from './Backups.jsx';
 import { ProjectExportSection } from './ProjectExport.jsx';
 import { Ask } from './Ask.jsx';
 import { fraction, retryRun, runOutcome } from '../runs.js';
-import { libraryChanged } from '../library.js';
+import { libraryChanged, libraryEvents, readGuard } from '../library.js';
 import { LocalHelperSection, LocalOnlySearchNote } from './LocalHelper.jsx';
 import { IndexSection } from './SearchIndex.jsx'; // S1-17
 import { offerOutcome, runCounts, runReason } from '../search.js'; // S1-17
@@ -44,9 +44,10 @@ const MAX_SUBAGENT_MODELS = 5;
 export function Settings({ open, onOpenChange, health, project, onLanguage, onProjectChanged, startPage }) {
   const t = useT();
   const [page, setPage] = useState('general');
-  useEffect(() => { // S1-19c: opened at a page by the help skill's open_place
+  const [stored, setStored] = useState(null); // an added endpoint's key went to the private file: said on Providers
+  useEffect(() => { // S1-19c: opened at a page by the help skill's open_place; one already open keeps its page
     if (open && PAGES.includes(startPage)) setPage(startPage);
-  }, [open, startPage]);
+  }, [open]);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex h-[min(88vh,820px)] max-w-4xl flex-col gap-0 p-0 sm:flex-row">
@@ -64,10 +65,10 @@ export function Settings({ open, onOpenChange, health, project, onLanguage, onPr
           ))}
         </nav>
         <div className="scroll-thin min-h-0 flex-1 overflow-y-auto px-6 py-6 sm:px-8">
-          {open && page === 'general' && <General onLanguage={onLanguage} projectId={project?.id} />}
-          {open && page === 'providers' && <Providers />}
+          {open && page === 'general' && <General onLanguage={onLanguage} project={project} />}
+          {open && page === 'providers' && <Providers stored={stored} onStored={setStored} />}
           {open && page === 'subagents' && <Subagents />}
-          {open && page === 'project' && project && <ThisProject project={project} onProjectChanged={onProjectChanged}
+          {open && page === 'project' && project && <ThisProject key={project.id} project={project} onProjectChanged={onProjectChanged}
             onOpenAdvanced={() => setPage('advanced')} />}
           {open && page === 'advanced' && <Advanced health={health} project={project} />}
         </div>
@@ -80,7 +81,7 @@ function PageTitle({ children }) {
   return <h2 className="text-lg font-semibold tracking-tight">{children}</h2>;
 }
 
-function General({ onLanguage, projectId }) {
+function General({ onLanguage, project }) {
   const t = useT();
   const personal = useSettingsFile();
   const [problem, setProblem] = useState(null);
@@ -131,16 +132,17 @@ function General({ onLanguage, projectId }) {
         </div>
       </Field>
       <InstructionsEditor label={t('settings.personalInstructions')} hint={t('settings.personalInstructionsHint')}
-        withProject={projectId} />
+        beside={project} />
     </div>
   );
 }
 
 // An AGENTS.md editor. The combined personal and project instructions are capped at 32 KiB;
-// the editor warns before that, as the text is typed.
-function InstructionsEditor({ projectId, withProject, label, hint }) {
+// the editor warns before that, as the text is typed. beside, for the personal file: the open project (null: none).
+function InstructionsEditor({ projectId, beside, label, hint }) {
   const t = useT();
-  const instructions = useInstructions(projectId, withProject);
+  const instructions = useInstructions(projectId);
+  const project = useInstructionsBeside(projectId ? null : beside?.id);
   const rejected = useRef(null); // a draft whose save met a changed file: kept to reconcile
   const [draft, setDraft] = useState(null);
   const [saving, setSaving] = useState(false); // the text cannot change while it is saved and read back
@@ -151,16 +153,22 @@ function InstructionsEditor({ projectId, withProject, label, hint }) {
     rejected.current = null;
     setConfirming(false);
   }, [file?.text, file?.hash]);
-  if (!file || draft === null) return <LoadState problem={instructions.problem} onRetry={instructions.reload} />;
-  // As the backend joins them: the two files, with a blank line between when both hold text.
+  if (!file || draft === null) {
+    return <LoadState problem={instructions.problem} onRetry={() => { instructions.reload(); project.reload(); }} />;
+  }
+  // As the backend joins them: the two files, with a blank line between when both hold text. The other file: read with
+  // a project's own (the personal one), and where no project is open (null: none); else the open project's, through
+  // its own read, null until that is read and while its record is not known (undefined): no size is said that leaves
+  // it out, and the box, its text, Save and Cancel stay (design review AH; point c, "the size waits").
   const own = utf8Bytes(draft);
-  const combined = own + file.other_bytes + (own && file.other_bytes ? 2 : 0);
-  const over = combined > file.cap_bytes;
+  const other = projectId || beside === null ? file.other_bytes : project.bytes;
+  const combined = other === null ? null : own + other + (own && other ? 2 : 0);
+  const over = combined !== null && combined > file.cap_bytes;
   const id = projectId ? 'project-instructions' : 'personal-instructions';
   return (
     <div className="space-y-2">
       <Field label={label} htmlFor={id} hint={hint}
-        aside={<span className={cn('text-xs tabular-nums', over ? 'text-destructive' : 'text-muted-foreground')}>
+        aside={combined !== null && <span className={cn('text-xs tabular-nums', over ? 'text-destructive' : 'text-muted-foreground')}>
           {t('settings.instructionsSize', { used: Math.ceil(combined / 1024), cap: file.cap_bytes / 1024 })}
         </span>}>
         <Textarea id={id} value={draft} onChange={(event) => setDraft(event.target.value)} rows={8} readOnly={saving || file.unreadable}
@@ -169,7 +177,7 @@ function InstructionsEditor({ projectId, withProject, label, hint }) {
       {file.unreadable && <p role="alert" className="text-xs text-destructive">{t('settings.instructionsUnreadable')}</p>}
       {file.replaced && <p role="alert" className="text-xs text-warning">{t('settings.instructionsReplaced')}</p>}
       {over && <p role="alert" className="text-xs text-destructive">{t('settings.instructionsOverCap')}</p>}
-      <Problem code={instructions.problem} />
+      <Problem code={instructions.problem ?? project.problem} />
       <div className="flex justify-end gap-2">
         <Button variant="ghost" size="sm" disabled={saving || draft === file.text}
           onClick={() => { setDraft(file.text); setConfirming(false); }}>{t('common.cancel')}</Button>
@@ -235,6 +243,7 @@ function Subagents() {
   const remove = (id) => change((base) => base.filter((m) => m !== id));
   function add() {
     const id = adding.trim();
+    if (busy) return; // nothing is added while another change is saved: what was typed stays
     change((base) => (!id || base.includes(id) || base.length >= MAX_SUBAGENT_MODELS ? null : [...base, id]));
     setAdding('');
   }
@@ -451,18 +460,27 @@ function BackgroundRuns() {
   const [problem, setProblem] = useState(null); // a cancel that failed; the next cancel clears it
   const [polled, setPolled] = useState(null); // the last read's error; a read that succeeds clears it
 
-  const load = useCallback(() => get('/api/activity').then((data) => {
-    setRuns(data.runs);
-    setPolled(null);
-  }).catch((error) => {
-    setPolled(error instanceof ApiError ? error.code : 'internal');
-  }), []);
+  // The list names each run's project and its papers: after a change (a deletion settled, here or in the Sidebar) what
+  // was read before is dropped at once and no read asked before it is shown, as every other view (library.js readGuard).
+  const [guard] = useState(readGuard);
+  const load = useCallback(() => {
+    const settle = guard.ask();
+    return get('/api/activity').then((data) => {
+      if (!settle(true)) return;
+      setRuns(data.runs);
+      setPolled(null);
+    }).catch((error) => {
+      if (settle(false)) setPolled(error instanceof ApiError ? error.code : 'internal');
+    });
+  }, [guard]);
 
   useEffect(() => {
     load();
     const timer = setInterval(load, POLL_MS);
-    return () => clearInterval(timer);
-  }, [load]);
+    const changed = () => { guard.libraryChanged(); setRuns(null); load(); };
+    libraryEvents.addEventListener('changed', changed);
+    return () => { clearInterval(timer); libraryEvents.removeEventListener('changed', changed); };
+  }, [load, guard]);
 
   // A run tried again or stopped here changes its project's papers too: the Library open on that
   // project reads them again, and follows the new reading until it ends (S1-20's retried OCR).

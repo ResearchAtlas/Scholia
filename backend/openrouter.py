@@ -21,7 +21,6 @@ prompt, an answer, a key, a URL or a provider's error body.
 
 import asyncio
 import hashlib
-import json
 import logging
 import sys
 import time
@@ -30,7 +29,9 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from backend import whole_json as json
 from backend import reasoning_capability
+from backend.whole_json import whole_text
 from backend.outbound_gate import DISPATCHED, NO_RESPONSE_CACHE, OutboundDenied
 from backend.reasoning_control import resolve_reasoning_payload
 from backend.settings import visible
@@ -93,8 +94,15 @@ class Attempt:
 
     @property
     def reported_cost(self):
-        """The cost the provider reported, if it is a valid amount (finite, not negative, at most spending.MAX_USD)."""
-        return amount(self.usage.get("cost"))
+        """The cost the provider reported, if it is a valid amount (finite, not negative, at most spending.MAX_USD).
+        A request OpenRouter marks bring-your-own-key (is_byok) reports only its fee as cost: it costs that plus what
+        the upstream provider charged, and without a valid upstream cost it reported no cost (Harold, 2026-11-14)."""
+        cost = amount(self.usage.get("cost"))
+        if cost is None or self.usage.get("is_byok") is not True:
+            return cost
+        details = self.usage.get("cost_details")
+        upstream = amount(details.get("upstream_inference_cost")) if isinstance(details, dict) else None
+        return None if upstream is None else combined(cost + upstream)
 
     def record(self) -> dict:
         """The run-event form: counts and codes only."""
@@ -372,7 +380,7 @@ def _ms(started):
 
 def _json(response):
     try:
-        return response.json()
+        return whole_text(response.json())
     except Exception:  # not JSON, or nested deeper than the decoder follows (RecursionError): malformed (PR 52 cycle 4)
         return None
 

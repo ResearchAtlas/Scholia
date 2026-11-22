@@ -561,6 +561,47 @@ async def test_a_rolled_back_restore_from_an_older_schema_file_leaves_only_its_s
     assert sorted(listed[i]["schema_version"] for i in set(listed) - before) == [len(MIGRATIONS)] * 2  # safety copies
 
 
+async def test_a_restore_from_an_older_schema_file_put_back_only_at_the_next_launch_leaves_only_its_safety_copy(
+        tmp_path, monkeypatch):
+    # PR 59's Fable round 3 (R4's limits, P3, privacy and deletion): a restore that failed and could not be put back
+    # at once was put back by a later launch, which kept the copy its migrations took, the file's records (records
+    # purged earlier included) then in an automatic backup though nothing was changed
+    data = tmp_path / "data"
+
+    def older():
+        with Database(data, migrations=MIGRATIONS[:3]) as db:
+            generation = db.backup()
+        with zipfile.ZipFile(tmp_path / "m1.zip", "w") as archive:
+            for path in generation.iterdir():
+                archive.write(path, path.name)
+
+    await asyncio.to_thread(older)
+    real, calls = backups_module._back_from_journal, []
+
+    def failing_once(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise OSError("the files cannot be put back now")
+        return real(*args)
+
+    committing = backups_module._commit_journal
+
+    def failing(data_dir, journal, audits):  # the restore's commit and the launch's replay forward, not a put back
+        if not any(audit.get("finished") == "back" for audit in audits):
+            raise OSError("the journal cannot be written")
+        return committing(data_dir, journal, audits)
+    monkeypatch.setattr(backups_module, "_commit_journal", failing)
+    monkeypatch.setattr(backups_module, "_back_from_journal", failing_once)
+    async with started(data) as client:
+        before = {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+        response = await client.post("/api/backups/restore", json={"file": str(tmp_path / "m1.zip")})
+        assert (response.status_code, response.json()["code"]) == (500, "restore_interrupted")
+    async with started(data) as client:  # the launch replays it, cannot commit it, and puts the previous state back
+        assert len(calls) == 2
+        listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
+    assert sorted(listed[i]["schema_version"] for i in set(listed) - before) == [len(MIGRATIONS)]  # its safety copy
+
+
 def fables_folder(data, now):
     """Weekly backups 16 and 9 days old and daily ones 6 to 1 days old, at schema 3 (Fable's folder): the daily names."""
     from datetime import timedelta
@@ -587,10 +628,12 @@ async def test_failed_restores_leave_the_weeks_backups(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("outcome", ["committed", "rolled back"])
 @pytest.mark.parametrize("rotation", ["promoted", "deleted"])
-async def test_a_restore_of_a_backup_over_a_week_old_its_safety_copy_rotates_keeps_a_backup_of_it(
+async def test_a_restore_of_a_backup_over_a_week_old_next_in_line_to_rotate_leaves_it_where_it_was(
         tmp_path, monkeypatch, rotation, outcome):
-    # PR 59 batch 1, item 5, rewritten for design review H: a backup over a week old is still rotated by count; the
-    # restore's own backup before its migrations is then what keeps that state, promoted or deleted
+    # PR 59 batch 1, item 5, rewritten for design review H and again for design review R (Option 1): a backup over a
+    # week old next in line to rotate (to weekly, or away) stays where it was during its own restore, since nothing is
+    # rotated while a restore is in progress; committed adds the safety copy and the backup before its migrations,
+    # rolled back the safety copy only
     from datetime import UTC, datetime, timedelta
     data = tmp_path / "data"
     now = datetime.now(UTC)
@@ -615,12 +658,44 @@ async def test_a_restore_of_a_backup_over_a_week_old_its_safety_copy_rotates_kee
         response = await client.post("/api/backups/restore", json={"generation": f"daily/{name}"})
         assert response.status_code == (200 if outcome == "committed" else 500), response.text
         listed = {b["id"]: b for b in (await client.get("/api/backups")).json()["backups"]}
-    names = {i.split("/")[1] for i in before}  # by name: the rotation may move one to weekly
-    added = sorted(b["schema_version"] for i, b in listed.items() if i.split("/")[1] not in names)
-    # rolled back, the copy stays only when it is the one backup of that state: the source deleted (R4)
-    kept_copy = outcome == "committed" or rotation == "deleted"
-    assert added == ([3, len(MIGRATIONS)] if kept_copy else [len(MIGRATIONS)])
-    assert (f"weekly/{name}" in listed) == (rotation == "promoted") and f"daily/{name}" not in listed
+    added = sorted(b["schema_version"] for i, b in listed.items() if i not in before)
+    assert added == ([3, len(MIGRATIONS)] if outcome == "committed" else [len(MIGRATIONS)])
+    assert before <= set(listed) and f"daily/{name}" in listed  # every backup where it was, the source too
+
+
+@pytest.mark.parametrize("source", ["weekly", "daily"])
+async def test_a_restore_that_fails_leaves_the_backup_it_restores_where_it_was(tmp_path, monkeypatch, source):
+    # PR 59's rechecks (Fable 2, P3; Fable round 3, the weekly site): at the current schema, the safety copy's
+    # rotation promoted a daily one and so trimmed the oldest weekly backup, or deleted the oldest daily one over a week
+    # old; when the restore then failed, that backup was gone, and its state in no backup ("nothing was changed")
+    from datetime import UTC, datetime, timedelta
+    data = tmp_path / "data"
+    now = datetime.now(UTC)
+
+    def folder():  # weekly 60 to 39 days old; daily over a week old, the launch's backup promoting the 30-day one
+        with Database(data) as db:
+            weekly = [db.backup(now=now - timedelta(days=days)) for days in (60, 53, 46, 39)]
+            (data / "backups" / "weekly").mkdir()
+            for generation in weekly:
+                generation.rename(data / "backups" / "weekly" / generation.name)
+            return {days: db.backup(now=now - timedelta(days=days)).name
+                    for days in (30, 22 if source == "weekly" else 26, 14, 13, 12, 11, 10)}, weekly[1].name
+
+    daily, weekly = await asyncio.to_thread(folder)
+    restored = f"weekly/{weekly}" if source == "weekly" else f"daily/{daily[26]}"
+    async with started(data) as client:
+        assert restored in {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+        real = backups_module._commit_journal
+
+        def failing(*args):
+            raise OSError("the journal cannot be written")
+        monkeypatch.setattr(backups_module, "_commit_journal", failing)
+        response = await client.post("/api/backups/restore", json={"generation": restored})
+        assert response.status_code == 500, response.text
+        assert restored in {b["id"] for b in (await client.get("/api/backups")).json()["backups"]}
+        monkeypatch.setattr(backups_module, "_commit_journal", real)
+        response = await client.post("/api/backups/restore", json={"generation": restored})
+        assert response.status_code == 200, response.text
 
 
 async def restored_from_fables_folder(tmp_path, more, days=5):
@@ -2022,3 +2097,19 @@ async def test_a_project_export_holds_its_memory_unless_left_out_and_never_perso
     assert not any(b"I prefer tables" in read(with_memory, name) for name in names(with_memory))
     without = destination / left.result["file"].rsplit("/", 1)[1]
     assert "memory.json" not in names(without) and left.result["memory"] == 0
+
+
+async def test_a_message_stored_with_half_a_surrogate_pair_exports_with_the_replacement_character(tmp_path):
+    # PR 63's Fable recheck (a note outside the PR): a record a build before PR 57 stored with half a pair (the M2
+    # audit's note A: a message's JSON holding the escape \ud83d) failed its project's export whole
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    async with started(tmp_path / "data") as client:
+        project = await new_project(client)
+        conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
+        await send(client, conversation, "How large a sample do I need?")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE turns SET user_message = replace(user_message, 'How large', '\\ud83d How large')"))
+        exported, markdown = await exported_conversation(client, project, conversation, destination)
+    assert "� How large" in json.dumps(exported["turns"][0]["message"], ensure_ascii=False)
+    assert "� How large a sample do I need?" in markdown

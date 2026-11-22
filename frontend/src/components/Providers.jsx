@@ -10,7 +10,7 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, put } from '../api.js';
 import { errorText } from '../text.js';
 import { WINDOW_PRESETS, forgetModels, groupOf, loadModels, onCatalogChange, settingKey, useSettingsFile } from '../settings.js';
-import { CommitField, Field, FileProblems, LoadState, Restore, Section, Segmented } from './fields.jsx';
+import { CommitField, Field, FileProblems, LoadState, Restore, Segmented } from './fields.jsx';
 import { KeyConfirmation, LocalDeclaration } from './Governance.jsx';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -20,7 +20,10 @@ const MIN_WINDOW = 4096; // the smallest supported window (backend/providers.py)
 const GROUPS = ['ready', 'setup', 'off'];
 const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/; // a provider's name, a bare TOML key
 
-export function Providers() {
+// stored and onStored: that a key saved here went to the private file (the key store's warning, ticket 16), held by
+// Settings so it outlives this page: a key stored after the page was left is said when it is next drawn (Harold,
+// 2026-11-22). It is never taken back in the window: a later key that went to the store does not move an earlier one.
+export function Providers({ stored = null, onStored = () => {} }) {
   const t = useT();
   const personal = useSettingsFile();
   const [list, setList] = useState(null);
@@ -70,28 +73,32 @@ export function Providers() {
         </p>
       )}
       <FileProblems problems={personal.problems} />
+      {stored && <p role="status" className="rounded-md bg-warning/10 px-3 py-2 text-sm text-warning">{t('setup.storeWarning')}</p>}
       {adding && <AddEndpoint existing={list.map((p) => p.name)} onCancel={() => setAdding(false)}
-        onAdded={async () => { setAdding(false); await changed(); }} />}
-      {GROUPS.map((group) => {
-        const members = list.filter((p) => groupOf(p) === group);
-        if (!members.length) return null;
-        return (
-          <Section key={group} title={t(`providers.group.${group}`)}>
-            <div className="space-y-3">
-              {members.map((provider) => (
-                <ProviderCard key={provider.name} provider={provider} table={tables[provider.name] ?? {}}
-                  save={personal.save} onChanged={changed} />
-              ))}
-            </div>
-          </Section>
-        );
-      })}
+        onAdded={async (warning) => { setAdding(false); if (warning) onStored('credential_store_unavailable'); await changed(); }} />}
+      {/* One keyed list, the groups' headings among the cards (design review AF's G): a card whose group changes (its
+        first key saved, turned off or on) moves and is the same card, with what was typed in it and what its save said.
+        The spacing is the sections' as they were: 32 px between groups, 16 px under a heading, 12 px between cards. */}
+      <div className="space-y-3">
+        {GROUPS.flatMap((group) => {
+          const members = list.filter((p) => groupOf(p) === group);
+          return members.length ? [
+            <h3 key={`group:${group}`} className="pb-1 pt-5 text-sm font-semibold first:pt-0">{t(`providers.group.${group}`)}</h3>,
+            ...members.map((provider) => (
+              <ProviderCard key={`card:${provider.name}`} provider={provider} table={tables[provider.name] ?? {}}
+                save={personal.save} onChanged={changed} onStored={onStored} />
+            )),
+          ] : [];
+        })}
+      </div>
     </div>
   );
 }
 
-function ProviderCard({ provider, table, save, onChanged }) {
+function ProviderCard({ provider, table, save, onChanged, onStored }) {
   const t = useT();
+  const here = useRef(false); // still drawn: a key stored after the page was left is said by Settings (ticket 16)
+  useEffect(() => { here.current = true; return () => { here.current = false; }; }, []);
   const [key, setKey] = useState('');
   const [keyProblem, setKeyProblem] = useState(null); // the key form's
   const [modelsProblem, setModelsProblem] = useState(null); // the model policy's and the default window's
@@ -107,8 +114,9 @@ function ProviderCard({ provider, table, save, onChanged }) {
     setKeyProblem(null);
     try {
       const saved = await put(`/api/keys/${encodeURIComponent(provider.name)}`, { key });
-      setKey('');
+      setKey((now) => (now === key ? '' : now)); // cleared only if it is still the key saved
       setNotice(saved.warning ? t('setup.storeWarning') : null);
+      if (saved.warning && !here.current) onStored('credential_store_unavailable'); // the page was left meanwhile
       await onChanged();
     } catch (error) {
       setKeyProblem(error instanceof ApiError ? error.code : 'internal');
@@ -365,8 +373,8 @@ function AddEndpoint({ existing, onCancel, onAdded }) {
       const saved = await personal.save({ [settingKey('providers', name, 'kind')]: 'openai-compatible',
         [settingKey('providers', name, 'base_url')]: url.trim() });
       if (!saved) return;
-      await put(`/api/keys/${encodeURIComponent(name)}`, { key });
-      await onAdded();
+      const kept = await put(`/api/keys/${encodeURIComponent(name)}`, { key });
+      await onAdded(kept?.warning); // the key went to the private file: the page says so once the form has closed
     } catch (error) {
       setProblem(error instanceof ApiError ? error.code : 'internal');
     } finally {
@@ -380,20 +388,20 @@ function AddEndpoint({ existing, onCancel, onAdded }) {
       <p className="text-xs leading-relaxed text-muted-foreground">{t('providers.addHint')}</p>
       <div className="grid gap-4 sm:grid-cols-2">
         <Field label={t('providers.name')} htmlFor="new-provider-name" hint={t('providers.nameHint')}>
-          <Input id="new-provider-name" value={name} onChange={(event) => setName(event.target.value.toLowerCase())} className="h-9 font-mono" />
+          <Input id="new-provider-name" value={name} onChange={(event) => setName(event.target.value.toLowerCase())} className="h-9 font-mono" readOnly={busy} />
         </Field>
         <Field label={t('providers.address')} htmlFor="new-provider-url" hint={t('providers.addressHint')}>
           <Input id="new-provider-url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder={t('providers.addressPlaceholder')}
-            className="h-9 font-mono" spellCheck={false} />
+            className="h-9 font-mono" spellCheck={false} readOnly={busy} />
         </Field>
       </div>
       <Field label={t('providers.key')} htmlFor="new-provider-key" hint={t('providers.keyHint')}>
         <Input id="new-provider-key" type="password" autoComplete="off" value={key} onChange={(event) => setKey(event.target.value)}
-          className="h-9 font-mono" />
+          className="h-9 font-mono" readOnly={busy} />
       </Field>
       {(problem || personal.problem) && <p role="alert" className="text-sm text-destructive">{errorText(t, problem ?? personal.problem)}</p>}
       <div className="flex justify-end gap-2">
-        <Button type="button" variant="ghost" size="sm" onClick={onCancel}>{t('common.cancel')}</Button>
+        <Button type="button" variant="ghost" size="sm" disabled={busy} onClick={onCancel}>{t('common.cancel')}</Button>
         <Button type="submit" size="sm" disabled={busy || !nameOk || !url.trim() || !key.trim()}>{t('providers.addSubmit')}</Button>
       </div>
     </form>

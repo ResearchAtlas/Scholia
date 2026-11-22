@@ -33,11 +33,12 @@ test('search says why it is keyword-only, with an entry for every reason', () =>
   }
 });
 
-test('Advanced offers the download unless the current project is Local only', () => {
+test('Advanced offers the download unless the current project is Local only, or open and not known', () => {
   assert.equal(downloadOffered({ kind: 'research', sensitivity: 'local_only', review_lock: false }), false);
   assert.equal(downloadOffered({ kind: 'research', sensitivity: 'local_only', review_lock: true }), false);
+  assert.equal(downloadOffered(undefined), false); // a project open whose record is not known (recheck r9)
   for (const project of [{ kind: 'research', sensitivity: 'normal' }, { kind: 'research', sensitivity: 'private' },
-    { kind: 'general', sensitivity: 'normal' }, null, undefined]) {
+    { kind: 'general', sensitivity: 'normal' }, null]) {
     assert.equal(downloadOffered(project), true, JSON.stringify(project));
   }
 });

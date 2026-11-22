@@ -399,3 +399,23 @@ async def test_a_models_endpoint_listing_is_read_bounded_and_cached():
         return httpx.Response(200, json={"data": {"endpoints": [{"tag": "a"}, {"context_length": 9}]}})
 
     assert await catalog.endpoints(client_for(untagged), OPENROUTER, "model/y") is None  # one it cannot name
+
+
+@pytest.mark.asyncio
+async def test_half_a_surrogate_pair_in_the_catalog_or_an_endpoint_listing_is_the_replacement_character():
+    # PR 63's Fable recheck (a note outside the PR): the catalog and the endpoint listing were decoded without
+    # openrouter.whole_text, so a name holding half a pair (a JSON escape) would fail the models answer while cached
+    catalog_body = (b'{"data": [{"id": "new/model", "name": "\\ud83d name", "pricing": {"prompt": "0",'
+                    b' "completion": "0"}, "context_length": 32000}]}')
+    listing_body = b'{"data": {"endpoints": [{"tag": "a\\ud83d", "pricing": {"prompt": "1"}}]}}'
+
+    def serve(request):
+        if request.url.path.endswith("/zdr"):
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(200, content=listing_body if request.url.path.endswith("/endpoints") else catalog_body)
+
+    client = client_for(serve)
+    models = await catalog.models(client, OPENROUTER, KEY)
+    assert models["new/model"]["name"] == "� name"
+    [endpoint] = await catalog.endpoints(client, OPENROUTER, "new/model")
+    assert endpoint["tag"] == "a�"

@@ -95,11 +95,12 @@ function component(hook) {
 
 // libraryRead.js's hook, given the stand-in's hooks and the real papers' generation.
 function readHook(react) {
-  const { useLibraryRead } = declarations(file('libraryRead.js'), ['useLibraryRead']);
-  return new Function('useCallback', 'useEffect', 'useRef', 'useState', 'useSyncExternalStore', 'libraryGeneration',
-    'watchLibrary', `return (${useLibraryRead});`)(react.useCallback, react.useEffect, react.useRef, react.useState,
-    react.useSyncExternalStore, libraryGeneration, watchLibrary);
+  const { useRead } = declarations(file('libraryRead.js'), ['useRead']);
+  const core = new Function('useCallback', 'useEffect', 'useRef', 'useState', 'useSyncExternalStore', `return (${useRead});`)(
+    react.useCallback, react.useEffect, react.useRef, react.useState, react.useSyncExternalStore);
+  return (key, read) => core(PAPERS, key, read);
 }
+const PAPERS = { watch: watchLibrary, now: libraryGeneration };
 
 // A request the test answers when it chooses: asked[n].answer(value) or .fail(error).
 function requests() {
@@ -298,4 +299,26 @@ test('design review F\'s rider 1: the delete dialog fires its change when its re
     globalThis.fetch = answer;
     await server.close();
   }
+});
+
+test('design review U, rule H: a reload kept from an earlier key reads nothing, so no key shows another key\'s answer', async () => {
+  // PR 63's recheck r2 (pass 1 F3): a reload made for key A, called once key B is read, ran B's reader, filed its answer
+  // under A and overtook B's own read: B stayed loading for good, and A, read again, showed B's list
+  const { asked, get } = requests();
+  const hook = component((react) => readHook(react));
+  hook.update('a', () => get('a'));
+  asked.shift().answer('A list');
+  await settle();
+  const kept = hook.update().reload; // a dialog's completion holds this
+  hook.update('b', () => get('b'));
+  kept();
+  assert.deepEqual(asked.map((r) => r.path), ['b']); // only B's own read
+  asked.shift().answer('B list');
+  await settle();
+  assert.equal(hook.update().value, 'B list');
+  hook.update('a', () => get('a'));
+  assert.equal(hook.update().value, null); // nothing of B under A's key
+  asked.shift().answer('A list again');
+  await settle();
+  assert.equal(hook.update().value, 'A list again');
 });

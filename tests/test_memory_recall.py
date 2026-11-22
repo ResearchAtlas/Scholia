@@ -166,6 +166,89 @@ async def test_recall_ranks_by_meaning_when_the_search_model_answers_and_a_forgo
         assert await asyncio.to_thread(index.memory_embedded, [wages["id"]]) == set()  # removed, checked gone
 
 
+async def test_an_index_that_goes_unavailable_after_the_nearest_lookup_falls_back_to_the_newest(tmp_path, monkeypatch):
+    # PR 62's round 7 pass 2 (P2), the last follow-up PR's item 15: a rebuild starting between recall's nearest lookup
+    # and its read of which records have vectors raised out of recall, so the turn failed (ticket 31: then by recency)
+    from cited import cited
+    from backend.search_index import SearchIndex, Unavailable
+    from test_search import idle
+    async with cited(tmp_path) as client:
+        project = await project_of(client)
+        for i in range(11):
+            await entered(client, project, f"Unrelated item {i} about scheduling")
+        wages = await entered(client, project, "Wage floors raise the earnings of low-paid workers")
+        await idle(client, project)
+        await background_idle(client, timeout=20)
+        nearest = []
+
+        def rebuilding(self, ids):  # the nearest lookup has answered; the index is rebuilding now
+            raise Unavailable("rebuilding")
+        real_nearest = search.nearest_memory
+
+        async def answered(*args):
+            nearest.append(await real_nearest(*args))
+            return nearest[-1]
+        monkeypatch.setattr(search, "nearest_memory", answered)
+        monkeypatch.setattr(SearchIndex, "memory_embedded", rebuilding)
+        stream = await send(client, await conversation_in(client, project),
+                            "Last time we decided what about wage floors and earnings?")
+        assert stream[-1]["status"] == "succeeded", stream[-1]
+        assert nearest and wages["id"] in nearest[0]  # the lookup did answer, so the second read is what failed
+        [(trace,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'retrieval_trace'"
+                                        " AND json_extract(data, '$.memory') IS NOT NULL", stream[0]["run_id"])
+        trace = json.loads(trace)["memory"]
+        assert (trace["mode"], trace["reason"], trace["records"][0]) == ("recency", "unavailable", wages["id"])
+
+
+async def test_an_index_held_during_the_read_of_which_records_have_vectors_falls_back_to_the_newest_by_the_deadline(
+        tmp_path, monkeypatch):
+    # PR 63's recheck r8 (pass 1, finding 2): the nearest lookup answers, then the second read waits for the index's
+    # own lock; spec section 13's memory lookup deadline bounds both reads, so recall takes the newest, said, in time
+    from cited import cited
+    from test_search import idle, setting
+    async with cited(tmp_path) as client:
+        project = await project_of(client)
+        for i in range(11):
+            await entered(client, project, f"Unrelated item {i} about scheduling")
+        wages = await entered(client, project, "Wage floors raise the earnings of low-paid workers")
+        await idle(client, project)
+        await background_idle(client, timeout=20)
+        index, question = client.state["index"], "Last time we decided what about wage floors and earnings?"
+        answer = await search.nearest_memory(search._STATES[client.state["harness"]], project, question)
+        assert answer and wages["id"] in answer  # what the lookup answers, known before the turn
+        await setting(client, "retrieval.memory_ms", 500)
+        held, times, ranked = [], {}, memory.ranked
+        loop = asyncio.get_running_loop()
+
+        def release():
+            if held:
+                held.pop().release()
+
+        async def at_once(*args):  # the lookup answers at once; from here, the index's lock is held
+            assert index._lock.acquire(timeout=5)
+            held.append(index._lock)
+            times["answered"] = loop.time()
+            loop.call_later(10, release)  # only if recall never stops waiting: the test then fails on its mode
+            return answer
+
+        def ranking(*args, **kwargs):  # recall has stopped waiting for the index
+            times["ranked"] = loop.time()
+            release()
+            return ranked(*args, **kwargs)
+        monkeypatch.setattr(search, "nearest_memory", at_once)
+        monkeypatch.setattr(memory, "ranked", ranking)
+        try:
+            stream = await send(client, await conversation_in(client, project), question)
+        finally:
+            release()
+        assert stream[-1]["status"] == "succeeded", stream[-1]
+        assert times["ranked"] - times["answered"] < 5  # by the 500 ms deadline, not the 10 s release
+        [(trace,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'retrieval_trace'"
+                                        " AND json_extract(data, '$.memory') IS NOT NULL", stream[0]["run_id"])
+        trace = json.loads(trace)["memory"]
+        assert (trace["mode"], trace["reason"], trace["records"][0]) == ("recency", "deadline", wages["id"])
+
+
 async def test_an_earlier_decision_memory_lacks_is_said_missing_never_invented(tmp_path):
     # R3: the missing-information section says so; that the answer never invents one is [PAID]
     provider = MockProvider()
@@ -771,6 +854,37 @@ async def test_a_project_deleted_between_an_edit_and_its_reread_restarts_no_othe
         assert len(await runs_of(client, "index", other)) == 1  # still the one cancelled
         [(kept,)] = await rows(client, "SELECT id FROM memory_records WHERE status = 'confirmed' AND scope = 'personal'")
         assert await _vectors(client, [kept]) == {kept}
+
+
+@pytest.mark.parametrize("site", ["edit", "keep"])
+async def test_a_record_deleted_between_its_edit_and_the_reread_is_not_found_not_an_error(tmp_path, monkeypatch, site):
+    # design review E2's other finding (PR 60's rounds 4 to 7, PR 63's first review pass 1 finding 10): the reread
+    # found no record and _written raised TypeError, a 500
+    from test_search import app
+    async with app(tmp_path) as client:
+        project = await project_of(client, "First")
+        if site == "edit":
+            record = (await entered(client, project, "We use interviews"))["id"]
+        else:
+            record = await write(client, lambda conn: memory.write(
+                conn, project_id=project, scope="project", kind="decision", content="We use interviews",
+                status="proposed", sources=[("project", project)]))
+        await background_idle(client)
+        db, loop, real = client.state["db"], asyncio.get_running_loop(), client.state["db"].write
+
+        def write_then_delete(fn, *args, **kwargs):  # the project, and its records, deleted once the write commits
+            done = real(fn, *args, **kwargs)
+            if getattr(fn, "__name__", "") in ("change", "answer"):
+                asyncio.run_coroutine_threadsafe(client.delete(f"/api/projects/{project}"), loop).result(20)
+            return done
+        monkeypatch.setattr(db, "write", write_then_delete)
+        response = await (client.patch(f"/api/memory/{record}", json={"project_id": project, "version": 1,
+                                                                       "content": "We use surveys"})
+                          if site == "edit" else
+                          client.post("/api/memory/review", json={"project_id": project, "id": record, "action": "keep",
+                                                                  "version": 1}))
+        monkeypatch.setattr(db, "write", real)
+        assert (response.status_code, response.json()["code"]) == (404, "not_found"), response.text
 
 
 async def test_a_memory_write_still_asks_the_general_projects_run_when_its_projects_request_fails(tmp_path, monkeypatch):
@@ -1493,6 +1607,21 @@ async def test_a_whole_rebuild_while_the_app_runs_asks_for_the_runs_of_memory_it
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.02)
         assert await _vectors(client, ids) == set(ids)
+
+
+async def test_a_helper_answering_a_memory_vector_of_another_dimension_fails_the_run(tmp_path, monkeypatch):
+    # design E's R2 (PR 60's rechecks, PR 63's first review pass 1 finding 11): the vector was skipped and the run
+    # succeeded with the record unembedded; as with a passage, it fails with request_failed
+    import synthetic_materials as synthetic
+    from test_search import app, runs_of
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await background_idle(client)
+        monkeypatch.setattr(synthetic, "embedding", lambda text, dimensions=512: [1.0] * dimensions)
+        await entered(client, project, "Wage floors raise the earnings of low-paid workers")
+        await background_idle(client)
+        assert [(r["status"], (r["result"] or {}).get("reason")) for r in await runs_of(client, "index", project)][-1] == (
+            "failed", "request_failed")
 
 
 async def test_a_helper_that_fails_on_a_memory_record_fails_the_run_and_retry_embeds_it(tmp_path):

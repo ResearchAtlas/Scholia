@@ -17,7 +17,6 @@ import ctypes
 import errno
 import fcntl
 import functools
-import json
 import logging
 import os
 import secrets
@@ -27,6 +26,8 @@ import sys
 import threading
 import time
 from pathlib import Path
+
+from backend import whole_json as json
 
 APP_NAME = "Scholia"
 LOCK_FILE = "scholia.lock"

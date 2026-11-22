@@ -16,10 +16,10 @@ not stay in old WAL frames, and unreferenced content files are collected.
 """
 
 import contextlib
-import json
 import logging
 import weakref
 
+from backend import whole_json as json
 from backend import provenance
 from backend.db.content import referenced_sql
 from backend.extraction import EXTRACTORS, extractor_of
@@ -295,25 +295,21 @@ def supersede(conn, earlier, newer):
     """Remove a reading (an extraction and its passages) that a newer reading of the same file by the
     same extractor has replaced, inside the newer reading's commit: conn is its transaction, in which
     backend/materials.py has queued the earlier passages' removals from every project's index.
-    Section 7.1: a re-parse rebuilds passages, and citations re-resolve through their quotes. Each
-    citation of one of its passages is pointed at the newer reading's passage with that passage's own
-    text (on the same page and nearest it first); one with none keeps no passage, and a found one is
-    not_found until its quote is found (materials._resolve, in the same transaction). Then the
+    Section 7.1: a re-parse rebuilds passages, and citations re-resolve through their quotes. Their
+    choice is made before, in the same transaction (citations.retarget, design review J): a citation
+    still on one of its passages is one no passage of the paper's reading now holds, so it keeps no
+    passage, and one found (ok) whose paper reads the newer reading is not_found until a later
+    reading holds its quote (S1-20 reading 3); a replaced paper's reads as removed. Then the
     passages and the reading go, and the reading's tombstone is written (kind reading, no title), as
     for every deletion (section 4.2). No audit record: the researcher did not delete it, and a
     re-read's record is its run. Nothing else references a passage or a reading: citations are the
     only foreign key into passages (S1-21: memory sources naming a passage are to be pointed again
     here in the same way)."""
-    for citation, text, page, ordinal in conn.execute(
-            "SELECT c.id, p.text, p.page, p.ordinal FROM citations c JOIN passages p ON p.id = c.passage_id"
-            " WHERE p.extraction_id = ?", (earlier,)).fetchall():
-        found = conn.execute("SELECT id, page FROM passages WHERE extraction_id = ? AND text = ?"
-                             " ORDER BY page IS NOT ?, abs(ordinal - ?) LIMIT 1", (newer, text, page, ordinal)).fetchone()
-        if found is not None:
-            conn.execute("UPDATE citations SET passage_id = ?, page = coalesce(?, page) WHERE id = ?", (*found, citation))
-        else:
-            conn.execute("UPDATE citations SET passage_id = NULL,"
-                         " existence = CASE existence WHEN 'ok' THEN 'not_found' ELSE existence END WHERE id = ?", (citation,))
+    conn.execute(
+        "UPDATE citations SET passage_id = NULL, existence = CASE WHEN existence = 'ok' AND material_id IN"
+        f" (SELECT w.material_id FROM material_versions w JOIN extractions e ON {_reads_now('w', 'e')} WHERE e.id = ?)"
+        " THEN 'not_found' ELSE existence END WHERE passage_id IN (SELECT id FROM passages WHERE extraction_id = ?)",
+        (newer, earlier))
     conn.execute("DELETE FROM passages WHERE extraction_id = ?", (earlier,))
     conn.execute("DELETE FROM extractions WHERE id = ?", (earlier,))
     conn.execute("INSERT INTO tombstones (object_id, kind) VALUES (?, 'reading')", (earlier,))

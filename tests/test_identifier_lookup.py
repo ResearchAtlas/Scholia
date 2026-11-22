@@ -185,6 +185,24 @@ async def test_an_uploads_lookup_answered_later_puts_the_project_first_only_when
         assert await first_project(client) == (other if edited else project)
 
 
+async def test_a_details_change_that_changes_nothing_leaves_the_paper_to_its_lookup(tmp_path):
+    # PR 61 batch 6's internal review: the details form's forced submit sends an empty change, which marked the paper
+    # checked by the researcher (and moved its updated_at), so its lookup then filled nothing
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client, level="local_only")
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [ask] = await ask_of(client, project)
+        paper = result["materials"][0]["id"]
+        before = (await client.get(f"/api/materials/{paper}")).json()
+        unchanged = await client.patch(f"/api/materials/{paper}", json={})
+        assert unchanged.status_code == 200 and unchanged.json()["updated_at"] == before["updated_at"]
+        assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
+                                  json={"option": "lookup"})).status_code == 200
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        found = (await client.get(f"/api/materials/{paper}")).json()
+        assert (found["title"], found["checked_by"]) == (TITLE, "lookup")
+
+
 async def test_a_lookup_resumed_after_a_restart_keeps_its_answer(tmp_path, monkeypatch):
     data = tmp_path / "data"
     async with started(data, scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
@@ -1245,3 +1263,58 @@ async def test_a_local_only_lookup_cancelled_while_it_asks_closes_its_ask(tmp_pa
         assert (await listing(client, project))["asks"] == [] and client.provider.scholarly.requests == []
         [paper] = (await listing(client, project))["materials"]
         assert (paper["lookup"]["status"], paper["lookup"]["reason"]) == ("cancelled", None)  # stopped, not skipped
+
+
+HALF = "\ud83d"
+
+
+@pytest.mark.parametrize("source, field", [("openalex", "author"), ("openalex", "venue"), ("openalex", "volume"),
+                                           ("openalex", "pages"), ("openalex", "title"),
+                                           ("openalex", "author as raw bytes"), ("crossref", "family name"),
+                                           ("crossref", "venue"), ("crossref", "title")])
+async def test_a_lookups_answer_holding_half_a_surrogate_pair_is_kept_with_the_replacement_character(tmp_path, source,
+                                                                                                     field):
+    # The third Fable recheck (finding 1) and design review AA: half a pair in a field OpenAlex or Crossref sends, as a
+    # JSON escape or as raw bytes, reached materials.csl, and the Library could not be listed (or a title's lookup
+    # failed). Decoded through backend/whole_json.py, it is the replacement character
+    marked = f"Half {HALF} pair"
+    if source == "openalex":
+        record = openalex_work(DOI, TITLE)
+        if field.startswith("author"):
+            record["authorships"] = [{"author": {"display_name": marked}}]
+        elif field == "venue":
+            record["primary_location"] = {"source": {"display_name": marked}}
+        elif field == "volume":
+            record["biblio"]["volume"] = marked
+        elif field == "pages":
+            record["biblio"]["first_page"] = marked
+        else:
+            record["title"] = record["display_name"] = marked
+        body = json.dumps(record).encode()  # its escapes, as JSON sends half a pair
+        if field == "author as raw bytes":
+            body = body.replace(b"\\ud83d", HALF.encode("utf-8", "surrogatepass"))
+    else:
+        record = crossref_work(DOI, TITLE)
+        if field == "family name":
+            record["author"] = [{"given": "Ana", "family": marked}]
+        elif field == "venue":
+            record["container-title"] = [marked]
+        else:
+            record["title"] = [marked]
+        body = json.dumps({"status": "ok", "message": record}).encode()
+    host = "api.openalex.org" if source == "openalex" else "api.crossref.org"
+
+    async def answer(request):
+        if request.url.host == host:
+            return httpx.Response(200, content=body, headers={"content-type": "application/json"})
+        return httpx.Response(404, json={"error": "Not found"})
+
+    async with started(tmp_path / "data", MockProvider(scholarly=answer)) as client:
+        project = await project_of(client)
+        await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["lookup"]["outcome"] == "resolved" and paper["lookup"]["source"] == source
+        assert "Half \ufffd pair" in json.dumps(paper, ensure_ascii=False)
+        # and it is stored whole: new records hold no half pair, as an escape or as it is (the internal review, F1)
+        for value in [v for row in await rows(client, "SELECT title, csl FROM materials") for v in row if v]:
+            assert "\\ud83d" not in value and "\ud83d" not in value

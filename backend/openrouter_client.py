@@ -14,7 +14,6 @@ configured base URL, and provider-supplied links are never followed.
 
 import asyncio
 import hashlib
-import json
 import logging
 import math
 import time
@@ -22,6 +21,7 @@ import zlib
 
 import httpx
 
+from backend import whole_json as json
 from backend.openrouter import classify_error
 
 log = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ async def _fetch_catalog_rows(client, url, id_field, key):
                     response.raise_for_status()
                     body = await _bounded(response, MAX_CATALOG_BYTES - total_bytes)  # every page's, together
                     total_bytes += len(body)
-                    payload = json.loads(body)
+                    payload = json.loads(body)  # whole_json: half a surrogate pair is the replacement character
                 if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
                     raise ValueError("invalid catalog shape")
                 page = payload["data"]

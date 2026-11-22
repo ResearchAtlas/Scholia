@@ -21,11 +21,11 @@ caps a candidate at proposed unless the words it rests on are in the researcher'
 an existing record only under section 8's three conditions (`apply_extraction`).
 """
 
-import json
 import re
 import unicodedata
 from datetime import UTC, datetime, timedelta
 
+from backend import whole_json as json
 from backend.db import new_id, utc_now
 
 TYPES = ("profile", "project_state", "decision", "event", "preference", "progress", "agent_note")
@@ -349,7 +349,7 @@ def edit(conn, record, version, *, content=None, confirm=False):
                  structured=structured or None)
 
 
-def keep(conn, proposal, version, edited=False):
+def keep(conn, proposal, version):
     """The researcher's Keep (confirm) of a proposal, in place (the views, the card, a Save command): it replaces the
     record it names (supersedes_id) only if that record is still at the version the proposal saw; else it stays
     proposed and is marked out of date (section 8), in this transaction, and None is returned. Returns its id, or raises
@@ -555,9 +555,9 @@ def parse(text):
     and writes nothing). A reply in one code fence is read inside it."""
     body = (text or "").strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", body, re.S)
-    try:
+    try:  # half a surrogate pair (an escape or raw bytes) is the replacement character (whole_json)
         found = json.loads(fenced.group(1) if fenced else body)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return None
     if not isinstance(found, dict) or set(found) != {"records"} or not isinstance(found["records"], list) \
             or len(found["records"]) > MAX_CANDIDATES:
@@ -943,7 +943,7 @@ import sqlite3  # noqa: E402
 from typing import Literal  # noqa: E402
 
 from fastapi import APIRouter, Request  # noqa: E402
-from fastapi.responses import JSONResponse  # noqa: E402
+from backend.json_answer import WholeJSONResponse  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
 router = APIRouter()
@@ -979,7 +979,7 @@ class Refused(Exception):
 
 
 def _refused(error):
-    return JSONResponse({"code": error.code, "message": error.message}, status_code=error.status)
+    return WholeJSONResponse({"code": error.code, "message": error.message}, status_code=error.status)
 
 
 _CHANGE_ERRORS = {"changed": (409, "version_changed", "This record changed since it was shown; look again"),
@@ -1071,7 +1071,8 @@ async def create_memory(body: NewRecord, request: Request):
         return _refused(error)
     except sqlite3.IntegrityError as error:  # reading 4: never personal from a Private, Local only or locked project
         return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
-    return await asyncio.to_thread(state["db"].read, lambda conn: row(conn, record))
+    found = await asyncio.to_thread(state["db"].read, lambda conn: row(conn, record))
+    return found if found is not None else _refused(Refused(404, "not_found", "No such record"))  # deleted meanwhile
 
 
 @router.patch("/api/memory/{record_id}")
@@ -1084,6 +1085,23 @@ async def change_memory(record_id: str, body: Change, request: Request):
         content = visible(body.content)
         if content is None:
             return _refused(Refused(400, "empty", "The record is empty"))
+
+    if body.content is None and body.status is None:  # a change of nothing: no edit, and no confirmation (section 8);
+        # checked as a change is (where it is made from, the version shown), and the record answered as it is
+        def unchanged(conn):
+            _from(conn, record_id, body.project_id)
+            found = row(conn, record_id)
+            if found is None:
+                raise LookupError(record_id)
+            if found["version"] != body.version or found["status"] == "superseded":
+                raise ValueError("changed")
+            return found
+        try:
+            return await asyncio.to_thread(state["db"].read, unchanged)
+        except LookupError:
+            return _refused(Refused(404, "not_found", "No such record"))
+        except ValueError as error:
+            return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
 
     def change(conn):
         _from(conn, record_id, body.project_id)
@@ -1101,11 +1119,14 @@ async def change_memory(record_id: str, body: Change, request: Request):
 
 async def _written(state, change):
     """change(conn) written; the record it gives back read, and its index run asked for (under _to_end); None when it
-    gives none (a proposal marked out of date)."""
+    gives none (a proposal marked out of date). LookupError when a deletion took the record before the reread: it is
+    not there, and nothing of it is to be indexed."""
     record = await asyncio.to_thread(state["db"].write, change)
     if record is None:
         return None
     found = await asyncio.to_thread(state["db"].read, lambda conn: row(conn, record))
+    if found is None:
+        raise LookupError(record)
     await _embed_soon(state, found["project_id"])
     return found
 

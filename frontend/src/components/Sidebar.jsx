@@ -2,7 +2,7 @@
 // The sidebar (slice-1 spec section 3): the project switcher, with deleting the current
 // project, a new conversation, the project's conversations with rename, move and delete
 // (the delete dialogs of S14), and Settings.
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Check, ChevronsUpDown, Loader2, MoreHorizontal, PanelLeftClose, Pencil, Plus, Settings, SquarePen,
   Trash2, FolderInput } from 'lucide-react';
 import { useT } from '../i18n/index.js';
@@ -22,11 +22,14 @@ import { HoldsChoice } from './Governance.jsx';
 import { memoryChanged } from '../memory.js'; // S1-21a
 import { libraryChanged } from '../library.js';
 
-export function Sidebar({ projects, projectId, conversations, conversationId, onProject, onProjectsChanged,
-  onConversation, onConversationsChanged, onNewConversation, onSettings, onHide }) {
+export function Sidebar({ projects, projectId, conversations, problem, conversationId, onProject, onProjectCreated, onProjectDeleted,
+  onConversation, onConversationsChanged, onConversationRemoved, onConversationDeleted, onNewConversation, onSettings, onHide }) {
   const t = useT();
   const [dialog, setDialog] = useState(null); // { kind, conversation? }
   const project = projects.find((p) => p.id === projectId);
+  // drawn still: an answer whose dialog went with the sidebar (the window narrowed) says what changed and moves nothing
+  const here = useRef(false);
+  useEffect(() => { here.current = true; return () => { here.current = false; }; }, []);
 
   return (
     <nav className="flex h-full flex-col bg-sidebar" aria-label={t('sidebar.projects')}>
@@ -75,10 +78,14 @@ export function Sidebar({ projects, projectId, conversations, conversationId, on
 
       <h2 className="px-4 pb-1 pt-2 text-xs font-medium text-muted-foreground">{t('sidebar.conversations')}</h2>
       <ul className="scroll-thin min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 pb-2">
-        {conversations.length === 0 && (
+        {/* null: not read since what it lists changed (Shell.jsx): nothing read before is shown */}
+        {conversations === null && (problem
+          ? <li role="alert" className="px-2 py-3 text-sm text-destructive">{problem}</li>
+          : <li role="status" className="px-2 py-3 text-sm text-muted-foreground">{t('common.loading')}</li>)}
+        {conversations?.length === 0 && (
           <li className="px-2 py-3 text-sm text-muted-foreground">{t('sidebar.noConversations')}</li>
         )}
-        {conversations.map((c) => (
+        {conversations?.map((c) => (
           <li key={c.id} className="group relative">
             <button type="button" onClick={() => onConversation(c.id)} aria-current={c.id === conversationId ? 'page' : undefined}
               className={cn('flex w-full items-center gap-2 rounded-md py-1.5 pl-2.5 pr-8 text-left text-sm transition-colors hover:bg-accent',
@@ -118,25 +125,29 @@ export function Sidebar({ projects, projectId, conversations, conversationId, on
       </div>
 
       <NewProjectDialog open={dialog?.kind === 'project'} onClose={() => setDialog(null)}
-        onCreated={(created) => { setDialog(null); onProjectsChanged(created.id); }} />
+        onCreated={(created) => { setDialog(null); onProjectCreated(created.id, here.current); }} />
       <RenameDialog conversation={dialog?.kind === 'rename' ? dialog.conversation : null} onClose={() => setDialog(null)}
         onDone={() => { setDialog(null); onConversationsChanged(); }} />
       <MoveDialog conversation={dialog?.kind === 'move' ? dialog.conversation : null} projects={projects} from={project}
-        onClose={() => setDialog(null)} onDone={(moved) => { setDialog(null); onConversationsChanged(moved); }} />
+        onClose={() => setDialog(null)} onDone={(moved) => { setDialog(null); onConversationRemoved(moved, here.current); }} />
       <DeleteDialog onClose={() => setDialog(null)}
         target={dialog?.kind === 'delete' ? { kind: 'conversation', id: dialog.conversation.id,
           title: t('conversation.deleteTitle'), body: t('conversation.deleteBody') }
           : dialog?.kind === 'deleteProject' ? { kind: 'project', id: dialog.project.id,
             title: t('project.deleteTitle', { name: projectName(t, dialog.project) }), body: t('project.deleteBody') }
             : null}
-        onDone={(deleted) => {
-          const kind = dialog?.kind;
-          setDialog(null);
+        onSettled={(id, deleted) => { // as its request settles, however it ends (deleted: it is known to be; else it may
+          // be, though it failed), and a notice keeps the dialog open (design review F, site 3)
           memoryChanged(null); // S1-21a: records resting only on what was deleted went with it
-          if (kind === 'deleteProject') libraryChanged(null); // and its papers (a memory change moves no generation)
-          if (kind === 'deleteProject') onProjectsChanged(); // another project is shown
-          else onConversationsChanged(deleted);
-        }} />
+          // and a project's papers, or a conversation's runs, whose questions the Library lists (a memory change moves
+          // no generation)
+          libraryChanged(dialog?.kind === 'deleteProject' ? null : projectId);
+          // a deletion known to have happened leaves what it removed even when the sidebar went: nothing of it can be sent
+          // to, and what was typed in it goes with it (design review S); rider W is for what still exists
+          if (dialog?.kind === 'deleteProject') onProjectDeleted(id, deleted);
+          else onConversationDeleted(id, deleted);
+        }}
+        onDone={() => setDialog(null)} />
     </nav>
   );
 }
@@ -158,19 +169,20 @@ function NewProjectDialog({ open, onClose, onCreated }) {
     }
   }
   return (
-    <Dialog open={open} onOpenChange={(next) => { if (!next) { reset(); onClose(); } }}>
+    <Dialog open={open} onOpenChange={(next) => { if (!next && !busy) { reset(); onClose(); } }}>
       <DialogContent className="max-h-[90vh] max-w-md overflow-y-auto">
         <form onSubmit={submit} className="grid gap-4">
           <DialogHeader><DialogTitle>{t('project.newTitle')}</DialogTitle></DialogHeader>
           <div className="grid gap-1.5">
             <label htmlFor="new-project" className="text-sm font-medium">{t('project.nameLabel')}</label>
             <Input id="new-project" value={name} maxLength={200} autoFocus placeholder={t('project.namePlaceholder')}
-              onChange={(event) => setName(event.target.value)} />
+              onChange={(event) => setName(event.target.value)} readOnly={busy} />
           </div>
-          <HoldsChoice value={holds} onChange={setHolds} venue={venue} onVenue={setVenue} name="new-project-holds" />
+          <HoldsChoice value={holds} onChange={setHolds} venue={venue} onVenue={setVenue} name="new-project-holds" disabled={busy} />
           {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
+          {busy && <p role="status" className="text-sm text-muted-foreground">{t('backups.working')}</p>}
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
+            <Button type="button" variant="ghost" disabled={busy} onClick={onClose}>{t('common.cancel')}</Button>
             <Button type="submit" disabled={busy || !name.trim()}>{t('project.create')}</Button>
           </DialogFooter>
         </form>
@@ -190,7 +202,7 @@ function RenameDialog({ conversation, onClose, onDone }) {
   }
   return (
     <Dialog open={Boolean(conversation)} onOpenChange={(next) => {
-      if (next) return;
+      if (next || busy) return;
       reset();
       onClose();
     }}>
@@ -199,11 +211,12 @@ function RenameDialog({ conversation, onClose, onDone }) {
           <DialogHeader><DialogTitle>{t('conversation.renameTitle')}</DialogTitle></DialogHeader>
           <div className="grid gap-1.5">
             <label htmlFor="rename" className="text-sm font-medium">{t('conversation.titleLabel')}</label>
-            <Input id="rename" value={title} maxLength={200} onChange={(event) => setTitle(event.target.value)} />
+            <Input id="rename" value={title} maxLength={200} onChange={(event) => setTitle(event.target.value)} readOnly={busy} />
           </div>
           {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
+          {busy && <p role="status" className="text-sm text-muted-foreground">{t('backups.working')}</p>}
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
+            <Button type="button" variant="ghost" disabled={busy} onClick={onClose}>{t('common.cancel')}</Button>
             <Button type="submit" disabled={busy || !title.trim()}>{t('common.save')}</Button>
           </DialogFooter>
         </form>
@@ -227,7 +240,7 @@ function MoveDialog({ conversation, projects, from, onClose, onDone }) {
   }
   return (
     <Dialog open={Boolean(conversation)} onOpenChange={(next) => {
-      if (next) return;
+      if (next || busy) return;
       reset();
       setTarget(null);
       onClose();
@@ -246,7 +259,7 @@ function MoveDialog({ conversation, projects, from, onClose, onDone }) {
               {targets.map((p) => (
                 <label key={p.id} className={cn('flex cursor-pointer items-center gap-2.5 rounded-md border px-3 py-2 text-sm transition-colors hover:bg-accent',
                   target === p.id && 'border-brand bg-brand-soft')}>
-                  <input type="radio" name="target" value={p.id} checked={target === p.id}
+                  <input type="radio" name="target" value={p.id} checked={target === p.id} disabled={busy}
                     onChange={() => setTarget(p.id)} className="accent-[hsl(var(--brand))]" />
                   <span className="truncate">{projectName(t, p)}</span>
                 </label>
@@ -254,8 +267,9 @@ function MoveDialog({ conversation, projects, from, onClose, onDone }) {
             </fieldset>
           )}
           {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
+          {busy && <p role="status" className="text-sm text-muted-foreground">{t('backups.working')}</p>}
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
+            <Button type="button" variant="ghost" disabled={busy} onClick={onClose}>{t('common.cancel')}</Button>
             <Button type="submit" disabled={busy || !target}>{t('common.move')}</Button>
           </DialogFooter>
         </form>

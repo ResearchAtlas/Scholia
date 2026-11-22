@@ -98,6 +98,7 @@ export function Library({ project }) {
   }
 
   async function add(files) {
+    if (!project) return; // drawn for no project (a removal known, its projects read again): nowhere to add to
     const report = addNotice();
     const result = await addTo(project.id, files, t, report);
     if (result?.materials.some((m) => m.existing)) report(t('library.alreadyHere'));

@@ -55,7 +55,6 @@ Nothing here logs text, a title, a query or a path.
 
 import concurrent.futures
 import hashlib
-import json
 import logging
 import os
 import queue
@@ -68,6 +67,7 @@ import apsw
 import apsw.fts5
 import sqlite_vec
 
+from backend import whole_json as json
 from backend.db import DatabaseClosedError
 from backend.db.database import close_connection, note_close_failed
 from backend.db.deletion import _reads_now

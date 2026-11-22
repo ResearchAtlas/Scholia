@@ -11,7 +11,7 @@ screen, S2) and records another place for the next launch.
 """
 
 import ctypes
-import json
+import json  # the record of the chosen folder's path round-trips the file system's bytes (tests/test_whole_json.py)
 import logging
 import os
 import platform
@@ -22,9 +22,10 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from backend.json_answer import WholeJSONResponse
 from backend import APP_VERSION
 from backend.db.database import (DB_NAME, DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError,
                                   check_identity)
@@ -266,12 +267,12 @@ def limited_app(default, data_dir, problem, reason, *, origin, session, frontend
     from backend.app import static_file
     from backend.local_guard import LocalRequestGuard
 
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, default_response_class=WholeJSONResponse)
     app.state.scholia = {}  # nothing for the desktop entry to stop
     frontend = Path(frontend_dir).resolve() if frontend_dir else None
 
     def error(status, code, message):
-        return JSONResponse({"code": code, "message": message}, status_code=status)
+        return WholeJSONResponse({"code": code, "message": message}, status_code=status)
 
     @app.exception_handler(RequestValidationError)
     async def invalid(request, failure):

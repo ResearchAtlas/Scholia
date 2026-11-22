@@ -199,6 +199,8 @@ def scanned_pdf(lines, size=(612, 792), dpi=300):
     import pypdfium2 as pdfium
     import pypdfium2.raw as raw
 
+    from backend.extraction import PDFIUM
+
     scale = dpi / 72
     width, height = round(size[0] * scale), round(size[1] * scale)
     rep = AppKit.NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(  # noqa: E501
@@ -222,18 +224,30 @@ def scanned_pdf(lines, size=(612, 792), dpi=300):
     finally:
         AppKit.NSGraphicsContext.restoreGraphicsState()
     stride, pixels = rep.bytesPerRow(), bytes(rep.bitmapData()[: rep.bytesPerRow() * height])
-    document = pdfium.PdfDocument.new()
-    page = document.new_page(*size)
-    bitmap = pdfium.PdfBitmap.new_native(width, height, raw.FPDFBitmap_Gray)
-    for row in range(height):
-        ctypes.memmove(ctypes.addressof(bitmap.buffer) + row * bitmap.stride, pixels[row * stride:row * stride + width], width)
-    image = pdfium.PdfImage.new(document)
-    image.set_bitmap(bitmap)
-    image.set_matrix(pdfium.PdfMatrix().scale(*size))
-    page.insert_obj(image)
-    page.gen_content()
-    out = io.BytesIO()
-    document.save(out)
+    with PDFIUM:  # pdfium is not thread-safe: every use holds this lock, as the app's readings do
+        document = pdfium.PdfDocument.new()
+        try:
+            page = document.new_page(*size)
+            image = pdfium.PdfImage.new(document)
+            try:
+                bitmap = pdfium.PdfBitmap.new_native(width, height, raw.FPDFBitmap_Gray)
+                try:
+                    for row in range(height):
+                        ctypes.memmove(ctypes.addressof(bitmap.buffer) + row * bitmap.stride,
+                                       pixels[row * stride:row * stride + width], width)
+                    image.set_bitmap(bitmap)
+                finally:
+                    bitmap.close()  # the image keeps its own reference; released inside the lock
+                image.set_matrix(pdfium.PdfMatrix().scale(*size))
+                page.insert_obj(image)
+            except BaseException:
+                image.close()  # on no page: released here, inside the lock, however it failed
+                raise
+            page.gen_content()
+            out = io.BytesIO()
+            document.save(out)
+        finally:
+            document.close()  # inside the lock, not later by the collector outside it
     return out.getvalue()
 
 

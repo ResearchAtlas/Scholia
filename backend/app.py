@@ -10,7 +10,6 @@ import asyncio
 import contextlib
 import dataclasses
 import hashlib
-import json
 import logging
 import secrets
 import shutil
@@ -24,12 +23,14 @@ from typing import Literal
 import anyio
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 
+from backend import whole_json as json
+from backend.json_answer import WholeJSONResponse
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend import backups
 from backend import agent, answers, asks, materials, memory
@@ -94,15 +95,17 @@ class ApiError(Exception):
 
 
 def _error(status, code, message):
-    return JSONResponse({"code": code, "message": message}, status_code=status)
+    return WholeJSONResponse({"code": code, "message": message}, status_code=status)
 
 
 async def _valid_text(request: Request):
-    """Every API request's JSON body holds only valid Unicode text: half a surrogate pair, which a JSON escape can give
-    (as "\\ud83d"), is refused as any invalid request is, in a string, a key or a list's item, whatever the route's model
-    says (the M2 audit's Fable 5 F1). Stored, the database could not read it back. FastAPI has parsed the body already
-    for a route that takes one, so this reads the same parse. Outside /api (the static pages) it reads nothing: the guard
-    bounds and authenticates only the API's bodies (PR 57's rechecks)."""
+    """Every API request's JSON body holds only valid Unicode text: half a surrogate pair, which a JSON escape (as
+    "\\ud83d") or the body's raw bytes can give (json decodes bytes with surrogatepass), is refused as any invalid
+    request is, in a string, a key or a list's item, whatever the route's model says (the M2 audit's Fable 5 F1). It
+    reads the body with the standard library's decoder (Request.json), which keeps half a pair, so it refuses it.
+    Stored, the database could not read it back. FastAPI has parsed the body already for a route that takes one, so
+    this reads the same parse. Outside /api (the static pages) it reads nothing: the guard bounds and authenticates
+    only the API's bodies (PR 57's rechecks)."""
     if not _is_api(request.scope["path"]):
         return
     try:  # an empty or absent body is not JSON either
@@ -420,7 +423,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 state["closed"] = True
 
     # Every route's, the included routers' too (see _valid_text)
-    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, dependencies=[Depends(_valid_text)])
+    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, dependencies=[Depends(_valid_text)],
+                  default_response_class=WholeJSONResponse)
     app.state.scholia = state  # the desktop entry reaches the harness through it at shutdown
     app.include_router(backups.router)  # backups, restore and project export, ahead of the catch-all routes
     app.include_router(materials.router)  # materials, passages, page images and retries (S1-13)
@@ -484,7 +488,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             del confirmations[token]
         token = secrets.token_urlsafe(18)
         confirmations[token] = (what, now + CONFIRM_SECONDS)
-        return JSONResponse({"code": "confirmation_required", "message": "Confirm this change", "token": token},
+        return WholeJSONResponse({"code": "confirmation_required", "message": "Confirm this change", "token": token},
                             status_code=409)
 
     def confirmed(token, *what):
@@ -497,7 +501,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def health():
         why = backups.limited(state)
         return {"ok": True, "version": APP_VERSION, "data_folder": str(data_dir),
-                **({"database_damaged": why[1], "limited": why[0]} if why else {})}
+                **({"database_damaged": why[1], "limited": why[0]} if why else {}),
+                **({"restoring": True} if state.get("restores") else {})}  # backups.restore: from its request to its end
 
     async def provider_list():
         configured = providers.configured(data_dir, include_off=True)
@@ -1482,7 +1487,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
         registry = harness().registry
         listed = await read(listing)
-        return JSONResponse({"runs": [{
+        return WholeJSONResponse({"runs": [{
             "run_id": run, "project_id": project_id, "project_name": name, "project_kind": kind,
             "workflow": workflow, "status": status, "cancel_reason": cancel,
             "cost_usd": cost, "attempts": attempts, "started_at": started, "finished_at": finished,

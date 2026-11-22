@@ -34,7 +34,7 @@ export function App() {
   const [shown, setShown] = useState({ language: null, failed: null });
   const { language } = shown;
   // The window's language, decided by the first launch step that knows it; later ones (load again
-  // after the setup, a restore or Try again) leave it as it is.
+  // after the setup or Try again) leave it as it is. A restore reloads the window (Backups.jsx).
   const decided = useRef(false);
   const launchLanguage = useCallback(async (setting) => {
     if (decided.current) return;
@@ -47,6 +47,9 @@ export function App() {
   const load = useCallback(async () => {
     try {
       const health = await get('/api/health');
+      // design review AC: a restore is under way (from its request to its end): nothing of a database that is about to
+      // be replaced is read; the window says so, and Try again reloads it
+      if (health.restoring) throw new ApiError(503, 'restoring');
       if (health.data_folder_problem || health.database_damaged) {
         const settings = await get('/api/settings').catch(() => null); // a limited app may not serve it
         await launchLanguage(settings?.values?.ui?.language ?? 'system');
@@ -97,9 +100,9 @@ export function App() {
     <LanguageContext.Provider value={language}>
       {englishUnsaved && <EnglishNotSaved onRetry={retryEnglish} onClose={() => setEnglishUnsaved(false)} />}
       {state.phase === 'loading' && <Splash />}
-      {state.phase === 'error' && <Failure code={state.code} onRetry={load} />}
+      {state.phase === 'error' && <Failure code={state.code} onRetry={state.code === 'restoring' ? () => window.location.reload() : load} />}
       {state.phase === 'dataFolder' && <DataFolderScreen health={state.health} />}
-      {state.phase === 'damaged' && <DamagedDatabaseScreen onRestored={load} restart={state.health?.limited === 'restart_required'} />}
+      {state.phase === 'damaged' && <DamagedDatabaseScreen restart={state.health?.limited === 'restart_required'} />}
       {state.phase === 'setup' && <FirstRun onDone={load} />}
       {state.phase === 'ready' && <Shell health={state.health} settings={state.settings}
         onLanguage={() => setEnglishUnsaved(false)} />}

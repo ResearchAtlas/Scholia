@@ -463,7 +463,7 @@ async def test_an_inherited_judge_is_planned_and_reserved_on_the_facts_of_its_ow
 
 async def test_a_remapped_citation_keeps_its_verdict_only_for_the_same_passage_text(tmp_path):
     # b2 (5): a re-read whose passage keeps the quote but changes the text leaves the citation unchecked.
-    from backend import materials as materials_module
+    from backend import citations as citations_module
     async with cited(tmp_path) as client:
         project, [material] = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)
@@ -477,11 +477,7 @@ async def test_a_remapped_citation_keeps_its_verdict_only_for_the_same_passage_t
             conn.execute("UPDATE passages SET text = ? WHERE id = ?", (quote + suffix, pid))
             conn.execute("UPDATE citations SET passage_id = NULL, existence = 'not_found', support = 'supported'"
                          " WHERE id = ?", (cid,))
-            sha, kind, extraction = conn.execute(
-                "SELECT v.file_sha256, coalesce(v.media_type, f.media_type), p.extraction_id FROM material_versions v"
-                " JOIN content_files f ON f.sha256 = v.file_sha256 JOIN passages p ON p.id = ? WHERE v.material_id = ?",
-                (pid, material)).fetchone()
-            materials_module._resolve(conn, sha, materials_module.extraction.extractor_of(kind), extraction)
+            citations_module.retarget(conn, material)  # as a reading's commit does (design review J)
             return conn.execute("SELECT existence, support, support_run_id FROM citations").fetchone()
         same = await asyncio.to_thread(db.write, lambda conn: remap(conn, ""))
         assert same[:2] == ("ok", "supported")  # the passage's text is the quote's: the verdict stands
