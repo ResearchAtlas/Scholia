@@ -336,7 +336,7 @@ export function AuditLog({ project }) {
   // An open project, known or not (undefined: its record is read again), is its own default; while its record is not
   // known nothing is read or exported in its name, nor for no project (the batch J review; recheck r9's class)
   const [scope, setScope] = useState(project === null ? 'all' : 'project');
-  const waiting = scope === 'project' && !project;
+  const waiting = scope === 'project' && project === undefined; // null: no project open now, so the whole log
   const [page, setPage] = useState(null); // { entries, next, allowed_off_this_mac }
   const [read, setRead] = useState(null);
   const [exported, setExported] = useState(null);

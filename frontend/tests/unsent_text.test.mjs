@@ -977,6 +977,19 @@ const scenarios = {
     await s.redraw({ project: { id: 'p1', name: 'Project Alpha', kind: 'research', sensitivity: 'normal' } });
     assert.ok(paths.length > 0 && paths.every((path) => path.includes('project_id=p1')), `read once its record came: ${paths}`);
   },
+  // The batch J recheck (P3-1): a log whose project was known and is then closed (null: none open) reads the whole log,
+  // not "waiting" for a record that will never come.
+  async anAuditLogWhoseProjectWasClosedReadsTheWholeLog(w, strict) {
+    const paths = [];
+    const s = await drawn(w, strict, {}, 'Governance', 'AuditLog', { project: { id: 'p1', name: 'Project Alpha', kind: 'research', sensitivity: 'normal' } }, () => {
+      const answering = globalThis.fetch;
+      globalThis.fetch = (path, init) => { if (String(path).startsWith('/api/audit')) paths.push(`${init?.method ?? 'GET'} ${path}`); return answering(path, init); };
+    });
+    paths.length = 0;
+    await s.redraw({ project: null });
+    assert.ok(paths.some((path) => path.startsWith('GET /api/audit') && !path.includes('project_id')), `the whole log was not read: ${paths}`);
+    assert.equal(one(s.shown().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Export'), 'Export').props.disabled, false);
+  },
 };
 
 // Design review AF's row vi: when a removal becomes known the projects are read again, and Settings' This project page
