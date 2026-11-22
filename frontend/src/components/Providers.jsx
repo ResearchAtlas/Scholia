@@ -20,8 +20,9 @@ const MIN_WINDOW = 4096; // the smallest supported window (backend/providers.py)
 const GROUPS = ['ready', 'setup', 'off'];
 const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/; // a provider's name, a bare TOML key
 
-// stored and onStored: what an added endpoint's key save said (the key store's warning, ticket 16), held by Settings
-// so it outlives this page: a key stored after the page was left is said when it is next drawn (Harold, 2026-11-22).
+// stored and onStored: that a key saved here went to the private file (the key store's warning, ticket 16), held by
+// Settings so it outlives this page: a key stored after the page was left is said when it is next drawn (Harold,
+// 2026-11-22). It is never taken back in the window: a later key that went to the store does not move an earlier one.
 export function Providers({ stored = null, onStored = () => {} }) {
   const t = useT();
   const personal = useSettingsFile();
@@ -74,7 +75,7 @@ export function Providers({ stored = null, onStored = () => {} }) {
       <FileProblems problems={personal.problems} />
       {stored && <p role="status" className="rounded-md bg-warning/10 px-3 py-2 text-sm text-warning">{t('setup.storeWarning')}</p>}
       {adding && <AddEndpoint existing={list.map((p) => p.name)} onCancel={() => setAdding(false)}
-        onAdded={async (warning) => { setAdding(false); onStored(warning ? 'credential_store_unavailable' : null); await changed(); }} />}
+        onAdded={async (warning) => { setAdding(false); if (warning) onStored('credential_store_unavailable'); await changed(); }} />}
       {/* One keyed list, the groups' headings among the cards (design review AF's G): a card whose group changes (its
         first key saved, turned off or on) moves and is the same card, with what was typed in it and what its save said.
         The spacing is the sections' as they were: 32 px between groups, 16 px under a heading, 12 px between cards. */}

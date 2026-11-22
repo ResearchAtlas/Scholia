@@ -1056,6 +1056,29 @@ const scenarios = {
     assert.deepEqual(paths.filter((p) => /\/api\/(memory|audit)/.test(p)), [], 'memory or the audit log was read for no project');
     assert.equal(one(s.shown().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Export'), 'Export').props.disabled, true);
   },
+  // The batch K recheck (P3): one key went to the private file and was said; a later endpoint whose key went to the
+  // store does not take that back (the first key is still in the file).
+  async aLaterAddDoesNotTakeBackAnEarlierKeysStoreWarning(w, strict) {
+    const state = { personal: { providers: {}, ui: { language: 'system' }, budget: {}, zotero: {} }, gets: { '/api/providers': { providers: [lab()] } } };
+    const s = await settingsWorld(w, strict, state, { open: true });
+    await s.press('Providers and models');
+    await s.typeInto(byId('key-lab'), SUBMITTED, 'the key');
+    await s.submitWith(byId('key-lab'), 'the key form');
+    const put = s.server.next(writes('PUT', '/api/keys/lab'));
+    await s.press('General');
+    state.gets['/api/providers'].providers[0].has_key = true;
+    await s.release(put, (r) => r.answer({ ok: true, warning: 'credential_store_unavailable' }));
+    await s.press('Providers and models');
+    await s.press('Add an endpoint');
+    await s.typeInto(byId('new-provider-name'), 'second', 'name');
+    await s.typeInto(byId('new-provider-url'), 'http://localhost:1/v1', 'address');
+    await s.typeInto(byId('new-provider-key'), NEWER, 'key');
+    await s.submitWith(byId('new-provider-name'), 'the add form');
+    await s.release(s.server.next(writes('PUT', '/api/settings')), (r) => r.answer({ values: { providers: { second: {} } }, hash: 'h2', problems: [] }));
+    state.gets['/api/providers'].providers.push(lab({ name: 'second', has_key: true }));
+    await s.release(s.server.next(writes('PUT', '/api/keys/second')), (r) => r.answer({ ok: true }));
+    assert.ok(s.says('status').some((text) => text.includes(KEY_STORE)), 'an earlier key\'s store warning was taken back');
+  },
 };
 
 // Design review AF's row vi: when a removal becomes known the projects are read again, and Settings' This project page
