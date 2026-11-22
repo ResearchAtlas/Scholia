@@ -113,6 +113,10 @@ _CAPTION = re.compile(r"^(?:figure|fig\.|table|tab\.|exhibit|chart)\s*[0-9IVX]+[
 _REFERENCES = re.compile(r"^(?:\d+\.?\s*)?(?:references|bibliography|works cited|literature cited|reference list"
                          r"|参考文献|引用文献)\s*:?$", re.IGNORECASE)
 _ABSTRACT = re.compile(r"^(?:abstract|摘要|摘\s*要)\s*[:：.—-]?\s*", re.IGNORECASE)
+# A PDF's section heading set bold at about the body's size: numbered as a section or an appendix ("3 Method",
+# "3.1 Setup", "A Proofs", "B.2 Details"; the dotted groups give its depth), or headed Appendix.
+_NUMBERED = re.compile(r"^(?:\d{1,2}|[A-Z])((?:\.\d{1,2}){0,3})\.?\s+[A-Z]")
+_APPENDIX = re.compile(r"^appendix\b", re.IGNORECASE)
 
 # Identifiers (F3a step 3): the DOI pattern Crossref recommends, and arXiv's two forms.
 DOI = re.compile(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", re.IGNORECASE)
@@ -722,11 +726,14 @@ def _body_size(weights):
 
 def _pdf_blocks(number, lines, size, body, sections, recognized=False):
     """A page's lines grouped into headings and paragraphs, as passages. A larger font than the
-    body's marks a heading (the largest on the first page, the title); a vertical gap, a change of
-    size, a short line ending a sentence, or a caption's start ends a paragraph. Recognized lines
-    (OCR, _recognized) have no font size: none is a heading by its size or the title, and a line set
-    above the one before it (the next column) also ends a paragraph."""
-    passages, block, heading, previous, after_table = [], [], [], None, 0
+    body's marks a heading (the largest on the first page, the title), as does a known section heading
+    (References, Abstract), always a heading of its own, and a bold line at about the body's size
+    numbered as a section or headed Appendix (_NUMBERED, _APPENDIX), which starts a heading of its own
+    unless it is larger text too; a numbered heading's depth is its number's. A vertical gap, a change
+    of size, a short line ending a sentence, or a caption's start ends a paragraph. Recognized lines
+    (OCR, _recognized) have no font size or weight: none is a heading by its size or weight or the
+    title, and a line set above the one before it (the next column) also ends a paragraph."""
+    passages, block, heading, previous, after_table, alone = [], [], [], None, 0, False
     right_edge = max((line["right"] for line in lines), default=0.0)
     largest = max((line["size"] for line in lines), default=0.0)
     cells = [_cells(line) for line in lines]
@@ -738,7 +745,9 @@ def _pdf_blocks(number, lines, size, body, sections, recognized=False):
                     and not recognized and not any(p.kind == "title" for p in passages):
                 passages.extend(_pieces(text, "title", number, [], None, None, boxes, size))
             else:
-                sections.heading(1 if heading[0]["size"] >= body * 1.4 else 2, text)
+                numbered = _NUMBERED.match(_normal(text))
+                sections.heading(1 if heading[0]["size"] >= body * 1.4 else 2 + (numbered[1].count(".") if numbered else 0),
+                                 text)
             heading.clear()
         if block:
             text, boxes = _join(block)
@@ -761,10 +770,15 @@ def _pdf_blocks(number, lines, size, body, sections, recognized=False):
                 continue
         text = line["text"].strip()
         larger = not recognized and body and line["size"] >= body * 1.15 and len(text) < 200 and not text.endswith(".")
-        if larger or (len(text) < 40 and (_REFERENCES.match(text) or _ABSTRACT.fullmatch(text))):
-            if block or (heading and abs(heading[-1]["size"] - line["size"]) > 0.6):
+        known = len(text) < 40 and (_REFERENCES.match(text) or _ABSTRACT.fullmatch(text))
+        numbered = not recognized and body and line["bold"] and line["size"] >= body - 0.6 and len(text) < 100 \
+            and not text.endswith(".") and (_APPENDIX.match(text) or (_NUMBERED.match(text) and not _reference_start(text)))
+        if larger or known or numbered:
+            if block or (heading and (known or alone or abs(heading[-1]["size"] - line["size"]) > 0.6
+                                      or (numbered and not larger))):
                 flush()
             heading.append(line)
+            alone = bool(known)
             previous = None
             continue
         if heading:

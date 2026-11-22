@@ -383,6 +383,77 @@ def test_a_compounds_own_hyphen_at_a_line_end_is_kept_and_a_name_broken_before_a
     assert "selfcheckgpt" in tokens and "gpt" in tokens
 
 
+# Section headings set bold at about the body's size (ACL's 12 pt on 10.9 pt, and the like)
+
+BOLD = "Helvetica-Bold"
+FILLER = "Minimum wages raise the earnings of low-paid workers in the synthetic panel of regions."
+
+
+def _sections(*lines, size=10):
+    """Passages of a page of (font size or None for the body's, text, font or None) lines, 14 points apart,
+    under a title, with body text enough that size is the body's."""
+    page = [(72, 770, 20, "A Synthetic Paper")]
+    for n, (font_size, text, font) in enumerate(lines):
+        page.append((72, 750 - 14 * n, font_size or size, text, *([font] if font else [])))
+    page += [(72, 750 - 14 * (len(lines) + 1) - 12 * n, size, FILLER) for n in range(8)]
+    return [(p.kind, p.section_path, p.text) for p in extract(synthetic.pdf([page]), extraction.PDF).passages]
+
+
+def test_an_appendix_after_the_references_headed_bold_at_the_bodys_size_is_not_a_reference():  # M1
+    read = _sections((14, "References", None), (None, "Smith, J. (2020). An earlier synthetic paper.", None),
+                     (None, "Doe, A. (2019). Another synthetic paper.", None), (None, "A Additional Results", BOLD),
+                     (None, "The appendix reports further estimates.", None))
+    assert [kind for kind, _, text in read if text.startswith(("Smith", "Doe"))] == ["reference", "reference"]
+    [(kind, path, _)] = [r for r in read if r[2] == "The appendix reports further estimates."]
+    assert (kind, path) == ("paragraph", ["References", "A Additional Results"])  # its path keeps the parent
+
+
+def test_an_unnumbered_bold_appendix_at_the_bodys_size_ends_the_references():  # M2
+    read = _sections((None, "References", BOLD), (None, "Smith, J. (2020). An earlier synthetic paper.", None),
+                     (None, "Appendix", BOLD), (None, "The appendix reports further estimates.", None), size=12)
+    assert [(k, p) for k, p, t in read if t == "The appendix reports further estimates."] == [("paragraph", ["Appendix"])]
+
+
+def test_the_body_after_an_abstract_whose_first_heading_is_bold_near_the_bodys_size_is_not_abstract():  # M3
+    read = _sections((None, "Abstract", BOLD), (None, "We study minimum wages in a synthetic panel.", None),
+                     (None, "The data are made up for testing.", None), (12, "1 Introduction", BOLD),
+                     (None, "Minimum wages are a common policy.", None), size=11)
+    assert [k for k, _, t in read if t.startswith(("We study", "The data"))] == ["abstract", "abstract"]
+    assert [(k, p) for k, p, t in read if t.startswith("Minimum wages are")] == [("paragraph", ["1 Introduction"])]
+
+
+def test_an_abstract_heading_in_the_size_of_the_lines_above_it_is_a_heading_of_its_own():  # M4
+    read = _sections((12, "Institute of Synthetic Studies", None), (12, "someone@example.org", None),
+                     (12, "Abstract", BOLD), (None, "We study minimum wages in a synthetic panel.", None))
+    assert ("abstract", ["Abstract"], "We study minimum wages in a synthetic panel.") in read
+
+
+def test_a_numbered_headings_depth_is_its_numbers():  # 1.2
+    read = _sections((None, "3 Methodology", BOLD), (None, "We describe the method.", None),
+                     (None, "3.1 Problem Formulation", BOLD), (None, "The problem is set out here.", None))
+    assert [p for _, p, t in read if t == "The problem is set out here."] == [["3 Methodology", "3.1 Problem Formulation"]]
+
+
+def test_numbered_references_whose_numbers_are_bold_stay_one_list():  # G1
+    read = _sections((14, "References", None), (None, "19. Liu, F. et al. A synthetic study of wages", BOLD),
+                     (None, "20. Doe, A. Another synthetic study of wages", BOLD))
+    assert [(k, p) for k, p, t in read if t[:3] in ("19.", "20.")] == [("reference", ["References"])] * 2
+
+
+def test_a_bold_numbered_list_item_is_text():  # G2
+    read = _sections((14, "2 Method", None), (None, "1. Source and graph integrity. A source can be checked", BOLD),
+                     (None, "against the graph it came from.", None))
+    assert [(k, p) for k, p, t in read if t.startswith("1. Source")] == [("paragraph", ["2 Method"])]
+
+
+def test_a_two_line_title_whose_second_line_begins_like_a_numbered_heading_stays_one_title():  # G3
+    page = [(72, 750, 18, "Building Agents for Synthetic Work:", BOLD), (72, 728, 18, "A Desiderata for Panels", BOLD),
+            *[(72, 700 - 12 * n, 10, FILLER) for n in range(6)]]
+    read = extract(synthetic.pdf([page]), extraction.PDF).passages
+    assert (read[0].kind, read[0].text) == ("title", "Building Agents for Synthetic Work: A Desiderata for Panels")
+    assert all(p.section_path == [] for p in read)
+
+
 def test_a_table_piece_starting_on_a_wrapped_cell_has_its_range_in_order_over_all_its_characters():
     def row(y, *cells):
         return [(x, y, 10, cell) for x, cell in zip((72, 330, 430), cells)]
