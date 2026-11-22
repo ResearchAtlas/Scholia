@@ -178,6 +178,20 @@ const inForm = (e) => e.type === 'ui:Input' && e.up.some((x) => x.type === 'form
 const KEY_STORE = 'key store was unavailable';
 
 
+// recheck r9's picker scenarios: two models that each need a window, the picker open
+const picking = () => ({ personal: {}, gets: {
+  '/api/providers': { providers: [lab({ has_key: true })] }, '/api/models/recent': { models: [] },
+  '/api/providers/lab/models': { status: {}, models: [
+    { id: 'm1', name: 'Model One', offered: true, window: { status: 'needed' }, effort: { steps: [] } },
+    { id: 'm2', name: 'Model Two', offered: true, window: { status: 'needed' }, effort: { steps: [] } }] } } });
+const option = (s, name) => one(s.shown().filter((e) => e.type === 'button' && e.props.role === 'option' && e.text.includes(name)), name);
+const windowFor = async (s, name, value) => {
+  await s.act(() => one(s.elements().filter((e) => e.type === 'ui:Popover'), 'the picker').props.onOpenChange(true));
+  await s.act(() => option(s, name).props.onClick());
+  await s.typeInto(byId('picker-window'), value, 'the window');
+  await s.act(() => s.field(byId('picker-window'), 'the window').props.onKeyDown({ key: 'Enter', preventDefault() {} }));
+};
+
 const scenarios = {
   // r3-1 and r3-2, finding 1: a message is sent and its request fails after the researcher typed the next one: the box
   // holds what was typed since, and what was sent is given back.
@@ -858,6 +872,38 @@ const scenarios = {
     await s.release(s.server.next(writes('PUT', '/api/settings')), (r) => r.fail('internal'));
     assert.equal(s.says('alert').length, 1, 'the failure is said');
     assert.equal(await s.typeInto(byId('picker-window'), '16384', 'the window'), true, 'the field takes nothing after its save failed');
+  },
+  // PR 63's recheck r9 (pass 1 finding 2, pass 2 finding 3): while a model's window is saved, the picker's search and
+  // its choices are busy too (AF's rule C for the whole picker): a late success clears no search typed since, and a
+  // failure shows no draft or error under a model chosen since.
+  async aWindowSavedInThePickerClearsNoSearchTypedSince(w, strict) {
+    const s = await partWorld(w, strict, picking(), 'ModelPicker', 'ModelPicker', { projectId: null });
+    await windowFor(s, 'Model One', '8192');
+    const put = s.server.next(writes('PUT', '/api/settings'));
+    const typed = await s.typeInto(byId('picker-search'), NEWER, 'the search');
+    await s.release(put, (r) => r.answer({ values: {}, hash: 'h2' }));
+    assert.ok(!typed || s.field(byId('picker-search'), 'the search').props.value === NEWER, 'a search typed while the window was saved is gone');
+  },
+  async aWindowSavedInThePickerTakesNoOtherChoiceMeanwhile(w, strict) {
+    const s = await partWorld(w, strict, picking(), 'ModelPicker', 'ModelPicker', { projectId: null });
+    await windowFor(s, 'Model One', '8192');
+    const put = s.server.next(writes('PUT', '/api/settings'));
+    const two = option(s, 'Model Two');
+    const chose = !two.props.disabled;
+    if (chose) await s.act(() => two.props.onClick());
+    await s.release(put, (r) => r.fail('internal'));
+    if (chose) {
+      assert.ok(!s.screen().includes('Model Two') || !s.has((e) => e.props.value === '8192'), 'Model One\'s draft is shown under Model Two');
+      assert.equal(s.says('alert').length, 0, 'Model One\'s failure is said under Model Two');
+    }
+    assert.equal(chose, false, 'another model could be chosen while a window was saved');
+  },
+  async aWindowSavedInThePickerKeepsThePickerOpenUntilItsAnswer(w, strict) {
+    const s = await partWorld(w, strict, picking(), 'ModelPicker', 'ModelPicker', { projectId: null });
+    await windowFor(s, 'Model One', '8192');
+    const popover = one(s.elements().filter((e) => e.type === 'ui:Popover'), 'the picker');
+    await s.act(() => popover.props.onOpenChange(false)); // Escape, or a press outside it
+    assert.equal(one(s.elements().filter((e) => e.type === 'ui:Popover'), 'the picker').props.open, true, 'the picker closed while its window was saved');
   },
 };
 

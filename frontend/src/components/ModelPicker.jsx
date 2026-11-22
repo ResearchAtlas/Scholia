@@ -141,7 +141,9 @@ export function ModelPicker({ projectId }) {
   const [catalog, setCatalog, reload] = useCatalog(open, projectId, chosen?.model ? `${chosen.provider}:${chosen.model}` : null);
   const [fixing, setFixing] = useState(null); // a model whose window is asked for before it is chosen
   const [fixProblem, setFixProblem] = useState(null);
-  const [fixBusy, setFixBusy] = useState(false); // the window is saved: its field, which the answer closes, takes nothing meanwhile
+  // The window is saved: the answer closes the picker, so its window field and search take nothing and its choices and
+  // its closing are busy meanwhile (design review AF's rule C, for the whole picker: recheck r9)
+  const [fixBusy, setFixBusy] = useState(false);
   const model = catalog?.models.find((m) => m.provider === chosen?.provider && m.id === chosen?.model);
 
   const results = useMemo(() => {
@@ -206,7 +208,7 @@ export function ModelPicker({ projectId }) {
   const label = chosen?.model ? chosen.name ?? chosen.model : auto ? t('picker.auto') : fallback;
   return (
     <div className="flex min-w-0 items-center gap-2">
-      <Popover open={open} onOpenChange={setOpen}>
+      <Popover open={open} onOpenChange={(next) => { if (next || !fixBusy) setOpen(next); }}>
         <PopoverTrigger asChild>
           <button type="button" aria-label={t('picker.label', { model: label })}
             className="flex min-w-0 max-w-56 items-center gap-1.5 rounded-lg px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
@@ -221,20 +223,20 @@ export function ModelPicker({ projectId }) {
         <PopoverContent align="start" side="top" className="w-80 p-0">
           <div className="border-b p-2">
             <label htmlFor="picker-search" className="sr-only">{t('picker.search')}</label>
-            <input id="picker-search" autoFocus value={query} onChange={(event) => setQuery(event.target.value)}
+            <input id="picker-search" autoFocus value={query} onChange={(event) => setQuery(event.target.value)} readOnly={fixBusy}
               placeholder={t('picker.search')}
               className="h-8 w-full rounded-md bg-muted/60 px-2.5 text-sm outline-hidden focus-visible:ring-2 focus-visible:ring-ring" />
           </div>
           <div role="listbox" aria-label={t('picker.models')} className="scroll-thin max-h-80 overflow-y-auto p-1">
             {!query && (
-              <Item selected={auto} onSelect={() => pick(null)} title={t('picker.auto')} detail={t('picker.autoHint')}
+              <Item selected={auto} onSelect={() => pick(null)} disabled={fixBusy} title={t('picker.auto')} detail={t('picker.autoHint')}
                 icon={<Sparkles className="size-3.5 text-brand" aria-hidden="true" />} />
             )}
             {!query && recent.length > 0 && <Heading>{t('picker.recent')}</Heading>}
-            {!query && recent.map((m) => <ModelItem key={`r:${m.provider}:${m.id}`} m={m} chosen={chosen} several={catalog.several} onPick={pick} />)}
+            {!query && recent.map((m) => <ModelItem key={`r:${m.provider}:${m.id}`} m={m} chosen={chosen} several={catalog.several} disabled={fixBusy} onPick={pick} />)}
             {catalog && (query || recent.length > 0) && <Heading>{query ? t('picker.results') : t('picker.all')}</Heading>}
             {!catalog && <p className="px-2 py-3 text-sm text-muted-foreground" role="status">{t('common.loading')}</p>}
-            {catalog && results.map((m) => <ModelItem key={`${m.provider}:${m.id}`} m={m} chosen={chosen} several={catalog.several} onPick={pick} />)}
+            {catalog && results.map((m) => <ModelItem key={`${m.provider}:${m.id}`} m={m} chosen={chosen} several={catalog.several} disabled={fixBusy} onPick={pick} />)}
             {catalog?.problem && <div className="p-1"><LoadState problem={catalog.problem} onRetry={reload} /></div>}
             {catalog && !catalog.problem && results.length === 0 && <p className="px-2 py-3 text-sm text-muted-foreground">{t('picker.none')}</p>}
           </div>
@@ -275,12 +277,12 @@ function Item({ selected, onSelect, title, detail, icon, disabled, badge }) {
   );
 }
 
-function ModelItem({ m, chosen, several, onPick }) {
+function ModelItem({ m, chosen, several, disabled, onPick }) {
   const t = useT();
   const usable = m.window.status === 'ok';
   return (
     <Item selected={chosen?.provider === m.provider && chosen?.model === m.id} onSelect={() => onPick(m)}
-      disabled={m.window.status === 'too_small'}
+      disabled={disabled || m.window.status === 'too_small'}
       title={m.name} detail={several ? `${m.provider} · ${m.id}` : m.id}
       badge={usable ? null : t(m.window.status === 'needed' ? 'picker.windowNeeded' : 'picker.windowTooSmall')} />
   );

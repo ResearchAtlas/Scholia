@@ -21,7 +21,6 @@ const OTHER_RULE = {
   'Providers.jsx: {`key-${provider.name}`}': 'cleared after its save only if it still holds the key saved; its card is the same card in every group',
   'Backups.jsx: restore-file': 'no request answers into it: Restore opens the confirmation',
   'Library.jsx: {id}': 'the search field: results never write it',
-  'ModelPicker.jsx: picker-search': 'a filter: nothing is sent',
   'Providers.jsx: {`pick-${provider.name}`}': 'a filter: nothing is sent',
   'Providers.jsx: {`per-model-${provider.name}`}': 'a filter: nothing is sent',
   'Settings.jsx: subagent-add': 'cleared in the press that adds it, never by an answer; nothing is added, or cleared, while a change is saved',
@@ -48,6 +47,12 @@ const OTHER_RULE = {
 // file: a button's label -> why it may be pressed while its form's request is under way
 const NOT_BUSY = {
   'Memory.jsx: memory.cancel': 'closes an editor the answer\'s reread closes too; Edit is busy, so none opens before the answer',
+  // around the form, in the component that draws it (recheck r9)
+  'Memory.jsx: Row <Button> memory.cancel': 'the same Cancel, inside its form (above)',
+  'Memory.jsx: Proposal <Button> memory.cancel': 'the same Cancel, inside its form (above)',
+  'Sidebar.jsx: NewProjectDialog <Dialog>': 'its onOpenChange refuses to close while its request is under way',
+  'Sidebar.jsx: RenameDialog <Dialog>': 'its onOpenChange refuses to close while its request is under way',
+  'ModelPicker.jsx: ModelPicker <Popover>': 'its onOpenChange refuses to close while a window is saved',
 };
 
 // every opening tag of these names, whole, with its line
@@ -103,5 +108,37 @@ test('a form whose field goes read-only while its request is under way is closed
     }
   }
   assert.deepEqual(pressable, [], 'buttons that can be pressed while their form\'s request is under way');
-  assert.deepEqual(Object.keys(NOT_BUSY).filter((key) => !used.has(key)), [], 'listed buttons that no longer exist');
+  assert.deepEqual(Object.keys(NOT_BUSY).filter((key) => !/ <\w/.test(key) && !used.has(key)), [], 'listed buttons that no longer exist');
+});
+
+// Recheck r9: the controls around such a form count too. In the component that draws it, every other text field is
+// read-only with it (a filter included: the answer may clear it), and every control that can close the form or write
+// its fields (onClick, onSelect, onPick, onOpenChange) is busy, or listed. A close control drawn by another component
+// (the import's toggle is LocalHelperSection's) is not seen here: its scenario holds it.
+test('a form whose field goes read-only is closed only by its answer, whatever around it could close it', () => {
+  const live = []; const used = new Set(Object.keys(NOT_BUSY).filter((key) => !/ <\w/.test(key)));
+  for (const [file, source] of files()) {
+    const starts = [...source.matchAll(/^(?:export )?function \w+\(/gm)].map((m) => m.index);
+    const seen = new Set();
+    for (const open of source.matchAll(/<form\b/g)) {
+      const form = source.slice(open.index, source.indexOf('</form>', open.index));
+      if (!tags(form, `${FIELDS}|HoldsChoice`).some(({ tag }) => text(tag) && locked(tag))) continue;
+      const from = Math.max(...starts.filter((at) => at < open.index));
+      if (seen.has(from)) continue;
+      seen.add(from);
+      const part = source.slice(from, starts.find((at) => at > open.index) ?? source.length);
+      const name = /function (\w+)/.exec(part)[1];
+      for (const { tag } of tags(part, FIELDS)) if (text(tag) && !locked(tag)) live.push(`${file}: ${name} ${tag.slice(0, 50)}`);
+      for (const { tag, after } of tags(part, '[A-Za-z][\\w.]*')) {
+        if (!/\bon(Click|Select|Pick|OpenChange)=/.test(tag) || /\bdisabled=(?!\{false\})/.test(tag)) continue;
+        const type = /^<([\w.]+)/.exec(tag)[1];
+        const label = /^(Button|button)$/.test(type) && /t\('([^']+)'/.exec(after)?.[1];
+        const key = `${file}: ${name} <${type}>${label ? ` ${label}` : ''}`;
+        if (NOT_BUSY[key]) { used.add(key); continue; }
+        live.push(key);
+      }
+    }
+  }
+  assert.deepEqual(live, [], 'fields or controls around a form that can change it while its request is under way');
+  assert.deepEqual(Object.keys(NOT_BUSY).filter((key) => !used.has(key)), [], 'listed controls that no longer exist');
 });
