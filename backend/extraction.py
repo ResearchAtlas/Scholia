@@ -647,9 +647,9 @@ def _pdf_page(page, raw, measure=False):
                 mapped += 1
             # PDFium's line-end hyphen, its line joined to the next: dropped with its box (the word joined),
             # but kept as "-" where it is the word's own, in a word already hyphened (TeX breaks such a word
-            # only at its hyphen: state-of-the-art) or before a digit (GPT-4).
+            # only at its hyphen: state-of-the-art) or before an ASCII digit (GPT-4).
             if char == "\ufffe":
-                if not (hyphened or text[index + 1:index + 2].isdigit()):
+                if not (hyphened or "0" <= text[index + 1:index + 2] <= "9"):
                     continue
                 char = "-"
             hyphened = (hyphened or char == "-") and not char.isspace()

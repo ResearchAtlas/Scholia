@@ -460,6 +460,26 @@ def test_a_word_broken_twice_after_a_kept_hyphen_keeps_both_and_a_new_line_start
     assert passage.text == "We read the well-known decide on GPT-4o-mini today."  # the flag is cleared at a line break
 
 
+def _pdf_mapping_tilde(code_point, first="We use the GPT-", second="~ model here."):
+    """A one-page PDF of two Helvetica lines whose "~" is mapped (ToUnicode) to the code point given."""
+    cmap = (b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /T def 1 begincodespacerange"
+            b" <00> <FF> endcodespacerange 1 beginbfchar <7E> <%04X> endbfchar endcmap"
+            b" CMapName currentdict /CMap defineresource pop end end" % code_point)
+    content = b"BT /F1 10 Tf 72 720 Td (%s) Tj 0 -12 Td (%s) Tj ET" % (first.encode(), second.encode())
+    return _raw_pdf([b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                     b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >>"
+                     b" /Contents 5 0 R >>", b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>",
+                     *[b"<< /Length %d >>\nstream\n%s\nendstream" % (len(data), data) for data in (content, cmap)]])
+
+
+@pytest.mark.parametrize(("code_point", "read"), [(0x34, "GPT-4"), (0xFF14, "GPT\uff14"), (0x663, "GPT\u0663")])
+def test_only_an_ascii_digit_after_the_mark_keeps_the_hyphen(code_point, read):
+    data = _pdf_mapping_tilde(code_point)
+    assert "GPT\ufffe" in _pdfium_text(data)[0]  # PDFium marks the hyphen before a full-width or Arabic-Indic digit too
+    [passage] = extract(data, extraction.PDF).passages
+    assert passage.text == f"We use the {read} model here."
+
+
 def test_a_line_after_a_known_heading_never_joins_it():  # 1.0, its other half
     read = _sections((12, "Abstract", BOLD), (12, "Synthetic Evidence on Wages", None),
                      (None, "We study minimum wages in a synthetic panel.", None))
