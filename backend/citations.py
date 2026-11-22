@@ -58,14 +58,22 @@ _SPAN = re.compile(r"(?<![`\\])(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.DOTALL)
 _CELL_SPAN = re.compile(r"(?<![`\\])(`+)(?!`)((?:\\\||[^|])+?)(?<!`)\1(?!`)", re.DOTALL)  # \| stays in its cell
 VERDICTS = ("supported", "partly", "unsupported")
 QUOTE_CHARS = 500  # the part of a passage a citation keeps as its quote
-# A quote and a passage's text are compared with PDF extraction's line-end marks (U+FFFE, U+FFFF) and every hyphen
-# set aside, so that a citation made on a reading that kept the mark (pdf-3) follows a reading that joined its word
-# or kept its hyphen (pdf-4), under any rule for which.
+# A citation whose quote or old passage text holds PDF extraction's line-end mark (U+FFFE, U+FFFF: a pdf-3 reading)
+# is compared with the marks and every hyphen set aside, so that it follows a reading that joined its word or kept
+# its hyphen (pdf-4), under any rule for which (Harold 2026-11-23, "keep through join"). Any other is compared as
+# written: a new version that only drops a hyphen ("-0.3" to "0.3") has changed what it says.
 _BARE = "replace(replace(replace(p.text, char(65534), ''), char(65535), ''), '-', '')"
 
 
 def _bare(text):
     return text.replace("\ufffe", "").replace("\uffff", "").replace("-", "")
+
+
+def _comparison(quote, text):
+    """(how a text is compared, the passage column so compared) for a citation of this quote and old text."""
+    if any(mark in held for held in (quote, text) if held for mark in "\ufffe\uffff"):
+        return _bare, _BARE
+    return (lambda written: written), "p.text"
 
 
 def sources(records):
@@ -243,24 +251,25 @@ def locate(conn, material_id, quote, text=None, page=None, passage_id=None, ordi
     their quotes; design review J, Option 1): in the paper's reading now (deletion._reads_now, as every reader takes
     it), never a reference passage (not evidence), one holding the quote (a row with no quote: its old passage's
     text): the passage it is on first, then one with its old passage's text, then on its page, then nearest its place.
-    Texts are compared bare (_bare). (id, page, text, version id), or None: no passage holds it, or the paper is not
-    read now."""
-    bare = _bare(quote or text or "")
-    if not bare:
+    Texts are compared as _comparison says. (id, page, text, version id), or None: no passage holds it, or the paper
+    is not read now."""
+    norm, column = _comparison(quote, text)
+    held = norm(quote or text or "")
+    if not held:
         return None
     return conn.execute(
         f"SELECT p.id, p.page, p.text, w.id FROM material_versions w JOIN extractions e ON {_reads_now('w', 'e')}"
         " JOIN passages p ON p.extraction_id = e.id WHERE w.material_id = ? AND p.kind != 'reference'"
-        f" AND instr({_BARE}, ?) > 0 ORDER BY p.id IS NOT ?, {_BARE} IS NOT ?, p.page IS NOT ?,"
+        f" AND instr({column}, ?) > 0 ORDER BY p.id IS NOT ?, {column} IS NOT ?, p.page IS NOT ?,"
         " abs(p.ordinal - coalesce(?, 0)) LIMIT 1",
-        (material_id, bare, passage_id, None if text is None else _bare(text), page, ordinal)).fetchone()
+        (material_id, held, passage_id, None if text is None else norm(text), page, ordinal)).fetchone()
 
 
 def retarget(conn, material_id):
     """Every citation of the paper, whatever an earlier reading or commit left it as, computed again from its quote
     and the paper's reading now (locate): its passage, version and that passage's page, found (ok), its verdict kept
-    only when that passage's text is its old passage's, compared bare (B18 read through the join, Harold 2026-11-23;
-    with no old passage, the quote's when the quote is a whole passage). One no passage holds is left as it is: it
+    only when that passage's text is its old passage's, compared as _comparison says (B18, read through the join for
+    a pdf-3 citation; with no old passage, the quote's when the quote is a whole passage). One no passage holds is left as it is: it
     reads as removed (answers.resolve_now) until a later reading holds it. Called wherever a paper's reading changes
     (backend/materials.py: a reading's commit, and a version added on a reading made already); nowhere else is a
     citation pointed (design review J, Option 1)."""
@@ -269,8 +278,9 @@ def retarget(conn, material_id):
             " LEFT JOIN passages p ON p.id = c.passage_id WHERE c.material_id = ?", (material_id,)).fetchall():
         found = locate(conn, material_id, quote, text, page, pid, ordinal)
         if found is not None:
-            same = _bare(found[2]) == _bare(text) if text is not None else \
-                _bare(found[2]) == _bare(quote) and len(quote) < QUOTE_CHARS
+            norm, _ = _comparison(quote, text)
+            same = norm(found[2]) == norm(text) if text is not None else \
+                norm(found[2]) == norm(quote) and len(quote) < QUOTE_CHARS
             conn.execute("UPDATE citations SET passage_id = ?, material_version_id = ?, page = ?, existence = 'ok',"
                          " support = CASE WHEN ? THEN support ELSE 'unchecked' END,"
                          " support_run_id = CASE WHEN ? THEN support_run_id END WHERE id = ?",
