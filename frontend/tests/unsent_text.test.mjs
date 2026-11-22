@@ -1027,6 +1027,35 @@ const scenarios = {
     assert.equal(advanced.shown().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Download…').length, 0,
       'a download is offered before any project is decided');
   },
+  // The batch K review (P3-1; ticket 16): the same for a provider card's own key save. The page is left before the key
+  // is stored, which went to the private file; the warning is said when the page is next drawn.
+  async aProviderKeysStoreWarningOutlivesLeavingThePage(w, strict) {
+    const state = { personal: { providers: {}, ui: { language: 'system' }, budget: {}, zotero: {} }, gets: { '/api/providers': { providers: [lab()] } } };
+    const s = await settingsWorld(w, strict, state, { open: true });
+    await s.press('Providers and models');
+    await s.typeInto(byId('key-lab'), SUBMITTED, 'the key');
+    await s.submitWith(byId('key-lab'), 'the key form');
+    const put = s.server.next(writes('PUT', '/api/keys/lab'));
+    await s.press('General');
+    state.gets['/api/providers'].providers[0].has_key = true;
+    await s.release(put, (r) => r.answer({ ok: true, warning: 'credential_store_unavailable' }));
+    await s.press('Providers and models');
+    assert.ok(s.says('status').some((text) => text.includes(KEY_STORE)), 'the key store warning is lost');
+  },
+  // The batch K review (P3-2): Settings' Advanced page given no record (undefined: a project open and not known, or
+  // none decided yet), drawn whole: no download is offered, the memory section and This project's log wait, and
+  // nothing is read for no project.
+  async advancedWithNoRecordWaitsAndOffersNoDownload(w, strict) {
+    const state = { personal: { models: {}, ui: { language: 'system' }, budget: {}, zotero: {} }, gets: { '/api/helper': helper(false) } };
+    const paths = [];
+    const s = await settingsWorld(w, strict, state, { open: true, project: undefined });
+    const answering = globalThis.fetch;
+    globalThis.fetch = (path, init) => { paths.push(`${init?.method ?? 'GET'} ${path}`); return answering(path, init); };
+    await s.press('Advanced');
+    assert.equal(s.shown().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Download…').length, 0, 'a download is offered');
+    assert.deepEqual(paths.filter((p) => /\/api\/(memory|audit)/.test(p)), [], 'memory or the audit log was read for no project');
+    assert.equal(one(s.shown().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Export'), 'Export').props.disabled, true);
+  },
 };
 
 // Design review AF's row vi: when a removal becomes known the projects are read again, and Settings' This project page

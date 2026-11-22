@@ -145,7 +145,8 @@ test('a form whose field goes read-only is closed only by its answer, whatever a
 
 // Harold, 2026-11-22 (batch J's concern c): rule C covers a form's non-text fields too. Every choice inside a form (a
 // radio, a checkbox, a select) is disabled while its form's request is under way, or listed with why its answer
-// cannot be shown under another choice.
+// cannot be shown under another choice. It sees that a disabled= is there, not that it is the busy flag, and only
+// choices written inside the <form> tag (not a Segmented, nor one drawn by another component): scenarios hold those.
 const CHOICES = {
   'ProjectExport.jsx: export.memory': 'the export\'s form stays and its answer writes none of its fields; the run says what it was asked',
 };

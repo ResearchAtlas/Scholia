@@ -85,7 +85,7 @@ export function Providers({ stored = null, onStored = () => {} }) {
             <h3 key={`group:${group}`} className="pb-1 pt-5 text-sm font-semibold first:pt-0">{t(`providers.group.${group}`)}</h3>,
             ...members.map((provider) => (
               <ProviderCard key={`card:${provider.name}`} provider={provider} table={tables[provider.name] ?? {}}
-                save={personal.save} onChanged={changed} />
+                save={personal.save} onChanged={changed} onStored={onStored} />
             )),
           ] : [];
         })}
@@ -94,8 +94,10 @@ export function Providers({ stored = null, onStored = () => {} }) {
   );
 }
 
-function ProviderCard({ provider, table, save, onChanged }) {
+function ProviderCard({ provider, table, save, onChanged, onStored }) {
   const t = useT();
+  const here = useRef(false); // still drawn: a key stored after the page was left is said by Settings (ticket 16)
+  useEffect(() => { here.current = true; return () => { here.current = false; }; }, []);
   const [key, setKey] = useState('');
   const [keyProblem, setKeyProblem] = useState(null); // the key form's
   const [modelsProblem, setModelsProblem] = useState(null); // the model policy's and the default window's
@@ -113,6 +115,7 @@ function ProviderCard({ provider, table, save, onChanged }) {
       const saved = await put(`/api/keys/${encodeURIComponent(provider.name)}`, { key });
       setKey((now) => (now === key ? '' : now)); // cleared only if it is still the key saved
       setNotice(saved.warning ? t('setup.storeWarning') : null);
+      if (saved.warning && !here.current) onStored('credential_store_unavailable'); // the page was left meanwhile
       await onChanged();
     } catch (error) {
       setKeyProblem(error instanceof ApiError ? error.code : 'internal');

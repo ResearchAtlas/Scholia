@@ -5,7 +5,10 @@
 // key is another reader and the old one's answers go nowhere), and NONE (it asks for nothing that can change under it).
 // Anything else says its own guard in words. A new read fails here until it is listed; a listed one that is gone fails
 // too; a KEYED component drawn anywhere without a key fails. This is a declaration check, in the manner of
-// holders.test.mjs: it makes a read say its rule; the scenarios named beside a rule hold it.
+// holders.test.mjs: it makes a read say its rule; the scenarios named beside a rule hold it. What it does not see (the
+// batch K review): a second read inside a function already listed (one entry per top-level function, not per call); a
+// read written as anything but get( or getBlob( (api.get, a POST used as a read, stream(, api(); what a key names (only
+// that one is there: the scenarios hold what it must name); a key written after an arrow function in the same tag.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
