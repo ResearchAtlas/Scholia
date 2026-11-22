@@ -259,7 +259,7 @@ function MoveDialog({ conversation, projects, from, onClose, onDone }) {
               {targets.map((p) => (
                 <label key={p.id} className={cn('flex cursor-pointer items-center gap-2.5 rounded-md border px-3 py-2 text-sm transition-colors hover:bg-accent',
                   target === p.id && 'border-brand bg-brand-soft')}>
-                  <input type="radio" name="target" value={p.id} checked={target === p.id}
+                  <input type="radio" name="target" value={p.id} checked={target === p.id} disabled={busy}
                     onChange={() => setTarget(p.id)} className="accent-[hsl(var(--brand))]" />
                   <span className="truncate">{projectName(t, p)}</span>
                 </label>

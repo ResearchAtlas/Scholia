@@ -142,3 +142,27 @@ test('a form whose field goes read-only is closed only by its answer, whatever a
   assert.deepEqual(live, [], 'fields or controls around a form that can change it while its request is under way');
   assert.deepEqual(Object.keys(NOT_BUSY).filter((key) => !used.has(key)), [], 'listed controls that no longer exist');
 });
+
+// Harold, 2026-11-22 (batch J's concern c): rule C covers a form's non-text fields too. Every choice inside a form (a
+// radio, a checkbox, a select) is disabled while its form's request is under way, or listed with why its answer
+// cannot be shown under another choice.
+const CHOICES = {
+  'ProjectExport.jsx: export.memory': 'the export\'s form stays and its answer writes none of its fields; the run says what it was asked',
+};
+test('a form\'s choices are busy while its request is under way, or listed', () => {
+  const live = []; const used = new Set();
+  for (const [file, source] of files()) {
+    for (const open of source.matchAll(/<form\b/g)) {
+      const form = source.slice(open.index, source.indexOf('</form>', open.index));
+      for (const { tag, after } of tags(form, 'input|select|Select|Checkbox|Switch|RadioGroup')) {
+        if (/^<input\b/.test(tag) && !/type="(radio|checkbox)"/.test(tag)) continue;
+        if (/\bdisabled=(?!\{false\})/.test(tag)) continue;
+        const key = `${file}: ${/t\('([^']+)'/.exec(after)?.[1] ?? /\bname="([^"]+)"/.exec(tag)?.[1] ?? tag.slice(0, 40)}`;
+        if (CHOICES[key]) { used.add(key); continue; }
+        live.push(key);
+      }
+    }
+  }
+  assert.deepEqual(live, [], 'choices that can change while their form\'s request is under way');
+  assert.deepEqual(Object.keys(CHOICES).filter((key) => !used.has(key)), [], 'listed choices that no longer exist');
+});

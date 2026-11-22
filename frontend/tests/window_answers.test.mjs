@@ -1302,6 +1302,19 @@ const scenarios = {
     assert.deepEqual(seen, ['p1', 'undefined', 'p3']);
     assert.equal(given().open, true);
   },
+  // Harold, 2026-11-22 (batch J's concern c, "Yes, busy"): AF's rule C covers a form's non-text fields too. While a
+  // move's request is under way its destinations take no choice, so its answer or failure is never shown under
+  // another destination than the one asked.
+  async aMoveUnderWayTakesNoOtherDestination(w, strict) {
+    const state = { ...start(), projects: [P1, P2, P3] }; state.conversations.p3 = [];
+    const s = await world(w, strict, state);
+    await moveTo(s, 'Title Alpha', 'p2');
+    const radios = () => s.elements().filter((e) => e.type === 'input' && e.props.type === 'radio' && e.props.name === 'target');
+    assert.equal(radios().length, 2);
+    assert.ok(s.server.asked.some(writes('POST', '/move')), 'the move was asked');
+    assert.deepEqual(radios().map((e) => Boolean(e.props.disabled || e.up.some((x) => x.type === 'fieldset' && x.props.disabled))), [true, true],
+      'a destination can be chosen while the move is under way');
+  },
 };
 
 
