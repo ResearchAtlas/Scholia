@@ -168,6 +168,20 @@ const scenarios = {
     assert.ok(s.alerts().some((text) => text.includes(CONFLICT)), 'the conflict is not said');
     assert.equal(s.state.text, 'theirs', 'the other program\'s text was overwritten');
   },
+  // Point (c), for Harold: while the open project's record is not known no size is said (it would leave the project's
+  // file out); the editor, its text and Save stay; the size is back once the record is known.
+  async noSizeIsSaidWhileTheRecordIsNotKnown(w, strict) {
+    const s = await world(w, strict, {}, P1);
+    assert.equal(s.size(), '21');
+    assert.equal(await s.type('typed here'), true);
+    await s.redraw({ project: undefined });
+    assert.equal(s.size(), null, `a size is said while the record is not known: ${s.size()} of 32 KiB`);
+    assert.equal(s.text(), 'typed here');
+    assert.equal(s.enabled('Save'), true);
+    await s.redraw({ project: P1 });
+    assert.equal(s.size(), '21');
+    assert.equal(s.text(), 'typed here');
+  },
 };
 
 // Green at the head: the behavior kept.

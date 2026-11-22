@@ -157,10 +157,11 @@ function InstructionsEditor({ projectId, beside, label, hint }) {
     return <LoadState problem={instructions.problem} onRetry={() => { instructions.reload(); project.reload(); }} />;
   }
   // As the backend joins them: the two files, with a blank line between when both hold text. The other file: read with
-  // a project's own (the personal one), and where no project is open (none); else the open project's, through its own
-  // read, and null until that is read: no size is said that leaves it out (design review AH).
+  // a project's own (the personal one), and where no project is open (null: none); else the open project's, through
+  // its own read, null until that is read and while its record is not known (undefined): no size is said that leaves
+  // it out, and the box, its text, Save and Cancel stay (design review AH; point c, "the size waits").
   const own = utf8Bytes(draft);
-  const other = projectId || !beside ? file.other_bytes : project.bytes;
+  const other = projectId || beside === null ? file.other_bytes : project.bytes;
   const combined = other === null ? null : own + other + (own && other ? 2 : 0);
   const over = combined !== null && combined > file.cap_bytes;
   const id = projectId ? 'project-instructions' : 'personal-instructions';
