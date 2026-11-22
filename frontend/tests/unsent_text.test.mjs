@@ -1010,6 +1010,23 @@ const scenarios = {
     await s.press('Providers and models');
     assert.ok(s.says('status').some((text) => text.includes(KEY_STORE)), 'the key store warning is lost');
   },
+  // Harold, 2026-11-22 (batch J's concern d): before any project is decided (the projects not read yet), a project
+  // may be about to open, a Local only one among them. Settings is given no record then (undefined, as for a project
+  // open and not known), so Advanced offers no download and none is asked without a project. An empty list decides on
+  // none (null), which offers it (aWindowWithNoProjectOpenStillOffersTheDownload).
+  async noDownloadIsOfferedBeforeAProjectIsDecided(w, strict) {
+    const state = start({ projects: [{ ...P1, sensitivity: 'local_only' }] });
+    const server = backend(state);
+    server.hold('projects');
+    const { Shell } = await load.component('Shell');
+    const ui = await w.mount([w.jsx(Shell, { health: {}, settings: { values: {} }, onLanguage() {} })], { strict }).settle();
+    const s = hands(ui, server);
+    const given = () => one(s.elements().filter((e) => e.type === 'parts:Settings'), 'Settings').props.project;
+    assert.equal(given(), undefined, 'before any project is decided, Settings is given none open');
+    const advanced = await partWorld(w, strict, { gets: { '/api/helper': helper(false) } }, 'LocalHelper', 'LocalHelperSection', { project: given() });
+    assert.equal(advanced.shown().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Download…').length, 0,
+      'a download is offered before any project is decided');
+  },
 };
 
 // Design review AF's row vi: when a removal becomes known the projects are read again, and Settings' This project page
