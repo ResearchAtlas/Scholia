@@ -907,9 +907,10 @@ const scenarios = {
   },
   // PR 63's recheck r9 (both passes, P3; frozen ticket 16, "an owner-only file is used with a warning"): a key that
   // Add endpoint stored in the private file is said so once the form has closed, as a provider card's and First run's are.
-  async anEndpointAddedWhoseKeyWentToAFileSaysSo(w, strict) {
-    const state = { personal: { providers: {} }, gets: { '/api/providers': { providers: [] } } };
-    const s = await partWorld(w, strict, state, 'Providers', 'Providers');
+  async anEndpointAddedWhoseKeyWentToAFileSaysSo(w, strict) { // drawn in Settings, which holds the warning (batch K)
+    const state = { personal: { providers: {}, ui: { language: 'system' }, budget: {}, zotero: {} }, gets: { '/api/providers': { providers: [] } } };
+    const s = await settingsWorld(w, strict, state, { open: true });
+    await s.press('Providers and models');
     await s.press('Add an endpoint');
     await s.typeInto(byId('new-provider-name'), 'first', 'name');
     await s.typeInto(byId('new-provider-url'), 'http://localhost:1/v1', 'address');
@@ -989,6 +990,25 @@ const scenarios = {
     await s.redraw({ project: null });
     assert.ok(paths.some((path) => path.startsWith('GET /api/audit') && !path.includes('project_id')), `the whole log was not read: ${paths}`);
     assert.equal(one(s.shown().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Export'), 'Export').props.disabled, false);
+  },
+  // Harold, 2026-11-22 (batch J's concern b): the researcher leaves the Providers page before an added endpoint's key
+  // is stored; the key went to the private file. The warning is shown when the page is next drawn (Settings holds it).
+  async anEndpointsKeyStoreWarningOutlivesLeavingThePage(w, strict) {
+    const state = { personal: { providers: {}, ui: { language: 'system' }, budget: {}, zotero: {} }, gets: { '/api/providers': { providers: [] } } };
+    const s = await settingsWorld(w, strict, state, { open: true });
+    await s.press('Providers and models');
+    await s.press('Add an endpoint');
+    await s.typeInto(byId('new-provider-name'), 'first', 'name');
+    await s.typeInto(byId('new-provider-url'), 'http://localhost:1/v1', 'address');
+    await s.typeInto(byId('new-provider-key'), SUBMITTED, 'key');
+    await s.submitWith(byId('new-provider-name'), 'the add form');
+    await s.release(s.server.next(writes('PUT', '/api/settings')), (r) => r.answer({ values: { providers: { first: {} } }, hash: 'h2', problems: [] }));
+    const key = s.server.next(writes('PUT', '/api/keys/first'));
+    await s.press('General'); // the page is left before the key is stored
+    state.gets['/api/providers'].providers.push(lab({ name: 'first', has_key: true }));
+    await s.release(key, (r) => r.answer({ ok: true, warning: 'credential_store_unavailable' }));
+    await s.press('Providers and models');
+    assert.ok(s.says('status').some((text) => text.includes(KEY_STORE)), 'the key store warning is lost');
   },
 };
 

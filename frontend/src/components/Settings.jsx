@@ -44,6 +44,7 @@ const MAX_SUBAGENT_MODELS = 5;
 export function Settings({ open, onOpenChange, health, project, onLanguage, onProjectChanged, startPage }) {
   const t = useT();
   const [page, setPage] = useState('general');
+  const [stored, setStored] = useState(null); // an added endpoint's key went to the private file: said on Providers
   useEffect(() => { // S1-19c: opened at a page by the help skill's open_place; one already open keeps its page
     if (open && PAGES.includes(startPage)) setPage(startPage);
   }, [open]);
@@ -65,7 +66,7 @@ export function Settings({ open, onOpenChange, health, project, onLanguage, onPr
         </nav>
         <div className="scroll-thin min-h-0 flex-1 overflow-y-auto px-6 py-6 sm:px-8">
           {open && page === 'general' && <General onLanguage={onLanguage} projectId={project?.id} />}
-          {open && page === 'providers' && <Providers />}
+          {open && page === 'providers' && <Providers stored={stored} onStored={setStored} />}
           {open && page === 'subagents' && <Subagents />}
           {open && page === 'project' && project && <ThisProject key={project.id} project={project} onProjectChanged={onProjectChanged}
             onOpenAdvanced={() => setPage('advanced')} />}
