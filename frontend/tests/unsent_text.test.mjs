@@ -951,6 +951,32 @@ const scenarios = {
     const advanced = await partWorld(w, strict, { gets: { '/api/helper': helper(false) } }, 'LocalHelper', 'LocalHelperSection', { project: given });
     assert.equal(advanced.shown().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Download…').length, 1, 'no download is offered');
   },
+  // The batch J review (F1): after a window's save failed, another model chosen is asked for its own window: the first
+  // model's draft and its failure are not shown under it (r9-1's second order, the other way round).
+  async aWindowFailedForOneModelIsNotShownForAnother(w, strict) {
+    const s = await partWorld(w, strict, picking(), 'ModelPicker', 'ModelPicker', { projectId: null });
+    await windowFor(s, 'Model One', '8192');
+    await s.release(s.server.next(writes('PUT', '/api/settings')), (r) => r.fail('internal'));
+    assert.equal(s.says('alert').length, 1, 'the failure is said');
+    await s.act(() => option(s, 'Model Two').props.onClick());
+    assert.ok(s.screen().includes('Model Two'));
+    assert.deepEqual(s.says('alert'), [], 'Model One\'s failure is said under Model Two');
+    assert.equal(s.field(byId('picker-window'), 'the window').props.value, '', 'Model One\'s draft is under Model Two');
+  },
+  // The batch J review (F2): the audit log under Advanced, drawn while the open project's record is not known, reads
+  // and exports nothing for no project; it is the project's own once its record comes (as with a known project).
+  async anAuditLogOfAProjectNotKnownYetAsksNothingWithoutIt(w, strict) {
+    const paths = [];
+    const s = await drawn(w, strict, {}, 'Governance', 'AuditLog', { project: undefined }, () => {
+      const answering = globalThis.fetch;
+      globalThis.fetch = (path, init) => { if (String(path).startsWith('/api/audit')) paths.push(`${init?.method ?? 'GET'} ${path}`); return answering(path, init); };
+    });
+    assert.deepEqual(paths, [], 'the log was read for no project while a project is open');
+    assert.equal(one(s.shown().filter((e) => e.type === 'ui:Button' && e.text.trim() === 'Export'), 'Export').props.disabled, true,
+      'the log can be exported for no project while a project is open');
+    await s.redraw({ project: { id: 'p1', name: 'Project Alpha', kind: 'research', sensitivity: 'normal' } });
+    assert.ok(paths.length > 0 && paths.every((path) => path.includes('project_id=p1')), `read once its record came: ${paths}`);
+  },
 };
 
 // Design review AF's row vi: when a removal becomes known the projects are read again, and Settings' This project page

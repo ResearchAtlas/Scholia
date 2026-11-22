@@ -333,7 +333,10 @@ const PAGE = 50;
 export function AuditLog({ project }) {
   const t = useT();
   const language = useContext(LanguageContext);
-  const [scope, setScope] = useState(project ? 'project' : 'all');
+  // An open project, known or not (undefined: its record is read again), is its own default; while its record is not
+  // known nothing is read or exported in its name, nor for no project (the batch J review; recheck r9's class)
+  const [scope, setScope] = useState(project === null ? 'all' : 'project');
+  const waiting = scope === 'project' && !project;
   const [page, setPage] = useState(null); // { entries, next, allowed_off_this_mac }
   const [read, setRead] = useState(null);
   const [exported, setExported] = useState(null);
@@ -346,13 +349,14 @@ export function AuditLog({ project }) {
   }, [projectId]);
   const reads = useRef(0); // each fresh read of the log; a page asked for under an earlier one is dropped
   const load = useCallback(() => {
+    if (waiting) return Promise.resolve();
     const mine = ++reads.current;
     return fetchPage().then((data) => {
       if (mine !== reads.current) return;
       setPage(data);
       setRead(null);
     }).catch((error) => { if (mine === reads.current) setRead(codeOf(error)); });
-  }, [fetchPage]);
+  }, [fetchPage, waiting]);
   const { busy, problem, run } = useChange(load);
   useEffect(() => {
     setPage(null);
@@ -382,7 +386,7 @@ export function AuditLog({ project }) {
             options={[{ value: 'project', label: t('audit.thisProject') }, { value: 'all', label: t('audit.everything') }]} />
         )}
         <div className="ml-auto flex gap-2">
-          <Button size="sm" variant="outline" className="h-8" disabled={busy} onClick={exportLog}>{t('audit.export')}</Button>
+          <Button size="sm" variant="outline" className="h-8" disabled={busy || waiting} onClick={exportLog}>{t('audit.export')}</Button>
           <Button size="sm" variant="outline" className="h-8 text-destructive hover:text-destructive" disabled={busy}
             onClick={clear}>{t('audit.clear')}</Button>
         </div>

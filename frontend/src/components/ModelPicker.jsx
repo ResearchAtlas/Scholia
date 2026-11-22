@@ -158,6 +158,7 @@ export function ModelPicker({ projectId }) {
     picks += 1;
     if (m?.window.status === 'needed') { // a window can be set only where none is reported
       setFixing(m);
+      setFixProblem(null); // what an earlier model's save said is not this one's (the batch J review)
       return;
     }
     if (m && m.window.status !== 'ok') return; // reported below the smallest usable window: no setting can raise it
@@ -246,7 +247,7 @@ export function ModelPicker({ projectId }) {
           {fixing && (
             <form className="space-y-1.5 border-t p-2" onSubmit={(event) => event.preventDefault()}>
               <label htmlFor="picker-window" className="block text-xs font-medium">{t('picker.setWindow', { model: fixing.name })}</label>
-              <CommitField id="picker-window" type="number" min={4096} step={1} inputMode="numeric" suggestions={WINDOW_PRESETS}
+              <CommitField key={`${fixing.provider}:${fixing.id}`} id="picker-window" type="number" min={4096} step={1} inputMode="numeric" suggestions={WINDOW_PRESETS}
                 placeholder={t('providers.window')} readOnly={fixBusy} onCommit={(value, error) => (error ? null : setWindow(fixing, value))} />
               {fixProblem && <p role="alert" className="text-xs text-destructive">{errorText(t, fixProblem)}</p>}
               <p className="text-[11px] leading-relaxed text-muted-foreground">{t('providers.windowTrust')}</p>
