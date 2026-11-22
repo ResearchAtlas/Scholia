@@ -2,7 +2,7 @@
 // section 4.4). Each change is saved on its own against the file as the page last read or
 // saved it: a file changed on disk since then is never overwritten; it is read again and the
 // researcher is told, so the change is made again on what the file now holds (ticket 14).
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, get, put } from './api.js';
 
 // Saves updates against `read`, the file as it was last read or saved: the backend refuses
@@ -95,12 +95,19 @@ export function useInstructions(projectId, withProject) {
   const query = projectId ? `?project_id=${encodeURIComponent(projectId)}`
     : withProject ? `?with_project=${encodeURIComponent(withProject)}` : '';
 
+  // Only the newest read is shown: one asked for another query (the personal file's size without the open project's,
+  // while its record was not known) that answers late is dropped (design review AG, rider I). Not a keyed reader: the
+  // editor drawing this holds unsaved text, which a new instance would lose.
+  const reads = useRef(0);
   const reload = useCallback(async ({ keep = false } = {}) => {
+    const mine = ++reads.current;
     try {
-      setFile(await get(`/api/instructions${query}`));
+      const read = await get(`/api/instructions${query}`);
+      if (mine !== reads.current) return;
+      setFile(read);
       if (!keep) setProblem(null); // a read that succeeds clears an earlier error, not a conflict's
     } catch (error) {
-      setProblem(error instanceof ApiError ? error.code : 'internal');
+      if (mine === reads.current) setProblem(error instanceof ApiError ? error.code : 'internal');
     }
   }, [query]);
 

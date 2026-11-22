@@ -232,6 +232,19 @@ const scenarios = {
     assert.equal(s.rows().length, 1, 'the cleared log is not read');
     assert.equal(s.says('alert').length, 1, 'the failed request is not said');
   },
+  // This review, left under every option: the personal instructions' size counts the open project's file with them. The
+  // record becomes not known and known again; the read asked without the project answers last.
+  async theInstructionsSizeCountsTheOpenProjectsFile(w, strict) {
+    const s = await world(w, strict, { log: [], draw: (jsx, Settings, now) => jsx(Settings, { open: true, onOpenChange() {}, health: {}, onLanguage() {}, ...now }) },
+      'Settings', 'Settings', { project: P1 });
+    assert.ok(s.screen().includes('21 of 32 KiB'), s.screen().slice(0, 400));
+    s.server.hold('instructions');
+    await s.redraw({ project: undefined });
+    await s.redraw({ project: P1 });
+    await s.releaseAll((r) => r.kind === 'instructions' && r.path.includes('with_project='));
+    await s.releaseAll((r) => r.kind === 'instructions');
+    assert.ok(s.screen().includes('21 of 32 KiB'), 'the size shown leaves the project\'s file out: a read without the project answered last');
+  },
 };
 
 // Green at the head: the behavior kept.
