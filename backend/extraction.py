@@ -112,7 +112,9 @@ _CAPTION = re.compile(r"^(?:figure|fig\.|table|tab\.|exhibit|chart)\s*[0-9IVX]+[
                       re.IGNORECASE)
 _REFERENCES = re.compile(r"^(?:\d+\.?\s*)?(?:references|bibliography|works cited|literature cited|reference list"
                          r"|参考文献|引用文献)\s*:?$", re.IGNORECASE)
-_ABSTRACT = re.compile(r"^(?:abstract|摘要|摘\s*要)\s*[:：.—-]?\s*", re.IGNORECASE)
+# "Abstract" never as the start of a longer word ("Abstraction", "Abstract-level"): not before a lower-case letter,
+# whatever its own case; a label run into its text ("AbstractWe study", "ABSTRACTThe") is still a label.
+_ABSTRACT = re.compile(r"^(?:abstract(?-i:(?!-?[a-z]))|摘要|摘\s*要)\s*[:：.—-]?\s*", re.IGNORECASE)
 # A PDF's section heading set bold at about the body's size: numbered as a section or an appendix ("3 Method",
 # "3.1 Setup", "A Proofs", "B.2 Details"; the dotted groups give its depth), or headed Appendix.
 _NUMBERED = re.compile(r"^(?:\d{1,2}|[A-Z])((?:\.\d{1,2}){0,3})\.?\s+[A-Z]")
@@ -511,6 +513,12 @@ def _rects(boxes, size):
             for l, b, r, t in lines.values()]
 
 
+def _known_heading(text):
+    """Whether a heading's text is a section _Sections gives a kind (References, Abstract): never a title."""
+    text = _normal(text)
+    return bool(_REFERENCES.match(text) or _ABSTRACT.fullmatch(text))
+
+
 class _Sections:
     """The heading path above a block, and the kind its text takes there (abstract, reference)."""
 
@@ -763,7 +771,7 @@ def _pdf_blocks(number, lines, size, body, sections, recognized=False):
         if heading:  # consecutive heading lines of one size are one heading
             text, boxes = _join(heading)
             if number == 1 and heading[0]["size"] == largest and largest >= body * 1.3 and not sections.path \
-                    and not recognized and not any(p.kind == "title" for p in passages):
+                    and not recognized and not any(p.kind == "title" for p in passages) and not _known_heading(text):
                 passages.extend(_pieces(text, "title", number, [], None, None, boxes, size))
             else:
                 numbered = _NUMBERED.match(_normal(text))
@@ -1684,7 +1692,7 @@ def _html(source, stop):
     def emit(kind, text, start, end, level):
         stop()
         if kind == "heading":
-            if level == 1 and not title[0]:
+            if level == 1 and not title[0] and not _known_heading(text):
                 title[0] = text
                 passages.extend(_pieces(text, "title", None, [], start, end, source=source))
             else:
@@ -1820,7 +1828,7 @@ def _markdown(source, stop):
 
     def emit(kind, text, start, end, level=0):
         if kind == "heading":
-            if level == 1 and not titled[0] and not passages:
+            if level == 1 and not titled[0] and not passages and not _known_heading(text):
                 passages.extend(_pieces(text, "title", None, [], start, end, source=source))
                 titled[0] = True
             else:

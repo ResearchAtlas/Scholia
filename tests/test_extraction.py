@@ -503,6 +503,83 @@ def test_a_bold_sentence_beginning_like_a_numbered_heading_is_text():  # a guard
     assert [(k, p) for k, p, t in read if t.startswith("3 Regions")] == [("paragraph", ["2 Method"])]
 
 
+# Known section labels: whole words only; never the title
+
+ABSTRACTION = "Abstraction makes the synthetic method applicable across all measured regions and groups."
+LABELLED = "Abstract: We study minimum wages in a synthetic panel of regions across many years."
+
+
+def _abstraction_in(media):
+    """A document of each format with a Methods section whose paragraph begins "Abstraction", and an abstract
+    labelled inline: (its bytes, its media type)."""
+    if media == extraction.PDF:
+        return synthetic.pdf([[(72, 750, 18, "A Synthetic Paper"), (72, 720, 10, LABELLED), (72, 690, 14, "Methods"),
+                               (72, 670, 10, ABSTRACTION), *[(72, 640 - 12 * n, 10, FILLER) for n in range(6)]]]), media
+    if media == extraction.DOCX:
+        return synthetic.docx([("Title", "A Synthetic Paper"), (None, LABELLED), ("Heading1", "Methods"),
+                               (None, ABSTRACTION)]), media
+    if media == extraction.HTML:
+        return (f"<html><head><title>A Synthetic Paper</title></head><body><p>{LABELLED}</p><h2>Methods</h2>"
+                f"<p>{ABSTRACTION}</p></body></html>").encode(), media
+    if media == extraction.MARKDOWN:
+        return f"# A Synthetic Paper\n\n{LABELLED}\n\n## Methods\n\n{ABSTRACTION}\n".encode(), media
+    return (f"\\title{{A Synthetic Paper}}\n\\begin{{document}}\n{LABELLED}\n\n\\section{{Methods}}\n{ABSTRACTION}\n"
+            f"\\end{{document}}\n").encode(), media
+
+
+@pytest.mark.parametrize("media", [extraction.PDF, extraction.DOCX, extraction.HTML, extraction.MARKDOWN, extraction.LATEX])
+def test_a_word_beginning_with_abstract_is_not_an_abstract_label(media):
+    read = extract(*_abstraction_in(media)).passages
+    assert [(p.kind, p.section_path) for p in read if p.text == ABSTRACTION] == [("paragraph", ["Methods"])]
+    assert ("abstract", LABELLED[len("Abstract: "):]) in [(p.kind, p.text) for p in read]  # an inline label still is
+
+
+def test_abstract_hyphened_to_a_word_is_text_and_abstract_then_a_dash_is_a_label():
+    source = ("# A Synthetic Paper\n\nAbstract - We study minimum wages in a synthetic panel of regions over the years.\n\n"
+              "## Methods\n\nAbstract-level features of the synthetic panel are compared across all the regions.\n")
+    read = [(p.kind, p.text) for p in extract(source.encode(), extraction.MARKDOWN).passages]
+    assert ("abstract", "We study minimum wages in a synthetic panel of regions over the years.") in read
+    assert ("paragraph", "Abstract-level features of the synthetic panel are compared across all the regions.") in read
+    glued = extract(b"# A Synthetic Paper\n\nAbstractWe study minimum wages in a synthetic panel of regions over years.\n",
+                    extraction.MARKDOWN).passages  # a label run into its text, as text layers often give it
+    assert [(p.kind, p.text) for p in glued][1:] == [("abstract", "We study minimum wages in a synthetic panel of regions over years.")]
+
+
+def test_a_first_page_whose_largest_line_is_references_is_a_reference_list_not_a_title():
+    page = [(72, 750, 14, "References", "Helvetica-Bold"), (72, 730, 10, "Doe, J. (2020). A synthetic paper on wages."),
+            (72, 716, 10, "Roe, M. (2021). Another synthetic paper on prices."),
+            *[(72, 690 - 12 * n, 10, f"Smith, A. (20{n:02d}). A further synthetic paper.") for n in range(6)]]
+    read = extract(synthetic.pdf([page]), extraction.PDF).passages
+    assert not any(p.kind == "title" for p in read)
+    assert {(p.kind, tuple(p.section_path)) for p in read} == {("reference", ("References",))}
+    titled = extract(synthetic.pdf([[(72, 770, 20, "A Synthetic Paper"), *page]]), extraction.PDF).passages  # control
+    assert [(p.kind, p.text) for p in titled][0] == ("title", "A Synthetic Paper")
+    assert {p.kind for p in titled[1:]} == {"reference"}
+
+
+def test_a_first_page_whose_largest_line_is_abstract_keeps_its_abstract():
+    page = [(72, 750, 14, "Abstract", "Helvetica-Bold"), (72, 730, 10, "We study minimum wages in a synthetic panel."),
+            *[(72, 710 - 12 * n, 10, FILLER) for n in range(6)]]
+    read = extract(synthetic.pdf([page]), extraction.PDF).passages
+    assert not any(p.kind == "title" for p in read) and {p.kind for p in read} == {"abstract"}
+
+
+@pytest.mark.parametrize(("media", "source"), [
+    (extraction.HTML, "<html><body><h1>References</h1><p>Doe, J. (2020). A synthetic paper.</p></body></html>"),
+    (extraction.MARKDOWN, "# References\n\nDoe, J. (2020). A synthetic paper.\n")])
+def test_a_documents_first_heading_references_is_a_reference_list_not_its_title(media, source):
+    read = extract(source.encode(), media).passages
+    assert [(p.kind, p.section_path, p.text) for p in read] == [("reference", ["References"], "Doe, J. (2020). A synthetic paper.")]
+
+
+@pytest.mark.parametrize(("media", "source"), [
+    (extraction.HTML, "<html><body><h1>A Synthetic Paper</h1><h2>References</h2><p>Doe, J. (2020).</p></body></html>"),
+    (extraction.MARKDOWN, "# A Synthetic Paper\n\n## References\n\nDoe, J. (2020).\n")])
+def test_a_documents_real_first_heading_is_still_its_title(media, source):
+    read = extract(source.encode(), media).passages
+    assert [(p.kind, p.text) for p in read] == [("title", "A Synthetic Paper"), ("reference", "Doe, J. (2020).")]
+
+
 def test_a_table_piece_starting_on_a_wrapped_cell_has_its_range_in_order_over_all_its_characters():
     def row(y, *cells):
         return [(x, y, 10, cell) for x, cell in zip((72, 330, 430), cells)]

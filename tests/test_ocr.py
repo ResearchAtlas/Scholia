@@ -460,6 +460,14 @@ def test_recognized_lines_make_paragraphs_captions_and_references_as_a_text_page
     assert not any(p.kind == "title" for p in found.passages)  # no font size: no title, no heading by size
 
 
+def test_a_recognized_line_beginning_with_abstract_is_not_an_abstract_label(monkeypatch):
+    engine = Engine(lambda call: lines_at((0.10, "Abstraction makes the synthetic method applicable across all"),
+                                          (0.113, "measured regions and groups in the scan.")))
+    found = read(scan(), engine, monkeypatch)
+    assert [(p.kind, p.text) for p in found.passages] == [
+        ("paragraph", "Abstraction makes the synthetic method applicable across all measured regions and groups in the scan.")]
+
+
 def test_a_reference_list_on_a_text_page_continues_on_the_scanned_page_after_it(monkeypatch):
     engine = Engine(lines_at((0.1, "Roe, B. (2018). A third synthetic paper.")))
     found = read(synthetic.paper_pdf(scanned=1), engine, monkeypatch)  # its references begin on page 2
