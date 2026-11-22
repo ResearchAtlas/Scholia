@@ -905,6 +905,22 @@ const scenarios = {
     await s.act(() => popover.props.onOpenChange(false)); // Escape, or a press outside it
     assert.equal(one(s.elements().filter((e) => e.type === 'ui:Popover'), 'the picker').props.open, true, 'the picker closed while its window was saved');
   },
+  // PR 63's recheck r9 (both passes, P3; frozen ticket 16, "an owner-only file is used with a warning"): a key that
+  // Add endpoint stored in the private file is said so once the form has closed, as a provider card's and First run's are.
+  async anEndpointAddedWhoseKeyWentToAFileSaysSo(w, strict) {
+    const state = { personal: { providers: {} }, gets: { '/api/providers': { providers: [] } } };
+    const s = await partWorld(w, strict, state, 'Providers', 'Providers');
+    await s.press('Add an endpoint');
+    await s.typeInto(byId('new-provider-name'), 'first', 'name');
+    await s.typeInto(byId('new-provider-url'), 'http://localhost:1/v1', 'address');
+    await s.typeInto(byId('new-provider-key'), SUBMITTED, 'key');
+    await s.submitWith(byId('new-provider-name'), 'the add form');
+    await s.release(s.server.next(writes('PUT', '/api/settings')), (r) => r.answer({ values: { providers: { first: {} } }, hash: 'h2', problems: [] }));
+    state.gets['/api/providers'].providers.push(lab({ name: 'first', has_key: true }));
+    await s.release(s.server.next(writes('PUT', '/api/keys/first')), (r) => r.answer({ ok: true, warning: 'credential_store_unavailable' }));
+    assert.ok(!s.has(byId('new-provider-name')), 'the add form closed');
+    assert.ok(s.says('status').some((text) => text.includes(KEY_STORE)), 'the key store warning is not shown');
+  },
 };
 
 // Design review AF's row vi: when a removal becomes known the projects are read again, and Settings' This project page

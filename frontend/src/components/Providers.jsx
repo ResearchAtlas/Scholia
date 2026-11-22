@@ -26,6 +26,7 @@ export function Providers() {
   const [list, setList] = useState(null);
   const [problem, setProblem] = useState(null);
   const [adding, setAdding] = useState(false);
+  const [stored, setStored] = useState(null); // what an added endpoint's key save said: the key store's warning (ticket 16)
 
   const reads = useRef(0); // only the newest read of the providers is shown
   const load = useCallback(async () => {
@@ -70,8 +71,9 @@ export function Providers() {
         </p>
       )}
       <FileProblems problems={personal.problems} />
+      {stored && <p role="status" className="rounded-md bg-warning/10 px-3 py-2 text-sm text-warning">{stored}</p>}
       {adding && <AddEndpoint existing={list.map((p) => p.name)} onCancel={() => setAdding(false)}
-        onAdded={async () => { setAdding(false); await changed(); }} />}
+        onAdded={async (warning) => { setAdding(false); setStored(warning ? t('setup.storeWarning') : null); await changed(); }} />}
       {/* One keyed list, the groups' headings among the cards (design review AF's G): a card whose group changes (its
         first key saved, turned off or on) moves and is the same card, with what was typed in it and what its save said.
         The spacing is the sections' as they were: 32 px between groups, 16 px under a heading, 12 px between cards. */}
@@ -366,8 +368,8 @@ function AddEndpoint({ existing, onCancel, onAdded }) {
       const saved = await personal.save({ [settingKey('providers', name, 'kind')]: 'openai-compatible',
         [settingKey('providers', name, 'base_url')]: url.trim() });
       if (!saved) return;
-      await put(`/api/keys/${encodeURIComponent(name)}`, { key });
-      await onAdded();
+      const kept = await put(`/api/keys/${encodeURIComponent(name)}`, { key });
+      await onAdded(kept?.warning); // the key went to the private file: the page says so once the form has closed
     } catch (error) {
       setProblem(error instanceof ApiError ? error.code : 'internal');
     } finally {
