@@ -466,7 +466,7 @@ def test_a_line_after_a_known_heading_never_joins_it():  # 1.0, its other half
     assert [p for _, p, t in read if t.startswith("We study")] == [["Synthetic Evidence on Wages"]]
 
 
-def test_a_bold_sentence_beginning_like_a_numbered_heading_is_text():  # G4
+def test_a_bold_sentence_beginning_like_a_numbered_heading_is_text():  # a guard beside G1 to G3
     read = _sections((14, "2 Method", None), (None, "3 Regions report their wages in the panel.", BOLD))
     assert [(k, p) for k, p, t in read if t.startswith("3 Regions")] == [("paragraph", ["2 Method"])]
 

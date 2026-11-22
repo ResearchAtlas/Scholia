@@ -317,7 +317,7 @@ async def test_the_chooser_takes_the_citations_own_passage_then_its_text_then_it
         assert await asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, "the\uffff quo-te")) is not None
         assert await asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, "-\ufffe")) is None  # bare: empty
         await asyncio.to_thread(db.write, lambda conn: conn.execute(
-            "UPDATE passages SET text = ? WHERE id = ?", ("Paragraph 0 holds the\uffff quote.", a)))
+            "UPDATE passages SET text = ? WHERE id = ?", ("Paragraph 0 holds the\uffff qu\ufffeote.", a)))
         found = await asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, "Paragraph 0 holds the quote"))
         assert found is not None and found[0] == a  # the passage's own marks set aside too
 

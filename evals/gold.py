@@ -801,8 +801,9 @@ async def read_papers(client, state, papers, pdfs, field):
 
 
 def readable(text):
-    """A passage's text without the noncharacters PDF extraction leaves at a line-break hyphen (U+FFFE): the
-    worksheet, the quotes and the page show it so; quotes are compared by letters and digits either way."""
+    """A passage's text without the noncharacters PDF extraction left at a line-break hyphen (U+FFFE) before
+    pdf-4, which leaves none: the worksheet, the quotes and the page show it so; quotes are compared by letters
+    and digits either way."""
     return text.replace("\ufffe", "").replace("\uffff", "")
 
 
