@@ -98,7 +98,7 @@ async def test_a_citation_whose_quote_holds_pdfiums_line_end_mark_follows_the_pd
 
 
 async def test_a_new_version_that_only_drops_a_hyphen_does_not_keep_a_citation_without_the_mark(tmp_path, monkeypatch):
-    # quotes and texts are compared bare only where the stored text holds PDF's mark (pdf-3); elsewhere a hyphen counts
+    # only PDFium's mark is mapped (extraction.joined); a hyphen dropped by a new version changes the text
     read_in_process(monkeypatch)
     real = extraction.extract
     signed = "Minimum wages change the earnings of low-paid workers by -0.3 percent in the synthetic panel."
@@ -139,7 +139,7 @@ async def test_a_new_version_that_only_drops_a_hyphen_past_the_quote_finds_the_c
 
 
 async def test_a_pdf_3_passage_marked_only_past_its_quote_keeps_its_verdict_after_the_reread(tmp_path, monkeypatch):
-    # the old passage text holds the mark and the quote (its first QUOTE_CHARS) does not: compared bare all the same
+    # the old passage text holds the mark and the quote (its first QUOTE_CHARS) does not: joined all the same
     read_in_process(monkeypatch)
     real = extraction.extract
     long = OLD + " " + "Regional prices adjust slowly after a wage floor is raised in the panel. " * 7 + "Hours fell by a little."
@@ -159,6 +159,47 @@ async def test_a_pdf_3_passage_marked_only_past_its_quote_keeps_its_verdict_afte
         await idle(client, project)
         chip = await chip_of(client, conversation)
         assert chip["passage_id"] != before["passage_id"] and (chip["existence"], chip["support"]) == ("ok", "supported")
+
+
+async def test_a_pdf_3_citation_never_moves_to_a_passage_that_differs_from_its_own_but_by_a_hyphen(tmp_path):
+    # r1 pass 2: setting every hyphen aside made "-0.3" and "0.3" one text, so the chooser moved a citation of the
+    # negative passage onto the positive one and kept its verdict; the mark is now mapped as pdf-4 reads it (joined)
+    negative = "We estimate the effect at -0.3 percent in the synthetic panel of regions."
+    positive = "We estimate the effect at 0.3 percent in the synthetic panel of regions."
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, paper("Signs", positive, negative))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+
+        def as_pdf_3(conn):  # its passage gone, its quote the negative passage as pdf-3 read it
+            conn.execute("UPDATE citations SET passage_id = NULL, existence = 'source_removed', support = 'supported',"
+                         " quote = ?", (negative.replace("estimate", "esti\ufffemate"),))
+            citations.retarget(conn, material)
+        await asyncio.to_thread(client.state["db"].write, as_pdf_3)
+        assert await rows(client, "SELECT p.text, c.existence, c.support FROM citations c"
+                                  " JOIN passages p ON p.id = c.passage_id") == [(negative, "ok", "supported")]
+
+
+async def test_a_new_version_that_drops_a_minus_sign_inside_a_quote_whose_passage_held_the_mark_elsewhere(
+        tmp_path, monkeypatch):
+    # r1 pass 1: a mark past the quote made the comparison set every hyphen aside, so "-0.3" to "0.3" kept the verdict
+    read_in_process(monkeypatch)
+    real = extraction.extract
+    long = ("Minimum wages change the earnings of low-paid workers by -0.3 percent in the synthetic panel. "
+            + "Regional prices adjust slowly after a wage floor is raised in the panel. " * 7 + "Hours fell by a little.")
+    assert long.index("-0.3") < citations.QUOTE_CHARS < long.index("a little")
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+        rewording(monkeypatch, real, {"a little": "a lit\ufffetle"})  # as pdf-3 read a broken word, past the quote
+        project, [material] = await with_papers(client, paper("Wage Floors", long))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        before = await chip_of(client, conversation)
+        assert (before["existence"], before["support"]) == ("ok", "supported") and "\ufffe" not in before["quote"]
+        rewording(monkeypatch, real, {"by -0.3": "by 0.3"})  # the new version, read with no mark
+        await read_as(client, monkeypatch, material, "markdown-1")
+        await idle(client, project)
+        assert await rows(client, "SELECT passage_id, existence FROM citations") == [(None, "not_found")]
 
 
 async def test_a_reread_takes_the_new_passages_page(tmp_path, monkeypatch):
@@ -363,32 +404,31 @@ async def test_the_chooser_takes_the_citations_own_passage_then_its_text_then_it
         [(a, oa), (b, _), (c, oc), (d, _), (e, oe)] = passages
 
         def shape(conn):
-            conn.execute("UPDATE passages SET text = ? WHERE id = ?", (f"The old te-xt, with {quote}.", b))
+            conn.execute("UPDATE passages SET text = ? WHERE id = ?", (f"The old text, with {quote}.", b))
             conn.execute("UPDATE passages SET page = 7 WHERE id IN (?, ?)", (d, e))
         await asyncio.to_thread(db.write, shape)
 
         def chosen(**given):
             return asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, quote, **given)[0])
-        old = f"The old te-xt, with {quote}."
+        old = f"The old text, with {quote}."
         assert await chosen(text=old, page=7, passage_id=a, ordinal=oe) == a  # its own passage, while it holds the quote
         assert await chosen(text=old, page=7, passage_id=None, ordinal=oe) == b  # then one with its old passage's text
         assert await chosen(text="Gone.", page=7, passage_id=None, ordinal=oc) == d  # then on its page, nearest its place
         assert await chosen(text="Gone.", page=7, passage_id=None, ordinal=oe) == e
         assert await chosen(text="Gone.", page=None, passage_id=None, ordinal=oe) == c  # with no page: pageless first,
         assert await chosen(text="Gone.", page=None, passage_id=None, ordinal=oa) == a  # then nearest its place
-        # a pdf-3 citation (its quote or old text holds the mark): compared with U+FFFE, U+FFFF and hyphens set aside
+        # a pdf-3 citation's quote and old text (holding PDFium's mark) are taken as pdf-4 reads them (joined)
         assert await chosen(text=f"The ol\ufffed text, with {quote}.", page=7, passage_id=None, ordinal=oe) == b
-        assert await asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, "the\uffff quo-te")) is not None
-        assert await asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, "-\ufffe")) is None  # bare: empty
-        await asyncio.to_thread(db.write, lambda conn: conn.execute(
-            "UPDATE passages SET text = ? WHERE id = ?", ("Paragraph 0 holds the\uffff qu\ufffeote.", a)))
-        found = await asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, "Paragraph 0 holds the\ufffe quote"))
-        assert found is not None and found[0] == a  # the passage's own marks set aside too
-        assert await asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, "the qu-ote")) is None  # raw
+
+        def located(held):
+            return asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, held))
+        assert await located("the qu\ufffeote") is not None
+        assert await located("\ufffe") is None  # nothing once joined
+        assert await located("the qu-ote") is None  # any other hyphen counts
 
 
 async def test_a_citation_with_no_passage_keeps_its_verdict_when_its_quote_is_a_passage_but_for_the_mark(tmp_path):
-    # retarget's quote branch (no old passage), compared bare as its text branch is
+    # retarget's quote branch (no old passage), joined as its text branch is
     async with cited(tmp_path) as client:
         project, [material] = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)

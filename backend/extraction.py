@@ -645,12 +645,9 @@ def _pdf_page(page, raw, measure=False):
                     box = (left, bottom, right, top, at, len(lines), raw.FPDFText_GetFontSize(textpage, at))
             elif not char.isspace():
                 mapped += 1
-            # PDFium's line-end hyphen, its line joined to the next: dropped with its box (the word joined),
-            # but kept as "-" where it is the word's own, in a word already hyphened (TeX breaks such a word
-            # only at its hyphen: state-of-the-art) or before an ASCII digit (GPT-4).
-            if char == "\ufffe":
-                if not (hyphened or "0" <= text[index + 1:index + 2] <= "9"):
-                    continue
+            if char == "\ufffe":  # PDFium's line-end hyphen, its line joined to the next (_mark_kept)
+                if not _mark_kept(hyphened, text[index + 1:index + 2]):
+                    continue  # dropped with its box: the word joined
                 char = "-"
             hyphened = (hyphened or char == "-") and not char.isspace()
             chars.append(char)
@@ -672,6 +669,30 @@ def _pdf_page(page, raw, measure=False):
         return [], (width, height), True
     return [dict(_line(chars, boxes), bold=heavy) for (chars, boxes), heavy in zip(lines, bold)
             if "".join(chars).strip()], (width, height), False
+
+
+def _mark_kept(hyphened, following):
+    """Whether PDFium's line-end hyphen mark (U+FFFE) is the word's own hyphen, kept as "-", rather than a
+    broken word's, dropped: in a word already hyphened back to its last space (TeX breaks such a word only at
+    its hyphen: state-of-the-art), or before an ASCII digit (GPT-4)."""
+    return hyphened or "0" <= following <= "9"
+
+
+def joined(text):
+    """A text a PDF reading made before pdf-4, holding PDFium's marks as it gave them, as pdf-4 reads it:
+    each mark kept as "-" or dropped (_mark_kept), as _pdf_page does; any other text is itself. For a text
+    from a passage's start, as a citation's quote and old passage text are."""
+    if "\ufffe" not in text:
+        return text
+    out, hyphened = [], False
+    for index, char in enumerate(text):
+        if char == "\ufffe":
+            if not _mark_kept(hyphened, text[index + 1:index + 2]):
+                continue
+            char = "-"
+        hyphened = (hyphened or char == "-") and not char.isspace()
+        out.append(char)
+    return "".join(out)
 
 
 _BOLD_FONT = re.compile(r"bold|black|heavy|demi|cmbx", re.IGNORECASE)

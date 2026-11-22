@@ -480,6 +480,18 @@ def test_only_an_ascii_digit_after_the_mark_keeps_the_hyphen(code_point, read):
     assert passage.text == f"We use the {read} model here."
 
 
+def test_joined_reads_a_pdf_3_text_as_pdf_4_reads_its_page():
+    # a citation's stored quote from a pdf-3 reading (PDFium's marks kept) and the pdf-4 passage of the same lines
+    data = _hyphen_page("We de-", "cide on the state-of-the-", "art model, GPT-", "4o-", "mini, and Self-", "CheckGPT here.")
+    text, _ = _pdfium_text(data)
+    pdf_3 = text.split("\r\n", 1)[1]  # the paragraph's text as PDFium gives it, its marks in place
+    assert pdf_3.count("\ufffe") == 5 and "\r" not in pdf_3
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert extraction.joined(pdf_3) == passage.text == "We decide on the state-of-the-art model, GPT-4o-mini, and SelfCheckGPT here."
+    assert extraction.joined("No mark here, -0.3 and well-known.") == "No mark here, -0.3 and well-known."
+    assert extraction.joined("Kept \uffff as pdf-4 keeps it.") == "Kept \uffff as pdf-4 keeps it."
+
+
 def test_a_line_after_a_known_heading_never_joins_it():  # 1.0, its other half
     read = _sections((12, "Abstract", BOLD), (12, "Synthetic Evidence on Wages", None),
                      (None, "We study minimum wages in a synthetic panel.", None))
