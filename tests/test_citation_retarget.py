@@ -7,6 +7,7 @@ import asyncio
 
 import pytest
 
+import synthetic_materials as synthetic
 from backend import citations, extraction
 from backend.db import new_id, utc_now
 from cited import cited, conversation_in, rows, with_papers
@@ -29,9 +30,9 @@ async def evidence(client, project):
     return await asyncio.to_thread(client.state["db"].read, lambda conn: citations.readings(conn, project, references=False))
 
 
-async def read_as(client, monkeypatch, material, name):
-    """The paper's file read again by another version of the Markdown reader (an app update's re-read)."""
-    monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", name))
+async def read_as(client, monkeypatch, material, name, kind=extraction.MARKDOWN):
+    """The paper's file read again by another version of its reader (an app update's re-read)."""
+    monkeypatch.setitem(extraction.EXTRACTORS, kind, (extraction.EXTRACTORS[kind][0], name))
     [(version,)] = await rows(client, "SELECT id FROM material_versions WHERE material_id = ? AND is_current = 1", material)
     again = await client.post(f"/api/material-versions/{version}/read")
     assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
@@ -66,6 +67,34 @@ async def test_a_reread_never_points_a_citation_at_a_reference_passage(tmp_path,
         assert chip["passage_id"] in read_now, await rows(client, "SELECT c.existence, p.kind, p.text FROM citations c"
                                                                 " LEFT JOIN passages p ON p.id = c.passage_id")
         assert (chip["existence"], chip["support"]) == ("ok", "unchecked")
+
+
+@pytest.mark.parametrize(("lines", "marked", "now"), [
+    (("Minimum wages raise the earn-", "ings of low-paid workers in the synthetic panel."),
+     {"earnings": "earn\ufffeings"}, OLD),  # the word joined
+    (("Minimum wages raise the earnings of low-paid workers in the GPT-", "4 synthetic panel."),
+     {"GPT-4": "GPT\ufffe4"}, "Minimum wages raise the earnings of low-paid workers in the GPT-4 synthetic panel.")])  # kept
+async def test_a_citation_whose_quote_holds_pdfiums_line_end_mark_follows_the_pdf_4_reread_and_keeps_its_verdict(  # V1
+        tmp_path, monkeypatch, lines, marked, now):
+    # PDF extraction before pdf-4 kept U+FFFE in a word broken at a line's end; pdf-4 joins it or keeps a hyphen
+    read_in_process(monkeypatch)
+    real, pdf4 = extraction.extract, extraction.EXTRACTORS[extraction.PDF][1]
+    paper_pdf = synthetic.pdf([[(72, 750, 18, "Wage Floors"), (72, 720, 10, lines[0]), (72, 708, 10, lines[1])]])
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
+        rewording(monkeypatch, real, marked)  # as pdf-3 read it
+        project, [material] = await with_papers(client, ("Wage Floors.pdf", paper_pdf))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        before = await chip_of(client, conversation)
+        assert (before["existence"], before["support"]) == ("ok", "supported") and "\ufffe" in before["quote"]
+        monkeypatch.setattr(extraction, "extract", real)
+        await read_as(client, monkeypatch, material, pdf4, extraction.PDF)
+        await idle(client, project)
+        chip, read_now = await chip_of(client, conversation), await evidence(client, project)
+        assert chip["passage_id"] in read_now and chip["passage_id"] != before["passage_id"]
+        assert read_now[chip["passage_id"]][4] == now
+        assert (chip["existence"], chip["support"]) == ("ok", "supported")
 
 
 async def test_a_reread_takes_the_new_passages_page(tmp_path, monkeypatch):
