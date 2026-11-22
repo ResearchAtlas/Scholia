@@ -333,7 +333,8 @@ const PAGE = 50;
 export function AuditLog({ project }) {
   const t = useT();
   // An open project, known or not (undefined: its record is read again), is its own default; while its record is not
-  // known nothing is read or exported in its name, nor for no project (the batch J review; recheck r9's class)
+  // known nothing is read or exported in its name, nor for no project (the batch J review; recheck r9's class).
+  // Everything needs no project: it can be chosen, read, paged and exported whenever one is open (design review AG, c).
   const [scope, setScope] = useState(project === null ? 'all' : 'project');
   const waiting = scope === 'project' && project === undefined; // null: no project open now, so the whole log
   const projectId = scope === 'project' ? project?.id ?? null : null;
@@ -351,7 +352,7 @@ export function AuditLog({ project }) {
   return (
     <Section title={t('audit.title')} hint={t('audit.hint')}>
       <div className="flex flex-wrap items-center gap-2">
-        {project && (
+        {project !== null && (
           <Segmented label={t('audit.show')} value={scope} onChange={setScope}
             options={[{ value: 'project', label: t('audit.thisProject') }, { value: 'all', label: t('audit.everything') }]} />
         )}

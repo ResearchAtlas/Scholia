@@ -189,6 +189,22 @@ const scenarios = {
     await s.releaseAll(memories);
     assert.ok(s.screen().includes('Fact Beta'), 'the open project\'s memory is not shown: a read for no project answered last');
   },
+  // Recheck r10 pass 1, finding 2: while the open project's record is not known, Everything can be chosen, read and
+  // exported (it needs no project); This project reads and exports nothing meanwhile.
+  async everythingIsReadWhileTheRecordIsNotKnown(w, strict) {
+    const s = await auditWorld(w, strict, {}, undefined);
+    assert.deepEqual(s.server.paths.filter((p) => p.includes('/api/audit')), [], 'asked before a choice');
+    assert.equal(s.enabled('Export'), false);
+    assert.equal(await s.choose('Everything'), true, 'Everything cannot be chosen while the record is not known');
+    assert.ok(s.of('p1') > 0 && s.of('p2') > 0, 'the whole log is not shown');
+    assert.equal(s.enabled('Export'), true);
+    assert.equal(await s.choose('This project'), true);
+    assert.equal(s.rows().length, 0, 'the whole log stays under This project');
+    assert.equal(s.enabled('Export'), false);
+    await s.redraw({ project: P1 });
+    assert.equal(s.of('p1'), 50);
+    assert.equal(s.of('p2'), 0);
+  },
 };
 
 // Green at the head: the behavior kept.
