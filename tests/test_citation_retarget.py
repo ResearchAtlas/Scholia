@@ -218,6 +218,21 @@ async def test_a_citation_of_a_text_paper_whose_own_text_holds_u_fffe_follows_an
         assert (chip["existence"], chip["support"]) == ("ok", "supported")
 
 
+async def test_a_text_papers_citation_with_no_passage_keeps_its_verdict_on_its_quote_as_written(tmp_path):
+    # retarget's quote branch: a Markdown passage that holds U+FFFE itself is its quote as written
+    held = OLD.replace("earnings", "earn\ufffeings")
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, paper("Wage Floors", held))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+
+        def removed_then_retargeted(conn):
+            conn.execute("UPDATE citations SET passage_id = NULL, existence = 'source_removed', quote = ?", (held,))
+            citations.retarget(conn, material)
+        await asyncio.to_thread(client.state["db"].write, removed_then_retargeted)
+        assert await rows(client, "SELECT existence, support FROM citations") == [("ok", "supported")]
+
+
 async def test_a_reread_takes_the_new_passages_page(tmp_path, monkeypatch):
     # round 3, the open row: page = coalesce(new, old) in supersede and the null-passage loop
     read_in_process(monkeypatch)
@@ -441,6 +456,10 @@ async def test_the_chooser_takes_the_citations_own_passage_then_its_text_then_it
         assert await located("the qu\ufffeote") is not None
         assert await located("\ufffe") is None  # nothing once joined
         assert await located("the qu-ote") is None  # any other hyphen counts
+        # a text paper's own U+FFFE: its passage as written comes before one equal to it only once joined
+        await asyncio.to_thread(db.write, lambda conn: [conn.execute("UPDATE passages SET text = ? WHERE id = ?", (t, i))
+                                                       for t, i in ((f"Own\ufffe text, with {quote}.", c), (f"Own text, with {quote}.", e))])
+        assert await chosen(text=f"Own\ufffe text, with {quote}.", page=7, passage_id=None, ordinal=oe) == c
 
 
 async def test_a_citation_with_no_passage_keeps_its_verdict_when_its_quote_is_a_passage_but_for_the_mark(tmp_path):

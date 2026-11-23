@@ -235,7 +235,8 @@ def locate(conn, material_id, quote, text=None, page=None, passage_id=None, ordi
     """The one choice of the passage a citation of this paper points at (section 7.1: citations re-resolve through
     their quotes; design review J, Option 1): in the paper's reading now (deletion._reads_now, as every reader takes
     it), never a reference passage (not evidence), one holding the quote (a row with no quote: its old passage's
-    text): the passage it is on first, then one with its old passage's text, then on its page, then nearest its place.
+    text): the passage it is on first, then one with its old passage's text (as written, then as pdf-4 reads it), then
+    on its page, then nearest its place.
     A quote or old text is taken as written, and as pdf-4 reads it where a PDF reading before pdf-4 left PDFium's
     marks in it (extraction.joined: joined or kept as hyphens, Harold 2026-11-23). (id, page, text, version id), or
     None: no passage holds it, or the paper is not read now."""
@@ -247,7 +248,7 @@ def locate(conn, material_id, quote, text=None, page=None, passage_id=None, ordi
         f"SELECT p.id, p.page, p.text, w.id FROM material_versions w JOIN extractions e ON {_reads_now('w', 'e')}"
         " JOIN passages p ON p.extraction_id = e.id WHERE w.material_id = ? AND p.kind != 'reference'"
         " AND (instr(p.text, ?) > 0 OR instr(p.text, ?) > 0) ORDER BY p.id IS NOT ?,"
-        " (p.text IS NOT ? AND p.text IS NOT ?), p.page IS NOT ?, abs(p.ordinal - coalesce(?, 0)) LIMIT 1",
+        " p.text IS NOT ?, p.text IS NOT ?, p.page IS NOT ?, abs(p.ordinal - coalesce(?, 0)) LIMIT 1",
         (material_id, written, held, passage_id, text, None if text is None else joined(text), page,
          ordinal)).fetchone()
 

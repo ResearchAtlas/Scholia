@@ -535,10 +535,13 @@ def test_an_abstract_beginning_with_a_word_beginning_abstract_keeps_that_word():
 
 def test_a_caption_is_a_label_then_a_number_and_not_a_word_beginning_like_a_roman_numeral():
     source = ("# A Synthetic Paper\n\nChart vivid colours mark the regions of the synthetic panel.\n\n"
-              "Table IV. Employment by region.\n")
+              "Table is where the synthetic panel's regions are listed by size.\n\nTable IV. Employment by region.\n\n"
+              "Table iv. Wages by region.\n\nFig. 2b. Prices by region.\n")
     read = [(p.kind, p.text) for p in extract(source.encode(), extraction.MARKDOWN).passages]
     assert ("paragraph", "Chart vivid colours mark the regions of the synthetic panel.") in read
-    assert ("caption", "Table IV. Employment by region.") in read
+    assert ("paragraph", "Table is where the synthetic panel's regions are listed by size.") in read
+    assert [t for k, t in read if k == "caption"] == ["Table IV. Employment by region.", "Table iv. Wages by region.",
+                                                      "Fig. 2b. Prices by region."]
 
 ABSTRACTION = "Abstraction makes the synthetic method applicable across all measured regions and groups."
 LABELLED = "Abstract: We study minimum wages in a synthetic panel of regions across many years."
@@ -575,9 +578,9 @@ def test_abstract_hyphened_to_a_word_is_text_and_abstract_then_a_dash_is_a_label
     read = [(p.kind, p.text) for p in extract(source.encode(), extraction.MARKDOWN).passages]
     assert ("abstract", "We study minimum wages in a synthetic panel of regions over the years.") in read
     assert ("paragraph", "Abstract-level features of the synthetic panel are compared across all the regions.") in read
-    hyphened = extract(b"# A Synthetic Paper\n\n## Methods\n\nAbstract-Level features of the synthetic panel are compared.\n",
-                       extraction.MARKDOWN).passages
-    assert ("paragraph", "Abstract-Level features of the synthetic panel are compared.") in [(p.kind, p.text) for p in hyphened]
+    dashed = extract(b"# A Synthetic Paper\n\nAbstract-We study minimum wages in a synthetic panel of regions over years.\n",
+                     extraction.MARKDOWN).passages  # a hyphen for the label's dash, as old text layers give it
+    assert [(p.kind, p.text) for p in dashed][1:] == [("abstract", "We study minimum wages in a synthetic panel of regions over years.")]
     glued = extract(b"# A Synthetic Paper\n\nAbstractWe study minimum wages in a synthetic panel of regions over years.\n",
                     extraction.MARKDOWN).passages  # a label run into its text, as text layers often give it
     assert [(p.kind, p.text) for p in glued][1:] == [("abstract", "We study minimum wages in a synthetic panel of regions over years.")]
