@@ -108,13 +108,14 @@ SCANNED_CHARS = 100
 SCANNED_IMAGE_COVER = 0.6
 
 _SENTENCE_END = re.compile(r"(?<=[.!?;])[\"')\]]*\s+|(?<=[。！？；])")
-_CAPTION = re.compile(r"^(?:figure|fig\.|table|tab\.|exhibit|chart)\s*[0-9IVX]+[a-z]?\b|^(?:图|表)\s*[0-9一二三四五六七八九十]+",
+_CAPTION = re.compile(r"^(?:figure|fig\.|table|tab\.|exhibit|chart)\s*(?-i:[0-9IVX]+)[a-z]?\b|^(?:图|表)\s*[0-9一二三四五六七八九十]+",
                       re.IGNORECASE)
 _REFERENCES = re.compile(r"^(?:\d+\.?\s*)?(?:references|bibliography|works cited|literature cited|reference list"
                          r"|参考文献|引用文献)\s*:?$", re.IGNORECASE)
-# "Abstract" never as the start of a longer word ("Abstraction", "Abstract-level"): not before a lower-case letter,
-# whatever its own case; a label run into its text ("AbstractWe study", "ABSTRACTThe") is still a label.
-_ABSTRACT = re.compile(r"^(?:abstract(?-i:(?!-?[a-z]))|摘要|摘\s*要)\s*[:：.—-]?\s*", re.IGNORECASE)
+# "Abstract" never as the start of a longer word ("Abstraction", "Abstract-level"): not before a lower-case letter
+# or a hyphen and a letter, whatever its own case; a label run into its text ("AbstractWe study", "ABSTRACTThe") is
+# still a label.
+_ABSTRACT = re.compile(r"^(?:abstract(?-i:(?![a-z]|-[A-Za-z]))|摘要|摘\s*要)\s*[:：.—-]?\s*", re.IGNORECASE)
 # A PDF's section heading set bold at about the body's size: numbered as a section or an appendix ("3 Method",
 # "3.1 Setup", "A Proofs", "B.2 Details"; the dotted groups give its depth), or headed Appendix.
 _NUMBERED = re.compile(r"^(?:\d{1,2}|[A-Z])((?:\.\d{1,2}){0,3})\.?\s+[A-Z]")
@@ -1696,6 +1697,7 @@ def _html(source, stop):
                 title[0] = text
                 passages.extend(_pieces(text, "title", None, [], start, end, source=source))
             else:
+                title[0] = title[0] or level == 1  # the first h1, a known heading, takes the title's place
                 sections.heading(level, text)
             return
         kind = kind if kind in ("table", "caption") else sections.kind(text)
@@ -1830,9 +1832,9 @@ def _markdown(source, stop):
         if kind == "heading":
             if level == 1 and not titled[0] and not passages and not _known_heading(text):
                 passages.extend(_pieces(text, "title", None, [], start, end, source=source))
-                titled[0] = True
             else:
                 sections.heading(level, text)
+            titled[0] = titled[0] or level == 1  # only the first h1 may be the title
             return
         kind = kind if kind in ("table", "caption") else sections.kind(text)
         passages.extend(_pieces(_ABSTRACT.sub("", text, count=1) if kind == "abstract" else text, kind, None,

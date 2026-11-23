@@ -202,6 +202,22 @@ async def test_a_new_version_that_drops_a_minus_sign_inside_a_quote_whose_passag
         assert await rows(client, "SELECT passage_id, existence FROM citations") == [(None, "not_found")]
 
 
+async def test_a_citation_of_a_text_paper_whose_own_text_holds_u_fffe_follows_an_identical_reread(tmp_path, monkeypatch):
+    # r1 batch review 2: a noncharacter in a Markdown file is the file's own; the quote as written still matches
+    read_in_process(monkeypatch)
+    held = OLD.replace("earnings", "earn\ufffeings")
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+        project, [material] = await with_papers(client, paper("Wage Floors", held))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        assert (await chip_of(client, conversation))["quote"] == held
+        await read_as(client, monkeypatch, material, "markdown-1")
+        await idle(client, project)
+        chip = await chip_of(client, conversation)
+        assert (chip["existence"], chip["support"]) == ("ok", "supported")
+
+
 async def test_a_reread_takes_the_new_passages_page(tmp_path, monkeypatch):
     # round 3, the open row: page = coalesce(new, old) in supersede and the null-passage loop
     read_in_process(monkeypatch)

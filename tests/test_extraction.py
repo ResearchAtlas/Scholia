@@ -472,7 +472,8 @@ def _pdf_mapping_tilde(code_point, first="We use the GPT-", second="~ model here
                      *[b"<< /Length %d >>\nstream\n%s\nendstream" % (len(data), data) for data in (content, cmap)]])
 
 
-@pytest.mark.parametrize(("code_point", "read"), [(0x34, "GPT-4"), (0xFF14, "GPT\uff14"), (0x663, "GPT\u0663")])
+@pytest.mark.parametrize(("code_point", "read"), [(0x34, "GPT-4"), (0x30, "GPT-0"), (0x39, "GPT-9"), (0xFF14, "GPT\uff14"),
+                                                  (0x663, "GPT\u0663")])
 def test_only_an_ascii_digit_after_the_mark_keeps_the_hyphen(code_point, read):
     data = _pdf_mapping_tilde(code_point)
     assert "GPT\ufffe" in _pdfium_text(data)[0]  # PDFium marks the hyphen before a full-width or Arabic-Indic digit too
@@ -490,6 +491,7 @@ def test_joined_reads_a_pdf_3_text_as_pdf_4_reads_its_page():
     assert extraction.joined(pdf_3) == passage.text == "We decide on the state-of-the-art model, GPT-4o-mini, and SelfCheckGPT here."
     assert extraction.joined("No mark here, -0.3 and well-known.") == "No mark here, -0.3 and well-known."
     assert extraction.joined("Kept \uffff as pdf-4 keeps it.") == "Kept \uffff as pdf-4 keeps it."
+    assert extraction.joined("Kept \uffff, de\ufffecide.") == "Kept \uffff, decide."  # U+FFFF beside a mark too
 
 
 def test_a_line_after_a_known_heading_never_joins_it():  # 1.0, its other half
@@ -504,6 +506,39 @@ def test_a_bold_sentence_beginning_like_a_numbered_heading_is_text():  # a guard
 
 
 # Known section labels: whole words only; never the title
+
+
+@pytest.mark.parametrize(("media", "source"), [
+    (extraction.HTML, "<html><body><h1>Abstract</h1><p>We study minimum wages.</p><h1>Introduction</h1>"
+                      "<p>Minimum wages are a common policy.</p></body></html>"),
+    (extraction.MARKDOWN, "# Abstract\n\n# Introduction\n\nMinimum wages are a common policy.\n"),
+    (extraction.HTML, "<html><body><h1>References</h1><p>Doe, J. (2020). A paper.</p><h1>Appendix A</h1>"
+                      "<p>Minimum wages are a common policy.</p></body></html>")])
+def test_after_a_known_first_heading_a_later_h1_is_a_section_not_the_title(media, source):
+    # r1 batch review 1: a later h1 taken as the title left the known heading's kind over its section
+    read = extract(source.encode(), media).passages
+    assert not any(p.kind == "title" for p in read)
+    [(kind, path)] = [(p.kind, p.section_path) for p in read if p.text == "Minimum wages are a common policy."]
+    assert kind == "paragraph" and path[-1] in ("Introduction", "Appendix A")
+
+
+def test_an_abstract_beginning_with_a_word_beginning_abstract_keeps_that_word():
+    source = "# A Synthetic Paper\n\n## Abstract\n\nAbstractive models summarize the synthetic panel of regions well.\n"
+    read = [(p.kind, p.text) for p in extract(source.encode(), extraction.MARKDOWN).passages]
+    assert ("abstract", "Abstractive models summarize the synthetic panel of regions well.") in read
+    page = [(72, 750, 18, "A Synthetic Paper"), (72, 720, 12, "Abstract", "Helvetica-Bold"),
+            (72, 700, 10, "Abstractive models summarize the synthetic panel of regions well."),
+            *[(72, 670 - 12 * n, 10, FILLER) for n in range(6)]]
+    pdf = [(p.kind, p.text) for p in extract(synthetic.pdf([page]), extraction.PDF).passages]
+    assert ("abstract", "Abstractive models summarize the synthetic panel of regions well.") in pdf
+
+
+def test_a_caption_is_a_label_then_a_number_and_not_a_word_beginning_like_a_roman_numeral():
+    source = ("# A Synthetic Paper\n\nChart vivid colours mark the regions of the synthetic panel.\n\n"
+              "Table IV. Employment by region.\n")
+    read = [(p.kind, p.text) for p in extract(source.encode(), extraction.MARKDOWN).passages]
+    assert ("paragraph", "Chart vivid colours mark the regions of the synthetic panel.") in read
+    assert ("caption", "Table IV. Employment by region.") in read
 
 ABSTRACTION = "Abstraction makes the synthetic method applicable across all measured regions and groups."
 LABELLED = "Abstract: We study minimum wages in a synthetic panel of regions across many years."
@@ -540,6 +575,9 @@ def test_abstract_hyphened_to_a_word_is_text_and_abstract_then_a_dash_is_a_label
     read = [(p.kind, p.text) for p in extract(source.encode(), extraction.MARKDOWN).passages]
     assert ("abstract", "We study minimum wages in a synthetic panel of regions over the years.") in read
     assert ("paragraph", "Abstract-level features of the synthetic panel are compared across all the regions.") in read
+    hyphened = extract(b"# A Synthetic Paper\n\n## Methods\n\nAbstract-Level features of the synthetic panel are compared.\n",
+                       extraction.MARKDOWN).passages
+    assert ("paragraph", "Abstract-Level features of the synthetic panel are compared.") in [(p.kind, p.text) for p in hyphened]
     glued = extract(b"# A Synthetic Paper\n\nAbstractWe study minimum wages in a synthetic panel of regions over years.\n",
                     extraction.MARKDOWN).passages  # a label run into its text, as text layers often give it
     assert [(p.kind, p.text) for p in glued][1:] == [("abstract", "We study minimum wages in a synthetic panel of regions over years.")]
