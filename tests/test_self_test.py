@@ -52,8 +52,8 @@ def test_the_interface_check_serves_every_script_the_page_s_scripts_import(tmp_p
 def test_the_materials_check_reads_a_pdf_and_latex_and_renders_a_page_each_in_its_child():
     from backend import extraction, reading
     found = st.check_materials()
-    assert (found["pdf"], found["latex"]) == (extraction.extractor_of(extraction.PDF)[1], "latex-2+pylatexenc-2.11")
-    assert extraction.extractor_of(extraction.PDF)[1].startswith("pdf-3+pypdfium2-5.14.0")
+    assert (found["pdf"], found["latex"]) == (extraction.extractor_of(extraction.PDF)[1], "latex-3+pylatexenc-2.11")
+    assert extraction.extractor_of(extraction.PDF)[1].startswith("pdf-4+pypdfium2-5.14.0")
     assert 0 < found["child_ready_seconds"] < 10 and 0 < found["child_peak_mib"] < reading.READING_CEILING >> 20
     assert not reading.LIVE
 

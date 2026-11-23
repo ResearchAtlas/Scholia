@@ -90,8 +90,8 @@ EXTENSIONS = {".pdf": PDF, ".docx": DOCX, ".html": HTML, ".htm": HTML, ".xhtml":
               ".markdown": MARKDOWN, ".tex": LATEX, ".latex": LATEX}
 # Each media type's extractor and its version. Bump a version when its parser's output changes:
 # extractions are shared by file and extractor version.
-EXTRACTORS = {PDF: ("pdf", "pdf-3"), DOCX: ("docx", "docx-2"), HTML: ("html", "html-2"),
-              MARKDOWN: ("markdown", "markdown-3"), LATEX: ("latex", "latex-2")}
+EXTRACTORS = {PDF: ("pdf", "pdf-4"), DOCX: ("docx", "docx-3"), HTML: ("html", "html-3"),
+              MARKDOWN: ("markdown", "markdown-4"), LATEX: ("latex", "latex-3")}
 PDFIUM = threading.Lock()
 MAX_PAGE_PIXELS = 8 * 1024 * 1024  # a rendered page image's pixels: a letter page at scale 3 has 4.4 million
 MAX_PAGE_SIDE = 20_000  # a rendered page image's width or height: a letter page at scale 3 is 2,376 by 1,836
@@ -108,11 +108,18 @@ SCANNED_CHARS = 100
 SCANNED_IMAGE_COVER = 0.6
 
 _SENTENCE_END = re.compile(r"(?<=[.!?;])[\"')\]]*\s+|(?<=[。！？；])")
-_CAPTION = re.compile(r"^(?:figure|fig\.|table|tab\.|exhibit|chart)\s*[0-9IVX]+[a-z]?\b|^(?:图|表)\s*[0-9一二三四五六七八九十]+",
+_CAPTION = re.compile(r"^(?:figure|fig\.|table|tab\.|exhibit|chart)\s*(?:[0-9]+[a-z]?|(?-i:[IVX]+)[a-z]?|[ivx]+)\b|^(?:图|表)\s*[0-9一二三四五六七八九十]+",
                       re.IGNORECASE)
 _REFERENCES = re.compile(r"^(?:\d+\.?\s*)?(?:references|bibliography|works cited|literature cited|reference list"
                          r"|参考文献|引用文献)\s*:?$", re.IGNORECASE)
-_ABSTRACT = re.compile(r"^(?:abstract|摘要|摘\s*要)\s*[:：.—-]?\s*", re.IGNORECASE)
+# "Abstract" never as the start of a longer word ("Abstraction", "Abstract-level"): not before a lower-case letter,
+# or a hyphen and one, whatever its own case; a label run into its text ("AbstractWe study", "ABSTRACTThe") or set
+# off by a hyphen for a dash ("Abstract-We study") is still a label.
+_ABSTRACT = re.compile(r"^(?:abstract(?-i:(?!-?[a-z]))|摘要|摘\s*要)\s*[:：.—-]?\s*", re.IGNORECASE)
+# A PDF's section heading set bold at about the body's size: numbered as a section or an appendix ("3 Method",
+# "3.1 Setup", "A Proofs", "B.2 Details"; the dotted groups give its depth), or headed Appendix.
+_NUMBERED = re.compile(r"^(?:\d{1,2}|[A-Z])((?:\.\d{1,2}){0,3})\.?\s+[A-Z]")
+_APPENDIX = re.compile(r"^appendix\b", re.IGNORECASE)
 
 # Identifiers (F3a step 3): the DOI pattern Crossref recommends, and arXiv's two forms.
 DOI = re.compile(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", re.IGNORECASE)
@@ -436,26 +443,35 @@ def _split(text, limit=MAX_PASSAGE):
 def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None, source=None, base=0):
     """One block as passages, counted against the reading's bounds (_keep): split at sentence
     boundaries when longer than MAX_PASSAGE. char_boxes (one per character of text, or None) give
-    each piece its line rectangles and its own range of PDFium's characters. Otherwise each piece
-    takes its own part of the block's source range [start, end), where source (the document's text,
-    or a DOCX paragraph's own, base its offset) is searched for each later piece's start (_located)."""
+    each piece its line rectangles and its own range of PDFium's characters (in UTF-16 units, _units).
+    Otherwise each piece takes its own part of the block's source range [start, end), where source
+    (the document's text, or a DOCX paragraph's own, base its offset) is searched for each later
+    piece's start (_located)."""
     if not text:
         return []
+    if char_boxes is not None:  # a PDF block: cut in PDFium's form, as pdf-3 cut it, so no piece passes MAX_PASSAGE
+        text, char_boxes = _marked(text, char_boxes)
     _keep(text)
     bounds = [0, *_split(text), len(text)]
-    spans = [(a, b, text[a:b].strip()) for a, b in zip(bounds, bounds[1:])]
-    spans = [span for span in spans if span[2]]
+    spans = [(a, b, text[a:b]) for a, b in zip(bounds, bounds[1:])]
+    if char_boxes is not None:  # each piece's marks decided on it (joined), with the boxes it keeps
+        spans = [(a, b, joined(piece, char_boxes[a:b])) for a, b, piece in spans]
+        spans = [(a, b, (piece.strip(), boxes)) for a, b, (piece, boxes) in spans]
+    else:
+        spans = [(a, b, (piece.strip(), None)) for a, b, piece in spans]
+    spans = [span for span in spans if span[2][0]]
     _build(len(spans) * sum(map(len, path)))  # each piece's section path, as it will be written out
-    located = (_located([piece for _, _, piece in spans], source, base, start, end)
+    located = (_located([piece for _, _, (piece, _) in spans], source, base, start, end)
                if char_boxes is None and start is not None and end is not None else None)
     passages = []
-    for n, (a, b, piece) in enumerate(spans):
-        rects = _rects(char_boxes[a:b], page_size) if char_boxes and page_size else None
+    for n, (a, b, (piece, piece_boxes)) in enumerate(spans):
+        rects = _rects(piece_boxes, page_size) if piece_boxes and page_size else None
         if rects and (reading := _READING.get()) is not None:  # at most a piece's lines, counted as made
             reading.rectangles(len(rects))
-        if char_boxes is not None:  # a PDF piece: PDFium's characters it is made of
-            chars = [i for i in char_boxes[a:b] if i is not None]
-            first, last = (chars[0][4], chars[-1][4] + 1) if chars else (start, end)
+        if char_boxes is not None:  # a PDF piece: the span of PDFium's characters it is made of
+            # each character's PDFium characters [first, end) (_pdf_page); out of order in a wrapped table cell
+            chars = [i[4] for i in piece_boxes if i is not None]
+            first, last = (min(a for a, _ in chars), max(b for _, b in chars)) if chars else (start, end)
         elif located is not None:
             first, last = located[n], located[n + 1] if n + 1 < len(located) else end
         else:
@@ -490,7 +506,7 @@ def _located(pieces, source, base, start, end):
 
 
 def _rects(boxes, size):
-    """Character boxes (left, bottom, right, top, index, line) merged per line, as fractions of the
+    """Character boxes (left, bottom, right, top, (first, end), line) merged per line, as fractions of the
     page with a top-left origin, rounded."""
     width, height = size
     lines = {}
@@ -505,6 +521,12 @@ def _rects(boxes, size):
             min(merged[0], left), min(merged[1], bottom), max(merged[2], right), max(merged[3], top))
     return [[round(l / width, 4), round(1 - t / height, 4), round(r / width, 4), round(1 - b / height, 4)]
             for l, b, r, t in lines.values()]
+
+
+def _known_heading(text):
+    """Whether a heading's text is a section _Sections gives a kind (References, Abstract): never a title."""
+    text = _normal(text)
+    return bool(_REFERENCES.match(text) or _ABSTRACT.fullmatch(text))
 
 
 class _Sections:
@@ -602,8 +624,10 @@ def _pdf_read(document, number, raw, measure=False):
 
 
 def _pdf_page(page, raw, measure=False):
-    """The page's lines: [{"text", "boxes" (per character: (l, b, r, t, index, line) or None), "size",
-    "left", "right", "top", "bottom", "bold"}], its size, and whether it is scanned. Sizes, boxes and
+    """The page's lines: [{"text", "boxes" (per character: (l, b, r, t, (first, end), line) or None, [first, end) the
+    PDFium characters it is read from and its box over them (_pdf_box), with a seventh
+    element when PDFium gave a line-end hyphen mark after that character: the mark's box, the mark itself out of
+    the text, _marked), "size", "left", "right", "top", "bottom", "bold"}], its size, and whether it is scanned. Sizes, boxes and
     edges are of the page as displayed and rendered, its rotation and crop applied (_displayed), in points
     from its bottom left. With measure, only each line's text and size are true: no box is read and no
     line is checked for bold, the rest (lines, sizes, the scanned check) as without it."""
@@ -616,13 +640,18 @@ def _pdf_page(page, raw, measure=False):
         count = textpage.count_chars()
         if count > MAX_PAGE_CHARS:  # refused before its text is decoded: a small page can hold a great deal
             raise Unreadable()
-        text = textpage.get_text_range() if count else ""
-        # The text leaves out some characters PDFium counts (control characters) when it is shorter:
-        # each of its characters is then found among them by PDFium's own map (-1 for one it put in).
-        aligned = len(text) == count
-        mapped = unmapped = 0
+        # half a surrogate pair kept (surrogatepass) so its unit is counted, then left out of the lines (below)
+        text = textpage.get_text_range(errors="surrogatepass") if count else ""
+        # PDFium indexes its text in UTF-16 units, a character above U+FFFF two of its characters (_units). The
+        # text leaves out some characters PDFium counts (control characters) when it is shorter: each of its
+        # characters is then found among them by PDFium's own map, from its UTF-16 place (-1 for one it put in).
+        aligned = len(text.encode("utf-16-le", "surrogatepass")) == 2 * count
+        mapped = unmapped = unit = 0
         lines, chars, boxes = [], [], []
-        for index, char in enumerate(text):
+        for char in text:
+            index, unit = unit, unit + _units(char)
+            if "\ud800" <= char <= "\udfff":  # half a pair, no character: left out, as pdf-3's decoding left it out
+                continue
             if char in "\r\n":
                 if chars:
                     lines.append((chars, boxes))
@@ -630,22 +659,31 @@ def _pdf_page(page, raw, measure=False):
                 continue
             box = None
             at = index if aligned else raw.FPDFText_GetCharIndexFromTextIndex(textpage, index)
+            # its last unit's PDFium character: a pair's halves may be apart, PDFium leaving out a control between them
+            last = unit - 1 if aligned else at if unit - index == 1 else \
+                raw.FPDFText_GetCharIndexFromTextIndex(textpage, unit - 1)
             if at >= 0:
                 if raw.FPDFText_HasUnicodeMapError(textpage, at) == 1:
                     unmapped += 1
                 elif not char.isspace():
                     mapped += 1
                 if not char.isspace():
-                    left, bottom, right, top = (0.0, 0.0, 0.0, 0.0) if measure else shown(*textpage.get_charbox(at))
-                    box = (left, bottom, right, top, at, len(lines), raw.FPDFText_GetFontSize(textpage, at))
+                    last = max(at, last)
+                    left, bottom, right, top = (0.0, 0.0, 0.0, 0.0) if measure else _pdf_box(textpage, shown, at, last)
+                    box = (left, bottom, right, top, (at, last + 1), len(lines), raw.FPDFText_GetFontSize(textpage, at))
             elif not char.isspace():
                 mapped += 1
+            if char == "\ufffe" and boxes and boxes[-1] is not None:
+                # PDFium's line-end hyphen, its line joined to the next: out of the line, which the classifier reads,
+                # its box carried on the box before it (_marked), and decided on the piece it ends in (joined)
+                boxes[-1] = (*boxes[-1][:7], box)
+                continue
             chars.append(char)
             boxes.append(box)
         if chars:
             lines.append((chars, boxes))
         # Whether each line is bold, by its first character with a box.
-        bold = [not measure and _bold(textpage, raw, next((b[4] for b in boxes if b), None)) for _, boxes in lines]
+        bold = [not measure and _bold(textpage, raw, next((b[4][0] for b in boxes if b), None)) for _, boxes in lines]
     finally:
         textpage.close()
     cover = 0.0
@@ -659,6 +697,62 @@ def _pdf_page(page, raw, measure=False):
         return [], (width, height), True
     return [dict(_line(chars, boxes), bold=heavy) for (chars, boxes), heavy in zip(lines, bold)
             if "".join(chars).strip()], (width, height), False
+
+
+def _pdf_box(textpage, shown, first, last):
+    """A character's box as displayed: over its first and last unit's PDFium characters, each half of a pair its own
+    glyph or both one."""
+    boxes = [shown(*textpage.get_charbox(at)) for at in {first, last}]
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+def _units(char):
+    """A character's length in UTF-16 units, as PDFium counts its characters (and as a PDF passage's range does):
+    two for one above U+FFFF (mathematical italic x, say), else one."""
+    return 2 if char > "\uffff" else 1
+
+
+def _mark_kept(hyphened, following):
+    """Whether PDFium's line-end hyphen mark (U+FFFE) is the word's own hyphen, kept as "-", rather than a
+    broken word's, dropped: in a word already hyphened back to its last space (TeX breaks such a word only at
+    its hyphen: state-of-the-art), or before an ASCII digit (GPT-4)."""
+    return hyphened or "0" <= following <= "9"
+
+
+def _marked(text, boxes):
+    """A block's text and boxes in PDFium's form: each mark _pdf_page took out of its line put back after the
+    character whose box carries it (a box's seventh element: the mark's own box), with that box."""
+    if not any(box is not None and len(box) > 6 for box in boxes):
+        return text, boxes
+    out, kept = [], []
+    for char, box in zip(text, boxes):
+        out.append(char)
+        kept.append(box if box is None else box[:6])
+        if box is not None and len(box) > 6:
+            out.append("\ufffe")
+            kept.append(box[6])
+    return "".join(out), kept
+
+
+def joined(text, boxes=None):
+    """A text in PDFium's form, its marks in it (as a PDF reading before pdf-4 stored a passage, and as a pdf-4
+    piece is before it is read), read as pdf-4 reads it: each mark kept as "-" or dropped (_mark_kept), the word
+    so far being the text's back to its last whitespace; any other text is itself. pdf-4 makes every piece of a
+    PDF so (_pieces), after its label is dropped and it is cut, so joined of what pdf-3 stored is what pdf-4
+    reads wherever the piece is the same. With boxes (one a character), the kept characters' boxes too."""
+    if "\ufffe" not in text:
+        return text if boxes is None else (text, boxes)
+    out, kept, hyphened = [], [], False
+    for index, char in enumerate(text):
+        if char == "\ufffe":
+            if not _mark_kept(hyphened, text[index + 1:index + 2]):
+                continue
+            char = "-"
+        hyphened = (hyphened or char == "-") and not char.isspace()
+        out.append(char)
+        if boxes is not None:
+            kept.append(boxes[index])
+    return "".join(out) if boxes is None else ("".join(out), kept)
 
 
 _BOLD_FONT = re.compile(r"bold|black|heavy|demi|cmbx", re.IGNORECASE)
@@ -699,7 +793,8 @@ def _displayed(page, raw, width, height):
 def _line(chars, boxes):
     found = [b for b in boxes if b is not None]
     sizes = sorted(b[6] for b in found)
-    return {"text": "".join(chars), "boxes": [b[:6] if b else None for b in boxes],
+    return {"text": "".join(chars), "boxes": [(b[:6] + (b[7][:6] if b[7] else None,) if len(b) > 7 else b[:6]) if b else None
+                                              for b in boxes],
             "size": sizes[len(sizes) // 2] if sizes else 0.0,
             "left": min((b[0] for b in found), default=0.0), "right": max((b[2] for b in found), default=0.0),
             "top": max((b[3] for b in found), default=0.0), "bottom": min((b[1] for b in found), default=0.0)}
@@ -713,23 +808,28 @@ def _body_size(weights):
 
 def _pdf_blocks(number, lines, size, body, sections, recognized=False):
     """A page's lines grouped into headings and paragraphs, as passages. A larger font than the
-    body's marks a heading (the largest on the first page, the title); a vertical gap, a change of
-    size, a short line ending a sentence, or a caption's start ends a paragraph. Recognized lines
-    (OCR, _recognized) have no font size: none is a heading by its size or the title, and a line set
-    above the one before it (the next column) also ends a paragraph."""
-    passages, block, heading, previous, after_table = [], [], [], None, 0
+    body's marks a heading (the largest on the first page, the title), as does a known section heading
+    (References, Abstract), always a heading of its own, and a bold line at about the body's size
+    numbered as a section or headed Appendix (_NUMBERED, _APPENDIX), which starts a heading of its own
+    unless it is larger text too; a numbered heading's depth is its number's. A vertical gap, a change
+    of size, a short line ending a sentence, or a caption's start ends a paragraph. Recognized lines
+    (OCR, _recognized) have no font size or weight: none is a heading by its size or weight or the
+    title, and a line set above the one before it (the next column) also ends a paragraph."""
+    passages, block, heading, previous, after_table, alone = [], [], [], None, 0, False
     right_edge = max((line["right"] for line in lines), default=0.0)
     largest = max((line["size"] for line in lines), default=0.0)
     cells = [_cells(line) for line in lines]
 
     def flush():
-        if heading:  # consecutive heading lines of one size are one heading
+        if heading:  # consecutive heading lines of one size are one heading, read without its marks as a block is
             text, boxes = _join(heading)
             if number == 1 and heading[0]["size"] == largest and largest >= body * 1.3 and not sections.path \
-                    and not recognized and not any(p.kind == "title" for p in passages):
-                passages.extend(_pieces(text, "title", number, [], None, None, boxes, size))
-            else:
-                sections.heading(1 if heading[0]["size"] >= body * 1.4 else 2, text)
+                    and not recognized and not any(p.kind == "title" for p in passages) and not _known_heading(text):
+                passages.extend(_pieces(text, "title", number, [], None, None, boxes, size))  # cut, then joined
+            else:  # its path as pdf-3 kept it (cut at MAX_HEADING_CHARS in PDFium's form), its marks then decided
+                numbered = _NUMBERED.match(_normal(text))
+                sections.heading(1 if heading[0]["size"] >= body * 1.4 else 2 + (numbered[1].count(".") if numbered else 0),
+                                 joined(_normal(_marked(text, boxes)[0])[:MAX_HEADING_CHARS].rstrip()))
             heading.clear()
         if block:
             text, boxes = _join(block)
@@ -752,10 +852,15 @@ def _pdf_blocks(number, lines, size, body, sections, recognized=False):
                 continue
         text = line["text"].strip()
         larger = not recognized and body and line["size"] >= body * 1.15 and len(text) < 200 and not text.endswith(".")
-        if larger or (len(text) < 40 and (_REFERENCES.match(text) or _ABSTRACT.fullmatch(text))):
-            if block or (heading and abs(heading[-1]["size"] - line["size"]) > 0.6):
+        known = len(text) < 40 and (_REFERENCES.match(text) or _ABSTRACT.fullmatch(text))
+        numbered = not recognized and body and line["bold"] and line["size"] >= body - 0.6 and len(text) < 100 \
+            and not text.endswith(".") and (_APPENDIX.match(text) or (_NUMBERED.match(text) and not _reference_start(text)))
+        if larger or known or numbered:
+            if block or (heading and (known or alone or abs(heading[-1]["size"] - line["size"]) > 0.6
+                                      or (numbered and not larger))):
                 flush()
             heading.append(line)
+            alone = bool(known)
             previous = None
             continue
         if heading:
@@ -941,7 +1046,8 @@ def _recognized(document, number, size, engine, body, sections, stop):
     images keep rendering meanwhile. Its lines become passages as a text page's do (_pdf_blocks), each
     line with one box, its characters' (line-level anchors); each passage's boxes also record that it
     was recognized and the lowest confidence among its lines. No line is left out for its confidence.
-    Offsets are into the page's recognized text: its lines in the engine's order, one a line."""
+    Offsets are into the page's recognized text, in UTF-16 units as a text page's are (_units): its lines in the
+    engine's order, one a line."""
     bitmap = _ocr_bitmap(document, number)
     stop()
     PDFIUM.release()
@@ -963,10 +1069,13 @@ def _recognized(document, number, size, engine, body, sections, stop):
             continue
         left, top, right, bottom = line.box
         box = (left * width, (1 - bottom) * height, right * width, (1 - top) * height)  # points, from the bottom left
-        boxes = [None if char.isspace() else (*box, at + i, len(lines), 0.0) for i, char in enumerate(text)]
+        boxes, unit = [], at
+        for char in text:  # offsets in UTF-16 units, as a text page's are (_units)
+            boxes.append(None if char.isspace() else (*box, (unit, unit + _units(char)), len(lines), 0.0))
+            unit += _units(char)
         lines.append(dict(_line(list(text), boxes), bold=False))
-        spans.append((at, at + len(text), line.confidence))
-        at += len(text) + 1
+        spans.append((at, unit, line.confidence))
+        at = unit + 1
     passages = _pdf_blocks(number + 1, lines, size, body, sections, recognized=True)
     for passage in passages:
         lowest = min((c for start, end, c in spans if start < passage.char_end and end > passage.char_start), default=0.0)
@@ -1625,8 +1734,8 @@ class _HtmlReader(_BoundedHtml):
 
 
 def _html(source, stop):
-    """An HTML document's passages: its title first (its <title>, read in a first pass, or else its
-    first h1), then its blocks as the reader gives them; each pass bounded (_BoundedHtml)."""
+    """An HTML document's passages: its title first (its <title>, read in a first pass, or else an h1
+    before any section has begun), then its blocks as the reader gives them; each pass bounded (_BoundedHtml)."""
     sections, passages = _Sections(), []
     titles = _HtmlTitle()
     try:
@@ -1640,7 +1749,7 @@ def _html(source, stop):
     def emit(kind, text, start, end, level):
         stop()
         if kind == "heading":
-            if level == 1 and not title[0]:
+            if level == 1 and not title[0] and not sections.path and not _known_heading(text):  # before any section
                 title[0] = text
                 passages.extend(_pieces(text, "title", None, [], start, end, source=source))
             else:
@@ -1772,13 +1881,12 @@ def _markdown(source, stop):
     """A Markdown file's blocks, read line by line from the text itself (no list of its lines), each
     made into passages as it ends; a paragraph's text is taken from its range of the source then,
     rather than held line by line."""
-    sections, passages, titled = _Sections(), [], [False]
+    sections, passages = _Sections(), []
 
     def emit(kind, text, start, end, level=0):
         if kind == "heading":
-            if level == 1 and not titled[0] and not passages:
+            if level == 1 and not passages and not sections.path and not _known_heading(text):  # before any section
                 passages.extend(_pieces(text, "title", None, [], start, end, source=source))
-                titled[0] = True
             else:
                 sections.heading(level, text)
             return

@@ -302,7 +302,7 @@ async def test_cancel_ends_a_child_in_the_middle_of_one_long_step_at_once(tmp_pa
 
 
 # The S1-13 hardening through the child: its readers' own calls to stop() are the child's reports,
-# Cancel ends the child wherever its reader is, and markdown-3 reads the same in the child
+# Cancel ends the child wherever its reader is, and markdown-4 reads the same in the child
 
 
 def long_html():
@@ -371,7 +371,7 @@ async def test_the_hardened_markdown_reader_reads_the_same_in_its_child(tmp_path
     except extraction.Unreadable as unreadable:
         found = unreadable.code
     assert found == expected and gone()
-    assert extraction.extractor_of(extraction.MARKDOWN) == ("markdown", "markdown-3")
+    assert extraction.extractor_of(extraction.MARKDOWN) == ("markdown", "markdown-4")
 
 
 # The child ends in every case
@@ -654,7 +654,7 @@ async def test_a_child_that_fails_fails_its_reading_cleanly_and_retry_reads_it(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("mode", "kind"), [
     *((("frame", name), extraction.PDF) for name in (
-        "long-passage", "empty-passage", "page-zero", "page-out-of-order", "no-page-in-a-pdf", "one-offset",
+        "long-passage", "empty-passage", "page-zero", "page-out-of-order", "no-page-in-a-pdf", "reversed-pdf-offsets", "one-offset",
         "confidence-past-one", "rectangle-backwards", "more-rectangles-than-characters", "progress-past-total")),
     *((("done", name), extraction.PDF)
       for name in ("page-past-pages", "scanned-past-pages", "ocr-needed-without-scans")),
@@ -663,7 +663,7 @@ async def test_a_child_that_fails_fails_its_reading_cleanly_and_retry_reads_it(
 ])
 async def test_a_value_outside_what_the_extraction_promises_is_a_wrong_frame(tmp_path, reading_stub, mode, kind):
     """Section 7.1 and backend/extraction.py: a passage of 1 to 2,000 characters; a PDF's passages on its
-    pages from 1, in order; offsets both there or neither, a text's start at most its end; rectangles in
+    pages from 1, in order; offsets both there or neither, the start at most the end (a PDF's too); rectangles in
     order, at most one a character; a confidence from 0 to 1; scanned pages at most the pages; none of
     these in a text."""
     reading_stub(*mode)
@@ -1120,8 +1120,8 @@ async def test_every_synthetic_material_reads_in_its_child_as_in_process(tmp_pat
 
 def wrapped_table_pdf(rows=24, pad=8):
     """A PDF table past MAX_PASSAGE whose rows' first cells wrap onto a line of their own: a piece of it
-    begins on a wrapped line, whose characters PDFium numbers after its row's later cells, so its
-    char_start (its first character's index) is past its char_end (its last's)."""
+    begins on a wrapped line, whose characters PDFium numbers after its row's later cells (its range
+    the span of its characters, not its first's index to its last's, which would run backwards)."""
     y, page = 1900, []
     for r in range(rows):
         page += [(72, y, 10, f"Employment rate group {r:02d}" + "x" * pad),
@@ -1132,10 +1132,11 @@ def wrapped_table_pdf(rows=24, pad=8):
 
 
 @pytest.mark.asyncio
-async def test_a_pdf_table_whose_pieces_offsets_run_backwards_reads_the_same_in_its_child(tmp_path):
+async def test_a_pdf_table_piece_beginning_on_a_wrapped_line_reads_the_same_in_its_child(tmp_path):
     data = wrapped_table_pdf()
     expected = extraction.extract(data, extraction.PDF)
-    assert any(p.char_start > p.char_end for p in expected.passages if p.char_start is not None)  # the case
+    assert expected.passages[1].text.startswith("aged 25 | ")  # the case
+    assert all(p.char_start <= p.char_end for p in expected.passages)
     path, sha256 = stored(tmp_path, data)
     assert await asyncio.to_thread(reading.read, path, sha256, extraction.PDF) == expected and gone()
 

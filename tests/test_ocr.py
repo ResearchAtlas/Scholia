@@ -460,6 +460,14 @@ def test_recognized_lines_make_paragraphs_captions_and_references_as_a_text_page
     assert not any(p.kind == "title" for p in found.passages)  # no font size: no title, no heading by size
 
 
+def test_a_recognized_line_beginning_with_abstract_is_not_an_abstract_label(monkeypatch):
+    engine = Engine(lambda call: lines_at((0.10, "Abstraction makes the synthetic method applicable across all"),
+                                          (0.113, "measured regions and groups in the scan.")))
+    found = read(scan(), engine, monkeypatch)
+    assert [(p.kind, p.text) for p in found.passages] == [
+        ("paragraph", "Abstraction makes the synthetic method applicable across all measured regions and groups in the scan.")]
+
+
 def test_a_reference_list_on_a_text_page_continues_on_the_scanned_page_after_it(monkeypatch):
     engine = Engine(lines_at((0.1, "Roe, B. (2018). A third synthetic paper.")))
     found = read(synthetic.paper_pdf(scanned=1), engine, monkeypatch)  # its references begin on page 2
@@ -484,6 +492,15 @@ def test_a_long_recognized_paragraph_splits_at_sentences_under_the_passage_limit
     assert " ".join(p.text for p in found.passages) == " ".join([sentence.strip()] * 60)
     starts = [p.char_start for p in found.passages]
     assert starts == sorted(starts) and found.passages[0].char_start == 0  # offsets into the page's recognized text
+
+
+def test_recognized_offsets_count_a_character_above_u_ffff_as_two_as_a_text_pages_do(monkeypatch):  # r5 F1
+    # in UTF-16 units, as PDFium's are: a line ending in one does not reach into the next, nor take its confidence
+    engine = Engine(lines_at((0.10, "We fit \U0001d465", 0.1, 0.9), (0.20, "A second paragraph the engine doubts.", 0.1, 0.2)))
+    first, second = read(scan(), engine, monkeypatch).passages
+    assert (first.text, first.char_start, first.char_end) == ("We fit \U0001d465", 0, 9)
+    assert (second.char_start, second.char_end) == (10, 10 + len(second.text))
+    assert (first.boxes["ocr"]["confidence"], second.boxes["ocr"]["confidence"]) == (0.9, 0.2)
 
 
 def test_no_line_is_left_out_for_its_confidence_and_each_passage_keeps_its_lowest(monkeypatch):

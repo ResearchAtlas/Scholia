@@ -13,7 +13,7 @@ import zlib
 
 import pytest
 
-from backend import extraction
+from backend import extraction, search_index
 from backend.extraction import Passage, extract, identifiers, media_type
 import synthetic_materials as synthetic
 
@@ -328,6 +328,630 @@ def test_a_wrapped_cell_in_a_tables_last_row_joins_its_row():
     assert [p.text for p in read.passages if p.kind == "table"] == [
         "Region | Workers | Share\nNorth | 120 | 0.40\nWestern coastal districts of the synthetic panel | 88 | 0.30"]
     assert "Text after the table, further down." in [p.text for p in read.passages]
+
+
+def _pdfium_text(data):
+    import pypdfium2 as pdfium
+
+    with extraction.PDFIUM:
+        document = pdfium.PdfDocument(data)
+        try:
+            textpage = document[0].get_textpage()
+            return textpage.get_text_range(), textpage.count_chars()
+        finally:
+            document.close()
+
+
+def _hyphen_page(*lines, size=10):
+    """A page whose title is followed by lines at the body's size, 12 points apart."""
+    return synthetic.pdf([[(72, 750, 18, "A Synthetic Paper"), *[(72, 720 - 12 * n, size, line) for n, line in enumerate(lines)]]])
+
+
+def test_a_word_broken_at_a_line_end_is_one_word():  # H1
+    data = _hyphen_page("We de-", "cide the documents.")
+    assert "de\ufffecide" in _pdfium_text(data)[0]  # PDFium's mark, its two lines joined into one
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.text == "We decide the documents."
+    assert "decide" in [t[2] for t in search_index.tokens(passage.text)]
+
+
+def test_a_heading_broken_at_a_line_end_is_one_heading_in_its_section_path():  # H2
+    page = [(72, 750, 18, "A Synthetic Paper"), (72, 720, 14, "2 Retrieval-Augmented Gen-"), (72, 704, 14, "eration Results"),
+            (72, 680, 10, "Minimum wages raise the earnings of low-paid workers in the panel.")]
+    data = synthetic.pdf([page])
+    assert "Gen\ufffeeration" in _pdfium_text(data)[0]
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.section_path == ["2 Retrieval-Augmented Generation Results"]
+
+
+def test_a_joined_passage_keeps_pdfiums_range_with_the_mark_and_a_rectangle_a_line():  # H3
+    data = _hyphen_page("Minimum wages raise the earnings of workers who de-", "cide to stay in the panel, and",
+                        "the rest move.")
+    text, count = _pdfium_text(data)
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.text == "Minimum wages raise the earnings of workers who decide to stay in the panel, and the rest move."
+    assert (passage.char_start, passage.char_end) == (text.index("Minimum"), count)  # the dropped mark's index inside
+    assert len(passage.boxes["rects"]) == text[text.index("Minimum"):].count("\n") + 1  # one for each of PDFium's lines
+
+
+def test_a_compounds_own_hyphen_at_a_line_end_is_kept_and_a_name_broken_before_a_capital_is_joined():  # H4
+    data = _hyphen_page("This is state-of-the-", "art work, run with GPT-", "4 and Self-", "CheckGPT here.")
+    assert _pdfium_text(data)[0].count("\ufffe") == 3
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.text == "This is state-of-the-art work, run with GPT-4 and SelfCheckGPT here."
+    tokens = [t[2] for t in search_index.tokens(passage.text)]
+    assert "selfcheckgpt" in tokens and "gpt" in tokens
+
+
+# Section headings set bold at about the body's size (ACL's 12 pt on 10.9 pt, and the like)
+
+BOLD = "Helvetica-Bold"
+FILLER = "Minimum wages raise the earnings of low-paid workers in the synthetic panel of regions."
+
+
+def _sections(*lines, size=10, make=synthetic.pdf):
+    """Passages of a page of (font size or None for the body's, text, font or None) lines, 14 points apart,
+    under a title, with body text enough that size is the body's; made by synthetic.pdf, or as make makes it."""
+    page = [(72, 770, 20, "A Synthetic Paper")]
+    for n, (font_size, text, font) in enumerate(lines):
+        page.append((72, 750 - 14 * n, font_size or size, text, *([font] if font else [])))
+    page += [(72, 750 - 14 * (len(lines) + 1) - 12 * n, size, FILLER) for n in range(8)]
+    return [(p.kind, p.section_path, p.text) for p in extract(make([page]), extraction.PDF).passages]
+
+
+def test_an_appendix_after_the_references_headed_bold_at_the_bodys_size_is_not_a_reference():  # M1
+    read = _sections((14, "References", None), (None, "Smith, J. (2020). An earlier synthetic paper.", None),
+                     (None, "Doe, A. (2019). Another synthetic paper.", None), (None, "A Additional Results", BOLD),
+                     (None, "The appendix reports further estimates.", None))
+    assert [kind for kind, _, text in read if text.startswith(("Smith", "Doe"))] == ["reference", "reference"]
+    [(kind, path, _)] = [r for r in read if r[2] == "The appendix reports further estimates."]
+    assert (kind, path) == ("paragraph", ["References", "A Additional Results"])  # its path keeps the parent
+
+
+def test_an_unnumbered_bold_appendix_at_the_bodys_size_ends_the_references():  # M2
+    read = _sections((None, "References", BOLD), (None, "Smith, J. (2020). An earlier synthetic paper.", None),
+                     (None, "Appendix", BOLD), (None, "The appendix reports further estimates.", None), size=12)
+    assert [(k, p) for k, p, t in read if t == "The appendix reports further estimates."] == [("paragraph", ["Appendix"])]
+
+
+def test_the_body_after_an_abstract_whose_first_heading_is_bold_near_the_bodys_size_is_not_abstract():  # M3
+    read = _sections((None, "Abstract", BOLD), (None, "We study minimum wages in a synthetic panel.", None),
+                     (None, "The data are made up for testing.", None), (12, "1 Introduction", BOLD),
+                     (None, "Minimum wages are a common policy.", None), size=11)
+    assert [k for k, _, t in read if t.startswith(("We study", "The data"))] == ["abstract", "abstract"]
+    assert [(k, p) for k, p, t in read if t.startswith("Minimum wages are")] == [("paragraph", ["1 Introduction"])]
+
+
+def test_an_abstract_heading_in_the_size_of_the_lines_above_it_is_a_heading_of_its_own():  # M4
+    read = _sections((12, "Institute of Synthetic Studies", None), (12, "someone@example.org", None),
+                     (12, "Abstract", BOLD), (None, "We study minimum wages in a synthetic panel.", None))
+    assert ("abstract", ["Abstract"], "We study minimum wages in a synthetic panel.") in read
+
+
+def test_a_numbered_headings_depth_is_its_numbers():  # 1.2
+    read = _sections((None, "3 Methodology", BOLD), (None, "We describe the method.", None),
+                     (None, "3.1 Problem Formulation", BOLD), (None, "The problem is set out here.", None))
+    assert [p for _, p, t in read if t == "The problem is set out here."] == [["3 Methodology", "3.1 Problem Formulation"]]
+
+
+def test_numbered_references_whose_numbers_are_bold_stay_one_list():  # G1
+    read = _sections((14, "References", None), (None, "19. Liu, F. et al. A synthetic study of wages", BOLD),
+                     (None, "20. Doe, A. Another synthetic study of wages", BOLD))
+    assert [(k, p) for k, p, t in read if t[:3] in ("19.", "20.")] == [("reference", ["References"])] * 2
+
+
+def test_a_bold_numbered_list_item_is_text():  # G2
+    read = _sections((14, "2 Method", None), (None, "1. Source and graph integrity. A source can be checked", BOLD),
+                     (None, "against the graph it came from.", None))
+    assert [(k, p) for k, p, t in read if t.startswith("1. Source")] == [("paragraph", ["2 Method"])]
+
+
+def test_a_two_line_title_whose_second_line_begins_like_a_numbered_heading_stays_one_title():  # G3
+    page = [(72, 750, 18, "Building Agents for Synthetic Work:", BOLD), (72, 728, 18, "A Desiderata for Panels", BOLD),
+            *[(72, 700 - 12 * n, 10, FILLER) for n in range(6)]]
+    read = extract(synthetic.pdf([page]), extraction.PDF).passages
+    assert (read[0].kind, read[0].text) == ("title", "Building Agents for Synthetic Work: A Desiderata for Panels")
+    assert all(p.section_path == [] for p in read)
+
+
+def test_a_word_broken_twice_after_a_kept_hyphen_keeps_both_and_a_new_line_starts_a_new_word():  # H5
+    data = _hyphen_page("We read the well-known", "de-", "cide on GPT-", "4o-", "mini today.")
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.text == "We read the well-known decide on GPT-4o-mini today."  # the flag is cleared at a line break
+
+
+def _pdf_mapping_tilde(code_point, first="We use the GPT-", second="~ model here."):
+    """A one-page PDF of two Helvetica lines whose "~" is mapped (ToUnicode) to the code point given."""
+    cmap = (b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /T def 1 begincodespacerange"
+            b" <00> <FF> endcodespacerange 1 beginbfchar <7E> <%04X> endbfchar endcmap"
+            b" CMapName currentdict /CMap defineresource pop end end" % code_point)
+    content = b"BT /F1 10 Tf 72 720 Td (%s) Tj 0 -12 Td (%s) Tj ET" % (first.encode(), second.encode())
+    return _raw_pdf([b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                     b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >>"
+                     b" /Contents 5 0 R >>", b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>",
+                     *[b"<< /Length %d >>\nstream\n%s\nendstream" % (len(data), data) for data in (content, cmap)]])
+
+
+MATH_X = "\U0001d465"  # mathematical italic x: above U+FFFF, two UTF-16 units, so two of PDFium's characters
+
+
+def _math_pdf(pages, bar=None, dot=None):
+    """synthetic.pdf's one page of (x, y, font size, text, font or none for Helvetica) lines, each "~" mapped
+    (ToUnicode) to MATH_X; with bar, each "|" to those UTF-16 units (hex): 0002, a control character PDFium counts but
+    leaves out of its text; D835, half a surrogate pair, which PDFium counts and puts in its text; and so each "."
+    with dot."""
+    [lines] = pages
+    maps = [b" <%s> <%s>" % (code, units) for code, units in ((b"7C", bar), (b"2E", dot)) if units]
+    cmap = (b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /T def 1 begincodespacerange"
+            b" <00> <FF> endcodespacerange %d beginbfchar <7E> <D835DC65>%s endbfchar endcmap"
+            b" CMapName currentdict /CMap defineresource pop end end" % (1 + len(maps), b"".join(maps)))
+    fonts = sorted({(font[0] if font else "Helvetica") for *_, font in [(line[:4], line[4:]) for line in lines]})
+    content = b"BT " + b" ".join(
+        b"/F%d %g Tf 1 0 0 1 %g %g Tm (%s) Tj" % (fonts.index(font[0] if font else "Helvetica") + 1, size, x, y,
+                                                  re.sub(rb"([()\\])", rb"\\\1", text.encode()))
+        for x, y, size, text, *font in lines) + b" ET"
+    names = b" ".join(b"/F%d %d 0 R" % (n + 1, 6 + n) for n in range(len(fonts)))
+    return _raw_pdf([b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                     b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << %s >> >>"
+                     b" /Contents 4 0 R >>" % names,
+                     *[b"<< /Length %d >>\nstream\n%s\nendstream" % (len(data), data) for data in (content, cmap)],
+                     *[b"<< /Type /Font /Subtype /Type1 /BaseFont /%s /ToUnicode 5 0 R >>" % font.encode() for font in fonts]])
+
+
+def _read_back(data, passage):
+    """A PDF passage's range [char_start, char_end) on its page, as PDFium reads it."""
+    import pypdfium2 as pdfium
+
+    with extraction.PDFIUM:
+        document = pdfium.PdfDocument(data)
+        try:
+            textpage = document[passage.page - 1].get_textpage()
+            return textpage.get_text_range(passage.char_start, passage.char_end - passage.char_start)
+        finally:
+            document.close()
+
+
+@pytest.mark.parametrize("left_out", [False, True], ids=["aligned", "a character left out"])
+def test_a_character_above_u_ffff_is_two_of_pdfiums_and_a_passages_range_reads_back_its_text(left_out):  # r5 F1
+    # PDFium indexes its text in UTF-16 units: a character above U+FFFF is two of its characters, at both ends here
+    data = _math_pdf([[(72, 720, 10, "~ is fit to the|panel, and so is ~" if left_out else "~ is fit to the panel, and so is ~")]],
+                     bar=b"0002" if left_out else None)
+    text, count = _pdfium_text(data)
+    assert text.count(MATH_X) == 2 and count == len(text) + 2 + left_out
+    [passage] = extract(data, extraction.PDF).passages
+    assert passage.text == f"{MATH_X} is fit to the{'' if left_out else ' '}panel, and so is {MATH_X}"
+    assert (passage.char_start, passage.char_end) == (0, count) and _read_back(data, passage) == passage.text
+    [[left, _, right, _]] = passage.boxes["rects"]  # its line's rectangle, from its first character to its last
+    assert 0.11 < left < 0.13 and right > 0.3
+
+
+def test_each_piece_of_a_long_block_holding_characters_above_u_ffff_reads_back_its_text():  # r5 F1
+    # a later piece begins after the space it is cut at, and the last ends on MATH_X: its range covers both units
+    lines = [(72, 750 - 12 * n, 10, f"Sentence {n} fits ~ to the synthetic panel of regions in this paper.")
+             for n in range(30)] + [(72, 390, 10, "The last sentence ends on ~")]
+    data = _math_pdf([lines])
+    passages = extract(data, extraction.PDF).passages
+    assert len(passages) == 2 and passages[1].text.endswith(MATH_X)
+    assert [re.sub(r"\s+", " ", _read_back(data, p)) for p in passages] == [p.text for p in passages]
+
+
+def test_a_pieces_range_runs_from_its_first_pdfium_character_to_its_last_characters_end():  # r5 F1, c1 F1
+    # each character's box carries the PDFium characters it is read from: MATH_X two, b one after a left-out one
+    box = lambda left, span: (left, 700.0, left + 5, 710.0, span, 0)
+    [piece] = extraction._pieces(f" {MATH_X}b", "paragraph", 1, [], None, None, [None, box(72, (0, 2)), box(78, (3, 4))],
+                                 (612, 792))
+    assert (piece.text, piece.char_start, piece.char_end) == (f"{MATH_X}b", 0, 4)
+
+
+@pytest.mark.parametrize("half", [b"D835", b"DC65"], ids=["high", "low"])
+def test_half_a_surrogate_pair_is_left_out_of_the_text_and_counted_as_the_unit_pdfium_counts(half):  # batch 5 review F1
+    # PDFium puts the half in its text, which Python cannot hold: it is left out, as pdf-3 left it out, after its unit
+    data = _math_pdf([[(72, 720, 10, "Half |a pair, then ~ here."), (72, 660, 10, "A second paragraph begins far below it.")]],
+                     bar=half)
+    passages = extract(data, extraction.PDF).passages
+    assert [p.text for p in passages] == [f"Half a pair, then {MATH_X} here.", "A second paragraph begins far below it."]
+    assert all(_read_back(data, p) == p.text for p in passages)
+
+
+@pytest.mark.parametrize(("line", "units", "end"), [("|", b"D8350002DC65", 3), ("A|", b"D8350002DC65", 4),
+                                                   ("A|", b"D83500020002DC65", 5)],
+                         ids=["a control between its halves", "after a letter", "two controls between its halves"])
+def test_a_characters_range_ends_after_its_last_pdfium_unit_where_its_units_are_apart(line, units, end):  # c1 F1
+    # PDFium leaves the control out of its text, so the pair's halves are not consecutive among its characters
+    data = _math_pdf([[(72, 720, 10, line)]], bar=units)
+    [passage] = extract(data, extraction.PDF).passages
+    assert passage.text == line.replace("|", MATH_X)
+    assert (passage.char_start, passage.char_end) == (0, end) and _read_back(data, passage) == passage.text
+
+
+def test_a_character_from_two_glyphs_has_a_box_over_both():  # c1 F1
+    data = _math_pdf([[(72, 720, 10, "|.")]], bar=b"D835", dot=b"DC65")  # each half its own glyph, apart in every edge
+    import pypdfium2 as pdfium
+
+    with extraction.PDFIUM:
+        document = pdfium.PdfDocument(data)
+        try:
+            textpage = document[0].get_textpage()
+            assert textpage.count_chars() == 2
+            halves = [textpage.get_charbox(at) for at in (0, 1)]
+            assert len({edges for h in halves for edges in enumerate(h)}) == 8  # no edge the same
+        finally:
+            document.close()
+    [passage] = extract(data, extraction.PDF).passages
+    assert passage.text == MATH_X and (passage.char_start, passage.char_end) == (0, 2)
+    left, bottom = min(h[0] for h in halves), min(h[1] for h in halves)
+    right, top = max(h[2] for h in halves), max(h[3] for h in halves)
+    assert passage.boxes["rects"] == [[round(left / 612, 4), round(1 - top / 792, 4), round(right / 612, 4),
+                                       round(1 - bottom / 792, 4)]]  # the union of both
+
+
+def test_paragraphs_apart_after_a_character_above_u_ffff_stay_apart():  # r5 F1
+    data = _math_pdf([[(72, 720, 10, "We fit ~ to the synthetic panel of regions."),
+                       (72, 660, 10, "A second paragraph begins far below it.")]])
+    passages = extract(data, extraction.PDF).passages
+    assert [p.text for p in passages] == [f"We fit {MATH_X} to the synthetic panel of regions.",
+                                          "A second paragraph begins far below it."]
+    assert all(_read_back(data, p) == p.text for p in passages)
+
+
+def test_a_bold_appendix_after_a_character_above_u_ffff_in_the_references_is_not_a_reference():  # r5 F1, as M1
+    read = _sections((14, "References", None), (None, "Smith, J. (2020). An earlier paper on ~.", None),
+                     (None, "A Additional Results", BOLD), (None, "The appendix reports further estimates.", None),
+                     make=_math_pdf)
+    assert [k for k, _, t in read if t.startswith("Smith")] == ["reference"]
+    assert [(k, p) for k, p, t in read if t == "The appendix reports further estimates."] == [
+        ("paragraph", ["References", "A Additional Results"])]
+
+
+def test_the_body_after_an_abstract_holding_a_character_above_u_ffff_is_not_abstract():  # r5 F1, as M3
+    read = _sections((None, "Abstract", BOLD), (None, "We fit ~ to a synthetic panel.", None),
+                     (12, "1 Introduction", BOLD), (None, "Minimum wages are a common policy.", None), size=11,
+                     make=_math_pdf)
+    assert [k for k, _, t in read if t.startswith("We fit")] == ["abstract"]
+    assert [(k, p) for k, p, t in read if t.startswith("Minimum wages are")] == [("paragraph", ["1 Introduction"])]
+
+
+@pytest.mark.parametrize(("code_point", "read"), [(0x34, "GPT-4"), (0x30, "GPT-0"), (0x39, "GPT-9"), (0xFF14, "GPT\uff14"),
+                                                  (0x663, "GPT\u0663")])
+def test_only_an_ascii_digit_after_the_mark_keeps_the_hyphen(code_point, read):
+    data = _pdf_mapping_tilde(code_point)
+    assert "GPT\ufffe" in _pdfium_text(data)[0]  # PDFium marks the hyphen before a full-width or Arabic-Indic digit too
+    [passage] = extract(data, extraction.PDF).passages
+    assert passage.text == f"We use the {read} model here."
+
+
+def test_joined_reads_a_pdf_3_text_as_pdf_4_reads_its_page():
+    # a citation's stored quote from a pdf-3 reading (PDFium's marks kept) and the pdf-4 passage of the same lines
+    data = _hyphen_page("We de-", "cide on the state-of-the-", "art model, GPT-", "4o-", "mini, and Self-", "CheckGPT here.")
+    text, _ = _pdfium_text(data)
+    pdf_3 = text.split("\r\n", 1)[1]  # the paragraph's text as PDFium gives it, its marks in place
+    assert pdf_3.count("\ufffe") == 5 and "\r" not in pdf_3
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert extraction.joined(pdf_3) == passage.text == "We decide on the state-of-the-art model, GPT-4o-mini, and SelfCheckGPT here."
+    assert extraction.joined("No mark here, -0.3 and well-known.") == "No mark here, -0.3 and well-known."
+    assert extraction.joined("Kept \uffff as pdf-4 keeps it.") == "Kept \uffff as pdf-4 keeps it."
+    assert extraction.joined("Kept \uffff, de\ufffecide.") == "Kept \uffff, decide."  # U+FFFF beside a mark too
+
+
+def test_a_mark_is_decided_on_the_piece_after_its_label_is_dropped_and_joined_reads_the_same():
+    # r2 to r4 (design review AJ, option B): a mark is decided once, on the piece it ends in, after the label is
+    # dropped, by the plain rule ("the word so far" is the piece's, back to its last space); pdf-3 stored that
+    # piece, so joined of it is what pdf-4 reads
+    data = _hyphen_page("Abstract-Work-", "flows are measured in a synthetic panel of regions across many years.")
+    text, _ = _pdfium_text(data)
+    pdf_3 = text.split("\r\n", 1)[1][len("Abstract-"):]  # the pdf-3 passage, its label dropped
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.kind == "abstract"
+    assert passage.text == extraction.joined(pdf_3) == "Workflows are measured in a synthetic panel of regions across many years."
+    kept = _sections((14, "2 Methods", None), (None, "Abstract-Work-", None), (None, "flows in short.", None))
+    [(kind, words)] = [(k, t) for k, _, t in kept if "flows" in t]  # too short to be an abstract: the label stays,
+    assert (kind, words) == ("paragraph", "Abstract-Work-flows in short.")  # and its hyphen is the word's
+    assert extraction.joined("Abstract-Work\ufffeflows are measured") == "Abstract-Work-flows are measured"
+    assert extraction.joined("Abstract-level work\ufffeflows, abstract-high\ufffequality.") == \
+        "Abstract-level workflows, abstract-high-quality."  # a hyphen before a lower-case letter is a word's
+
+
+@pytest.mark.parametrize(("first", "second"), [
+    ("Abstract-Work-", "flows are measured in a synthetic panel of regions across many years."),
+    ("Abstract-\u00e9Minimum-", "wages are measured in a synthetic panel of regions across many years."),  # é: no a-z
+    ("Abstract-Abstract-Work-", "flows are measured in a synthetic panel of regions across many years."),  # doubled
+    ("ABSTRACT -Work-", "level wages are measured in a synthetic panel of regions across many years."),  # spaced
+    ("Abstract -work-", "flows are measured in a synthetic panel of regions across many years."),  # spaced, lower case
+    ("Abstract x-Work-", "flows are measured in a synthetic panel of regions across many years.")])  # the label is "Abstract "; "x-Work-" is a word, its hyphen counts
+def test_joined_of_a_pdf_3_abstract_whose_label_was_dropped_reads_as_its_pdf_4_passage(first, second):
+    # r3 review: the label's dash is left out exactly where _drop_label (_ABSTRACT) takes the label away
+    data = _hyphen_page(first, second)
+    text, _ = _pdfium_text(data)
+    line = text.split("\r\n", 1)[1]
+    pdf_3 = extraction._ABSTRACT.sub("", line, count=1)  # the pdf-3 passage: PDFium's text, its label dropped
+    assert "\ufffe" in pdf_3
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.kind == "abstract" and passage.text == extraction.joined(pdf_3)
+
+
+def test_joined_reads_a_kept_label_as_part_of_the_word_it_runs_into():
+    # the plain rule on the text as stored: a label that stayed in the passage is read with its word
+    assert extraction.joined("摘要-Work\ufffeflows are measured") == "摘要-Work-flows are measured"
+    assert extraction.joined("Work\ufffeflows are measured") == "Workflows are measured"  # once the label is dropped
+    text, boxes = extraction.joined("ab\ufffecd e\ufffe4", ["a", "b", "m", "c", "d", None, "e", "n", "4"])
+    assert (text, boxes) == ("abcd e-4", ["a", "b", "c", "d", None, "e", "n", "4"])  # the kept characters' boxes
+
+
+def test_a_long_pdf_block_is_cut_in_pdfium_form_then_each_piece_joined():
+    # cut where pdf-3 cut it (on the text with its marks), so a piece reads as joined of what pdf-3 stored
+    sentence = "Minimum wages raise the earn{}ings of workers in the synthetic panel of the regions. "
+    marked = "".join(sentence.format("\ufffe" if n % 2 else "") for n in range(24)).strip()
+    assert len(marked) > extraction.MAX_PASSAGE > len(extraction.joined(marked))  # one piece once joined, two as marked
+    text, boxes = "", []  # the block as _pdf_page gives it: the marks out, each on the box before it
+    for index, char in enumerate(marked):
+        if char == "\ufffe":
+            boxes[-1] = (*boxes[-1], (1.0, 1.0, 2.0, 2.0, (index, index + 1), 0))
+            continue
+        text += char
+        boxes.append(None if char.isspace() else (1.0, 1.0, 2.0, 2.0, (index, index + 1), 0))
+    pieces = [p.text for p in extraction._pieces(text, "paragraph", 1, [], None, None, boxes, (612, 792))]
+    cuts = [0, *extraction._split(marked), len(marked)]
+    assert pieces == [extraction.joined(marked[a:b]).strip() for a, b in zip(cuts, cuts[1:])]
+    joined_first = extraction.joined(marked)
+    cuts = [0, *extraction._split(joined_first), len(joined_first)]
+    assert pieces != [joined_first[a:b].strip() for a, b in zip(cuts, cuts[1:])]  # a cut after joining differs
+
+
+def test_the_classifier_reads_a_line_without_its_mark():
+    # the mark is out of the line the classifier reads (AJ, not the variant that leaves it in): "Fig-" / "ure 1." is
+    # a caption, its piece then read as joined of PDFium's form
+    page = [(72, 750, 18, "A Synthetic Paper"), (72, 720, 10, "Minimum wages raise the earnings of low-paid workers."),
+            (72, 700, 10, "Fig-"), (72, 688, 10, "ure 1. Earnings by region in the synthetic panel.")]
+    data = synthetic.pdf([page])
+    assert "Fig\ufffeure" in _pdfium_text(data)[0]
+    assert ("caption", "Figure 1. Earnings by region in the synthetic panel.") in kinds(extract(data, extraction.PDF).passages)
+
+
+def test_a_long_title_and_heading_are_cut_in_pdfium_form_then_joined(monkeypatch):
+    # r4b review F1: as a body block is; the heading's path is cut at MAX_HEADING_CHARS as pdf-3 cut it
+    lines = [(72, 780 - 11 * n, 12, "Minimum wages raise the earn-" if n % 2 == 0 else "ings of workers across the panel and")
+             for n in range(70)]
+    body = [(72, 760 - 12 * n, 8, FILLER) for n in range(60)]  # the body's size, on page 2
+    data = synthetic.pdf([lines, body])
+    pdf_4 = extract(data, extraction.PDF).passages
+    with monkeypatch.context() as as_pdf_3:
+        as_pdf_3.setattr(extraction, "joined", lambda text, boxes=None: text if boxes is None else (text, boxes))
+        pdf_3 = extract(data, extraction.PDF).passages
+    titles = [(old.text, new.text) for old, new in zip(pdf_3, pdf_4) if new.kind == "title"]
+    assert len(titles) > 1 and all(new == extraction.joined(old) for old, new in titles)  # cut as pdf-3 cut it
+    heading = [(72, 750, 18, "A Synthetic Paper")] + [(72, 730 - 16 * n, 14, "Minimum wages raise the earn-" if n % 2 == 0
+                                                       else "ings of workers across the panel and") for n in range(24)]
+    data = synthetic.pdf([heading, [(72, 760 - 12 * n, 10, FILLER) for n in range(60)]])
+    pdf_4 = extract(data, extraction.PDF).passages
+    with monkeypatch.context() as as_pdf_3:
+        as_pdf_3.setattr(extraction, "joined", lambda text, boxes=None: text if boxes is None else (text, boxes))
+        pdf_3 = extract(data, extraction.PDF).passages
+    [old] = {tuple(p.section_path) for p in pdf_3 if p.section_path}
+    [new] = {tuple(p.section_path) for p in pdf_4 if p.section_path}
+    assert len(old[0]) == extraction.MAX_HEADING_CHARS and new == (extraction.joined(old[0]),)
+
+
+def test_a_pieces_range_is_of_the_characters_it_keeps_a_kept_marks_box_among_them():
+    text, boxes, marks = "We use GPT4 and decide.", [], {"T": (5.0, 1.0, 6.0, 2.0, (99, 100), 0),
+                                                         "e": (5.0, 1.0, 6.0, 2.0, (200, 201), 0)}
+    for index, char in enumerate(text):
+        box = None if char.isspace() else (1.0, 1.0, 2.0, 2.0, (index, index + 1), 0)
+        if char in marks and text[index + 1:index + 2] in ("4", "c"):  # GPT<mark>4 (kept), de<mark>cide (dropped)
+            box = (*box, marks[char])
+        boxes.append(box)
+    [piece] = extraction._pieces(text, "paragraph", 1, [], None, None, boxes, (612, 792))
+    assert piece.text == "We use GPT-4 and decide."
+    assert (piece.char_start, piece.char_end) == (0, 100)  # the kept mark's index among them, the dropped one's not
+
+
+def test_a_headings_kept_hyphen_is_decided_on_the_heading():
+    page = [(72, 750, 18, "A Synthetic Paper"), (72, 720, 14, "2 A State-of-the-"), (72, 704, 14, "Art Survey"),
+            (72, 680, 10, "Minimum wages raise the earnings of low-paid workers in the panel.")]
+    [_, passage] = extract(synthetic.pdf([page]), extraction.PDF).passages
+    assert passage.section_path == ["2 A State-of-the-Art Survey"]
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_every_pdf_piece_is_joined_of_its_pdfium_form_over_generated_layouts(monkeypatch, seed):
+    # AJ's property: a pdf-4 piece's text is joined(M), where M is the piece in PDFium's form (what pdf-3 stored)
+    import random
+    rng = random.Random(seed)
+    starts = ["Abstract-", "Abstract:", "ABSTRACT -", "Abstract:Abstract-", "We discuss abstract", "Abstract -", ""]
+    words = ["Re-", "Work-", "state-of-the-", "GPT-", "well-known", "de-", "Self-", "x-Work-", "-Re-", "4o-", "the",
+             "panel", "regions", "wages", "Minimum-"]
+    nexts = ["signing", "flows", "art", "4", "cide", "CheckGPT", "level", "mini", "known", "Tree", "5 percent"]
+    layouts = []
+    for _ in range(25):
+        lines, y = [(72, 770, 20, "A Synthetic Paper")], 740
+        for _ in range(rng.randint(1, 3)):
+            first = " ".join(filter(None, [rng.choice(starts), *rng.sample(words, rng.randint(1, 3))]))
+            if not first.endswith("-"):
+                first += " " + rng.choice([w for w in words if w.endswith("-")])
+            lines += [(72, y, 10, first), (72, y - 12, 10, rng.choice(nexts) + " are measured in a synthetic panel of"
+                                                                             " regions across many years.")]
+            y -= 40
+        layouts.append(synthetic.pdf([lines]))
+    for data in layouts:
+        pdf_4 = extract(data, extraction.PDF).passages
+        with monkeypatch.context() as as_pdf_3:  # the same reading with every mark left as PDFium gave it
+            as_pdf_3.setattr(extraction, "joined", lambda text, boxes=None: text if boxes is None else (text, boxes))
+            pdf_3 = extract(data, extraction.PDF).passages
+        assert len(pdf_3) == len(pdf_4)
+        for old, new in zip(pdf_3, pdf_4):
+            assert new.text == extraction.joined(old.text) and new.kind == old.kind
+            assert new.section_path == [extraction.joined(part) for part in old.section_path]
+            assert (new.char_start, new.char_end) == (old.char_start, old.char_end)
+        assert any("\ufffe" in p.text for p in pdf_3)
+
+
+def test_a_line_after_a_known_heading_never_joins_it():  # 1.0, its other half
+    read = _sections((12, "Abstract", BOLD), (12, "Synthetic Evidence on Wages", None),
+                     (None, "We study minimum wages in a synthetic panel.", None))
+    assert [p for _, p, t in read if t.startswith("We study")] == [["Synthetic Evidence on Wages"]]
+
+
+def test_a_bold_sentence_beginning_like_a_numbered_heading_is_text():  # a guard beside G1 to G3
+    read = _sections((14, "2 Method", None), (None, "3 Regions report their wages in the panel.", BOLD))
+    assert [(k, p) for k, p, t in read if t.startswith("3 Regions")] == [("paragraph", ["2 Method"])]
+
+
+# Known section labels: whole words only; never the title
+
+
+@pytest.mark.parametrize(("media", "source"), [
+    (extraction.HTML, "<html><body><h1>Abstract</h1><p>We study minimum wages.</p><h1>Introduction</h1>"
+                      "<p>Minimum wages are a common policy.</p></body></html>"),
+    (extraction.MARKDOWN, "# Abstract\n\n# Introduction\n\nMinimum wages are a common policy.\n"),
+    (extraction.HTML, "<html><body><h1>References</h1><p>Doe, J. (2020). A paper.</p><h1>Appendix A</h1>"
+                      "<p>Minimum wages are a common policy.</p></body></html>")])
+def test_after_a_known_first_heading_a_later_h1_is_a_section_not_the_title(media, source):
+    # r1 batch review 1: a later h1 taken as the title left the known heading's kind over its section
+    read = extract(source.encode(), media).passages
+    assert not any(p.kind == "title" for p in read)
+    [(kind, path)] = [(p.kind, p.section_path) for p in read if p.text == "Minimum wages are a common policy."]
+    assert kind == "paragraph" and path[-1] in ("Introduction", "Appendix A")
+
+
+def test_an_abstract_beginning_with_a_word_beginning_abstract_keeps_that_word():
+    source = "# A Synthetic Paper\n\n## Abstract\n\nAbstractive models summarize the synthetic panel of regions well.\n"
+    read = [(p.kind, p.text) for p in extract(source.encode(), extraction.MARKDOWN).passages]
+    assert ("abstract", "Abstractive models summarize the synthetic panel of regions well.") in read
+    page = [(72, 750, 18, "A Synthetic Paper"), (72, 720, 12, "Abstract", "Helvetica-Bold"),
+            (72, 700, 10, "Abstractive models summarize the synthetic panel of regions well."),
+            *[(72, 670 - 12 * n, 10, FILLER) for n in range(6)]]
+    pdf = [(p.kind, p.text) for p in extract(synthetic.pdf([page]), extraction.PDF).passages]
+    assert ("abstract", "Abstractive models summarize the synthetic panel of regions well.") in pdf
+
+
+def test_a_caption_is_a_label_then_a_number_and_not_a_word_beginning_like_a_roman_numeral():
+    source = ("# A Synthetic Paper\n\nChart vivid colours mark the regions of the synthetic panel.\n\n"
+              "Table is where the synthetic panel's regions are listed by size.\n\nTable IV. Employment by region.\n\n"
+              "Table iv. Wages by region.\n\nFig. 2b. Prices by region.\n\nTable IIa. Hours by region.\n")
+    read = [(p.kind, p.text) for p in extract(source.encode(), extraction.MARKDOWN).passages]
+    assert ("paragraph", "Chart vivid colours mark the regions of the synthetic panel.") in read
+    assert ("paragraph", "Table is where the synthetic panel's regions are listed by size.") in read
+    assert [t for k, t in read if k == "caption"] == ["Table IV. Employment by region.", "Table iv. Wages by region.",
+                                                      "Fig. 2b. Prices by region.", "Table IIa. Hours by region."]
+
+ABSTRACTION = "Abstraction makes the synthetic method applicable across all measured regions and groups."
+LABELLED = "Abstract: We study minimum wages in a synthetic panel of regions across many years."
+
+
+def _abstraction_in(media):
+    """A document of each format with a Methods section whose paragraph begins "Abstraction", and an abstract
+    labelled inline: (its bytes, its media type)."""
+    if media == extraction.PDF:
+        return synthetic.pdf([[(72, 750, 18, "A Synthetic Paper"), (72, 720, 10, LABELLED), (72, 690, 14, "Methods"),
+                               (72, 670, 10, ABSTRACTION), *[(72, 640 - 12 * n, 10, FILLER) for n in range(6)]]]), media
+    if media == extraction.DOCX:
+        return synthetic.docx([("Title", "A Synthetic Paper"), (None, LABELLED), ("Heading1", "Methods"),
+                               (None, ABSTRACTION)]), media
+    if media == extraction.HTML:
+        return (f"<html><head><title>A Synthetic Paper</title></head><body><p>{LABELLED}</p><h2>Methods</h2>"
+                f"<p>{ABSTRACTION}</p></body></html>").encode(), media
+    if media == extraction.MARKDOWN:
+        return f"# A Synthetic Paper\n\n{LABELLED}\n\n## Methods\n\n{ABSTRACTION}\n".encode(), media
+    return (f"\\title{{A Synthetic Paper}}\n\\begin{{document}}\n{LABELLED}\n\n\\section{{Methods}}\n{ABSTRACTION}\n"
+            f"\\end{{document}}\n").encode(), media
+
+
+@pytest.mark.parametrize("media", [extraction.PDF, extraction.DOCX, extraction.HTML, extraction.MARKDOWN, extraction.LATEX])
+def test_a_word_beginning_with_abstract_is_not_an_abstract_label(media):
+    read = extract(*_abstraction_in(media)).passages
+    assert [(p.kind, p.section_path) for p in read if p.text == ABSTRACTION] == [("paragraph", ["Methods"])]
+    assert ("abstract", LABELLED[len("Abstract: "):]) in [(p.kind, p.text) for p in read]  # an inline label still is
+
+
+def test_abstract_hyphened_to_a_word_is_text_and_abstract_then_a_dash_is_a_label():
+    source = ("# A Synthetic Paper\n\nAbstract - We study minimum wages in a synthetic panel of regions over the years.\n\n"
+              "## Methods\n\nAbstract-level features of the synthetic panel are compared across all the regions.\n")
+    read = [(p.kind, p.text) for p in extract(source.encode(), extraction.MARKDOWN).passages]
+    assert ("abstract", "We study minimum wages in a synthetic panel of regions over the years.") in read
+    assert ("paragraph", "Abstract-level features of the synthetic panel are compared across all the regions.") in read
+    dashed = extract(b"# A Synthetic Paper\n\nAbstract-We study minimum wages in a synthetic panel of regions over years.\n",
+                     extraction.MARKDOWN).passages  # a hyphen for the label's dash, as old text layers give it
+    assert [(p.kind, p.text) for p in dashed][1:] == [("abstract", "We study minimum wages in a synthetic panel of regions over years.")]
+    glued = extract(b"# A Synthetic Paper\n\nAbstractWe study minimum wages in a synthetic panel of regions over years.\n",
+                    extraction.MARKDOWN).passages  # a label run into its text, as text layers often give it
+    assert [(p.kind, p.text) for p in glued][1:] == [("abstract", "We study minimum wages in a synthetic panel of regions over years.")]
+
+
+def test_a_first_page_whose_largest_line_is_references_is_a_reference_list_not_a_title():
+    page = [(72, 750, 14, "References", "Helvetica-Bold"), (72, 730, 10, "Doe, J. (2020). A synthetic paper on wages."),
+            (72, 716, 10, "Roe, M. (2021). Another synthetic paper on prices."),
+            *[(72, 690 - 12 * n, 10, f"Smith, A. (20{n:02d}). A further synthetic paper.") for n in range(6)]]
+    read = extract(synthetic.pdf([page]), extraction.PDF).passages
+    assert not any(p.kind == "title" for p in read)
+    assert {(p.kind, tuple(p.section_path)) for p in read} == {("reference", ("References",))}
+    titled = extract(synthetic.pdf([[(72, 770, 20, "A Synthetic Paper"), *page]]), extraction.PDF).passages  # control
+    assert [(p.kind, p.text) for p in titled][0] == ("title", "A Synthetic Paper")
+    assert {p.kind for p in titled[1:]} == {"reference"}
+
+
+def test_a_first_page_whose_largest_line_is_abstract_keeps_its_abstract():
+    page = [(72, 750, 14, "Abstract", "Helvetica-Bold"), (72, 730, 10, "We study minimum wages in a synthetic panel."),
+            *[(72, 710 - 12 * n, 10, FILLER) for n in range(6)]]
+    read = extract(synthetic.pdf([page]), extraction.PDF).passages
+    assert not any(p.kind == "title" for p in read) and {p.kind for p in read} == {"abstract"}
+
+
+@pytest.mark.parametrize(("media", "source"), [
+    (extraction.HTML, "<html><body><h1>References</h1><p>Doe, J. (2020). A synthetic paper.</p></body></html>"),
+    (extraction.MARKDOWN, "# References\n\nDoe, J. (2020). A synthetic paper.\n")])
+def test_a_documents_first_heading_references_is_a_reference_list_not_its_title(media, source):
+    read = extract(source.encode(), media).passages
+    assert [(p.kind, p.section_path, p.text) for p in read] == [("reference", ["References"], "Doe, J. (2020). A synthetic paper.")]
+
+
+@pytest.mark.parametrize(("media", "source"), [
+    (extraction.HTML, "<html><body><h2>References</h2><p>Doe, J. (2020). A synthetic paper.</p><h1>Appendix A</h1>"
+                      "<p>The appendix reports further estimates of the synthetic panel.</p></body></html>"),
+    (extraction.HTML, "<html><body><h2>Abstract</h2><p>We study minimum wages in a synthetic panel.</p><h1>Appendix A</h1>"
+                      "<p>The appendix reports further estimates of the synthetic panel.</p></body></html>"),
+    (extraction.MARKDOWN, "## References\n\n# Appendix A\n\nThe appendix reports further estimates of the synthetic panel.\n"),
+    (extraction.HTML, "<html><body><h3>Notes</h3><h1>Appendix A</h1>"
+                      "<p>The appendix reports further estimates of the synthetic panel.</p></body></html>")],
+    ids=["html after references", "html after abstract", "markdown", "html after an h3"])
+def test_a_first_level_heading_after_a_section_is_a_section_not_the_title(media, source):
+    # r4 pass 2: an h1 taken as the title after a section had begun left that section's kind over what followed.
+    # A title inferred from an h1 is taken only before any section (PDF's first-page title already was); DOCX's
+    # Title style and LaTeX's \title are the author's own, and a section continues across them (test_materials)
+    read = extract(source.encode(), media).passages
+    assert not any(p.kind == "title" for p in read)
+    assert [(p.kind, p.section_path) for p in read if p.text.startswith("The appendix")] == [("paragraph", ["Appendix A"])]
+
+
+def test_an_empty_first_heading_leaves_the_markdown_title_to_the_next():
+    # a heading that reads as nothing begins no section, as an empty HTML heading never did
+    read = extract(b"# \n\n# A Synthetic Paper\n\nMinimum wages raise earnings in the synthetic panel.\n",
+                   extraction.MARKDOWN).passages
+    assert [(p.kind, p.text) for p in read][0] == ("title", "A Synthetic Paper")
+
+
+@pytest.mark.parametrize(("media", "source"), [
+    (extraction.HTML, "<html><body><h1>A Synthetic Paper</h1><h2>References</h2><p>Doe, J. (2020).</p></body></html>"),
+    (extraction.MARKDOWN, "# A Synthetic Paper\n\n## References\n\nDoe, J. (2020).\n")])
+def test_a_documents_real_first_heading_is_still_its_title(media, source):
+    read = extract(source.encode(), media).passages
+    assert [(p.kind, p.text) for p in read] == [("title", "A Synthetic Paper"), ("reference", "Doe, J. (2020).")]
+
+
+def test_a_table_piece_starting_on_a_wrapped_cell_has_its_range_in_order_over_all_its_characters():
+    def row(y, *cells):
+        return [(x, y, 10, cell) for x, cell in zip((72, 330, 430), cells)]
+
+    page = row(750, "Region", "Workers", "Share")
+    for n in range(35):  # rows enough that the table is cut in two at the last row's sentence end
+        page += row(738 - 12 * n, f"Synthetic district number {n:02d} of the panel", str(100 + n), "0.40")
+    page += [*row(318, "Districts named in the notes.", "88", "0.30"), (72, 306, 10, "synthetic panel")]  # wrapped
+    data = synthetic.pdf([page])
+    text, count = _pdfium_text(data)
+    first, last = extract(data, extraction.PDF).passages
+    assert (first.kind, last.kind, last.text) == ("table", "table", "synthetic panel | 88 | 0.30")
+    # PDFium numbers the wrapped line after the row's later cells: the piece spans from "88" to "panel".
+    assert text.index("88") < text.index("synthetic panel")
+    assert (last.char_start, last.char_end) == (text.index("88"), text.index("synthetic panel") + len("synthetic panel"))
+    assert (first.char_start, first.char_end) == (0, text.index("notes.") + len("notes."))
 
 
 def pixels(image):

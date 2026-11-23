@@ -20,3 +20,21 @@ Runs a and b were made under the manifest's earlier rules (rules hash 692683fd�
 | keyword_only | 0.627 [0.573, 0.679] | 0.451 | 0.405 | 5 ms, 8 ms |
 
 **Against the full baseline** (run c, its 328 questions paired by id): keyword-only rankings identical for 51, hybrid for 73; recall@8 differences +0.0035 [−0.0096, +0.0175] (keyword-only) and −0.0013 [−0.0088, +0.0037] (hybrid), no drop flagged. The differences come from the search index itself, not from the runner: its keyword scores (FTS5's BM25) take term statistics over every passage in the index, which here are 100 papers' instead of 416 papers', so the same question in the same paper can rank passages differently. Hence the reference run for subset comparisons is a subset run.
+
+## A PDF-only parser change (`pdf-4`, 2026-11-23)
+
+The PDF follow-up PR changes only PDF reading (`backend/extraction.py`'s PDF path, the `pdf-4` version) and how citations compare quotes. Tier 1's materials, QASPER's papers and the document benchmarks alike, are written and read as Markdown (`evals/tier1.py`), so no tier 1 number can move with it, and the full run that `evals/README.md` asks of "a change to … the parser" would repeat the baseline. On Harold's word (2026-11-23) the subset was run as the check instead, at `8e3e70e` on the reference Mac (macOS 27.2.1, so `compare` says not like for like; load 1.75 at the start, 2.19 at the end): 258.5 s, 5,884 passages, 328 questions; every metric's paired difference from `tier1-subset.json` is +0.0000 in both arms, with rankings identical for 328 of 328 (keyword only) and 327 of 328 (hybrid), as between the recorded runs above.
+
+The same PR's fix batch 1 (2026-11-23) also changed two patterns every reader shares, so it reaches Markdown:
+- `_ABSTRACT`: "Abstract" is no longer the start of a longer word.
+- `_CAPTION`: a Roman numeral must stand alone, so prose such as "Table is ..." is not a caption.
+
+Every tier 1 material of all five benchmarks was read by the `82f2031` and the final code (`06a6c82`): 210,623 passages both times, and 37 materials differ.
+- In 35, a passage beginning with a word such as "Abstractive", "Abstraction" or "Abstracts" was typed `abstract` with its first eight letters cut off. It is now a `paragraph`, whole.
+- In 2, prose beginning "Table is" was typed `caption`. It is now a `paragraph`.
+
+One of these, QASPER's 1911.06919, is a subset paper, so the subset was run again at `06a6c82` on the reference Mac (macOS 27.2.1, so `compare` says not like for like; load 1.94 at the start, 1.89 at the end; 244.5 s; 5,884 passages, 328 questions).
+- Every metric's paired difference from `tier1-subset.json` is again +0.0000.
+- Rankings are identical for 328 of 328 questions (keyword only) and 326 of 328 (hybrid).
+- The two hybrid rankings that differ are in other papers (1605.04278, 1903.04329). Each paper is built in its own project, and both versions read these two identically, so the differences are run to run in the meaning search, not this change.
+- Two earlier runs during the batch, at `6e9d2cf` and `3ee1ae8`, had 6 and 3 such differences, also in unchanged papers.

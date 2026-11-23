@@ -31,6 +31,7 @@ from backend import provenance
 from backend.context import MESSAGE_FRAMING, REPLY_FRAMING, count
 from backend.db.deletion import _reads_now
 from backend.evidence import CITATION
+from backend.extraction import joined
 from backend.search_index import readings, still_read
 
 # A marker that starts like a citation but does not parse ([S1], [S1.x], [S 2.3]): kept as not_found.
@@ -230,34 +231,47 @@ def check_existence(conn, project_id, text, numbered):
     return out
 
 
+def _forms(text):
+    """A quote's or old passage text's forms: as written, then as pdf-4 reads it (extraction.joined)."""
+    return text, joined(text)
+
+
 def locate(conn, material_id, quote, text=None, page=None, passage_id=None, ordinal=None):
     """The one choice of the passage a citation of this paper points at (section 7.1: citations re-resolve through
     their quotes; design review J, Option 1): in the paper's reading now (deletion._reads_now, as every reader takes
     it), never a reference passage (not evidence), one holding the quote (a row with no quote: its old passage's
-    text): the passage it is on first, then one with its old passage's text, then on its page, then nearest its place.
-    (id, page, text, version id), or None: no passage holds it, or the paper is not read now."""
-    if not (quote or text):
+    text): the passage it is on first, then one with its old passage's text (as written, then as pdf-4 reads it), then
+    on its page, then nearest its place.
+    A quote or old text is taken in each of its forms (_forms: as written, and as pdf-4 reads it where a PDF reading
+    before pdf-4 left PDFium's marks in it, Harold 2026-11-23), the old text's in that order. (id, page, text, version
+    id), or None: no passage holds it, or the paper is not read now."""
+    held = _forms(quote or text or "")
+    if not held[1]:
         return None
+    old = _forms(text) if text is not None else (None,) * 2
     return conn.execute(
         f"SELECT p.id, p.page, p.text, w.id FROM material_versions w JOIN extractions e ON {_reads_now('w', 'e')}"
         " JOIN passages p ON p.extraction_id = e.id WHERE w.material_id = ? AND p.kind != 'reference'"
-        " AND instr(p.text, ?) > 0 ORDER BY p.id IS NOT ?, p.text IS NOT ?, p.page IS NOT ?,"
-        " abs(p.ordinal - coalesce(?, 0)) LIMIT 1", (material_id, quote or text, passage_id, text, page, ordinal)).fetchone()
+        " AND (instr(p.text, ?) > 0 OR instr(p.text, ?) > 0) ORDER BY p.id IS NOT ?,"
+        " p.text IS NOT ?, p.text IS NOT ?, p.page IS NOT ?, abs(p.ordinal - coalesce(?, 0)) LIMIT 1",
+        (material_id, *held, passage_id, *old, page, ordinal)).fetchone()
 
 
 def retarget(conn, material_id):
     """Every citation of the paper, whatever an earlier reading or commit left it as, computed again from its quote
     and the paper's reading now (locate): its passage, version and that passage's page, found (ok), its verdict kept
-    only when that passage's text is its old passage's (B18; with no old passage, the quote's when the quote is a
-    whole passage). One no passage holds is left as it is: it reads as removed (answers.resolve_now) until a later
-    reading holds it. Called wherever a paper's reading changes (backend/materials.py: a reading's commit, and a
-    version added on a reading made already); nowhere else is a citation pointed (design review J, Option 1)."""
+    only when that passage's text is its old passage's in one of its forms (_forms; B18, read through the join:
+    Harold 2026-11-23; with no old passage, the quote's when the quote is a whole passage).
+    One no passage holds is left as it is: it reads as removed (answers.resolve_now) until a later reading holds
+    it. Called wherever a paper's reading changes (backend/materials.py: a reading's commit, and a version added on
+    a reading made already); nowhere else is a citation pointed (design review J, Option 1)."""
     for cid, quote, page, pid, text, ordinal in conn.execute(
             "SELECT c.id, c.quote, c.page, c.passage_id, p.text, p.ordinal FROM citations c"
             " LEFT JOIN passages p ON p.id = c.passage_id WHERE c.material_id = ?", (material_id,)).fetchall():
         found = locate(conn, material_id, quote, text, page, pid, ordinal)
         if found is not None:
-            same = found[2] == text if text is not None else found[2] == quote and len(quote) < QUOTE_CHARS
+            same = found[2] in _forms(text) if text is not None else \
+                found[2] in _forms(quote) and len(quote) < QUOTE_CHARS
             conn.execute("UPDATE citations SET passage_id = ?, material_version_id = ?, page = ?, existence = 'ok',"
                          " support = CASE WHEN ? THEN support ELSE 'unchecked' END,"
                          " support_run_id = CASE WHEN ? THEN support_run_id END WHERE id = ?",

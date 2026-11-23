@@ -7,11 +7,12 @@ import asyncio
 
 import pytest
 
+import synthetic_materials as synthetic
 from backend import citations, extraction
 from backend.db import new_id, utc_now
 from cited import cited, conversation_in, rows, with_papers
 from scholia_app import read_in_process, run_finished, send
-from test_materials import added
+from test_materials import added, project_of
 from test_search import WAGES, idle, paper
 
 pytestmark = pytest.mark.asyncio
@@ -29,9 +30,9 @@ async def evidence(client, project):
     return await asyncio.to_thread(client.state["db"].read, lambda conn: citations.readings(conn, project, references=False))
 
 
-async def read_as(client, monkeypatch, material, name):
-    """The paper's file read again by another version of the Markdown reader (an app update's re-read)."""
-    monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", name))
+async def read_as(client, monkeypatch, material, name, kind=extraction.MARKDOWN):
+    """The paper's file read again by another version of its reader (an app update's re-read)."""
+    monkeypatch.setitem(extraction.EXTRACTORS, kind, (extraction.EXTRACTORS[kind][0], name))
     [(version,)] = await rows(client, "SELECT id FROM material_versions WHERE material_id = ? AND is_current = 1", material)
     again = await client.post(f"/api/material-versions/{version}/read")
     assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
@@ -66,6 +67,346 @@ async def test_a_reread_never_points_a_citation_at_a_reference_passage(tmp_path,
         assert chip["passage_id"] in read_now, await rows(client, "SELECT c.existence, p.kind, p.text FROM citations c"
                                                                 " LEFT JOIN passages p ON p.id = c.passage_id")
         assert (chip["existence"], chip["support"]) == ("ok", "unchecked")
+
+
+@pytest.mark.parametrize(("lines", "marked", "now"), [
+    (("Minimum wages raise the earn-", "ings of low-paid workers in the synthetic panel."),
+     {"earnings": "earn\ufffeings"}, OLD),  # the word joined
+    (("Minimum wages raise the earnings of low-paid workers in the GPT-", "4 synthetic panel."),
+     {"GPT-4": "GPT\ufffe4"}, "Minimum wages raise the earnings of low-paid workers in the GPT-4 synthetic panel.")])  # kept
+async def test_a_citation_whose_quote_holds_pdfiums_line_end_mark_follows_the_pdf_4_reread_and_keeps_its_verdict(  # V1
+        tmp_path, monkeypatch, lines, marked, now):
+    # PDF extraction before pdf-4 kept U+FFFE in a word broken at a line's end; pdf-4 joins it or keeps a hyphen
+    read_in_process(monkeypatch)
+    real, pdf4 = extraction.extract, extraction.EXTRACTORS[extraction.PDF][1]
+    paper_pdf = synthetic.pdf([[(72, 750, 18, "Wage Floors"), (72, 720, 10, lines[0]), (72, 708, 10, lines[1])]])
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
+        rewording(monkeypatch, real, marked)  # as pdf-3 read it
+        project, [material] = await with_papers(client, ("Wage Floors.pdf", paper_pdf))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        before = await chip_of(client, conversation)
+        assert (before["existence"], before["support"]) == ("ok", "supported") and "\ufffe" in before["quote"]
+        monkeypatch.setattr(extraction, "extract", real)
+        await read_as(client, monkeypatch, material, pdf4, extraction.PDF)
+        await idle(client, project)
+        chip, read_now = await chip_of(client, conversation), await evidence(client, project)
+        assert chip["passage_id"] in read_now and chip["passage_id"] != before["passage_id"]
+        assert read_now[chip["passage_id"]][4] == now
+        assert (chip["existence"], chip["support"]) == ("ok", "supported")
+
+
+async def test_a_new_version_that_only_drops_a_hyphen_does_not_keep_a_citation_without_the_mark(tmp_path, monkeypatch):
+    # only PDFium's mark is mapped (extraction.joined); a hyphen dropped by a new version changes the text
+    read_in_process(monkeypatch)
+    real = extraction.extract
+    signed = "Minimum wages change the earnings of low-paid workers by -0.3 percent in the synthetic panel."
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+        project, [material] = await with_papers(client, paper("Wage Floors", signed))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        before = await chip_of(client, conversation)
+        assert (before["existence"], before["support"], before["quote"]) == ("ok", "supported", signed)
+        rewording(monkeypatch, real, {"by -0.3": "by 0.3"})
+        await read_as(client, monkeypatch, material, "markdown-1")
+        await idle(client, project)
+        assert await rows(client, "SELECT passage_id, existence, support FROM citations") == [(None, "not_found", "supported")]
+        chip = await chip_of(client, conversation)
+        assert chip["existence"] != "ok"
+
+
+async def test_a_new_version_that_only_drops_a_hyphen_past_the_quote_finds_the_citation_but_not_its_verdict(
+        tmp_path, monkeypatch):
+    # the quote (its first QUOTE_CHARS) still holds; the passage's text changed past it, so its verdict is not kept
+    read_in_process(monkeypatch)
+    real = extraction.extract
+    long = OLD + " " + "Regional prices adjust slowly after a wage floor is raised in the panel. " * 7 + "Hours fell by -0.3."
+    assert long.index("-0.3") > citations.QUOTE_CHARS
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+        project, [material] = await with_papers(client, paper("Wage Floors", long))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        assert ((await chip_of(client, conversation))["existence"], (await chip_of(client, conversation))["support"]) == (
+            "ok", "supported")
+        rewording(monkeypatch, real, {"by -0.3": "by 0.3"})
+        await read_as(client, monkeypatch, material, "markdown-1")
+        await idle(client, project)
+        chip = await chip_of(client, conversation)
+        assert (chip["existence"], chip["support"]) == ("ok", "unchecked")
+
+
+async def test_a_pdf_3_passage_marked_only_past_its_quote_keeps_its_verdict_after_the_reread(tmp_path, monkeypatch):
+    # the old passage text holds the mark and the quote (its first QUOTE_CHARS) does not: joined all the same
+    read_in_process(monkeypatch)
+    real = extraction.extract
+    long = OLD + " " + "Regional prices adjust slowly after a wage floor is raised in the panel. " * 7 + "Hours fell by a little."
+    assert long.index("Hours") > citations.QUOTE_CHARS
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+        rewording(monkeypatch, real, {"a little": "a lit\ufffetle"})  # as pdf-3 read a broken word
+        project, [material] = await with_papers(client, paper("Wage Floors", long))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        before = await chip_of(client, conversation)
+        assert (before["existence"], before["support"]) == ("ok", "supported") and "\ufffe" not in before["quote"]
+        assert await rows(client, "SELECT instr(text, char(65534)) > 0 FROM passages WHERE id = ?",
+                          before["passage_id"]) == [(1,)]  # the old passage text holds the mark
+        monkeypatch.setattr(extraction, "extract", real)
+        await read_as(client, monkeypatch, material, "markdown-1")
+        await idle(client, project)
+        chip = await chip_of(client, conversation)
+        assert chip["passage_id"] != before["passage_id"] and (chip["existence"], chip["support"]) == ("ok", "supported")
+
+
+async def test_a_pdf_3_citation_never_moves_to_a_passage_that_differs_from_its_own_but_by_a_hyphen(tmp_path):
+    # r1 pass 2: setting every hyphen aside made "-0.3" and "0.3" one text, so the chooser moved a citation of the
+    # negative passage onto the positive one and kept its verdict; the mark is now mapped as pdf-4 reads it (joined)
+    negative = "We estimate the effect at -0.3 percent in the synthetic panel of regions."
+    positive = "We estimate the effect at 0.3 percent in the synthetic panel of regions."
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, paper("Signs", positive, negative))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+
+        def as_pdf_3(conn):  # its passage gone, its quote the negative passage as pdf-3 read it
+            conn.execute("UPDATE citations SET passage_id = NULL, existence = 'source_removed', support = 'supported',"
+                         " quote = ?", (negative.replace("estimate", "esti\ufffemate"),))
+            citations.retarget(conn, material)
+        await asyncio.to_thread(client.state["db"].write, as_pdf_3)
+        assert await rows(client, "SELECT p.text, c.existence, c.support FROM citations c"
+                                  " JOIN passages p ON p.id = c.passage_id") == [(negative, "ok", "supported")]
+
+
+async def test_a_new_version_that_drops_a_minus_sign_inside_a_quote_whose_passage_held_the_mark_elsewhere(
+        tmp_path, monkeypatch):
+    # r1 pass 1: a mark past the quote made the comparison set every hyphen aside, so "-0.3" to "0.3" kept the verdict
+    read_in_process(monkeypatch)
+    real = extraction.extract
+    long = ("Minimum wages change the earnings of low-paid workers by -0.3 percent in the synthetic panel. "
+            + "Regional prices adjust slowly after a wage floor is raised in the panel. " * 7 + "Hours fell by a little.")
+    assert long.index("-0.3") < citations.QUOTE_CHARS < long.index("a little")
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+        rewording(monkeypatch, real, {"a little": "a lit\ufffetle"})  # as pdf-3 read a broken word, past the quote
+        project, [material] = await with_papers(client, paper("Wage Floors", long))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        before = await chip_of(client, conversation)
+        assert (before["existence"], before["support"]) == ("ok", "supported") and "\ufffe" not in before["quote"]
+        rewording(monkeypatch, real, {"by -0.3": "by 0.3"})  # the new version, read with no mark
+        await read_as(client, monkeypatch, material, "markdown-1")
+        await idle(client, project)
+        assert await rows(client, "SELECT passage_id, existence FROM citations") == [(None, "not_found")]
+
+
+async def test_a_citation_of_a_text_paper_whose_own_text_holds_u_fffe_follows_an_identical_reread(tmp_path, monkeypatch):
+    # r1 batch review 2: a noncharacter in a Markdown file is the file's own; the quote as written still matches
+    read_in_process(monkeypatch)
+    held = OLD.replace("earnings", "earn\ufffeings")
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+        project, [material] = await with_papers(client, paper("Wage Floors", held))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        assert (await chip_of(client, conversation))["quote"] == held
+        await read_as(client, monkeypatch, material, "markdown-1")
+        await idle(client, project)
+        chip = await chip_of(client, conversation)
+        assert (chip["existence"], chip["support"]) == ("ok", "supported")
+
+
+async def test_a_text_papers_citation_with_no_passage_keeps_its_verdict_on_its_quote_as_written(tmp_path):
+    # retarget's quote branch: a Markdown passage that holds U+FFFE itself is its quote as written
+    held = OLD.replace("earnings", "earn\ufffeings")
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, paper("Wage Floors", held))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+
+        def removed_then_retargeted(conn):
+            conn.execute("UPDATE citations SET passage_id = NULL, existence = 'source_removed', quote = ?", (held,))
+            citations.retarget(conn, material)
+        await asyncio.to_thread(client.state["db"].write, removed_then_retargeted)
+        assert await rows(client, "SELECT existence, support FROM citations") == [("ok", "supported")]
+
+
+async def test_a_pdf_3_quote_whose_dropped_label_held_the_hyphen_follows_with_its_verdict(tmp_path):
+    # r2 pass 1: "Abstract-Work-" / "flows ..." reads "Workflows ..." under pdf-4 (the label's dash is no hyphen of
+    # "Work") and "Work<mark>flows ..." under pdf-3, the label gone from both; joined of the quote reads the same
+    now = "Workflows are measured in a synthetic panel of regions across many years and wages."
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, paper("Wage Floors", now))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+
+        def as_pdf_3(conn):
+            conn.execute("UPDATE citations SET passage_id = NULL, existence = 'source_removed', support = 'supported',"
+                         " quote = ?", (now.replace("Workflows", "Work\ufffeflows"),))
+            citations.retarget(conn, material)
+        await asyncio.to_thread(client.state["db"].write, as_pdf_3)
+        assert await rows(client, "SELECT p.text, c.existence, c.support FROM citations c"
+                                  " JOIN passages p ON p.id = c.passage_id") == [(now, "ok", "supported")]
+
+
+async def test_a_pdf_3_passage_whose_dropped_label_held_the_hyphen_keeps_its_verdict_through_the_reread(tmp_path, monkeypatch):
+    # retarget's old-text branch: the cited passage is still there when the pdf-4 reading commits
+    read_in_process(monkeypatch)
+    real, pdf4 = extraction.extract, extraction.EXTRACTORS[extraction.PDF][1]
+    paper_pdf = synthetic.pdf([[(72, 750, 18, "Wage Floors"), (72, 720, 10, "Abstract-Minimum-"),
+                                (72, 708, 10, "wages raise the earnings of low-paid workers in the synthetic panel.")]])
+    now = "Minimumwages raise the earnings of low-paid workers in the synthetic panel."  # 2.B: no hyphen in "Minimum"
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
+        rewording(monkeypatch, real, {"Minimumwages": "Minimum\ufffewages"})  # as pdf-3 read it, its label dropped
+        project, [material] = await with_papers(client, ("Wage Floors.pdf", paper_pdf))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        before = await chip_of(client, conversation)
+        assert (before["existence"], before["support"]) == ("ok", "supported") and "\ufffe" in before["quote"]
+        monkeypatch.setattr(extraction, "extract", real)
+        await read_as(client, monkeypatch, material, pdf4, extraction.PDF)
+        await idle(client, project)
+        chip, read_now = await chip_of(client, conversation), await evidence(client, project)
+        assert chip["passage_id"] != before["passage_id"] and read_now[chip["passage_id"]][4] == now
+        assert (chip["existence"], chip["support"]) == ("ok", "supported")
+
+
+RECOVER = "the samples of the synthetic panel of regions after the minimum wage rose."
+
+
+def _two_lines(first, second):
+    return synthetic.pdf([[(72, 750, 18, "Wage Floors"), (72, 720, 10, first), (72, 708, 10, second)]])
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["fresh reading", "shared reading"])
+@pytest.mark.parametrize("old_text", [True, False], ids=["with old text", "without old text"])
+async def test_a_replacement_that_really_says_re_cover_drops_a_pdf_3_citation_of_re_mark_cover(
+        tmp_path, monkeypatch, shared, old_text):
+    # r3: the old pdf-3 passage read "Re<mark>cover ..." (pdf-4: "Recover ..."); a replacement that really says
+    # "Re-cover ..." is changed text, so the citation cannot follow it, through either write path, with or without
+    # its old passage (at 3db2694 it read as removed; fix batch 2's guessed form kept it supported)
+    read_in_process(monkeypatch)
+    real, pdf4 = extraction.extract, extraction.EXTRACTORS[extraction.PDF]
+    replacement = synthetic.pdf([[(72, 750, 18, "Wage Floors"), (72, 720, 10, "Re-cover " + RECOVER)]])
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
+        rewording(monkeypatch, real, {"Recover": "Re\ufffecover"})  # as pdf-3 read the broken word
+        project, [material] = await with_papers(client, ("Wage Floors.pdf", _two_lines("Re-", "cover " + RECOVER)))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        before = await chip_of(client, conversation)
+        assert (before["existence"], before["support"]) == ("ok", "supported") and "\ufffe" in before["quote"]
+        monkeypatch.setattr(extraction, "extract", real)
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, pdf4)
+        if not old_text:
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                "UPDATE citations SET passage_id = NULL, existence = 'source_removed'"))
+        if shared:  # the replacement's file read already, for another paper
+            other = await project_of(client, "Other")
+            await added(client, other, ("Elsewhere.pdf", replacement))
+            await idle(client, other)
+        await added(client, project, ("Wage Floors.pdf", replacement), material_id=material)
+        await idle(client, project)
+        chip = await chip_of(client, conversation)
+        assert chip["existence"] != "ok", chip
+
+
+async def test_an_unchanged_pdfs_abstract_citation_stays_on_the_abstract_when_another_passage_reads_alike(
+        tmp_path, monkeypatch):
+    # r3 (b): "Abstract-Re-" / "signing ..." and a Results paragraph "Resigning ..."; the label's dash is no
+    # word's hyphen, so pdf-4 reads the abstract "Resigning ...", which its pdf-3 citation follows
+    read_in_process(monkeypatch)
+    real, pdf4 = extraction.extract, extraction.EXTRACTORS[extraction.PDF][1]
+    said = "was associated with higher reported wellbeing among workers in the synthetic panel."
+    paper_pdf = synthetic.pdf([[(72, 770, 20, "Wage Floors"), (72, 740, 10, "Abstract-Re-"), (72, 728, 10, "signing " + said),
+                                (72, 700, 14, "Results"), (72, 680, 10, "Resigning " + said)]])
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
+        project, [material] = await with_papers(client, ("Wage Floors.pdf", paper_pdf))
+        [(abstract, _)] = await rows(client, "SELECT id, text FROM passages WHERE kind = 'abstract'")
+
+        def as_pdf_3(conn):  # its passage as pdf-3 read it, and the answer's citation of it
+            conn.execute("UPDATE passages SET text = ? WHERE id = ?", ("Re\ufffesigning " + said, abstract))
+        await asyncio.to_thread(client.state["db"].write, as_pdf_3)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "What was associated with wellbeing among workers?")
+        cited_now = await rows(client, "SELECT c.passage_id, c.support FROM citations c")
+        assert ("", "") != cited_now[0] and (abstract, "supported") in cited_now, cited_now
+        await read_as(client, monkeypatch, material, pdf4, extraction.PDF)
+        await idle(client, project)
+        assert await rows(client, "SELECT p.kind, p.text, c.existence, c.support FROM citations c JOIN passages p"
+                                  " ON p.id = c.passage_id WHERE c.quote LIKE 'Re%'") == [
+            ("abstract", "Resigning " + said, "ok", "supported")]
+
+
+SAID = "improves outcomes in the synthetic panel of workers across the regions."
+R4 = {  # r4's two shapes: (the cited passage's lines, its twin's text, its pdf-3 text, the twin's section)
+    "doubled label": ([(72, 740, 10, "Abstract:Abstract-Re-"), (72, 728, 10, "signing " + SAID)],
+                      "Abstract:Abstract-Resigning " + SAID, "Abstract-Re\ufffesigning " + SAID),
+    "line ending abstract": ([(72, 740, 10, "We discuss abstract"), (72, 728, 10, "-Re-"), (72, 716, 10, "signing " + SAID)],
+                             "We discuss abstract -Resigning " + SAID, "We discuss abstract -Re\ufffesigning " + SAID)}
+
+
+def _r4_pdf(shape, twin=True):
+    lines, twin_text, _ = R4[shape]
+    page = [(72, 770, 20, "Wage Floors"), *lines]
+    if twin:
+        page += [(72, 690, 14, "Results"), (72, 670, 10, twin_text)]
+    return synthetic.pdf([page])
+
+
+async def _cite_as_pdf_3(client, project, pdf_3):
+    """A citation of the passage before the twin's section, its text and quote as pdf-3 stored them."""
+    conversation = await conversation_in(client, project)
+    await send(client, conversation, QUESTION)
+    [(target, text)] = await rows(client, "SELECT id, text FROM passages WHERE section_path = '[]' AND kind != 'title'")
+
+    def as_pdf_3(conn):
+        conn.execute("UPDATE passages SET text = ? WHERE id = ?", (pdf_3, target))
+        conn.execute("UPDATE citations SET passage_id = ?, quote = ?, existence = 'ok', support = 'supported'",
+                     (target, pdf_3))
+    await asyncio.to_thread(client.state["db"].write, as_pdf_3)
+    return conversation, text
+
+
+@pytest.mark.parametrize("shape", list(R4))
+async def test_an_unchanged_pdfs_citation_stays_on_its_passage_beside_a_twin_that_reads_as_a_guessed_join(
+        tmp_path, monkeypatch, shape):
+    # r4: the stored pdf-3 text had lost context _pdf_page used (a doubled label, a line break), so joined of it read
+    # as a twin passage, and the citation moved there with its verdict; pdf-4 now reads each piece as joined of it
+    read_in_process(monkeypatch)
+    pdf4 = extraction.EXTRACTORS[extraction.PDF][1]
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
+        project, [material] = await with_papers(client, ("Wage Floors.pdf", _r4_pdf(shape)))
+        _, now = await _cite_as_pdf_3(client, project, R4[shape][2])
+        await read_as(client, monkeypatch, material, pdf4, extraction.PDF)
+        await idle(client, project)
+        assert await rows(client, "SELECT p.text, p.section_path, c.existence, c.support FROM citations c"
+                                  " JOIN passages p ON p.id = c.passage_id") == [(now, "[]", "ok", "supported")]
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["fresh reading", "shared reading"])
+async def test_a_replacement_saying_minus_resigning_drops_the_citation_of_minus_re_mark_signing(tmp_path, monkeypatch, shared):
+    # r4 pass 2: the replacement really says "-Resigning"; the old pdf-3 text "-Re<mark>signing" reads "-Re-signing"
+    read_in_process(monkeypatch)
+    pdf4 = extraction.EXTRACTORS[extraction.PDF]
+    replacement = synthetic.pdf([[(72, 770, 20, "Wage Floors"), (72, 740, 10, R4["line ending abstract"][1])]])
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
+        project, [material] = await with_papers(client, ("Wage Floors.pdf", _r4_pdf("line ending abstract", twin=False)))
+        conversation, _ = await _cite_as_pdf_3(client, project, R4["line ending abstract"][2])
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, pdf4)
+        if shared:
+            other = await project_of(client, "Other")
+            await added(client, other, ("Elsewhere.pdf", replacement))
+            await idle(client, other)
+        await added(client, project, ("Wage Floors.pdf", replacement), material_id=material)
+        await idle(client, project)
+        assert (await chip_of(client, conversation))["existence"] != "ok"
 
 
 async def test_a_reread_takes_the_new_passages_page(tmp_path, monkeypatch):
@@ -283,6 +624,38 @@ async def test_the_chooser_takes_the_citations_own_passage_then_its_text_then_it
         assert await chosen(text="Gone.", page=7, passage_id=None, ordinal=oe) == e
         assert await chosen(text="Gone.", page=None, passage_id=None, ordinal=oe) == c  # with no page: pageless first,
         assert await chosen(text="Gone.", page=None, passage_id=None, ordinal=oa) == a  # then nearest its place
+        # a pdf-3 citation's quote and old text (holding PDFium's mark) are taken as pdf-4 reads them (joined)
+        assert await chosen(text=f"The ol\ufffed text, with {quote}.", page=7, passage_id=None, ordinal=oe) == b
+
+        def located(held):
+            return asyncio.to_thread(db.read, lambda conn: citations.locate(conn, material, held))
+        assert await located("the qu\ufffeote") is not None
+        assert await located("\ufffe") is None  # nothing once joined
+        assert await located("the qu-ote") is None  # any other hyphen counts
+        # a text paper's own U+FFFE: its passage as written comes before one equal to it only once joined
+        await asyncio.to_thread(db.write, lambda conn: [conn.execute("UPDATE passages SET text = ? WHERE id = ?", (t, i))
+                                                       for t, i in ((f"Own\ufffe text, with {quote}.", c), (f"Own text, with {quote}.", e))])
+        assert await chosen(text=f"Own\ufffe text, with {quote}.", page=7, passage_id=None, ordinal=oe) == c
+        # the old text as pdf-4 reads it; a hyphen pdf-4 would not read is never guessed
+        await asyncio.to_thread(db.write, lambda conn: [conn.execute("UPDATE passages SET text = ? WHERE id = ?", (t, i))
+                                                       for t, i in ((f"Decide, with {quote}.", c), (f"De-cide, with {quote}.", e))])
+        assert await chosen(text=f"De\ufffecide, with {quote}.", page=7, passage_id=None, ordinal=oe) == c
+
+
+async def test_a_citation_with_no_passage_keeps_its_verdict_when_its_quote_is_a_passage_but_for_the_mark(tmp_path):
+    # retarget's quote branch (no old passage), joined as its text branch is
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        assert await rows(client, "SELECT support FROM citations") == [("supported",)]
+
+        def removed_then_retargeted(conn):
+            conn.execute("UPDATE citations SET passage_id = NULL, existence = 'source_removed', quote = ?",
+                         (OLD.replace("earnings", "earn\ufffeings"),))
+            citations.retarget(conn, material)
+        await asyncio.to_thread(client.state["db"].write, removed_then_retargeted)
+        assert await rows(client, "SELECT existence, support FROM citations") == [("ok", "supported")]
 
 
 async def test_a_papers_reading_changes_only_where_its_citations_are_pointed_again():

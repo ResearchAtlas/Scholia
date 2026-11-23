@@ -44,7 +44,7 @@
  "seed": 20261001,
  "extractor": {
   "name": "pdf",
-  "version": "pdf-3+pypdfium2-5.14.0+vision-3"
+  "version": "pdf-4+pypdfium2-5.14.0+vision-3"
  },
  "papers": [
   {

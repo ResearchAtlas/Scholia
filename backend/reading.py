@@ -506,10 +506,9 @@ class _Reading(_Received):
     """A reading's frames, each field checked against what the extraction promises (backend/extraction.py,
     section 7.1): a passage of 1 to MAX_PASSAGE characters; a PDF's passages on pages from 1, in page
     order, within the document's pages, and no other format's on a page; offsets both absent or both
-    there, a text's start at most its end (a PDF's are its first and last characters' PDFium indices,
-    which a table's wrapped cell can put out of order); a PDF's rectangles at most one for each
-    character, each with its left at
-    most its right and its top at most its bottom; a recognized passage's confidence from 0 to 1; no
+    there, the start at most the end (a PDF's are the lowest PDFium index among its characters
+    and one past the highest's last UTF-16 unit); a PDF's rectangles at most one for each character,
+    each with its left at most its right and its top at most its bottom; a recognized passage's confidence from 0 to 1; no
     boxes outside a PDF; a PDF's scanned pages at most its pages, ocr_needed only with some; and no
     pages or scanned pages for another format. Anything else is a wrong frame."""
 
@@ -560,7 +559,7 @@ class _Reading(_Received):
                 or not _optional_count(start) or not _optional_count(end):
             raise _Bad("a passage that is not one")
         if not 0 < len(text) <= extraction.MAX_PASSAGE or (start is None) != (end is None) \
-                or (start is not None and start > end and not self.pdf) \
+                or (start is not None and start > end) \
                 or (page is None if self.pdf else page is not None) or (self.pdf and not self.page <= page) \
                 or (page == 0) or (not self.pdf and boxes is not None):
             raise _Bad("a passage its reading does not agree with")
