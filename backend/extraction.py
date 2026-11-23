@@ -456,8 +456,7 @@ def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None,
     spans = [(a, b, text[a:b]) for a, b in zip(bounds, bounds[1:])]
     if char_boxes is not None:  # each piece's marks decided on it (joined), with the boxes it keeps
         spans = [(a, b, joined(piece, char_boxes[a:b])) for a, b, piece in spans]
-        spans = [(a, b, (piece.strip(), boxes[len(piece) - len(piece.lstrip()):len(piece.rstrip())]))
-                 for a, b, (piece, boxes) in spans]  # the boxes of the characters it keeps, one a character
+        spans = [(a, b, (piece.strip(), boxes)) for a, b, (piece, boxes) in spans]
     else:
         spans = [(a, b, (piece.strip(), None)) for a, b, piece in spans]
     spans = [span for span in spans if span[2][0]]
@@ -470,8 +469,8 @@ def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None,
         if rects and (reading := _READING.get()) is not None:  # at most a piece's lines, counted as made
             reading.rectangles(len(rects))
         if char_boxes is not None:  # a PDF piece: the span of PDFium's characters it is made of
-            # each character from its index to its end (_units); out of order in a wrapped table cell
-            chars = [(i[4], i[4] + _units(c)) for c, i in zip(piece, piece_boxes) if i is not None]
+            # each character's PDFium characters [first, end) (_pdf_page); out of order in a wrapped table cell
+            chars = [i[4] for i in piece_boxes if i is not None]
             first, last = (min(a for a, _ in chars), max(b for _, b in chars)) if chars else (start, end)
         elif located is not None:
             first, last = located[n], located[n + 1] if n + 1 < len(located) else end
@@ -507,7 +506,7 @@ def _located(pieces, source, base, start, end):
 
 
 def _rects(boxes, size):
-    """Character boxes (left, bottom, right, top, index, line) merged per line, as fractions of the
+    """Character boxes (left, bottom, right, top, (first, end), line) merged per line, as fractions of the
     page with a top-left origin, rounded."""
     width, height = size
     lines = {}
@@ -625,7 +624,8 @@ def _pdf_read(document, number, raw, measure=False):
 
 
 def _pdf_page(page, raw, measure=False):
-    """The page's lines: [{"text", "boxes" (per character: (l, b, r, t, index, line) or None, with a seventh
+    """The page's lines: [{"text", "boxes" (per character: (l, b, r, t, (first, end), line) or None, [first, end) the
+    PDFium characters it is read from and its box over them (_pdf_box), with a seventh
     element when PDFium gave a line-end hyphen mark after that character: the mark's box, the mark itself out of
     the text, _marked), "size", "left", "right", "top", "bottom", "bold"}], its size, and whether it is scanned. Sizes, boxes and
     edges are of the page as displayed and rendered, its rotation and crop applied (_displayed), in points
@@ -659,14 +659,18 @@ def _pdf_page(page, raw, measure=False):
                 continue
             box = None
             at = index if aligned else raw.FPDFText_GetCharIndexFromTextIndex(textpage, index)
+            # its last unit's PDFium character: a pair's halves may be apart, PDFium leaving out a control between them
+            last = unit - 1 if aligned else at if unit - index == 1 else \
+                raw.FPDFText_GetCharIndexFromTextIndex(textpage, unit - 1)
             if at >= 0:
                 if raw.FPDFText_HasUnicodeMapError(textpage, at) == 1:
                     unmapped += 1
                 elif not char.isspace():
                     mapped += 1
                 if not char.isspace():
-                    left, bottom, right, top = (0.0, 0.0, 0.0, 0.0) if measure else shown(*textpage.get_charbox(at))
-                    box = (left, bottom, right, top, at, len(lines), raw.FPDFText_GetFontSize(textpage, at))
+                    last = max(at, last)
+                    left, bottom, right, top = (0.0, 0.0, 0.0, 0.0) if measure else _pdf_box(textpage, shown, at, last)
+                    box = (left, bottom, right, top, (at, last + 1), len(lines), raw.FPDFText_GetFontSize(textpage, at))
             elif not char.isspace():
                 mapped += 1
             if char == "\ufffe" and boxes and boxes[-1] is not None:
@@ -679,7 +683,7 @@ def _pdf_page(page, raw, measure=False):
         if chars:
             lines.append((chars, boxes))
         # Whether each line is bold, by its first character with a box.
-        bold = [not measure and _bold(textpage, raw, next((b[4] for b in boxes if b), None)) for _, boxes in lines]
+        bold = [not measure and _bold(textpage, raw, next((b[4][0] for b in boxes if b), None)) for _, boxes in lines]
     finally:
         textpage.close()
     cover = 0.0
@@ -693,6 +697,13 @@ def _pdf_page(page, raw, measure=False):
         return [], (width, height), True
     return [dict(_line(chars, boxes), bold=heavy) for (chars, boxes), heavy in zip(lines, bold)
             if "".join(chars).strip()], (width, height), False
+
+
+def _pdf_box(textpage, shown, first, last):
+    """A character's box as displayed: over its first and last unit's PDFium characters, each half of a pair its own
+    glyph or both one."""
+    boxes = [shown(*textpage.get_charbox(at)) for at in {first, last}]
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
 
 
 def _units(char):
@@ -1060,7 +1071,7 @@ def _recognized(document, number, size, engine, body, sections, stop):
         box = (left * width, (1 - bottom) * height, right * width, (1 - top) * height)  # points, from the bottom left
         boxes, unit = [], at
         for char in text:  # offsets in UTF-16 units, as a text page's are (_units)
-            boxes.append(None if char.isspace() else (*box, unit, len(lines), 0.0))
+            boxes.append(None if char.isspace() else (*box, (unit, unit + _units(char)), len(lines), 0.0))
             unit += _units(char)
         lines.append(dict(_line(list(text), boxes), bold=False))
         spans.append((at, unit, line.confidence))

@@ -475,14 +475,16 @@ def _pdf_mapping_tilde(code_point, first="We use the GPT-", second="~ model here
 MATH_X = "\U0001d465"  # mathematical italic x: above U+FFFF, two UTF-16 units, so two of PDFium's characters
 
 
-def _math_pdf(pages, bar=None):
+def _math_pdf(pages, bar=None, caret=None):
     """synthetic.pdf's one page of (x, y, font size, text, font or none for Helvetica) lines, each "~" mapped
     (ToUnicode) to MATH_X; with bar, each "|" to those UTF-16 units (hex): 0002, a control character PDFium counts but
-    leaves out of its text; D835, half a surrogate pair, which PDFium counts and puts in its text."""
+    leaves out of its text; D835, half a surrogate pair, which PDFium counts and puts in its text; and so each "^"
+    with caret."""
     [lines] = pages
+    maps = [b" <%s> <%s>" % (code, units) for code, units in ((b"7C", bar), (b"5E", caret)) if units]
     cmap = (b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /T def 1 begincodespacerange"
             b" <00> <FF> endcodespacerange %d beginbfchar <7E> <D835DC65>%s endbfchar endcmap"
-            b" CMapName currentdict /CMap defineresource pop end end" % (1 + bool(bar), b" <7C> <%s>" % bar if bar else b""))
+            b" CMapName currentdict /CMap defineresource pop end end" % (1 + len(maps), b"".join(maps)))
     fonts = sorted({(font[0] if font else "Helvetica") for *_, font in [(line[:4], line[4:]) for line in lines]})
     content = b"BT " + b" ".join(
         b"/F%d %g Tf 1 0 0 1 %g %g Tm (%s) Tj" % (fonts.index(font[0] if font else "Helvetica") + 1, size, x, y,
@@ -533,11 +535,12 @@ def test_each_piece_of_a_long_block_holding_characters_above_u_ffff_reads_back_i
     assert [re.sub(r"\s+", " ", _read_back(data, p)) for p in passages] == [p.text for p in passages]
 
 
-def test_a_pieces_range_pairs_each_kept_character_with_its_own_box():  # r5 F1
-    # a piece's boxes are cut with its text, so MATH_X after a stripped space still counts as two units
-    box = lambda left, index: (left, 700.0, left + 5, 710.0, index, 0)
-    [piece] = extraction._pieces(f" {MATH_X}b", "paragraph", 1, [], None, None, [None, box(72, 0), box(78, 2)], (612, 792))
-    assert (piece.text, piece.char_start, piece.char_end) == (f"{MATH_X}b", 0, 3)
+def test_a_pieces_range_runs_from_its_first_pdfium_character_to_its_last_characters_end():  # r5 F1, c1 F1
+    # each character's box carries the PDFium characters it is read from: MATH_X two, b one after a left-out one
+    box = lambda left, span: (left, 700.0, left + 5, 710.0, span, 0)
+    [piece] = extraction._pieces(f" {MATH_X}b", "paragraph", 1, [], None, None, [None, box(72, (0, 2)), box(78, (3, 4))],
+                                 (612, 792))
+    assert (piece.text, piece.char_start, piece.char_end) == (f"{MATH_X}b", 0, 4)
 
 
 @pytest.mark.parametrize("half", [b"D835", b"DC65"], ids=["high", "low"])
@@ -548,6 +551,35 @@ def test_half_a_surrogate_pair_is_left_out_of_the_text_and_counted_as_the_unit_p
     passages = extract(data, extraction.PDF).passages
     assert [p.text for p in passages] == [f"Half a pair, then {MATH_X} here.", "A second paragraph begins far below it."]
     assert all(_read_back(data, p) == p.text for p in passages)
+
+
+@pytest.mark.parametrize(("line", "units", "end"), [("|", b"D8350002DC65", 3), ("A|", b"D8350002DC65", 4),
+                                                   ("A|", b"D83500020002DC65", 5)],
+                         ids=["a control between its halves", "after a letter", "two controls between its halves"])
+def test_a_characters_range_ends_after_its_last_pdfium_unit_where_its_units_are_apart(line, units, end):  # c1 F1
+    # PDFium leaves the control out of its text, so the pair's halves are not consecutive among its characters
+    data = _math_pdf([[(72, 720, 10, line)]], bar=units)
+    [passage] = extract(data, extraction.PDF).passages
+    assert passage.text == line.replace("|", MATH_X)
+    assert (passage.char_start, passage.char_end) == (0, end) and _read_back(data, passage) == passage.text
+
+
+def test_a_character_from_two_glyphs_has_a_box_over_both():  # c1 F1
+    data = _math_pdf([[(72, 720, 10, "|^")]], bar=b"D835", caret=b"DC65")  # each half its own glyph
+    import pypdfium2 as pdfium
+
+    with extraction.PDFIUM:
+        document = pdfium.PdfDocument(data)
+        try:
+            textpage = document[0].get_textpage()
+            assert textpage.count_chars() == 2
+            right = textpage.get_charbox(1)[2]  # the low half's glyph
+        finally:
+            document.close()
+    [passage] = extract(data, extraction.PDF).passages
+    assert passage.text == MATH_X and (passage.char_start, passage.char_end) == (0, 2)
+    [[_, _, rect_right, _]] = passage.boxes["rects"]
+    assert rect_right == round(right / 612, 4)
 
 
 def test_paragraphs_apart_after_a_character_above_u_ffff_stay_apart():  # r5 F1
@@ -650,10 +682,10 @@ def test_a_long_pdf_block_is_cut_in_pdfium_form_then_each_piece_joined():
     text, boxes = "", []  # the block as _pdf_page gives it: the marks out, each on the box before it
     for index, char in enumerate(marked):
         if char == "\ufffe":
-            boxes[-1] = (*boxes[-1], (1.0, 1.0, 2.0, 2.0, index, 0))
+            boxes[-1] = (*boxes[-1], (1.0, 1.0, 2.0, 2.0, (index, index + 1), 0))
             continue
         text += char
-        boxes.append(None if char.isspace() else (1.0, 1.0, 2.0, 2.0, index, 0))
+        boxes.append(None if char.isspace() else (1.0, 1.0, 2.0, 2.0, (index, index + 1), 0))
     pieces = [p.text for p in extraction._pieces(text, "paragraph", 1, [], None, None, boxes, (612, 792))]
     cuts = [0, *extraction._split(marked), len(marked)]
     assert pieces == [extraction.joined(marked[a:b]).strip() for a, b in zip(cuts, cuts[1:])]
@@ -697,9 +729,10 @@ def test_a_long_title_and_heading_are_cut_in_pdfium_form_then_joined(monkeypatch
 
 
 def test_a_pieces_range_is_of_the_characters_it_keeps_a_kept_marks_box_among_them():
-    text, boxes, marks = "We use GPT4 and decide.", [], {"T": (5.0, 1.0, 6.0, 2.0, 99, 0), "e": (5.0, 1.0, 6.0, 2.0, 200, 0)}
+    text, boxes, marks = "We use GPT4 and decide.", [], {"T": (5.0, 1.0, 6.0, 2.0, (99, 100), 0),
+                                                         "e": (5.0, 1.0, 6.0, 2.0, (200, 201), 0)}
     for index, char in enumerate(text):
-        box = None if char.isspace() else (1.0, 1.0, 2.0, 2.0, index, 0)
+        box = None if char.isspace() else (1.0, 1.0, 2.0, 2.0, (index, index + 1), 0)
         if char in marks and text[index + 1:index + 2] in ("4", "c"):  # GPT<mark>4 (kept), de<mark>cide (dropped)
             box = (*box, marks[char])
         boxes.append(box)
