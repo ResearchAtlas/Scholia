@@ -494,17 +494,21 @@ def test_joined_reads_a_pdf_3_text_as_pdf_4_reads_its_page():
     assert extraction.joined("Kept \uffff, de\ufffecide.") == "Kept \uffff, decide."  # U+FFFF beside a mark too
 
 
-def test_joined_of_a_passage_whose_label_held_the_hyphen_reads_as_pdf_4_with_the_hyphen_assumed():
-    # r2 pass 1: "Abstract-" told _pdf_page the word was hyphened; the label leaves both readings, so joined of the
-    # stored text starts without it and is asked both ways
+def test_an_abstract_labels_dash_is_no_hyphen_of_the_word_it_runs_into_and_joined_reads_the_same():
+    # r2 pass 1 and r3: "Abstract-" made _pdf_page keep the mark in "Work-flows"; the label leaves the passage, and
+    # a pdf-3 quote lost it too, so joined could not see it. The label's dash is now no word's hyphen, in both.
     data = _hyphen_page("Abstract-Work-", "flows are measured in a synthetic panel of regions across many years.")
     text, _ = _pdfium_text(data)
     pdf_3 = text.split("\r\n", 1)[1][len("Abstract-"):]  # the pdf-3 passage, its label dropped
     [_, passage] = extract(data, extraction.PDF).passages
-    assert passage.text == "Work-flows are measured in a synthetic panel of regions across many years."
-    assert extraction.joined(pdf_3) == "Workflows are measured in a synthetic panel of regions across many years."
-    assert extraction.joined(pdf_3, hyphened=True) == passage.text
-    assert extraction.joined("We de\ufffecide here.", hyphened=True) == "We decide here."  # its first word only
+    assert passage.kind == "abstract"
+    assert passage.text == extraction.joined(pdf_3) == "Workflows are measured in a synthetic panel of regions across many years."
+    kept = _sections((14, "2 Methods", None), (None, "Abstract-Work-", None), (None, "flows in short.", None))
+    [(kind, words)] = [(k, t) for k, _, t in kept if "flows" in t]  # too short to be an abstract: the label stays
+    assert (kind, words) == ("paragraph", "Abstract-Workflows in short.")
+    assert extraction.joined("Abstract-Work\ufffeflows are measured") == "Abstract-Workflows are measured"
+    assert extraction.joined("Abstract-level work\ufffeflows, abstract-high\ufffequality.") == \
+        "Abstract-level workflows, abstract-high-quality."  # a hyphen before a lower-case letter is a word's
 
 
 def test_a_line_after_a_known_heading_never_joins_it():  # 1.0, its other half

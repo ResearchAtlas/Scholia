@@ -232,9 +232,8 @@ def check_existence(conn, project_id, text, numbered):
 
 
 def _forms(text):
-    """A quote's or old passage text's forms, as written, then as pdf-4 reads it (extraction.joined), then so with
-    its first word taken as hyphened (a dropped label, "Abstract-", held the hyphen _pdf_page saw)."""
-    return text, joined(text), joined(text, hyphened=True)
+    """A quote's or old passage text's forms: as written, then as pdf-4 reads it (extraction.joined)."""
+    return text, joined(text)
 
 
 def locate(conn, material_id, quote, text=None, page=None, passage_id=None, ordinal=None):
@@ -249,12 +248,12 @@ def locate(conn, material_id, quote, text=None, page=None, passage_id=None, ordi
     held = _forms(quote or text or "")
     if not held[1]:
         return None
-    old = _forms(text) if text is not None else (None,) * 3
+    old = _forms(text) if text is not None else (None,) * 2
     return conn.execute(
         f"SELECT p.id, p.page, p.text, w.id FROM material_versions w JOIN extractions e ON {_reads_now('w', 'e')}"
         " JOIN passages p ON p.extraction_id = e.id WHERE w.material_id = ? AND p.kind != 'reference'"
-        " AND (instr(p.text, ?) > 0 OR instr(p.text, ?) > 0 OR instr(p.text, ?) > 0) ORDER BY p.id IS NOT ?,"
-        " p.text IS NOT ?, p.text IS NOT ?, p.text IS NOT ?, p.page IS NOT ?, abs(p.ordinal - coalesce(?, 0)) LIMIT 1",
+        " AND (instr(p.text, ?) > 0 OR instr(p.text, ?) > 0) ORDER BY p.id IS NOT ?,"
+        " p.text IS NOT ?, p.text IS NOT ?, p.page IS NOT ?, abs(p.ordinal - coalesce(?, 0)) LIMIT 1",
         (material_id, *held, passage_id, *old, page, ordinal)).fetchone()
 
 

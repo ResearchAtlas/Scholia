@@ -12,7 +12,7 @@ from backend import citations, extraction
 from backend.db import new_id, utc_now
 from cited import cited, conversation_in, rows, with_papers
 from scholia_app import read_in_process, run_finished, send
-from test_materials import added
+from test_materials import added, project_of
 from test_search import WAGES, idle, paper
 
 pytestmark = pytest.mark.asyncio
@@ -234,10 +234,9 @@ async def test_a_text_papers_citation_with_no_passage_keeps_its_verdict_on_its_q
 
 
 async def test_a_pdf_3_quote_whose_dropped_label_held_the_hyphen_follows_with_its_verdict(tmp_path):
-    # r2 pass 1: "Abstract-Work-" / "flows ..." reads "Work-flows ..." under pdf-4 and "Work<mark>flows ..." under pdf-3,
-    # the label gone from both; joined of the quote without the label gives "Workflows" unless its first word is
-    # taken as hyphened (which is asked after the plain form)
-    now = "Work-flows are measured in a synthetic panel of regions across many years and wages."
+    # r2 pass 1: "Abstract-Work-" / "flows ..." reads "Workflows ..." under pdf-4 (the label's dash is no hyphen of
+    # "Work") and "Work<mark>flows ..." under pdf-3, the label gone from both; joined of the quote reads the same
+    now = "Workflows are measured in a synthetic panel of regions across many years and wages."
     async with cited(tmp_path) as client:
         project, [material] = await with_papers(client, paper("Wage Floors", now))
         conversation = await conversation_in(client, project)
@@ -245,7 +244,7 @@ async def test_a_pdf_3_quote_whose_dropped_label_held_the_hyphen_follows_with_it
 
         def as_pdf_3(conn):
             conn.execute("UPDATE citations SET passage_id = NULL, existence = 'source_removed', support = 'supported',"
-                         " quote = ?", (now.replace("Work-flows", "Work\ufffeflows"),))
+                         " quote = ?", (now.replace("Workflows", "Work\ufffeflows"),))
             citations.retarget(conn, material)
         await asyncio.to_thread(client.state["db"].write, as_pdf_3)
         assert await rows(client, "SELECT p.text, c.existence, c.support FROM citations c"
@@ -258,10 +257,10 @@ async def test_a_pdf_3_passage_whose_dropped_label_held_the_hyphen_keeps_its_ver
     real, pdf4 = extraction.extract, extraction.EXTRACTORS[extraction.PDF][1]
     paper_pdf = synthetic.pdf([[(72, 750, 18, "Wage Floors"), (72, 720, 10, "Abstract-Minimum-"),
                                 (72, 708, 10, "wages raise the earnings of low-paid workers in the synthetic panel.")]])
-    now = "Minimum-wages raise the earnings of low-paid workers in the synthetic panel."
+    now = "Minimumwages raise the earnings of low-paid workers in the synthetic panel."  # 2.B: no hyphen in "Minimum"
     async with cited(tmp_path) as client:
         monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
-        rewording(monkeypatch, real, {"Minimum-wages": "Minimum\ufffewages"})  # as pdf-3 read it, its label dropped
+        rewording(monkeypatch, real, {"Minimumwages": "Minimum\ufffewages"})  # as pdf-3 read it, its label dropped
         project, [material] = await with_papers(client, ("Wage Floors.pdf", paper_pdf))
         conversation = await conversation_in(client, project)
         await send(client, conversation, QUESTION)
@@ -273,6 +272,74 @@ async def test_a_pdf_3_passage_whose_dropped_label_held_the_hyphen_keeps_its_ver
         chip, read_now = await chip_of(client, conversation), await evidence(client, project)
         assert chip["passage_id"] != before["passage_id"] and read_now[chip["passage_id"]][4] == now
         assert (chip["existence"], chip["support"]) == ("ok", "supported")
+
+
+RECOVER = "the samples of the synthetic panel of regions after the minimum wage rose."
+
+
+def _two_lines(first, second):
+    return synthetic.pdf([[(72, 750, 18, "Wage Floors"), (72, 720, 10, first), (72, 708, 10, second)]])
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["fresh reading", "shared reading"])
+@pytest.mark.parametrize("old_text", [True, False], ids=["with old text", "without old text"])
+async def test_a_replacement_that_really_says_re_cover_drops_a_pdf_3_citation_of_re_mark_cover(
+        tmp_path, monkeypatch, shared, old_text):
+    # r3: the old pdf-3 passage read "Re<mark>cover ..." (pdf-4: "Recover ..."); a replacement that really says
+    # "Re-cover ..." is changed text, so the citation cannot follow it, through either write path, with or without
+    # its old passage (at 3db2694 it read as removed; fix batch 2's guessed form kept it supported)
+    read_in_process(monkeypatch)
+    real, pdf4 = extraction.extract, extraction.EXTRACTORS[extraction.PDF]
+    replacement = synthetic.pdf([[(72, 750, 18, "Wage Floors"), (72, 720, 10, "Re-cover " + RECOVER)]])
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
+        rewording(monkeypatch, real, {"Recover": "Re\ufffecover"})  # as pdf-3 read the broken word
+        project, [material] = await with_papers(client, ("Wage Floors.pdf", _two_lines("Re-", "cover " + RECOVER)))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        before = await chip_of(client, conversation)
+        assert (before["existence"], before["support"]) == ("ok", "supported") and "\ufffe" in before["quote"]
+        monkeypatch.setattr(extraction, "extract", real)
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, pdf4)
+        if not old_text:
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                "UPDATE citations SET passage_id = NULL, existence = 'source_removed'"))
+        if shared:  # the replacement's file read already, for another paper
+            other = await project_of(client, "Other")
+            await added(client, other, ("Elsewhere.pdf", replacement))
+            await idle(client, other)
+        await added(client, project, ("Wage Floors.pdf", replacement), material_id=material)
+        await idle(client, project)
+        chip = await chip_of(client, conversation)
+        assert chip["existence"] != "ok", chip
+
+
+async def test_an_unchanged_pdfs_abstract_citation_stays_on_the_abstract_when_another_passage_reads_alike(
+        tmp_path, monkeypatch):
+    # r3 (b): "Abstract-Re-" / "signing ..." and a Results paragraph "Resigning ..."; the label's dash is no
+    # word's hyphen, so pdf-4 reads the abstract "Resigning ...", which its pdf-3 citation follows
+    read_in_process(monkeypatch)
+    real, pdf4 = extraction.extract, extraction.EXTRACTORS[extraction.PDF][1]
+    said = "was associated with higher reported wellbeing among workers in the synthetic panel."
+    paper_pdf = synthetic.pdf([[(72, 770, 20, "Wage Floors"), (72, 740, 10, "Abstract-Re-"), (72, 728, 10, "signing " + said),
+                                (72, 700, 14, "Results"), (72, 680, 10, "Resigning " + said)]])
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
+        project, [material] = await with_papers(client, ("Wage Floors.pdf", paper_pdf))
+        [(abstract, _)] = await rows(client, "SELECT id, text FROM passages WHERE kind = 'abstract'")
+
+        def as_pdf_3(conn):  # its passage as pdf-3 read it, and the answer's citation of it
+            conn.execute("UPDATE passages SET text = ? WHERE id = ?", ("Re\ufffesigning " + said, abstract))
+        await asyncio.to_thread(client.state["db"].write, as_pdf_3)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "What was associated with wellbeing among workers?")
+        cited_now = await rows(client, "SELECT c.passage_id, c.support FROM citations c")
+        assert ("", "") != cited_now[0] and (abstract, "supported") in cited_now, cited_now
+        await read_as(client, monkeypatch, material, pdf4, extraction.PDF)
+        await idle(client, project)
+        assert await rows(client, "SELECT p.kind, p.text, c.existence, c.support FROM citations c JOIN passages p"
+                                  " ON p.id = c.passage_id WHERE c.quote LIKE 'Re%'") == [
+            ("abstract", "Resigning " + said, "ok", "supported")]
 
 
 async def test_a_reread_takes_the_new_passages_page(tmp_path, monkeypatch):
@@ -502,7 +569,7 @@ async def test_the_chooser_takes_the_citations_own_passage_then_its_text_then_it
         await asyncio.to_thread(db.write, lambda conn: [conn.execute("UPDATE passages SET text = ? WHERE id = ?", (t, i))
                                                        for t, i in ((f"Own\ufffe text, with {quote}.", c), (f"Own text, with {quote}.", e))])
         assert await chosen(text=f"Own\ufffe text, with {quote}.", page=7, passage_id=None, ordinal=oe) == c
-        # the old text as pdf-4 reads it, before so with its first word taken as hyphened (a dropped label's)
+        # the old text as pdf-4 reads it; a hyphen pdf-4 would not read is never guessed
         await asyncio.to_thread(db.write, lambda conn: [conn.execute("UPDATE passages SET text = ? WHERE id = ?", (t, i))
                                                        for t, i in ((f"Decide, with {quote}.", c), (f"De-cide, with {quote}.", e))])
         assert await chosen(text=f"De\ufffecide, with {quote}.", page=7, passage_id=None, ordinal=oe) == c

@@ -635,12 +635,12 @@ def _pdf_page(page, raw, measure=False):
         aligned = len(text) == count
         mapped = unmapped = 0
         lines, chars, boxes = [], [], []
-        hyphened = False  # whether the line's word so far, back to its last space, holds a hyphen
+        hyphened, word = False, ""  # whether the line's word so far holds a hyphen; its first letters (_hyphens)
         for index, char in enumerate(text):
             if char in "\r\n":
                 if chars:
                     lines.append((chars, boxes))
-                chars, boxes, hyphened = [], [], False
+                chars, boxes, hyphened, word = [], [], False, ""
                 continue
             box = None
             at = index if aligned else raw.FPDFText_GetCharIndexFromTextIndex(textpage, index)
@@ -658,7 +658,7 @@ def _pdf_page(page, raw, measure=False):
                 if not _mark_kept(hyphened, text[index + 1:index + 2]):
                     continue  # dropped with its box: the word joined
                 char = "-"
-            hyphened = (hyphened or char == "-") and not char.isspace()
+            hyphened, word = _hyphens(hyphened, word, char, text[index + 1:index + 2])
             chars.append(char)
             boxes.append(box)
         if chars:
@@ -687,21 +687,31 @@ def _mark_kept(hyphened, following):
     return hyphened or "0" <= following <= "9"
 
 
-def joined(text, hyphened=False):
+def _hyphens(hyphened, word, char, following):
+    """(hyphened, word) once char is the word's next character: whether the word, back to its last space, holds a
+    hyphen, and its first letters (enough to tell an abstract's label). An abstract's label set off by a hyphen for
+    its dash ("Abstract-Work-flows", as _ABSTRACT reads a label) is no hyphen of the word it runs into: the label
+    leaves the passage (_drop_label), so the word reads as if it began there, and a pdf-3 quote, which lost the
+    label too, reads the same through joined."""
+    if char.isspace():
+        return False, ""
+    label = char == "-" and word.lower() in ("abstract", "摘要") and not following.islower()
+    return hyphened or (char == "-" and not label), word + char if len(word) < 9 else word
+
+
+def joined(text):
     """A text a PDF reading made before pdf-4, holding PDFium's marks as it gave them, as pdf-4 reads it:
-    each mark kept as "-" or dropped (_mark_kept), as _pdf_page does; any other text is itself. For a text
-    from a passage's start, as a citation's quote and old passage text are. hyphened: whether the text's first
-    word is taken as already hyphened, as when the label a passage began with ("Abstract-") was dropped from it
-    after _pdf_page read its line."""
+    each mark kept as "-" or dropped (_mark_kept, _hyphens), as _pdf_page does; any other text is itself. For a
+    text from a passage's start, as a citation's quote and old passage text are."""
     if "\ufffe" not in text:
         return text
-    out = []
+    out, hyphened, word = [], False, ""
     for index, char in enumerate(text):
         if char == "\ufffe":
             if not _mark_kept(hyphened, text[index + 1:index + 2]):
                 continue
             char = "-"
-        hyphened = (hyphened or char == "-") and not char.isspace()
+        hyphened, word = _hyphens(hyphened, word, char, text[index + 1:index + 2])
         out.append(char)
     return "".join(out)
 
