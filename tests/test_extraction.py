@@ -494,9 +494,10 @@ def test_joined_reads_a_pdf_3_text_as_pdf_4_reads_its_page():
     assert extraction.joined("Kept \uffff, de\ufffecide.") == "Kept \uffff, decide."  # U+FFFF beside a mark too
 
 
-def test_an_abstract_labels_dash_is_no_hyphen_of_the_word_it_runs_into_and_joined_reads_the_same():
-    # r2 pass 1 and r3: "Abstract-" made _pdf_page keep the mark in "Work-flows"; the label leaves the passage, and
-    # a pdf-3 quote lost it too, so joined could not see it. The label's dash is now no word's hyphen, in both.
+def test_a_mark_is_decided_on_the_piece_after_its_label_is_dropped_and_joined_reads_the_same():
+    # r2 to r4 (design review AJ, option B): a mark is decided once, on the piece it ends in, after the label is
+    # dropped, by the plain rule ("the word so far" is the piece's, back to its last space); pdf-3 stored that
+    # piece, so joined of it is what pdf-4 reads
     data = _hyphen_page("Abstract-Work-", "flows are measured in a synthetic panel of regions across many years.")
     text, _ = _pdfium_text(data)
     pdf_3 = text.split("\r\n", 1)[1][len("Abstract-"):]  # the pdf-3 passage, its label dropped
@@ -504,9 +505,9 @@ def test_an_abstract_labels_dash_is_no_hyphen_of_the_word_it_runs_into_and_joine
     assert passage.kind == "abstract"
     assert passage.text == extraction.joined(pdf_3) == "Workflows are measured in a synthetic panel of regions across many years."
     kept = _sections((14, "2 Methods", None), (None, "Abstract-Work-", None), (None, "flows in short.", None))
-    [(kind, words)] = [(k, t) for k, _, t in kept if "flows" in t]  # too short to be an abstract: the label stays
-    assert (kind, words) == ("paragraph", "Abstract-Workflows in short.")
-    assert extraction.joined("Abstract-Work\ufffeflows are measured") == "Abstract-Workflows are measured"
+    [(kind, words)] = [(k, t) for k, _, t in kept if "flows" in t]  # too short to be an abstract: the label stays,
+    assert (kind, words) == ("paragraph", "Abstract-Work-flows in short.")  # and its hyphen is the word's
+    assert extraction.joined("Abstract-Work\ufffeflows are measured") == "Abstract-Work-flows are measured"
     assert extraction.joined("Abstract-level work\ufffeflows, abstract-high\ufffequality.") == \
         "Abstract-level workflows, abstract-high-quality."  # a hyphen before a lower-case letter is a word's
 
@@ -529,10 +530,82 @@ def test_joined_of_a_pdf_3_abstract_whose_label_was_dropped_reads_as_its_pdf_4_p
     assert passage.kind == "abstract" and passage.text == extraction.joined(pdf_3)
 
 
-def test_a_chinese_abstract_labels_dash_is_no_hyphen_of_the_word_it_runs_into():
-    assert extraction.joined("摘要-Work\ufffeflows are measured") == "摘要-Workflows are measured"
-    assert extraction.joined("摘要-work\ufffeflows are measured") == "摘要-workflows are measured"  # 摘要 then any letter
-    assert extraction.joined("Work\ufffeflows are measured") == "Workflows are measured"
+def test_joined_reads_a_kept_label_as_part_of_the_word_it_runs_into():
+    # the plain rule on the text as stored: a label that stayed in the passage is read with its word
+    assert extraction.joined("摘要-Work\ufffeflows are measured") == "摘要-Work-flows are measured"
+    assert extraction.joined("Work\ufffeflows are measured") == "Workflows are measured"  # once the label is dropped
+    text, boxes = extraction.joined("ab\ufffecd e\ufffe4", ["a", "b", "m", "c", "d", None, "e", "n", "4"])
+    assert (text, boxes) == ("abcd e-4", ["a", "b", "c", "d", None, "e", "n", "4"])  # the kept characters' boxes
+
+
+def test_a_long_pdf_block_is_cut_in_pdfium_form_then_each_piece_joined():
+    # cut where pdf-3 cut it (on the text with its marks), so a piece reads as joined of what pdf-3 stored
+    sentence = "Minimum wages raise the earn{}ings of workers in the synthetic panel of the regions. "
+    marked = "".join(sentence.format("\ufffe" if n % 2 else "") for n in range(24)).strip()
+    assert len(marked) > extraction.MAX_PASSAGE > len(extraction.joined(marked))  # one piece once joined, two as marked
+    text, boxes = "", []  # the block as _pdf_page gives it: the marks out, each on the box before it
+    for index, char in enumerate(marked):
+        if char == "\ufffe":
+            boxes[-1] = (*boxes[-1], (1.0, 1.0, 2.0, 2.0, index, 0))
+            continue
+        text += char
+        boxes.append(None if char.isspace() else (1.0, 1.0, 2.0, 2.0, index, 0))
+    pieces = [p.text for p in extraction._pieces(text, "paragraph", 1, [], None, None, boxes, (612, 792))]
+    cuts = [0, *extraction._split(marked), len(marked)]
+    assert pieces == [extraction.joined(marked[a:b]).strip() for a, b in zip(cuts, cuts[1:])]
+    joined_first = extraction.joined(marked)
+    cuts = [0, *extraction._split(joined_first), len(joined_first)]
+    assert pieces != [joined_first[a:b].strip() for a, b in zip(cuts, cuts[1:])]  # a cut after joining differs
+
+
+def test_the_classifier_reads_a_line_without_its_mark():
+    # the mark is out of the line the classifier reads (AJ, not the variant that leaves it in): "Fig-" / "ure 1." is
+    # a caption, its piece then read as joined of PDFium's form
+    page = [(72, 750, 18, "A Synthetic Paper"), (72, 720, 10, "Minimum wages raise the earnings of low-paid workers."),
+            (72, 700, 10, "Fig-"), (72, 688, 10, "ure 1. Earnings by region in the synthetic panel.")]
+    data = synthetic.pdf([page])
+    assert "Fig\ufffeure" in _pdfium_text(data)[0]
+    assert ("caption", "Figure 1. Earnings by region in the synthetic panel.") in kinds(extract(data, extraction.PDF).passages)
+
+
+def test_a_headings_kept_hyphen_is_decided_on_the_heading():
+    page = [(72, 750, 18, "A Synthetic Paper"), (72, 720, 14, "2 A State-of-the-"), (72, 704, 14, "Art Survey"),
+            (72, 680, 10, "Minimum wages raise the earnings of low-paid workers in the panel.")]
+    [_, passage] = extract(synthetic.pdf([page]), extraction.PDF).passages
+    assert passage.section_path == ["2 A State-of-the-Art Survey"]
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_every_pdf_piece_is_joined_of_its_pdfium_form_over_generated_layouts(monkeypatch, seed):
+    # AJ's property: a pdf-4 piece's text is joined(M), where M is the piece in PDFium's form (what pdf-3 stored)
+    import random
+    rng = random.Random(seed)
+    starts = ["Abstract-", "Abstract:", "ABSTRACT -", "Abstract:Abstract-", "We discuss abstract", "Abstract -", ""]
+    words = ["Re-", "Work-", "state-of-the-", "GPT-", "well-known", "de-", "Self-", "x-Work-", "-Re-", "4o-", "the",
+             "panel", "regions", "wages", "Minimum-"]
+    nexts = ["signing", "flows", "art", "4", "cide", "CheckGPT", "level", "mini", "known", "Tree", "5 percent"]
+    layouts = []
+    for _ in range(25):
+        lines, y = [(72, 770, 20, "A Synthetic Paper")], 740
+        for _ in range(rng.randint(1, 3)):
+            first = " ".join(filter(None, [rng.choice(starts), *rng.sample(words, rng.randint(1, 3))]))
+            if not first.endswith("-"):
+                first += " " + rng.choice([w for w in words if w.endswith("-")])
+            lines += [(72, y, 10, first), (72, y - 12, 10, rng.choice(nexts) + " are measured in a synthetic panel of"
+                                                                             " regions across many years.")]
+            y -= 40
+        layouts.append(synthetic.pdf([lines]))
+    for data in layouts:
+        pdf_4 = extract(data, extraction.PDF).passages
+        with monkeypatch.context() as as_pdf_3:  # the same reading with every mark left as PDFium gave it
+            as_pdf_3.setattr(extraction, "joined", lambda text, boxes=None: text if boxes is None else (text, boxes))
+            pdf_3 = extract(data, extraction.PDF).passages
+        assert len(pdf_3) == len(pdf_4)
+        for old, new in zip(pdf_3, pdf_4):
+            assert new.text == extraction.joined(old.text) and new.kind == old.kind
+            assert new.section_path == [extraction.joined(part) for part in old.section_path]
+            assert (new.char_start, new.char_end) == (old.char_start, old.char_end)
+        assert any("\ufffe" in p.text for p in pdf_3)
 
 
 def test_a_line_after_a_known_heading_never_joins_it():  # 1.0, its other half

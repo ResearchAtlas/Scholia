@@ -448,20 +448,27 @@ def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None,
     or a DOCX paragraph's own, base its offset) is searched for each later piece's start (_located)."""
     if not text:
         return []
+    if char_boxes is not None:  # a PDF block: cut in PDFium's form, as pdf-3 cut it, so no piece passes MAX_PASSAGE
+        text, char_boxes = _marked(text, char_boxes)
     _keep(text)
     bounds = [0, *_split(text), len(text)]
-    spans = [(a, b, text[a:b].strip()) for a, b in zip(bounds, bounds[1:])]
-    spans = [span for span in spans if span[2]]
+    spans = [(a, b, text[a:b]) for a, b in zip(bounds, bounds[1:])]
+    if char_boxes is not None:  # each piece's marks decided on it (joined), with the boxes it keeps
+        spans = [(a, b, joined(piece, char_boxes[a:b])) for a, b, piece in spans]
+        spans = [(a, b, (piece.strip(), boxes)) for a, b, (piece, boxes) in spans]
+    else:
+        spans = [(a, b, (piece.strip(), None)) for a, b, piece in spans]
+    spans = [span for span in spans if span[2][0]]
     _build(len(spans) * sum(map(len, path)))  # each piece's section path, as it will be written out
-    located = (_located([piece for _, _, piece in spans], source, base, start, end)
+    located = (_located([piece for _, _, (piece, _) in spans], source, base, start, end)
                if char_boxes is None and start is not None and end is not None else None)
     passages = []
-    for n, (a, b, piece) in enumerate(spans):
-        rects = _rects(char_boxes[a:b], page_size) if char_boxes and page_size else None
+    for n, (a, b, (piece, piece_boxes)) in enumerate(spans):
+        rects = _rects(piece_boxes, page_size) if piece_boxes and page_size else None
         if rects and (reading := _READING.get()) is not None:  # at most a piece's lines, counted as made
             reading.rectangles(len(rects))
         if char_boxes is not None:  # a PDF piece: the span of PDFium's characters it is made of
-            chars = [i[4] for i in char_boxes[a:b] if i is not None]  # out of order in a wrapped table cell
+            chars = [i[4] for i in piece_boxes if i is not None]  # out of order in a wrapped table cell
             first, last = (min(chars), max(chars) + 1) if chars else (start, end)
         elif located is not None:
             first, last = located[n], located[n + 1] if n + 1 < len(located) else end
@@ -504,7 +511,7 @@ def _rects(boxes, size):
     for box in boxes:
         if box is None:
             continue
-        left, bottom, right, top, _, line = box
+        left, bottom, right, top, _, line = box[:6]
         if right <= left or top <= bottom:
             continue
         merged = lines.get(line)
@@ -635,12 +642,11 @@ def _pdf_page(page, raw, measure=False):
         aligned = len(text) == count
         mapped = unmapped = 0
         lines, chars, boxes = [], [], []
-        hyphened, word = False, ""  # whether the line's word so far holds a hyphen; its first letters (_hyphens)
         for index, char in enumerate(text):
             if char in "\r\n":
                 if chars:
                     lines.append((chars, boxes))
-                chars, boxes, hyphened, word = [], [], False, ""
+                chars, boxes = [], []
                 continue
             box = None
             at = index if aligned else raw.FPDFText_GetCharIndexFromTextIndex(textpage, index)
@@ -654,11 +660,11 @@ def _pdf_page(page, raw, measure=False):
                     box = (left, bottom, right, top, at, len(lines), raw.FPDFText_GetFontSize(textpage, at))
             elif not char.isspace():
                 mapped += 1
-            if char == "\ufffe":  # PDFium's line-end hyphen, its line joined to the next (_mark_kept)
-                if not _mark_kept(hyphened, text[index + 1:index + 2]):
-                    continue  # dropped with its box: the word joined
-                char = "-"
-            hyphened, word = _hyphens(hyphened, word, char, text[index + 1:index + 2])
+            if char == "\ufffe" and boxes and boxes[-1] is not None:
+                # PDFium's line-end hyphen, its line joined to the next: out of the line, which the classifier reads,
+                # its box carried on the box before it (_marked), and decided on the piece it ends in (joined)
+                boxes[-1] = (*boxes[-1][:7], box)
+                continue
             chars.append(char)
             boxes.append(box)
         if chars:
@@ -687,40 +693,40 @@ def _mark_kept(hyphened, following):
     return hyphened or "0" <= following <= "9"
 
 
-_LABELS = ("abstract", "摘要")
+def _marked(text, boxes):
+    """A block's text and boxes in PDFium's form: each mark _pdf_page took out of its line put back after the
+    character whose box carries it (a box's seventh element: the mark's own box), with that box."""
+    if not any(box is not None and len(box) > 6 for box in boxes):
+        return text, boxes
+    out, kept = [], []
+    for char, box in zip(text, boxes):
+        out.append(char)
+        kept.append(box if box is None else box[:6])
+        if box is not None and len(box) > 6:
+            out.append("\ufffe")
+            kept.append(box[6])
+    return "".join(out), kept
 
 
-def _hyphens(hyphened, word, char, following):
-    """(hyphened, word) once char is the word's next character: whether the word, back to its last space, holds a
-    hyphen, and its first letters (enough to tell an abstract's label; a label then spaces is kept, its spaces
-    after it). An abstract's label set off by a hyphen for its dash ("Abstract-Work-flows", "ABSTRACT -work", as
-    _ABSTRACT reads a label: "Abstract-" not straight before an a to z, "摘要-" before anything) is no hyphen of the
-    word it runs into, which starts afresh after it: the label leaves the passage (_drop_label), so the word reads as if it began there, and a pdf-3 quote, which
-    lost the label too, reads the same through joined."""
-    if char.isspace():
-        return False, word if word.endswith(" ") else word + " " if word.lower() in _LABELS else ""
-    label = word.rstrip().lower()
-    if char == "-" and label in _LABELS and (word.endswith(" ") or label == "摘要" or not "a" <= following <= "z"):
-        return False, ""
-    word = "" if word.endswith(" ") else word
-    return hyphened or char == "-", word + char if len(word) < 9 else word
-
-
-def joined(text):
-    """A text a PDF reading made before pdf-4, holding PDFium's marks as it gave them, as pdf-4 reads it:
-    each mark kept as "-" or dropped (_mark_kept, _hyphens), as _pdf_page does; any other text is itself. For a
-    text from a passage's start, as a citation's quote and old passage text are."""
+def joined(text, boxes=None):
+    """A text in PDFium's form, its marks in it (as a PDF reading before pdf-4 stored a passage, and as a pdf-4
+    piece is before it is read), read as pdf-4 reads it: each mark kept as "-" or dropped (_mark_kept), the word
+    so far being the text's back to its last whitespace; any other text is itself. pdf-4 makes every piece of a
+    PDF so (_pieces), after its label is dropped and it is cut, so joined of what pdf-3 stored is what pdf-4
+    reads wherever the piece is the same. With boxes (one a character), the kept characters' boxes too."""
     if "\ufffe" not in text:
-        return text
-    out, hyphened, word = [], False, ""
+        return text if boxes is None else (text, boxes)
+    out, kept, hyphened = [], [], False
     for index, char in enumerate(text):
         if char == "\ufffe":
             if not _mark_kept(hyphened, text[index + 1:index + 2]):
                 continue
             char = "-"
-        hyphened, word = _hyphens(hyphened, word, char, text[index + 1:index + 2])
+        hyphened = (hyphened or char == "-") and not char.isspace()
         out.append(char)
-    return "".join(out)
+        if boxes is not None:
+            kept.append(boxes[index])
+    return "".join(out) if boxes is None else ("".join(out), kept)
 
 
 _BOLD_FONT = re.compile(r"bold|black|heavy|demi|cmbx", re.IGNORECASE)
@@ -761,7 +767,8 @@ def _displayed(page, raw, width, height):
 def _line(chars, boxes):
     found = [b for b in boxes if b is not None]
     sizes = sorted(b[6] for b in found)
-    return {"text": "".join(chars), "boxes": [b[:6] if b else None for b in boxes],
+    return {"text": "".join(chars), "boxes": [(b[:6] + (b[7][:6] if b[7] else None,) if len(b) > 7 else b[:6]) if b else None
+                                              for b in boxes],
             "size": sizes[len(sizes) // 2] if sizes else 0.0,
             "left": min((b[0] for b in found), default=0.0), "right": max((b[2] for b in found), default=0.0),
             "top": max((b[3] for b in found), default=0.0), "bottom": min((b[1] for b in found), default=0.0)}
@@ -788,8 +795,8 @@ def _pdf_blocks(number, lines, size, body, sections, recognized=False):
     cells = [_cells(line) for line in lines]
 
     def flush():
-        if heading:  # consecutive heading lines of one size are one heading
-            text, boxes = _join(heading)
+        if heading:  # consecutive heading lines of one size are one heading, its marks decided on it
+            text, boxes = joined(*_marked(*_join(heading)))
             if number == 1 and heading[0]["size"] == largest and largest >= body * 1.3 and not sections.path \
                     and not recognized and not any(p.kind == "title" for p in passages) and not _known_heading(text):
                 passages.extend(_pieces(text, "title", number, [], None, None, boxes, size))

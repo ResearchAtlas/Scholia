@@ -342,6 +342,73 @@ async def test_an_unchanged_pdfs_abstract_citation_stays_on_the_abstract_when_an
             ("abstract", "Resigning " + said, "ok", "supported")]
 
 
+SAID = "improves outcomes in the synthetic panel of workers across the regions."
+R4 = {  # r4's two shapes: (the cited passage's lines, its twin's text, its pdf-3 text, the twin's section)
+    "doubled label": ([(72, 740, 10, "Abstract:Abstract-Re-"), (72, 728, 10, "signing " + SAID)],
+                      "Abstract:Abstract-Resigning " + SAID, "Abstract-Re\ufffesigning " + SAID),
+    "line ending abstract": ([(72, 740, 10, "We discuss abstract"), (72, 728, 10, "-Re-"), (72, 716, 10, "signing " + SAID)],
+                             "We discuss abstract -Resigning " + SAID, "We discuss abstract -Re\ufffesigning " + SAID)}
+
+
+def _r4_pdf(shape, twin=True):
+    lines, twin_text, _ = R4[shape]
+    page = [(72, 770, 20, "Wage Floors"), *lines]
+    if twin:
+        page += [(72, 690, 14, "Results"), (72, 670, 10, twin_text)]
+    return synthetic.pdf([page])
+
+
+async def _cite_as_pdf_3(client, project, pdf_3):
+    """A citation of the passage before the twin's section, its text and quote as pdf-3 stored them."""
+    conversation = await conversation_in(client, project)
+    await send(client, conversation, QUESTION)
+    [(target, text)] = await rows(client, "SELECT id, text FROM passages WHERE section_path = '[]' AND kind != 'title'")
+
+    def as_pdf_3(conn):
+        conn.execute("UPDATE passages SET text = ? WHERE id = ?", (pdf_3, target))
+        conn.execute("UPDATE citations SET passage_id = ?, quote = ?, existence = 'ok', support = 'supported'",
+                     (target, pdf_3))
+    await asyncio.to_thread(client.state["db"].write, as_pdf_3)
+    return conversation, text
+
+
+@pytest.mark.parametrize("shape", list(R4))
+async def test_an_unchanged_pdfs_citation_stays_on_its_passage_beside_a_twin_that_reads_as_a_guessed_join(
+        tmp_path, monkeypatch, shape):
+    # r4: the stored pdf-3 text had lost context _pdf_page used (a doubled label, a line break), so joined of it read
+    # as a twin passage, and the citation moved there with its verdict; pdf-4 now reads each piece as joined of it
+    read_in_process(monkeypatch)
+    pdf4 = extraction.EXTRACTORS[extraction.PDF][1]
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
+        project, [material] = await with_papers(client, ("Wage Floors.pdf", _r4_pdf(shape)))
+        _, now = await _cite_as_pdf_3(client, project, R4[shape][2])
+        await read_as(client, monkeypatch, material, pdf4, extraction.PDF)
+        await idle(client, project)
+        assert await rows(client, "SELECT p.text, p.section_path, c.existence, c.support FROM citations c"
+                                  " JOIN passages p ON p.id = c.passage_id") == [(now, "[]", "ok", "supported")]
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["fresh reading", "shared reading"])
+async def test_a_replacement_saying_minus_resigning_drops_the_citation_of_minus_re_mark_signing(tmp_path, monkeypatch, shared):
+    # r4 pass 2: the replacement really says "-Resigning"; the old pdf-3 text "-Re<mark>signing" reads "-Re-signing"
+    read_in_process(monkeypatch)
+    pdf4 = extraction.EXTRACTORS[extraction.PDF]
+    replacement = synthetic.pdf([[(72, 770, 20, "Wage Floors"), (72, 740, 10, R4["line ending abstract"][1])]])
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
+        project, [material] = await with_papers(client, ("Wage Floors.pdf", _r4_pdf("line ending abstract", twin=False)))
+        conversation, _ = await _cite_as_pdf_3(client, project, R4["line ending abstract"][2])
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, pdf4)
+        if shared:
+            other = await project_of(client, "Other")
+            await added(client, other, ("Elsewhere.pdf", replacement))
+            await idle(client, other)
+        await added(client, project, ("Wage Floors.pdf", replacement), material_id=material)
+        await idle(client, project)
+        assert (await chip_of(client, conversation))["existence"] != "ok"
+
+
 async def test_a_reread_takes_the_new_passages_page(tmp_path, monkeypatch):
     # round 3, the open row: page = coalesce(new, old) in supersede and the null-passage loop
     read_in_process(monkeypatch)
