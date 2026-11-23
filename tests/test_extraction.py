@@ -517,7 +517,7 @@ def test_an_abstract_labels_dash_is_no_hyphen_of_the_word_it_runs_into_and_joine
     ("Abstract-Abstract-Work-", "flows are measured in a synthetic panel of regions across many years."),  # doubled
     ("ABSTRACT -Work-", "level wages are measured in a synthetic panel of regions across many years."),  # spaced
     ("Abstract -work-", "flows are measured in a synthetic panel of regions across many years."),  # spaced, lower case
-    ("Abstract x-Work-", "flows are measured in a synthetic panel of regions across many years.")])  # no label: a word
+    ("Abstract x-Work-", "flows are measured in a synthetic panel of regions across many years.")])  # the label is "Abstract "; "x-Work-" is a word, its hyphen counts
 def test_joined_of_a_pdf_3_abstract_whose_label_was_dropped_reads_as_its_pdf_4_passage(first, second):
     # r3 review: the label's dash is left out exactly where _drop_label (_ABSTRACT) takes the label away
     data = _hyphen_page(first, second)
