@@ -687,13 +687,15 @@ def _mark_kept(hyphened, following):
     return hyphened or "0" <= following <= "9"
 
 
-def joined(text):
+def joined(text, hyphened=False):
     """A text a PDF reading made before pdf-4, holding PDFium's marks as it gave them, as pdf-4 reads it:
     each mark kept as "-" or dropped (_mark_kept), as _pdf_page does; any other text is itself. For a text
-    from a passage's start, as a citation's quote and old passage text are."""
+    from a passage's start, as a citation's quote and old passage text are. hyphened: whether the text's first
+    word is taken as already hyphened, as when the label a passage began with ("Abstract-") was dropped from it
+    after _pdf_page read its line."""
     if "\ufffe" not in text:
         return text
-    out, hyphened = [], False
+    out = []
     for index, char in enumerate(text):
         if char == "\ufffe":
             if not _mark_kept(hyphened, text[index + 1:index + 2]):

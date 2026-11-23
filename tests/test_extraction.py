@@ -494,6 +494,19 @@ def test_joined_reads_a_pdf_3_text_as_pdf_4_reads_its_page():
     assert extraction.joined("Kept \uffff, de\ufffecide.") == "Kept \uffff, decide."  # U+FFFF beside a mark too
 
 
+def test_joined_of_a_passage_whose_label_held_the_hyphen_reads_as_pdf_4_with_the_hyphen_assumed():
+    # r2 pass 1: "Abstract-" told _pdf_page the word was hyphened; the label leaves both readings, so joined of the
+    # stored text starts without it and is asked both ways
+    data = _hyphen_page("Abstract-Work-", "flows are measured in a synthetic panel of regions across many years.")
+    text, _ = _pdfium_text(data)
+    pdf_3 = text.split("\r\n", 1)[1][len("Abstract-"):]  # the pdf-3 passage, its label dropped
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.text == "Work-flows are measured in a synthetic panel of regions across many years."
+    assert extraction.joined(pdf_3) == "Workflows are measured in a synthetic panel of regions across many years."
+    assert extraction.joined(pdf_3, hyphened=True) == passage.text
+    assert extraction.joined("We de\ufffecide here.", hyphened=True) == "We decide here."  # its first word only
+
+
 def test_a_line_after_a_known_heading_never_joins_it():  # 1.0, its other half
     read = _sections((12, "Abstract", BOLD), (12, "Synthetic Evidence on Wages", None),
                      (None, "We study minimum wages in a synthetic panel.", None))

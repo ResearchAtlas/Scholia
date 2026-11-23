@@ -233,6 +233,25 @@ async def test_a_text_papers_citation_with_no_passage_keeps_its_verdict_on_its_q
         assert await rows(client, "SELECT existence, support FROM citations") == [("ok", "supported")]
 
 
+async def test_a_pdf_3_quote_whose_dropped_label_held_the_hyphen_follows_with_its_verdict(tmp_path):
+    # r2 pass 1: "Abstract-Work-" / "flows ..." reads "Work-flows ..." under pdf-4 and "Work<mark>flows ..." under pdf-3,
+    # the label gone from both; joined of the quote without the label gives "Workflows" unless its first word is
+    # taken as hyphened (which is asked after the plain form)
+    now = "Work-flows are measured in a synthetic panel of regions across many years and wages."
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, paper("Wage Floors", now))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+
+        def as_pdf_3(conn):
+            conn.execute("UPDATE citations SET passage_id = NULL, existence = 'source_removed', support = 'supported',"
+                         " quote = ?", (now.replace("Work-flows", "Work\ufffeflows"),))
+            citations.retarget(conn, material)
+        await asyncio.to_thread(client.state["db"].write, as_pdf_3)
+        assert await rows(client, "SELECT p.text, c.existence, c.support FROM citations c"
+                                  " JOIN passages p ON p.id = c.passage_id") == [(now, "ok", "supported")]
+
+
 async def test_a_reread_takes_the_new_passages_page(tmp_path, monkeypatch):
     # round 3, the open row: page = coalesce(new, old) in supersede and the null-passage loop
     read_in_process(monkeypatch)
@@ -460,6 +479,10 @@ async def test_the_chooser_takes_the_citations_own_passage_then_its_text_then_it
         await asyncio.to_thread(db.write, lambda conn: [conn.execute("UPDATE passages SET text = ? WHERE id = ?", (t, i))
                                                        for t, i in ((f"Own\ufffe text, with {quote}.", c), (f"Own text, with {quote}.", e))])
         assert await chosen(text=f"Own\ufffe text, with {quote}.", page=7, passage_id=None, ordinal=oe) == c
+        # the old text as pdf-4 reads it, before so with its first word taken as hyphened (a dropped label's)
+        await asyncio.to_thread(db.write, lambda conn: [conn.execute("UPDATE passages SET text = ? WHERE id = ?", (t, i))
+                                                       for t, i in ((f"Decide, with {quote}.", c), (f"De-cide, with {quote}.", e))])
+        assert await chosen(text=f"De\ufffecide, with {quote}.", page=7, passage_id=None, ordinal=oe) == c
 
 
 async def test_a_citation_with_no_passage_keeps_its_verdict_when_its_quote_is_a_passage_but_for_the_mark(tmp_path):
