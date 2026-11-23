@@ -539,11 +539,11 @@
    "sentence_language": "zh-CN",
    "passage": {
     "paper": "2601.03052v1",
-    "ordinal": 172,
+    "ordinal": 165,
     "page": 8,
     "kind": "paragraph",
     "section_path": [
-     "Internal Reasoning Graph R7 (3) = 𝑓(𝑥) R3←6 (1,2) R2←5",
+     "Layer-wise Relevance Propagation Internal Reasoning Graph",
      "4 Experiments",
      "4.5 The Impact of Hyperparameters"
     ],
@@ -798,11 +798,11 @@
    "sentence_language": "en",
    "passage": {
     "paper": "2601.03052v1",
-    "ordinal": 122,
+    "ordinal": 115,
     "page": 6,
     "kind": "paragraph",
     "section_path": [
-     "Internal Reasoning Graph R7 (3) = 𝑓(𝑥) R3←6 (1,2) R2←5",
+     "Layer-wise Relevance Propagation Internal Reasoning Graph",
      "4 Experiments",
      "4.1 Datasets"
     ],
