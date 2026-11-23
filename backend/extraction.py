@@ -640,15 +640,18 @@ def _pdf_page(page, raw, measure=False):
         count = textpage.count_chars()
         if count > MAX_PAGE_CHARS:  # refused before its text is decoded: a small page can hold a great deal
             raise Unreadable()
-        text = textpage.get_text_range() if count else ""
+        # half a surrogate pair kept (surrogatepass) so its unit is counted, then left out of the lines (below)
+        text = textpage.get_text_range(errors="surrogatepass") if count else ""
         # PDFium indexes its text in UTF-16 units, a character above U+FFFF two of its characters (_units). The
         # text leaves out some characters PDFium counts (control characters) when it is shorter: each of its
         # characters is then found among them by PDFium's own map, from its UTF-16 place (-1 for one it put in).
-        aligned = len(text.encode("utf-16-le")) == 2 * count
+        aligned = len(text.encode("utf-16-le", "surrogatepass")) == 2 * count
         mapped = unmapped = unit = 0
         lines, chars, boxes = [], [], []
         for char in text:
             index, unit = unit, unit + _units(char)
+            if "\ud800" <= char <= "\udfff":  # half a pair, no character: left out, as pdf-3's decoding left it out
+                continue
             if char in "\r\n":
                 if chars:
                     lines.append((chars, boxes))

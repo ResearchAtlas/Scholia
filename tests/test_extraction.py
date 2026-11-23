@@ -475,13 +475,14 @@ def _pdf_mapping_tilde(code_point, first="We use the GPT-", second="~ model here
 MATH_X = "\U0001d465"  # mathematical italic x: above U+FFFF, two UTF-16 units, so two of PDFium's characters
 
 
-def _math_pdf(pages, left_out=False):
+def _math_pdf(pages, bar=None):
     """synthetic.pdf's one page of (x, y, font size, text, font or none for Helvetica) lines, each "~" mapped
-    (ToUnicode) to MATH_X; with left_out, each "|" to a control character PDFium counts but leaves out of its text."""
+    (ToUnicode) to MATH_X; with bar, each "|" to those UTF-16 units (hex): 0002, a control character PDFium counts but
+    leaves out of its text; D835, half a surrogate pair, which PDFium counts and puts in its text."""
     [lines] = pages
     cmap = (b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /T def 1 begincodespacerange"
             b" <00> <FF> endcodespacerange %d beginbfchar <7E> <D835DC65>%s endbfchar endcmap"
-            b" CMapName currentdict /CMap defineresource pop end end" % (1 + left_out, b" <7C> <0002>" if left_out else b""))
+            b" CMapName currentdict /CMap defineresource pop end end" % (1 + bool(bar), b" <7C> <%s>" % bar if bar else b""))
     fonts = sorted({(font[0] if font else "Helvetica") for *_, font in [(line[:4], line[4:]) for line in lines]})
     content = b"BT " + b" ".join(
         b"/F%d %g Tf 1 0 0 1 %g %g Tm (%s) Tj" % (fonts.index(font[0] if font else "Helvetica") + 1, size, x, y,
@@ -512,7 +513,7 @@ def _read_back(data, passage):
 def test_a_character_above_u_ffff_is_two_of_pdfiums_and_a_passages_range_reads_back_its_text(left_out):  # r5 F1
     # PDFium indexes its text in UTF-16 units: a character above U+FFFF is two of its characters, at both ends here
     data = _math_pdf([[(72, 720, 10, "~ is fit to the|panel, and so is ~" if left_out else "~ is fit to the panel, and so is ~")]],
-                     left_out=left_out)
+                     bar=b"0002" if left_out else None)
     text, count = _pdfium_text(data)
     assert text.count(MATH_X) == 2 and count == len(text) + 2 + left_out
     [passage] = extract(data, extraction.PDF).passages
@@ -537,6 +538,15 @@ def test_a_pieces_range_pairs_each_kept_character_with_its_own_box():  # r5 F1
     box = lambda left, index: (left, 700.0, left + 5, 710.0, index, 0)
     [piece] = extraction._pieces(f" {MATH_X}b", "paragraph", 1, [], None, None, [None, box(72, 0), box(78, 2)], (612, 792))
     assert (piece.text, piece.char_start, piece.char_end) == (f"{MATH_X}b", 0, 3)
+
+
+def test_half_a_surrogate_pair_is_left_out_of_the_text_and_counted_as_the_unit_pdfium_counts():  # fix batch 5 review F1
+    # PDFium puts the half in its text, which Python cannot hold: it is left out, as pdf-3 left it out, after its unit
+    data = _math_pdf([[(72, 720, 10, "Half |a pair, then ~ here."), (72, 660, 10, "A second paragraph begins far below it.")]],
+                     bar=b"D835")
+    passages = extract(data, extraction.PDF).passages
+    assert [p.text for p in passages] == [f"Half a pair, then {MATH_X} here.", "A second paragraph begins far below it."]
+    assert all(_read_back(data, p) == p.text for p in passages)
 
 
 def test_paragraphs_apart_after_a_character_above_u_ffff_stay_apart():  # r5 F1
