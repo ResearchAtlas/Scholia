@@ -494,6 +494,15 @@ def test_a_long_recognized_paragraph_splits_at_sentences_under_the_passage_limit
     assert starts == sorted(starts) and found.passages[0].char_start == 0  # offsets into the page's recognized text
 
 
+def test_recognized_offsets_count_a_character_above_u_ffff_as_two_as_a_text_pages_do(monkeypatch):  # r5 F1
+    # in UTF-16 units, as PDFium's are: a line ending in one does not reach into the next, nor take its confidence
+    engine = Engine(lines_at((0.10, "We fit \U0001d465", 0.1, 0.9), (0.20, "A second paragraph the engine doubts.", 0.1, 0.2)))
+    first, second = read(scan(), engine, monkeypatch).passages
+    assert (first.text, first.char_start, first.char_end) == ("We fit \U0001d465", 0, 9)
+    assert (second.char_start, second.char_end) == (10, 10 + len(second.text))
+    assert (first.boxes["ocr"]["confidence"], second.boxes["ocr"]["confidence"]) == (0.9, 0.2)
+
+
 def test_no_line_is_left_out_for_its_confidence_and_each_passage_keeps_its_lowest(monkeypatch):
     engine = Engine(lines_at((0.10, "A line read with confidence.", 0.1, 1.0),
                              (0.113, "A faint line the engine doubts", 0.1, 0.1), (0.126, "and a third.", 0.1, 0.5)))

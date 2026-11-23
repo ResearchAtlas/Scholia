@@ -389,14 +389,14 @@ BOLD = "Helvetica-Bold"
 FILLER = "Minimum wages raise the earnings of low-paid workers in the synthetic panel of regions."
 
 
-def _sections(*lines, size=10):
+def _sections(*lines, size=10, make=synthetic.pdf):
     """Passages of a page of (font size or None for the body's, text, font or None) lines, 14 points apart,
-    under a title, with body text enough that size is the body's."""
+    under a title, with body text enough that size is the body's; made by synthetic.pdf, or as make makes it."""
     page = [(72, 770, 20, "A Synthetic Paper")]
     for n, (font_size, text, font) in enumerate(lines):
         page.append((72, 750 - 14 * n, font_size or size, text, *([font] if font else [])))
     page += [(72, 750 - 14 * (len(lines) + 1) - 12 * n, size, FILLER) for n in range(8)]
-    return [(p.kind, p.section_path, p.text) for p in extract(synthetic.pdf([page]), extraction.PDF).passages]
+    return [(p.kind, p.section_path, p.text) for p in extract(make([page]), extraction.PDF).passages]
 
 
 def test_an_appendix_after_the_references_headed_bold_at_the_bodys_size_is_not_a_reference():  # M1
@@ -470,6 +470,99 @@ def _pdf_mapping_tilde(code_point, first="We use the GPT-", second="~ model here
                      b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >>"
                      b" /Contents 5 0 R >>", b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>",
                      *[b"<< /Length %d >>\nstream\n%s\nendstream" % (len(data), data) for data in (content, cmap)]])
+
+
+MATH_X = "\U0001d465"  # mathematical italic x: above U+FFFF, two UTF-16 units, so two of PDFium's characters
+
+
+def _math_pdf(pages, left_out=False):
+    """synthetic.pdf's one page of (x, y, font size, text, font or none for Helvetica) lines, each "~" mapped
+    (ToUnicode) to MATH_X; with left_out, each "|" to a control character PDFium counts but leaves out of its text."""
+    [lines] = pages
+    cmap = (b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /T def 1 begincodespacerange"
+            b" <00> <FF> endcodespacerange %d beginbfchar <7E> <D835DC65>%s endbfchar endcmap"
+            b" CMapName currentdict /CMap defineresource pop end end" % (1 + left_out, b" <7C> <0002>" if left_out else b""))
+    fonts = sorted({(font[0] if font else "Helvetica") for *_, font in [(line[:4], line[4:]) for line in lines]})
+    content = b"BT " + b" ".join(
+        b"/F%d %g Tf 1 0 0 1 %g %g Tm (%s) Tj" % (fonts.index(font[0] if font else "Helvetica") + 1, size, x, y,
+                                                  re.sub(rb"([()\\])", rb"\\\1", text.encode()))
+        for x, y, size, text, *font in lines) + b" ET"
+    names = b" ".join(b"/F%d %d 0 R" % (n + 1, 6 + n) for n in range(len(fonts)))
+    return _raw_pdf([b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                     b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << %s >> >>"
+                     b" /Contents 4 0 R >>" % names,
+                     *[b"<< /Length %d >>\nstream\n%s\nendstream" % (len(data), data) for data in (content, cmap)],
+                     *[b"<< /Type /Font /Subtype /Type1 /BaseFont /%s /ToUnicode 5 0 R >>" % font.encode() for font in fonts]])
+
+
+def _read_back(data, passage):
+    """A PDF passage's range [char_start, char_end) on its page, as PDFium reads it."""
+    import pypdfium2 as pdfium
+
+    with extraction.PDFIUM:
+        document = pdfium.PdfDocument(data)
+        try:
+            textpage = document[passage.page - 1].get_textpage()
+            return textpage.get_text_range(passage.char_start, passage.char_end - passage.char_start)
+        finally:
+            document.close()
+
+
+@pytest.mark.parametrize("left_out", [False, True], ids=["aligned", "a character left out"])
+def test_a_character_above_u_ffff_is_two_of_pdfiums_and_a_passages_range_reads_back_its_text(left_out):  # r5 F1
+    # PDFium indexes its text in UTF-16 units: a character above U+FFFF is two of its characters, at both ends here
+    data = _math_pdf([[(72, 720, 10, "~ is fit to the|panel, and so is ~" if left_out else "~ is fit to the panel, and so is ~")]],
+                     left_out=left_out)
+    text, count = _pdfium_text(data)
+    assert text.count(MATH_X) == 2 and count == len(text) + 2 + left_out
+    [passage] = extract(data, extraction.PDF).passages
+    assert passage.text == f"{MATH_X} is fit to the{'' if left_out else ' '}panel, and so is {MATH_X}"
+    assert (passage.char_start, passage.char_end) == (0, count) and _read_back(data, passage) == passage.text
+    [[left, _, right, _]] = passage.boxes["rects"]  # its line's rectangle, from its first character to its last
+    assert 0.11 < left < 0.13 and right > 0.3
+
+
+def test_each_piece_of_a_long_block_holding_characters_above_u_ffff_reads_back_its_text():  # r5 F1
+    # a later piece begins after the space it is cut at, and the last ends on MATH_X: its range covers both units
+    lines = [(72, 750 - 12 * n, 10, f"Sentence {n} fits ~ to the synthetic panel of regions in this paper.")
+             for n in range(30)] + [(72, 390, 10, "The last sentence ends on ~")]
+    data = _math_pdf([lines])
+    passages = extract(data, extraction.PDF).passages
+    assert len(passages) == 2 and passages[1].text.endswith(MATH_X)
+    assert [re.sub(r"\s+", " ", _read_back(data, p)) for p in passages] == [p.text for p in passages]
+
+
+def test_a_pieces_range_pairs_each_kept_character_with_its_own_box():  # r5 F1
+    # a piece's boxes are cut with its text, so MATH_X after a stripped space still counts as two units
+    box = lambda left, index: (left, 700.0, left + 5, 710.0, index, 0)
+    [piece] = extraction._pieces(f" {MATH_X}b", "paragraph", 1, [], None, None, [None, box(72, 0), box(78, 2)], (612, 792))
+    assert (piece.text, piece.char_start, piece.char_end) == (f"{MATH_X}b", 0, 3)
+
+
+def test_paragraphs_apart_after_a_character_above_u_ffff_stay_apart():  # r5 F1
+    data = _math_pdf([[(72, 720, 10, "We fit ~ to the synthetic panel of regions."),
+                       (72, 660, 10, "A second paragraph begins far below it.")]])
+    passages = extract(data, extraction.PDF).passages
+    assert [p.text for p in passages] == [f"We fit {MATH_X} to the synthetic panel of regions.",
+                                          "A second paragraph begins far below it."]
+    assert all(_read_back(data, p) == p.text for p in passages)
+
+
+def test_a_bold_appendix_after_a_character_above_u_ffff_in_the_references_is_not_a_reference():  # r5 F1, as M1
+    read = _sections((14, "References", None), (None, "Smith, J. (2020). An earlier paper on ~.", None),
+                     (None, "A Additional Results", BOLD), (None, "The appendix reports further estimates.", None),
+                     make=_math_pdf)
+    assert [k for k, _, t in read if t.startswith("Smith")] == ["reference"]
+    assert [(k, p) for k, p, t in read if t == "The appendix reports further estimates."] == [
+        ("paragraph", ["References", "A Additional Results"])]
+
+
+def test_the_body_after_an_abstract_holding_a_character_above_u_ffff_is_not_abstract():  # r5 F1, as M3
+    read = _sections((None, "Abstract", BOLD), (None, "We fit ~ to a synthetic panel.", None),
+                     (12, "1 Introduction", BOLD), (None, "Minimum wages are a common policy.", None), size=11,
+                     make=_math_pdf)
+    assert [k for k, _, t in read if t.startswith("We fit")] == ["abstract"]
+    assert [(k, p) for k, p, t in read if t.startswith("Minimum wages are")] == [("paragraph", ["1 Introduction"])]
 
 
 @pytest.mark.parametrize(("code_point", "read"), [(0x34, "GPT-4"), (0x30, "GPT-0"), (0x39, "GPT-9"), (0xFF14, "GPT\uff14"),

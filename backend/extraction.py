@@ -443,9 +443,10 @@ def _split(text, limit=MAX_PASSAGE):
 def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None, source=None, base=0):
     """One block as passages, counted against the reading's bounds (_keep): split at sentence
     boundaries when longer than MAX_PASSAGE. char_boxes (one per character of text, or None) give
-    each piece its line rectangles and its own range of PDFium's characters. Otherwise each piece
-    takes its own part of the block's source range [start, end), where source (the document's text,
-    or a DOCX paragraph's own, base its offset) is searched for each later piece's start (_located)."""
+    each piece its line rectangles and its own range of PDFium's characters (in UTF-16 units, _units).
+    Otherwise each piece takes its own part of the block's source range [start, end), where source
+    (the document's text, or a DOCX paragraph's own, base its offset) is searched for each later
+    piece's start (_located)."""
     if not text:
         return []
     if char_boxes is not None:  # a PDF block: cut in PDFium's form, as pdf-3 cut it, so no piece passes MAX_PASSAGE
@@ -455,7 +456,8 @@ def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None,
     spans = [(a, b, text[a:b]) for a, b in zip(bounds, bounds[1:])]
     if char_boxes is not None:  # each piece's marks decided on it (joined), with the boxes it keeps
         spans = [(a, b, joined(piece, char_boxes[a:b])) for a, b, piece in spans]
-        spans = [(a, b, (piece.strip(), boxes)) for a, b, (piece, boxes) in spans]
+        spans = [(a, b, (piece.strip(), boxes[len(piece) - len(piece.lstrip()):len(piece.rstrip())]))
+                 for a, b, (piece, boxes) in spans]  # the boxes of the characters it keeps, one a character
     else:
         spans = [(a, b, (piece.strip(), None)) for a, b, piece in spans]
     spans = [span for span in spans if span[2][0]]
@@ -468,8 +470,9 @@ def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None,
         if rects and (reading := _READING.get()) is not None:  # at most a piece's lines, counted as made
             reading.rectangles(len(rects))
         if char_boxes is not None:  # a PDF piece: the span of PDFium's characters it is made of
-            chars = [i[4] for i in piece_boxes if i is not None]  # out of order in a wrapped table cell
-            first, last = (min(chars), max(chars) + 1) if chars else (start, end)
+            # each character from its index to its end (_units); out of order in a wrapped table cell
+            chars = [(i[4], i[4] + _units(c)) for c, i in zip(piece, piece_boxes) if i is not None]
+            first, last = (min(a for a, _ in chars), max(b for _, b in chars)) if chars else (start, end)
         elif located is not None:
             first, last = located[n], located[n + 1] if n + 1 < len(located) else end
         else:
@@ -638,12 +641,14 @@ def _pdf_page(page, raw, measure=False):
         if count > MAX_PAGE_CHARS:  # refused before its text is decoded: a small page can hold a great deal
             raise Unreadable()
         text = textpage.get_text_range() if count else ""
-        # The text leaves out some characters PDFium counts (control characters) when it is shorter:
-        # each of its characters is then found among them by PDFium's own map (-1 for one it put in).
-        aligned = len(text) == count
-        mapped = unmapped = 0
+        # PDFium indexes its text in UTF-16 units, a character above U+FFFF two of its characters (_units). The
+        # text leaves out some characters PDFium counts (control characters) when it is shorter: each of its
+        # characters is then found among them by PDFium's own map, from its UTF-16 place (-1 for one it put in).
+        aligned = len(text.encode("utf-16-le")) == 2 * count
+        mapped = unmapped = unit = 0
         lines, chars, boxes = [], [], []
-        for index, char in enumerate(text):
+        for char in text:
+            index, unit = unit, unit + _units(char)
             if char in "\r\n":
                 if chars:
                     lines.append((chars, boxes))
@@ -685,6 +690,12 @@ def _pdf_page(page, raw, measure=False):
         return [], (width, height), True
     return [dict(_line(chars, boxes), bold=heavy) for (chars, boxes), heavy in zip(lines, bold)
             if "".join(chars).strip()], (width, height), False
+
+
+def _units(char):
+    """A character's length in UTF-16 units, as PDFium counts its characters (and as a PDF passage's range does):
+    two for one above U+FFFF (mathematical italic x, say), else one."""
+    return 2 if char > "\uffff" else 1
 
 
 def _mark_kept(hyphened, following):
@@ -1021,7 +1032,8 @@ def _recognized(document, number, size, engine, body, sections, stop):
     images keep rendering meanwhile. Its lines become passages as a text page's do (_pdf_blocks), each
     line with one box, its characters' (line-level anchors); each passage's boxes also record that it
     was recognized and the lowest confidence among its lines. No line is left out for its confidence.
-    Offsets are into the page's recognized text: its lines in the engine's order, one a line."""
+    Offsets are into the page's recognized text, in UTF-16 units as a text page's are (_units): its lines in the
+    engine's order, one a line."""
     bitmap = _ocr_bitmap(document, number)
     stop()
     PDFIUM.release()
@@ -1043,10 +1055,13 @@ def _recognized(document, number, size, engine, body, sections, stop):
             continue
         left, top, right, bottom = line.box
         box = (left * width, (1 - bottom) * height, right * width, (1 - top) * height)  # points, from the bottom left
-        boxes = [None if char.isspace() else (*box, at + i, len(lines), 0.0) for i, char in enumerate(text)]
+        boxes, unit = [], at
+        for char in text:  # offsets in UTF-16 units, as a text page's are (_units)
+            boxes.append(None if char.isspace() else (*box, unit, len(lines), 0.0))
+            unit += _units(char)
         lines.append(dict(_line(list(text), boxes), bold=False))
-        spans.append((at, at + len(text), line.confidence))
-        at += len(text) + 1
+        spans.append((at, unit, line.confidence))
+        at = unit + 1
     passages = _pdf_blocks(number + 1, lines, size, body, sections, recognized=True)
     for passage in passages:
         lowest = min((c for start, end, c in spans if start < passage.char_end and end > passage.char_start), default=0.0)
