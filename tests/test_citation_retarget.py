@@ -252,6 +252,29 @@ async def test_a_pdf_3_quote_whose_dropped_label_held_the_hyphen_follows_with_it
                                   " JOIN passages p ON p.id = c.passage_id") == [(now, "ok", "supported")]
 
 
+async def test_a_pdf_3_passage_whose_dropped_label_held_the_hyphen_keeps_its_verdict_through_the_reread(tmp_path, monkeypatch):
+    # retarget's old-text branch: the cited passage is still there when the pdf-4 reading commits
+    read_in_process(monkeypatch)
+    real, pdf4 = extraction.extract, extraction.EXTRACTORS[extraction.PDF][1]
+    paper_pdf = synthetic.pdf([[(72, 750, 18, "Wage Floors"), (72, 720, 10, "Abstract-Minimum-"),
+                                (72, 708, 10, "wages raise the earnings of low-paid workers in the synthetic panel.")]])
+    now = "Minimum-wages raise the earnings of low-paid workers in the synthetic panel."
+    async with cited(tmp_path) as client:
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.PDF, ("pdf", "pdf-3"))
+        rewording(monkeypatch, real, {"Minimum-wages": "Minimum\ufffewages"})  # as pdf-3 read it, its label dropped
+        project, [material] = await with_papers(client, ("Wage Floors.pdf", paper_pdf))
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        before = await chip_of(client, conversation)
+        assert (before["existence"], before["support"]) == ("ok", "supported") and "\ufffe" in before["quote"]
+        monkeypatch.setattr(extraction, "extract", real)
+        await read_as(client, monkeypatch, material, pdf4, extraction.PDF)
+        await idle(client, project)
+        chip, read_now = await chip_of(client, conversation), await evidence(client, project)
+        assert chip["passage_id"] != before["passage_id"] and read_now[chip["passage_id"]][4] == now
+        assert (chip["existence"], chip["support"]) == ("ok", "supported")
+
+
 async def test_a_reread_takes_the_new_passages_page(tmp_path, monkeypatch):
     # round 3, the open row: page = coalesce(new, old) in supersede and the null-passage loop
     read_in_process(monkeypatch)
