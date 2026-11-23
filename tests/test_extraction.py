@@ -475,13 +475,13 @@ def _pdf_mapping_tilde(code_point, first="We use the GPT-", second="~ model here
 MATH_X = "\U0001d465"  # mathematical italic x: above U+FFFF, two UTF-16 units, so two of PDFium's characters
 
 
-def _math_pdf(pages, bar=None, caret=None):
+def _math_pdf(pages, bar=None, dot=None):
     """synthetic.pdf's one page of (x, y, font size, text, font or none for Helvetica) lines, each "~" mapped
     (ToUnicode) to MATH_X; with bar, each "|" to those UTF-16 units (hex): 0002, a control character PDFium counts but
-    leaves out of its text; D835, half a surrogate pair, which PDFium counts and puts in its text; and so each "^"
-    with caret."""
+    leaves out of its text; D835, half a surrogate pair, which PDFium counts and puts in its text; and so each "."
+    with dot."""
     [lines] = pages
-    maps = [b" <%s> <%s>" % (code, units) for code, units in ((b"7C", bar), (b"5E", caret)) if units]
+    maps = [b" <%s> <%s>" % (code, units) for code, units in ((b"7C", bar), (b"2E", dot)) if units]
     cmap = (b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /T def 1 begincodespacerange"
             b" <00> <FF> endcodespacerange %d beginbfchar <7E> <D835DC65>%s endbfchar endcmap"
             b" CMapName currentdict /CMap defineresource pop end end" % (1 + len(maps), b"".join(maps)))
@@ -565,7 +565,7 @@ def test_a_characters_range_ends_after_its_last_pdfium_unit_where_its_units_are_
 
 
 def test_a_character_from_two_glyphs_has_a_box_over_both():  # c1 F1
-    data = _math_pdf([[(72, 720, 10, "|^")]], bar=b"D835", caret=b"DC65")  # each half its own glyph
+    data = _math_pdf([[(72, 720, 10, "|.")]], bar=b"D835", dot=b"DC65")  # each half its own glyph, apart in every edge
     import pypdfium2 as pdfium
 
     with extraction.PDFIUM:
@@ -573,7 +573,8 @@ def test_a_character_from_two_glyphs_has_a_box_over_both():  # c1 F1
         try:
             textpage = document[0].get_textpage()
             assert textpage.count_chars() == 2
-            halves = [textpage.get_charbox(at) for at in (0, 1)]  # each half's glyph, apart in every edge here
+            halves = [textpage.get_charbox(at) for at in (0, 1)]
+            assert len({edges for h in halves for edges in enumerate(h)}) == 8  # no edge the same
         finally:
             document.close()
     [passage] = extract(data, extraction.PDF).passages
