@@ -573,13 +573,15 @@ def test_a_character_from_two_glyphs_has_a_box_over_both():  # c1 F1
         try:
             textpage = document[0].get_textpage()
             assert textpage.count_chars() == 2
-            right = textpage.get_charbox(1)[2]  # the low half's glyph
+            halves = [textpage.get_charbox(at) for at in (0, 1)]  # each half's glyph, apart in every edge here
         finally:
             document.close()
     [passage] = extract(data, extraction.PDF).passages
     assert passage.text == MATH_X and (passage.char_start, passage.char_end) == (0, 2)
-    [[_, _, rect_right, _]] = passage.boxes["rects"]
-    assert rect_right == round(right / 612, 4)
+    left, bottom = min(h[0] for h in halves), min(h[1] for h in halves)
+    right, top = max(h[2] for h in halves), max(h[3] for h in halves)
+    assert passage.boxes["rects"] == [[round(left / 612, 4), round(1 - top / 792, 4), round(right / 612, 4),
+                                       round(1 - bottom / 792, 4)]]  # the union of both
 
 
 def test_paragraphs_apart_after_a_character_above_u_ffff_stay_apart():  # r5 F1
