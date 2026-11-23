@@ -511,7 +511,7 @@ def _rects(boxes, size):
     for box in boxes:
         if box is None:
             continue
-        left, bottom, right, top, _, line = box[:6]
+        left, bottom, right, top, _, line = box
         if right <= left or top <= bottom:
             continue
         merged = lines.get(line)
@@ -622,8 +622,9 @@ def _pdf_read(document, number, raw, measure=False):
 
 
 def _pdf_page(page, raw, measure=False):
-    """The page's lines: [{"text", "boxes" (per character: (l, b, r, t, index, line) or None), "size",
-    "left", "right", "top", "bottom", "bold"}], its size, and whether it is scanned. Sizes, boxes and
+    """The page's lines: [{"text", "boxes" (per character: (l, b, r, t, index, line) or None, with a seventh
+    element when PDFium gave a line-end hyphen mark after that character: the mark's box, the mark itself out of
+    the text, _marked), "size", "left", "right", "top", "bottom", "bold"}], its size, and whether it is scanned. Sizes, boxes and
     edges are of the page as displayed and rendered, its rotation and crop applied (_displayed), in points
     from its bottom left. With measure, only each line's text and size are true: no box is read and no
     line is checked for bold, the rest (lines, sizes, the scanned check) as without it."""
@@ -795,15 +796,15 @@ def _pdf_blocks(number, lines, size, body, sections, recognized=False):
     cells = [_cells(line) for line in lines]
 
     def flush():
-        if heading:  # consecutive heading lines of one size are one heading, its marks decided on it
-            text, boxes = joined(*_marked(*_join(heading)))
+        if heading:  # consecutive heading lines of one size are one heading, read without its marks as a block is
+            text, boxes = _join(heading)
             if number == 1 and heading[0]["size"] == largest and largest >= body * 1.3 and not sections.path \
                     and not recognized and not any(p.kind == "title" for p in passages) and not _known_heading(text):
-                passages.extend(_pieces(text, "title", number, [], None, None, boxes, size))
-            else:
+                passages.extend(_pieces(text, "title", number, [], None, None, boxes, size))  # cut, then joined
+            else:  # its path as pdf-3 kept it (cut at MAX_HEADING_CHARS in PDFium's form), its marks then decided
                 numbered = _NUMBERED.match(_normal(text))
                 sections.heading(1 if heading[0]["size"] >= body * 1.4 else 2 + (numbered[1].count(".") if numbered else 0),
-                                 text)
+                                 joined(_normal(_marked(text, boxes)[0])[:MAX_HEADING_CHARS].rstrip()))
             heading.clear()
         if block:
             text, boxes = _join(block)

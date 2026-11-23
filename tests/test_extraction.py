@@ -568,6 +568,42 @@ def test_the_classifier_reads_a_line_without_its_mark():
     assert ("caption", "Figure 1. Earnings by region in the synthetic panel.") in kinds(extract(data, extraction.PDF).passages)
 
 
+def test_a_long_title_and_heading_are_cut_in_pdfium_form_then_joined(monkeypatch):
+    # r4b review F1: as a body block is; the heading's path is cut at MAX_HEADING_CHARS as pdf-3 cut it
+    lines = [(72, 780 - 11 * n, 12, "Minimum wages raise the earn-" if n % 2 == 0 else "ings of workers across the panel and")
+             for n in range(70)]
+    body = [(72, 760 - 12 * n, 8, FILLER) for n in range(60)]  # the body's size, on page 2
+    data = synthetic.pdf([lines, body])
+    pdf_4 = extract(data, extraction.PDF).passages
+    with monkeypatch.context() as as_pdf_3:
+        as_pdf_3.setattr(extraction, "joined", lambda text, boxes=None: text if boxes is None else (text, boxes))
+        pdf_3 = extract(data, extraction.PDF).passages
+    titles = [(old.text, new.text) for old, new in zip(pdf_3, pdf_4) if new.kind == "title"]
+    assert len(titles) > 1 and all(new == extraction.joined(old) for old, new in titles)  # cut as pdf-3 cut it
+    heading = [(72, 750, 18, "A Synthetic Paper")] + [(72, 730 - 16 * n, 14, "Minimum wages raise the earn-" if n % 2 == 0
+                                                       else "ings of workers across the panel and") for n in range(24)]
+    data = synthetic.pdf([heading, [(72, 760 - 12 * n, 10, FILLER) for n in range(60)]])
+    pdf_4 = extract(data, extraction.PDF).passages
+    with monkeypatch.context() as as_pdf_3:
+        as_pdf_3.setattr(extraction, "joined", lambda text, boxes=None: text if boxes is None else (text, boxes))
+        pdf_3 = extract(data, extraction.PDF).passages
+    [old] = {tuple(p.section_path) for p in pdf_3 if p.section_path}
+    [new] = {tuple(p.section_path) for p in pdf_4 if p.section_path}
+    assert len(old[0]) == extraction.MAX_HEADING_CHARS and new == (extraction.joined(old[0]),)
+
+
+def test_a_pieces_range_is_of_the_characters_it_keeps_a_kept_marks_box_among_them():
+    text, boxes, marks = "We use GPT4 and decide.", [], {"T": (5.0, 1.0, 6.0, 2.0, 99, 0), "e": (5.0, 1.0, 6.0, 2.0, 200, 0)}
+    for index, char in enumerate(text):
+        box = None if char.isspace() else (1.0, 1.0, 2.0, 2.0, index, 0)
+        if char in marks and text[index + 1:index + 2] in ("4", "c"):  # GPT<mark>4 (kept), de<mark>cide (dropped)
+            box = (*box, marks[char])
+        boxes.append(box)
+    [piece] = extraction._pieces(text, "paragraph", 1, [], None, None, boxes, (612, 792))
+    assert piece.text == "We use GPT-4 and decide."
+    assert (piece.char_start, piece.char_end) == (0, 100)  # the kept mark's index among them, the dropped one's not
+
+
 def test_a_headings_kept_hyphen_is_decided_on_the_heading():
     page = [(72, 750, 18, "A Synthetic Paper"), (72, 720, 14, "2 A State-of-the-"), (72, 704, 14, "Art Survey"),
             (72, 680, 10, "Minimum wages raise the earnings of low-paid workers in the panel.")]
