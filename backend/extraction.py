@@ -1705,19 +1705,18 @@ def _html(source, stop):
         titles.read(source)
     except (AssertionError, ValueError):
         raise Unreadable() from None
-    title, first = [_normal(titles.title.value())], [True]  # first: no h1 met yet
+    title = [_normal(titles.title.value())]
     if title[0]:
         passages += _pieces(title[0], "title", None, [], None, None)
 
     def emit(kind, text, start, end, level):
         stop()
         if kind == "heading":
-            if level == 1 and first[0] and not title[0] and not _known_heading(text):
+            if level == 1 and not title[0] and not sections.path and not _known_heading(text):  # before any section
                 title[0] = text
                 passages.extend(_pieces(text, "title", None, [], start, end, source=source))
             else:
                 sections.heading(level, text)
-            first[0] = first[0] and level != 1  # only the first h1 may be the title
             return
         kind = kind if kind in ("table", "caption") else sections.kind(text)
         passages.extend(_pieces(_ABSTRACT.sub("", text, count=1) if kind == "abstract" else text, kind, None,
@@ -1845,15 +1844,14 @@ def _markdown(source, stop):
     """A Markdown file's blocks, read line by line from the text itself (no list of its lines), each
     made into passages as it ends; a paragraph's text is taken from its range of the source then,
     rather than held line by line."""
-    sections, passages, titled = _Sections(), [], [False]
+    sections, passages = _Sections(), []
 
     def emit(kind, text, start, end, level=0):
         if kind == "heading":
-            if level == 1 and not titled[0] and not passages and not _known_heading(text):
+            if level == 1 and not passages and not sections.path and not _known_heading(text):  # before any section
                 passages.extend(_pieces(text, "title", None, [], start, end, source=source))
             else:
                 sections.heading(level, text)
-            titled[0] = titled[0] or level == 1  # only the first h1 may be the title
             return
         kind = kind if kind in ("table", "caption") else sections.kind(text)
         passages.extend(_pieces(_ABSTRACT.sub("", text, count=1) if kind == "abstract" else text, kind, None,

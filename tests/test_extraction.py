@@ -655,6 +655,22 @@ def test_a_documents_first_heading_references_is_a_reference_list_not_its_title(
 
 
 @pytest.mark.parametrize(("media", "source"), [
+    (extraction.HTML, "<html><body><h2>References</h2><p>Doe, J. (2020). A synthetic paper.</p><h1>Appendix A</h1>"
+                      "<p>The appendix reports further estimates of the synthetic panel.</p></body></html>"),
+    (extraction.HTML, "<html><body><h2>Abstract</h2><p>We study minimum wages in a synthetic panel.</p><h1>Appendix A</h1>"
+                      "<p>The appendix reports further estimates of the synthetic panel.</p></body></html>"),
+    (extraction.MARKDOWN, "## References\n\n# Appendix A\n\nThe appendix reports further estimates of the synthetic panel.\n")],
+    ids=["html after references", "html after abstract", "markdown"])
+def test_a_first_level_heading_after_a_section_is_a_section_not_the_title(media, source):
+    # r4 pass 2: an h1 taken as the title after a section had begun left that section's kind over what followed.
+    # A title inferred from an h1 is taken only before any section (PDF's first-page title already was); DOCX's
+    # Title style and LaTeX's \title are the author's own, and a section continues across them (test_materials)
+    read = extract(source.encode(), media).passages
+    assert not any(p.kind == "title" for p in read)
+    assert [(p.kind, p.section_path) for p in read if p.text.startswith("The appendix")] == [("paragraph", ["Appendix A"])]
+
+
+@pytest.mark.parametrize(("media", "source"), [
     (extraction.HTML, "<html><body><h1>A Synthetic Paper</h1><h2>References</h2><p>Doe, J. (2020).</p></body></html>"),
     (extraction.MARKDOWN, "# A Synthetic Paper\n\n## References\n\nDoe, J. (2020).\n")])
 def test_a_documents_real_first_heading_is_still_its_title(media, source):
