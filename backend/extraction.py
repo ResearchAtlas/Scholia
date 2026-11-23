@@ -693,13 +693,14 @@ _LABELS = ("abstract", "摘要")
 def _hyphens(hyphened, word, char, following):
     """(hyphened, word) once char is the word's next character: whether the word, back to its last space, holds a
     hyphen, and its first letters (enough to tell an abstract's label; a label then spaces is kept, its spaces
-    after it). An abstract's label set off by a hyphen for its dash ("Abstract-Work-flows", "ABSTRACT -Work", as
-    _ABSTRACT reads a label: not before an a to z) is no hyphen of the word it runs into, which starts afresh after
-    it: the label leaves the passage (_drop_label), so the word reads as if it began there, and a pdf-3 quote, which
+    after it). An abstract's label set off by a hyphen for its dash ("Abstract-Work-flows", "ABSTRACT -work", as
+    _ABSTRACT reads a label: "Abstract-" not straight before an a to z, "摘要-" before anything) is no hyphen of the
+    word it runs into, which starts afresh after it: the label leaves the passage (_drop_label), so the word reads as if it began there, and a pdf-3 quote, which
     lost the label too, reads the same through joined."""
     if char.isspace():
         return False, word if word.endswith(" ") else word + " " if word.lower() in _LABELS else ""
-    if char == "-" and word.rstrip().lower() in _LABELS and not "a" <= following <= "z":
+    label = word.rstrip().lower()
+    if char == "-" and label in _LABELS and (word.endswith(" ") or label == "摘要" or not "a" <= following <= "z"):
         return False, ""
     word = "" if word.endswith(" ") else word
     return hyphened or char == "-", word + char if len(word) < 9 else word

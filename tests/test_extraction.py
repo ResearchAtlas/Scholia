@@ -515,7 +515,9 @@ def test_an_abstract_labels_dash_is_no_hyphen_of_the_word_it_runs_into_and_joine
     ("Abstract-Work-", "flows are measured in a synthetic panel of regions across many years."),
     ("Abstract-\u00e9Minimum-", "wages are measured in a synthetic panel of regions across many years."),  # é: no a-z
     ("Abstract-Abstract-Work-", "flows are measured in a synthetic panel of regions across many years."),  # doubled
-    ("ABSTRACT -Work-", "level wages are measured in a synthetic panel of regions across many years.")])  # spaced
+    ("ABSTRACT -Work-", "level wages are measured in a synthetic panel of regions across many years."),  # spaced
+    ("Abstract -work-", "flows are measured in a synthetic panel of regions across many years."),  # spaced, lower case
+    ("Abstract x-Work-", "flows are measured in a synthetic panel of regions across many years.")])  # no label: a word
 def test_joined_of_a_pdf_3_abstract_whose_label_was_dropped_reads_as_its_pdf_4_passage(first, second):
     # r3 review: the label's dash is left out exactly where _drop_label (_ABSTRACT) takes the label away
     data = _hyphen_page(first, second)
@@ -529,6 +531,7 @@ def test_joined_of_a_pdf_3_abstract_whose_label_was_dropped_reads_as_its_pdf_4_p
 
 def test_a_chinese_abstract_labels_dash_is_no_hyphen_of_the_word_it_runs_into():
     assert extraction.joined("摘要-Work\ufffeflows are measured") == "摘要-Workflows are measured"
+    assert extraction.joined("摘要-work\ufffeflows are measured") == "摘要-workflows are measured"  # 摘要 then any letter
     assert extraction.joined("Work\ufffeflows are measured") == "Workflows are measured"
 
 
