@@ -540,10 +540,11 @@ def test_a_pieces_range_pairs_each_kept_character_with_its_own_box():  # r5 F1
     assert (piece.text, piece.char_start, piece.char_end) == (f"{MATH_X}b", 0, 3)
 
 
-def test_half_a_surrogate_pair_is_left_out_of_the_text_and_counted_as_the_unit_pdfium_counts():  # fix batch 5 review F1
+@pytest.mark.parametrize("half", [b"D835", b"DC65"], ids=["high", "low"])
+def test_half_a_surrogate_pair_is_left_out_of_the_text_and_counted_as_the_unit_pdfium_counts(half):  # batch 5 review F1
     # PDFium puts the half in its text, which Python cannot hold: it is left out, as pdf-3 left it out, after its unit
     data = _math_pdf([[(72, 720, 10, "Half |a pair, then ~ here."), (72, 660, 10, "A second paragraph begins far below it.")]],
-                     bar=b"D835")
+                     bar=half)
     passages = extract(data, extraction.PDF).passages
     assert [p.text for p in passages] == [f"Half a pair, then {MATH_X} here.", "A second paragraph begins far below it."]
     assert all(_read_back(data, p) == p.text for p in passages)
