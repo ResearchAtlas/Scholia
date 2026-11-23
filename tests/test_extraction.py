@@ -659,8 +659,10 @@ def test_a_documents_first_heading_references_is_a_reference_list_not_its_title(
                       "<p>The appendix reports further estimates of the synthetic panel.</p></body></html>"),
     (extraction.HTML, "<html><body><h2>Abstract</h2><p>We study minimum wages in a synthetic panel.</p><h1>Appendix A</h1>"
                       "<p>The appendix reports further estimates of the synthetic panel.</p></body></html>"),
-    (extraction.MARKDOWN, "## References\n\n# Appendix A\n\nThe appendix reports further estimates of the synthetic panel.\n")],
-    ids=["html after references", "html after abstract", "markdown"])
+    (extraction.MARKDOWN, "## References\n\n# Appendix A\n\nThe appendix reports further estimates of the synthetic panel.\n"),
+    (extraction.HTML, "<html><body><h3>Notes</h3><h1>Appendix A</h1>"
+                      "<p>The appendix reports further estimates of the synthetic panel.</p></body></html>")],
+    ids=["html after references", "html after abstract", "markdown", "html after an h3"])
 def test_a_first_level_heading_after_a_section_is_a_section_not_the_title(media, source):
     # r4 pass 2: an h1 taken as the title after a section had begun left that section's kind over what followed.
     # A title inferred from an h1 is taken only before any section (PDF's first-page title already was); DOCX's
@@ -668,6 +670,13 @@ def test_a_first_level_heading_after_a_section_is_a_section_not_the_title(media,
     read = extract(source.encode(), media).passages
     assert not any(p.kind == "title" for p in read)
     assert [(p.kind, p.section_path) for p in read if p.text.startswith("The appendix")] == [("paragraph", ["Appendix A"])]
+
+
+def test_an_empty_first_heading_leaves_the_markdown_title_to_the_next():
+    # a heading that reads as nothing begins no section, as an empty HTML heading never did
+    read = extract(b"# \n\n# A Synthetic Paper\n\nMinimum wages raise earnings in the synthetic panel.\n",
+                   extraction.MARKDOWN).passages
+    assert [(p.kind, p.text) for p in read][0] == ("title", "A Synthetic Paper")
 
 
 @pytest.mark.parametrize(("media", "source"), [

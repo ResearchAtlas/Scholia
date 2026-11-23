@@ -1697,8 +1697,8 @@ class _HtmlReader(_BoundedHtml):
 
 
 def _html(source, stop):
-    """An HTML document's passages: its title first (its <title>, read in a first pass, or else its
-    first h1), then its blocks as the reader gives them; each pass bounded (_BoundedHtml)."""
+    """An HTML document's passages: its title first (its <title>, read in a first pass, or else an h1
+    before any section has begun), then its blocks as the reader gives them; each pass bounded (_BoundedHtml)."""
     sections, passages = _Sections(), []
     titles = _HtmlTitle()
     try:
