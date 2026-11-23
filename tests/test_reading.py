@@ -302,7 +302,7 @@ async def test_cancel_ends_a_child_in_the_middle_of_one_long_step_at_once(tmp_pa
 
 
 # The S1-13 hardening through the child: its readers' own calls to stop() are the child's reports,
-# Cancel ends the child wherever its reader is, and markdown-3 reads the same in the child
+# Cancel ends the child wherever its reader is, and markdown-4 reads the same in the child
 
 
 def long_html():
@@ -371,7 +371,7 @@ async def test_the_hardened_markdown_reader_reads_the_same_in_its_child(tmp_path
     except extraction.Unreadable as unreadable:
         found = unreadable.code
     assert found == expected and gone()
-    assert extraction.extractor_of(extraction.MARKDOWN) == ("markdown", "markdown-3")
+    assert extraction.extractor_of(extraction.MARKDOWN) == ("markdown", "markdown-4")
 
 
 # The child ends in every case

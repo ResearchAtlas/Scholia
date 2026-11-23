@@ -1119,35 +1119,46 @@ async def test_attached_in_a_conversation_names_it_and_only_its_own_project(tmp_
         await settled(client, project)
 
 
-async def test_a_markdown_paper_read_by_markdown_2_is_read_once_again_by_markdown_3_at_launch(tmp_path):
-    """The S1-13 hardening bumped the Markdown reader to markdown-3 (a fence past the block bound is refused, a
-    front matter past the structural bound is read as text); S1-20's launch re-read reads a paper whose only
-    reading is by markdown-2 once again, by markdown-3, which supersedes the earlier reading."""
-    data, current = tmp_path / "data", extraction.EXTRACTORS[extraction.MARKDOWN]
-    assert current == ("markdown", "markdown-3")
-    with pytest.MonkeyPatch.context() as earlier:  # an earlier Scholia, as this process sees it: read here
-        read_in_process(earlier)
-        earlier.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-2"))
+# Each text reader's version before PR 64's fix batch 1 changed its output ("Abstract" and captions in every reader,
+# the first-h1 title in HTML and Markdown), as S1-13 hardening's markdown-2 was before markdown-3
+EARLIER = {extraction.DOCX: ("docx-2", "paper.docx", synthetic.paper_docx),
+           extraction.HTML: ("html-2", "paper.html", synthetic.paper_html),
+           extraction.MARKDOWN: ("markdown-3", "notes.md", synthetic.paper_markdown),
+           extraction.LATEX: ("latex-2", "paper.tex", synthetic.paper_latex)}
+
+
+@pytest.mark.parametrize("kind", list(EARLIER))
+async def test_a_text_paper_read_by_its_readers_earlier_version_is_read_once_again_at_launch(tmp_path, kind):
+    """A paper whose only reading is by its reader's earlier version (EARLIER) is read once again by this
+    version at launch (S1-20's launch re-read), which supersedes the earlier reading; the next launch reads it
+    no more."""
+    data, current = tmp_path / "data", extraction.EXTRACTORS[kind]
+    earlier, name, make = EARLIER[kind]
+    assert current[1] != earlier
+    with pytest.MonkeyPatch.context() as before:  # an earlier Scholia, as this process sees it: read here
+        read_in_process(before)
+        before.setitem(extraction.EXTRACTORS, kind, (current[0], earlier))
+        stored_then = extraction.extractor_of(kind)[1]
         async with started(data) as client:
             project = await project_of(client)
-            await added(client, project, ("notes.md", synthetic.paper_markdown()))
+            await added(client, project, (name, make()))
             [read] = await settled(client, project)
             assert read["state"] == "ready"
-            assert await rows(client, "SELECT extractor_version FROM extractions") == [("markdown-2",)]
-    assert extraction.EXTRACTORS[extraction.MARKDOWN] == current  # this one, read again in its child
+            assert await rows(client, "SELECT extractor_version FROM extractions") == [(stored_then,)]
+    assert extraction.EXTRACTORS[kind] == current  # this one, read again in its child
     outdated = "SELECT json_extract(inputs, '$.outdated') FROM runs WHERE workflow = 'extract'" \
                " AND json_extract(inputs, '$.outdated') IS NOT NULL"
     async with started(data, setup=False) as client:
         await asyncio.sleep(0.5)
         await background_idle(client, timeout=10)
-        assert await rows(client, outdated) == [("markdown/markdown-3",)]
+        assert await rows(client, outdated) == [("/".join(extraction.extractor_of(kind)),)]
         [ready] = await settled(client, project)
         assert (ready["state"], ready["extraction"]["passages"]) == ("ready", read["extraction"]["passages"])
-        assert await rows(client, "SELECT extractor_version FROM extractions") == [("markdown-3",)]  # the earlier one gone
+        assert await rows(client, "SELECT extractor_version FROM extractions") == [(extraction.extractor_of(kind)[1],)]
     async with started(data, setup=False) as client:  # once: the next launch reads it no more
         await asyncio.sleep(0.5)
         await background_idle(client, timeout=10)
-        assert await rows(client, outdated) == [("markdown/markdown-3",)]
+        assert await rows(client, outdated) == [("/".join(extraction.extractor_of(kind)),)]
 
 
 async def test_a_paper_stored_with_half_a_surrogate_pair_is_listed_with_the_replacement_character(tmp_path):

@@ -90,8 +90,8 @@ EXTENSIONS = {".pdf": PDF, ".docx": DOCX, ".html": HTML, ".htm": HTML, ".xhtml":
               ".markdown": MARKDOWN, ".tex": LATEX, ".latex": LATEX}
 # Each media type's extractor and its version. Bump a version when its parser's output changes:
 # extractions are shared by file and extractor version.
-EXTRACTORS = {PDF: ("pdf", "pdf-4"), DOCX: ("docx", "docx-2"), HTML: ("html", "html-2"),
-              MARKDOWN: ("markdown", "markdown-3"), LATEX: ("latex", "latex-2")}
+EXTRACTORS = {PDF: ("pdf", "pdf-4"), DOCX: ("docx", "docx-3"), HTML: ("html", "html-3"),
+              MARKDOWN: ("markdown", "markdown-4"), LATEX: ("latex", "latex-3")}
 PDFIUM = threading.Lock()
 MAX_PAGE_PIXELS = 8 * 1024 * 1024  # a rendered page image's pixels: a letter page at scale 3 has 4.4 million
 MAX_PAGE_SIDE = 20_000  # a rendered page image's width or height: a letter page at scale 3 is 2,376 by 1,836
