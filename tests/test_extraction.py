@@ -511,6 +511,27 @@ def test_an_abstract_labels_dash_is_no_hyphen_of_the_word_it_runs_into_and_joine
         "Abstract-level workflows, abstract-high-quality."  # a hyphen before a lower-case letter is a word's
 
 
+@pytest.mark.parametrize(("first", "second"), [
+    ("Abstract-Work-", "flows are measured in a synthetic panel of regions across many years."),
+    ("Abstract-\u00e9Minimum-", "wages are measured in a synthetic panel of regions across many years."),  # é: no a-z
+    ("Abstract-Abstract-Work-", "flows are measured in a synthetic panel of regions across many years."),  # doubled
+    ("ABSTRACT -Work-", "level wages are measured in a synthetic panel of regions across many years.")])  # spaced
+def test_joined_of_a_pdf_3_abstract_whose_label_was_dropped_reads_as_its_pdf_4_passage(first, second):
+    # r3 review: the label's dash is left out exactly where _drop_label (_ABSTRACT) takes the label away
+    data = _hyphen_page(first, second)
+    text, _ = _pdfium_text(data)
+    line = text.split("\r\n", 1)[1]
+    pdf_3 = extraction._ABSTRACT.sub("", line, count=1)  # the pdf-3 passage: PDFium's text, its label dropped
+    assert "\ufffe" in pdf_3
+    [_, passage] = extract(data, extraction.PDF).passages
+    assert passage.kind == "abstract" and passage.text == extraction.joined(pdf_3)
+
+
+def test_a_chinese_abstract_labels_dash_is_no_hyphen_of_the_word_it_runs_into():
+    assert extraction.joined("摘要-Work\ufffeflows are measured") == "摘要-Workflows are measured"
+    assert extraction.joined("Work\ufffeflows are measured") == "Workflows are measured"
+
+
 def test_a_line_after_a_known_heading_never_joins_it():  # 1.0, its other half
     read = _sections((12, "Abstract", BOLD), (12, "Synthetic Evidence on Wages", None),
                      (None, "We study minimum wages in a synthetic panel.", None))
