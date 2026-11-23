@@ -536,12 +536,12 @@ def test_an_abstract_beginning_with_a_word_beginning_abstract_keeps_that_word():
 def test_a_caption_is_a_label_then_a_number_and_not_a_word_beginning_like_a_roman_numeral():
     source = ("# A Synthetic Paper\n\nChart vivid colours mark the regions of the synthetic panel.\n\n"
               "Table is where the synthetic panel's regions are listed by size.\n\nTable IV. Employment by region.\n\n"
-              "Table iv. Wages by region.\n\nFig. 2b. Prices by region.\n")
+              "Table iv. Wages by region.\n\nFig. 2b. Prices by region.\n\nTable IIa. Hours by region.\n")
     read = [(p.kind, p.text) for p in extract(source.encode(), extraction.MARKDOWN).passages]
     assert ("paragraph", "Chart vivid colours mark the regions of the synthetic panel.") in read
     assert ("paragraph", "Table is where the synthetic panel's regions are listed by size.") in read
     assert [t for k, t in read if k == "caption"] == ["Table IV. Employment by region.", "Table iv. Wages by region.",
-                                                      "Fig. 2b. Prices by region."]
+                                                      "Fig. 2b. Prices by region.", "Table IIa. Hours by region."]
 
 ABSTRACTION = "Abstraction makes the synthetic method applicable across all measured regions and groups."
 LABELLED = "Abstract: We study minimum wages in a synthetic panel of regions across many years."

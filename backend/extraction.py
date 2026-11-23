@@ -108,7 +108,7 @@ SCANNED_CHARS = 100
 SCANNED_IMAGE_COVER = 0.6
 
 _SENTENCE_END = re.compile(r"(?<=[.!?;])[\"')\]]*\s+|(?<=[。！？；])")
-_CAPTION = re.compile(r"^(?:figure|fig\.|table|tab\.|exhibit|chart)\s*(?:[0-9]+[a-z]?|[ivx]+)\b|^(?:图|表)\s*[0-9一二三四五六七八九十]+",
+_CAPTION = re.compile(r"^(?:figure|fig\.|table|tab\.|exhibit|chart)\s*(?:[0-9]+[a-z]?|(?-i:[IVX]+)[a-z]?|[ivx]+)\b|^(?:图|表)\s*[0-9一二三四五六七八九十]+",
                       re.IGNORECASE)
 _REFERENCES = re.compile(r"^(?:\d+\.?\s*)?(?:references|bibliography|works cited|literature cited|reference list"
                          r"|参考文献|引用文献)\s*:?$", re.IGNORECASE)
