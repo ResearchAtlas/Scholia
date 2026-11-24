@@ -1,0 +1,84 @@
+name: Walkthrough trial
+
+# A trial, not a gate (the M2 retrospective, decision 1): the rendered walkthrough's eight
+# combinations on a GitHub-hosted runner, with the image's Chrome for Testing. It runs when this
+# file changes, or by hand. Whether it later runs on each push to main is decided from its result.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/walkthrough.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: walkthrough-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_PYTHON_DOWNLOADS: never
+  UV_PYTHON_PREFERENCE: only-system
+
+jobs:
+  walkthrough:
+    name: Walkthrough --all (trial)
+    runs-on: macos-26
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.19"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Install
+        run: |
+          uv sync --locked --python "${{ steps.python.outputs.python-path }}"
+          cd frontend && npm ci
+      # The image lists Chrome for Testing but no Playwright browser cache, so the driver is given
+      # the image's browser instead of its default path.
+      - name: Find Chrome for Testing
+        id: browser
+        run: |
+          app="$(find /Applications -maxdepth 2 -name 'Google Chrome for Testing.app' -print -quit)"
+          test -n "$app" || { echo "no Chrome for Testing in /Applications"; exit 1; }
+          bin="$app/Contents/MacOS/Google Chrome for Testing"
+          "$bin" --version
+          echo "path=$bin" >> "$GITHUB_OUTPUT"
+      # As in CI's Tests step: the runner passes every step two kernel-control sockets, and the
+      # server's network block will not start beside a socket it cannot inspect, so the driver runs
+      # in a child process that inherits only stdin, stdout and stderr.
+      - name: Walkthrough --all
+        env:
+          BROWSER: ${{ steps.browser.outputs.path }}
+        run: >
+          uv run --no-sync python -c
+          'import os, subprocess, sys; sys.exit(subprocess.call(["node", "tests/walkthrough_driver.mjs",
+          "--all", "--out", "build/walkthrough", "--browser", os.environ["BROWSER"]]))'
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '```'
+            cat build/walkthrough/runs.txt 2>/dev/null || echo "no runs.txt"
+            for m in build/walkthrough/*/manifest.json; do
+              [ -e "$m" ] && python3 -c 'import json, sys; m = json.load(open(sys.argv[1])); print(sys.argv[1].split("/")[-2], "ok" if m.get("ok") else "FAILED", m.get("commit"), "dirty" if m.get("dirty") else "clean", m.get("browser"))' "$m"
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: walkthrough
+          path: build/walkthrough
+          if-no-files-found: warn
+          retention-days: 14
