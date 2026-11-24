@@ -339,10 +339,10 @@ export function reasonKey(reason) {
   return reason ? `library.reason.${REASONS.has(reason) ? reason : 'other'}` : null;
 }
 
-// Whether the Library should look again soon: a paper is being read, a lookup runs, an ask waits, or a
-// merge has still to ask or to apply its answer (S1-14).
+// Whether the Library should look again soon: a paper is being read, a lookup runs, an ask waits, a
+// merge has still to ask or to apply its answer (S1-14), or the search model's offer has still to ask.
 export function unsettled(listing) {
-  return Boolean(listing && (listing.asks?.length || listing.merging
+  return Boolean(listing && (listing.asks?.length || listing.merging || listing.offering
     || listing.materials?.some((m) => m.state === 'reading' || m.lookup?.status === 'running')));
 }
 

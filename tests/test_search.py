@@ -441,6 +441,36 @@ async def test_the_first_material_raises_one_offer_and_nothing_is_sent_before_th
         assert (found["mode"], found["reason"]) == ("keyword_only", "model_missing") and found["results"]
 
 
+async def test_the_library_looks_again_while_the_offer_has_still_to_ask(tmp_path, monkeypatch):
+    # The walkthrough trial on a slower Mac (PR 65): the paper read as ready, the offer not asked yet, the Library stopped.
+    gate, original = asyncio.Event(), search._offer_run
+
+    async def held(*args):
+        await gate.wait()
+        return await original(*args)
+
+    monkeypatch.setattr(search, "_offer_run", held)
+    async with app(tmp_path, install=False) as client:
+        try:
+            project = await project_of(client)
+            await added(client, project, WAGES)
+            await idle(client, project)
+            [run] = await runs_of(client, "model_offer", project)
+            listing = (await client.get(f"/api/projects/{project}/materials")).json()
+            assert [m["state"] for m in listing["materials"]] == ["ready"] and run["status"] == "running"
+            assert (listing["asks"], listing["offering"]) == ([], 1)
+        finally:
+            gate.set()
+        [ask] = await until_offer(client, project)
+        listing = (await client.get(f"/api/projects/{project}/materials")).json()
+        assert ([a["ask_id"] for a in listing["asks"]], listing["offering"]) == ([ask["ask_id"]], 0)
+        answered = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "later"})
+        assert answered.status_code == 200, answered.text
+        await run_finished(client, ask["run_id"])
+        listing = (await client.get(f"/api/projects/{project}/materials")).json()
+        assert (listing["asks"], listing["offering"]) == ([], 0)
+
+
 async def test_an_offer_shows_in_the_conversation_its_file_was_attached_in(tmp_path):
     async with app(tmp_path, install=False) as client:
         project = await project_of(client)
