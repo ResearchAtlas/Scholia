@@ -189,7 +189,7 @@ async def test_a_deleted_reference_files_paper_is_read_back_nowhere_and_its_merg
         # Nothing of its title or its record is kept by the run that waited on it.
         kept = await rows(client, "SELECT inputs FROM runs UNION ALL SELECT data FROM run_events")
         assert not any("A Paper Already Here" in (text or "") for (text,) in kept)
-        assert (await client.get(f"/api/projects/{project}/materials")).json() == {"materials": [], "asks": [], "merging": 0}
+        assert (await client.get(f"/api/projects/{project}/materials")).json() == {"materials": [], "asks": [], "merging": 0, "offering": 0}
 
 
 # S1-19: a turn's evidence (L3)

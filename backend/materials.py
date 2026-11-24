@@ -1068,13 +1068,18 @@ async def list_materials(project_id: str, request: Request):
         open_asks = asks.open_asks(conn, project_id=project_id, registry=registry)
         listed = {ask["run_id"] for ask in open_asks}
         runs = _runs_of(conn, rows)
+
+        def unlisted(workflow):  # its runs still running whose question is not listed: the Library looks again
+            return sum(run not in listed and _live(run, registry) for (run,) in conn.execute(
+                "SELECT id FROM runs WHERE project_id = ? AND workflow = ? AND status = 'running'", (project_id, workflow)))
+
         return {"materials": [_describe(conn, row, registry, runs) for row in rows], "asks": open_asks,
-                # S1-14: merges still running whose question is not listed (not asked yet, asked under a
-                # policy the project no longer has and not yet asked again, or answered and applying it):
-                # the Library looks again
-                "merging": sum(run not in listed and _live(run, registry) for (run,) in conn.execute(
-                    "SELECT id FROM runs WHERE project_id = ? AND workflow = 'merge' AND status = 'running'",
-                    (project_id,)))}
+                # S1-14: merges not asked yet, asked under a policy the project no longer has and not yet asked
+                # again, or answered and applying it
+                "merging": unlisted("merge"),
+                # the search model's offer: recorded as the paper turns ready and asked a moment later by its run,
+                # so without this the Library could read the ready paper, see nothing under way and stop looking
+                "offering": unlisted("model_offer")}
 
     return await asyncio.to_thread(state["db"].read, listing)
 
