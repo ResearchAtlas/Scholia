@@ -43,6 +43,9 @@ test('the Library looks again only while something is under way', () => {
   assert.equal(unsettled({ materials: [{ state: 'reading' }], asks: [] }), true);
   assert.equal(unsettled({ materials: [{ state: 'ready', lookup: { status: 'running' } }], asks: [] }), true);
   assert.equal(unsettled({ materials: [], asks: [{}] }), true);
+  assert.equal(unsettled({ materials: [{ state: 'ready' }], asks: [], merging: 1 }), true);
+  assert.equal(unsettled({ materials: [{ state: 'ready' }], asks: [], offering: 1 }), true); // asked just after the paper is ready
+  assert.equal(unsettled({ materials: [{ state: 'ready' }], asks: [], merging: 0, offering: 0 }), false);
 });
 
 test('the details form sends only what changed, authors one per line', () => {
